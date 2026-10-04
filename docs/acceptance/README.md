@@ -15,6 +15,26 @@ starts.
 | `phase-6.md` | Installer, UX states, privacy disclosures | To write in Phase 6 |
 | `phase-7.md` | Full release matrix from `docs/build-plan.md` | To write in Phase 7 |
 
+## Revision track: phases A–G (governs going forward)
+
+The competitive-learnings revision (`docs/competitive-revision-plan.md`)
+defines phases A–G with hard exit gates and its own release-gate list.
+Mapping to the older numbering (formalized in ADR-015):
+
+| Revision phase | Contains (from older plans) | Acceptance home |
+|---|---|---|
+| A — Audit & rebaseline | Prior-art matrix, ADR-009…016, manifest schema v2, fastest-single harness *frozen* | `phase-a.md` (draft in first response) |
+| B — Protocol foundation | Original Phase 1 (tracker) + canonical serialization, leases, golden vectors; property gates | `phase-b.md` |
+| C — Single & hedged | Original Phases 2–4 (runtime, transport, gateway) + racing; first real benchmark *runs* | `phase-c.md` |
+| D — Exact two-peer speculation | Cooperative P1–P3 (internals lab, local spec, two-node protocol) | `phase-d.md` |
+| E — Multi-proposer trees | Cooperative P4 (+`search_verified` from P6 behind its own gate) | `phase-e.md` |
+| F — Public hostile swarm | Cooperative P7 + NAT/relay (amends ADR-003) + original Phase 5 hardening | `phase-f.md` |
+| G — Windows beta | Original Phases 6–7 + cooperative P8; signed installers | `phase-g.md` |
+
+Nothing in A–G has started. The Phase A exit gate (differentiation paragraph
++ approved ADRs + frozen harness/schemas) is defined in
+`docs/reviews/phase-a-first-response.md`.
+
 ## Follow-up track: cooperative inference (gated)
 
 Phases P0–P8 are specified in `docs/cooperative-plan.md` with per-phase gates

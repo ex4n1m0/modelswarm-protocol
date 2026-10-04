@@ -40,6 +40,31 @@ observed results. The next phase does not start until the previous one is review
 Phase 0 (this state of the repo) is design + scaffold only: **no tracker behavior, no
 inference, no fake "working" code.**
 
+## Plan of record and supersession (three planning documents)
+
+1. `docs/build-plan.md` — original prototype plan (phases 0–7).
+2. `docs/cooperative-plan.md` — cooperative-inference research (P0–P8),
+   gated on the original prototype.
+3. `docs/competitive-revision-plan.md` — **newest; governs where plans
+   conflict** until superseded. Phases A–G. Formal supersession map and the
+   rename of the ownership map to its nine-subagent roster (Prior-Art
+   Auditor, Protocol Architect, Runtime Engineer, Network Engineer,
+   Scheduler Scientist, Security Engineer, Tracker Engineer, Windows Product
+   Engineer, Test and Release Engineer) happen in Phase A via ADR-015/010.
+   Until then, the rules below and the original ownership map remain in
+   force, plus these revision invariants:
+
+   - Positioning: ModelSwarm forms small network-aware micro-swarms of peers
+     hosting the exact same immutable profile; cooperative modes must beat
+     the **fastest eligible single host** or fall back — no average-baseline
+     claims, ever.
+   - The hub stays content-blind; lossless correctness contracts precede any
+     approximate mode; performance honesty (negative results published) is a
+     release gate.
+   - Phase A's first response lives at
+     `docs/reviews/phase-a-first-response.md`; later phases do not start
+     until it is approved and its exit gate met.
+
 ## Follow-up track: cooperative inference (gated)
 
 `docs/cooperative-plan.md` specifies an experimental follow-up program

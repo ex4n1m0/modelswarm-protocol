@@ -22,6 +22,10 @@ evidence. Severity = impact × likelihood (H/M/L).
 | R15 | Windows path/AV interference with sidecar + models | M | Test on clean Win10/11 VMs early (Phase 2, not Phase 7); documented exclusions if needed | QA/Security | Phase 2 |
 | R16 | Cooperative research starts on an unstable baseline or overclaims speedups | H | Prerequisite gate in `docs/cooperative-plan.md` (original phases complete first); fastest-eligible-single comparator rule; per-phase gates with negative results preserved | Integrator | Follow-up P0 audit |
 | R17 | Multi-peer cooperative modes widen prompt exposure (N peers receive the prompt) | H | Privacy disclosure in cooperative UI (P8); invite-only swarm; cooperative prompt delivery documented in `docs/privacy.md` when P0 begins | QA/Security | Follow-up P8 |
+| R18 | Insufficient differentiation from prior art (p2ptokens ratio marketplace, LocalAI federation, Petals pipelines, exo LAN clusters) | H | Phase A prior-art matrix + testable differentiation paragraph (ADR-009); exact-profile micro-swarm + lossless speculation as identity | Prior-Art Auditor | Revision A |
+| R19 | Three overlapping plans (0–7, P0–P8, A–G) cause cross-implementation and gate confusion | H | ADR-015 supersession map; newest-plan-governs rule in AGENTS.md/README until then | Integrator | Revision A |
+| R20 | `speculative_exact` depends on runtime hooks llama.cpp does not expose (vLLM adapter or fork) | H | Phase D entry requires ADR on research runtime; stop condition on "large unsafe fork"; production llama.cpp path untouched | Runtime Engineer | Revision D |
+| R21 | Performance-dishonesty creep (average baselines, simulated results, hidden regressions) | H | Fastest-eligible-single comparator rule in AGENTS.md; release gates forbid simulated claims; Scheduler Scientist must publish negative results | Test/Release | Every revision phase |
 
 ## Standing review triggers
 

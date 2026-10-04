@@ -7,7 +7,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "validate:vectors": "node scripts/validate-vectors.mjs"
   },
   "dependencies": {
     "next": "^15.3.0",
@@ -19,6 +20,7 @@
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "ajv": "^8.20.0",
     "typescript": "^5.6.0"
   }
 }

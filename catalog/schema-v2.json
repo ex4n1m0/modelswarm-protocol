@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://modelswarm.deepflux.space/schemas/model-profile-manifest-v2.json",
+  "title": "ModelSwarm model-profile manifest v2 (ADR-011)",
+  "type": "object",
+  "$defs": {
+    "Hash32": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "ModelProfileManifest": {
+      "type": "object",
+      "description": "Identity-bearing fields. The ModelProfileId is derived: 'msp1:' + hex(sha256(canonical JSON of this object)). Every field is immutable; any change creates a new profile and swarm.",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "hf_repo", "hf_revision", "artifact_hashes",
+        "tokenizer_hash", "chat_template_hash", "architecture_hash",
+        "quantization", "runtime", "decoding_abi_version",
+        "speculative_capabilities"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "hf_repo": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
+        "hf_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "artifact_hashes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": { "type": "string", "pattern": "^[A-Za-z0-9._/-]+$" },
+              "sha256": { "$ref": "#/$defs/Hash32" }
+            }
+          }
+        },
+        "tokenizer_hash": { "$ref": "#/$defs/Hash32" },
+        "chat_template_hash": { "$ref": "#/$defs/Hash32" },
+        "architecture_hash": { "$ref": "#/$defs/Hash32" },
+        "quantization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["method", "bits"],
+          "properties": {
+            "method": { "type": "string", "pattern": "^[A-Za-z0-9_]+$" },
+            "bits": { "type": "integer", "minimum": 1, "maximum": 8 }
+          }
+        },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version", "build_hash"],
+          "properties": {
+            "name": { "const": "llama.cpp" },
+            "version": { "type": "string", "minLength": 1 },
+            "build_hash": { "$ref": "#/$defs/Hash32" }
+          }
+        },
+        "decoding_abi_version": { "type": "integer", "minimum": 1 },
+        "speculative_capabilities": {
+          "type": "array",
+          "items": { "enum": ["proposal_tokens", "logprobs", "batch_verify", "tree_attention"] }
+        }
+      }
+    },
+    "ProfileRecord": {
+      "type": "object",
+      "description": "Storage/catalog wrapper. Only 'manifest' is hashed; wrapper fields are mutable UI/admin state.",
+      "additionalProperties": false,
+      "required": ["manifest", "profile_id", "display_name", "status"],
+      "properties": {
+        "manifest": { "$ref": "#/$defs/ModelProfileManifest" },
+        "profile_id": { "type": "string", "pattern": "^msp1:[0-9a-f]{64}$" },
+        "display_name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "status": { "type": "string", "enum": ["candidate", "active", "deprecated"] },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "resolvedBy": { "type": "string" },
+            "resolvedAt": { "type": "string", "format": "date-time" },
+            "reviewedBy": { "type": "string" },
+            "licenseEvidenceUrl": { "type": "string", "format": "uri" }
+          }
+        }
+      }
+    }
+  }
+}

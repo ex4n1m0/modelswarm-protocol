@@ -3,9 +3,9 @@ name: tracker
 on:
   push:
     branches: [main]
-    paths: ["apps/tracker/**", ".github/workflows/tracker.yml"]
+    paths: ["apps/tracker/**", "protocol/vectors/**", "catalog/schema-v2.json", ".github/workflows/tracker.yml"]
   pull_request:
-    paths: ["apps/tracker/**", ".github/workflows/tracker.yml"]
+    paths: ["apps/tracker/**", "protocol/vectors/**", "catalog/schema-v2.json", ".github/workflows/tracker.yml"]
 
 defaults:
   run:
@@ -24,3 +24,4 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
+      - run: npm run validate:vectors

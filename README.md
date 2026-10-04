@@ -14,6 +14,14 @@ is actively and verifiably hosting the exact same profile P.
 Phase 0 — design and scaffold. See `docs/verification/phase-0.md` for the current
 verification report. No runtime functionality exists yet, by design.
 
+**Follow-up track (planned, not started):** an experimental cooperative-inference
+research program is specified in `docs/cooperative-plan.md` (phases P0–P8:
+hedged/speculative decoding, parallel search, adaptive planner). It is gated —
+no cooperative work begins until the original prototype passes that plan's
+prerequisite gate (three-node hosting, exact-profile lookup, direct streams,
+streaming gateway, fastest-peer baseline metrics, host-to-consume enforcement,
+prompt privacy — i.e., original Phases 1–7).
+
 ## Repository map
 
 | Path | Purpose |

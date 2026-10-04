@@ -32,6 +32,13 @@ technically read any prompt it serves. This is stated plainly at onboarding.
 Mitigation posture: invite-only swarm in v0.1, encrypted transport, no
 confidential-computing claims.
 
+**Planned change (follow-up track, gated):** the experimental cooperative
+modes in `docs/cooperative-plan.md` would deliver the prompt to a micro-swarm
+of 2–8 peers instead of one, multiplying exposure. If and when that track
+passes its prerequisite gate, this document must be updated with the exact
+recipient set per mode and the onboarding disclosure reworded before any
+cooperative request is served.
+
 ## 3. Secrets handling
 
 - Ed25519 private key: generated on-device, stored via DPAPI/Credential

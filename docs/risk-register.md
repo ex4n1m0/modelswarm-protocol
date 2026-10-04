@@ -20,6 +20,8 @@ evidence. Severity = impact × likelihood (H/M/L).
 | R13 | Hub signing key compromise | H | Env-var-only key storage; rotation runbook; short token TTLs bound damage | Tracker | Phase 1 ops doc |
 | R14 | Tracker outage degrades swarm | M | Leases expire gracefully; existing streams unaffected; UI degraded state | Tracker | Phase 7 drill |
 | R15 | Windows path/AV interference with sidecar + models | M | Test on clean Win10/11 VMs early (Phase 2, not Phase 7); documented exclusions if needed | QA/Security | Phase 2 |
+| R16 | Cooperative research starts on an unstable baseline or overclaims speedups | H | Prerequisite gate in `docs/cooperative-plan.md` (original phases complete first); fastest-eligible-single comparator rule; per-phase gates with negative results preserved | Integrator | Follow-up P0 audit |
+| R17 | Multi-peer cooperative modes widen prompt exposure (N peers receive the prompt) | H | Privacy disclosure in cooperative UI (P8); invite-only swarm; cooperative prompt delivery documented in `docs/privacy.md` when P0 begins | QA/Security | Follow-up P8 |
 
 ## Standing review triggers
 

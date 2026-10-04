@@ -40,6 +40,30 @@ observed results. The next phase does not start until the previous one is review
 Phase 0 (this state of the repo) is design + scaffold only: **no tracker behavior, no
 inference, no fake "working" code.**
 
+## Follow-up track: cooperative inference (gated)
+
+`docs/cooperative-plan.md` specifies an experimental follow-up program
+(phases P0–P8: baseline freeze, transformer internals, speculative decoding,
+multi-proposer trees, adaptive planner, search mode, adversarial resilience,
+Windows integration). It does **not** modify the rules above; it adds:
+
+- **Prerequisite gate.** No cooperative phase, crate, agent, or protocol
+  message may be implemented until the original prototype demonstrably
+  provides: three-node exact-profile hosting, exact-profile peer lookup,
+  direct encrypted streams, a correctly streaming local gateway, a recorded
+  fastest-peer baseline (TTFT/ITL/throughput/completion/bytes), working
+  host-to-consume eligibility, and verified prompt/completion absence from
+  tracker storage and logs. Until then, cooperative work is out of scope.
+- When P0 begins, the Integrator appends its subagents and owned paths
+  (`crates/ms-coop-protocol`, `ms-decode`, `ms-planner`, `ms-verification`,
+  `ms-network-model`, `apps/ms-bench`, `apps/ms-coop-sim`, `research/`,
+  `experiments/`) to the ownership map above under the same rules: ADR-gated
+  shared-schema changes, `HANDOFF.md` per agent, sequential integration, and
+  no invented fields outside `protocol/msp-cooperative-v1.md`.
+- Scientific rule for the follow-up: every cooperative claim compares against
+  the **fastest eligible single host at that moment**, never an average or
+  slower host; slowdowns are reported as visibly as speedups.
+
 ## Ownership map
 
 | Agent | Owned paths | Output required |

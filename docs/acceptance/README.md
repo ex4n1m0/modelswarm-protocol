@@ -15,5 +15,15 @@ starts.
 | `phase-6.md` | Installer, UX states, privacy disclosures | To write in Phase 6 |
 | `phase-7.md` | Full release matrix from `docs/build-plan.md` | To write in Phase 7 |
 
+## Follow-up track: cooperative inference (gated)
+
+Phases P0–P8 are specified in `docs/cooperative-plan.md` with per-phase gates
+and their own acceptance table. They have **not started**: the prerequisite
+gate (original prototype complete with baseline metrics, eligibility, and
+privacy verification) is unmet while only Phase 0 exists. When P0 begins,
+per-phase acceptance files `phase-p0.md`…`phase-p8.md` are authored here
+under the same rule below, plus the follow-up's scientific baseline rule
+(fastest eligible single host as comparator).
+
 Rule: a phase's acceptance file may only be authored from the frozen contract
 documents (`protocol/`, `catalog/`, ADRs) — never from an implementation.

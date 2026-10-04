@@ -1,0 +1,27 @@
+name: rust
+
+on:
+  push:
+    branches: [main]
+    paths: ["crates/**", "apps/**", "Cargo.toml", "rust-toolchain.toml", ".github/workflows/rust.yml"]
+  pull_request:
+    paths: ["crates/**", "apps/**", "Cargo.toml", "rust-toolchain.toml", ".github/workflows/rust.yml"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (warnings denied)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace

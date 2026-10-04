@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ms-core",
+    "crates/ms-crypto",
+    "crates/ms-catalog",
+    "crates/ms-runtime",
+    "crates/ms-p2p",
+    "crates/ms-scheduler",
+    "crates/ms-store",
+    "crates/ms-gateway",
+    "crates/ms-telemetry",
+    "apps/modelswarm-node",
+    "apps/modelswarm-desktop",
+    "apps/modelswarm-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+repository = "modelswarm"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Project code is held to warnings-denied from Phase 0 onward.
+all = { level = "deny", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

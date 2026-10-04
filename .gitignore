@@ -1,0 +1,38 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / Next.js
+node_modules/
+hub/.next/
+hub/out/
+hub/.vercel
+npm-debug.log*
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+secrets/
+.vercel/
+
+# Databases and local state
+*.sqlite
+*.sqlite3
+*.db
+hub/data/
+
+# Model artifacts (never commit weights)
+*.gguf
+models/
+
+# Logs and OS artifacts
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

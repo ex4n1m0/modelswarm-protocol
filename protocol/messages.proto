@@ -1,0 +1,113 @@
+// ModelSwarm Protocol v1 — message schema of record.
+//
+// Field names/numbers here are FROZEN by protocol/msp-v1.md §6. The on-wire
+// encoding (raw protobuf vs length-prefixed frames) is fixed by the Phase 3
+// opening ADR; the fields do not change either way.
+//
+// Hub↔node traffic is JSON over HTTPS and is NOT defined here (see msp-v1.md §3).
+
+syntax = "proto3";
+
+package msp.v1;
+
+// ---------- Handshake ----------
+
+message Handshake {
+  string protocol_version = 1;   // "1"
+  string peer_id = 2;            // libp2p PeerId of requester
+  string installation_id = 3;
+  string profile_id = 4;         // profile the request targets
+  string runtime_name = 5;       // e.g. "llama.cpp"
+  string runtime_build = 6;
+  string ts = 7;                 // RFC 3339 UTC
+  string nonce = 8;              // single-use
+  bytes  signature = 9;          // ed25519 over canonical fields 1..8
+}
+
+message HandshakeAck {
+  bool   ok = 1;
+  string error_code = 2;         // msp-v1.md §6.5 when !ok
+  uint32 queue_position = 3;
+  uint32 eta_ms = 4;
+}
+
+// ---------- Inference ----------
+
+message ChatMessage {
+  string role = 1;               // system | user | assistant
+  string content = 2;
+}
+
+message Sampling {
+  double temperature = 1;
+  double top_p = 2;
+  uint32 top_k = 3;
+  optional uint64 seed = 4;
+}
+
+message InferenceRequest {
+  string request_id = 1;         // uuid v4, single-use
+  string profile_id = 2;
+  string capability_token = 3;   // signed token from msp-v1.md §5
+  repeated ChatMessage messages = 4;
+  Sampling sampling = 5;
+  uint32 max_tokens = 6;
+  uint32 deadline_ms = 7;
+  bool   stream = 8;
+}
+
+message Cancel {
+  string request_id = 1;
+  string reason = 2;             // free-form, prompt text forbidden
+}
+
+// ---------- Stream events (one StreamEvent per frame, ordered) ----------
+
+message TokenDelta {
+  string request_id = 1;
+  string delta = 2;
+  uint32 index = 3;
+}
+
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  uint32 prefill_ms = 3;
+  uint32 decode_ms = 4;
+}
+
+message JobReceipt {
+  string request_id = 1;
+  string profile_id = 2;
+  string started_at = 3;
+  string ended_at = 4;
+  string outcome = 5;            // completed | interrupted | cancelled | error
+  string usage_digest = 6;
+  bytes  requester_signature = 7; // set only in the final receipt_ack phase (§7)
+  bytes  server_signature = 8;    // set by the server in the completed event
+  repeated string peer_ids = 9;   // [requesterPeerId, serverPeerId]
+}
+
+// Final message from requester on the stream after verifying the server's
+// receipt signature; completes the two-phase receipt of msp-v1.md §7.
+message ReceiptAck {
+  string request_id = 1;
+  bytes  requester_signature = 2;
+}
+
+message StreamEvent {
+  string request_id = 1;
+  oneof kind {
+    Accepted  accepted = 2;
+    TokenDelta token_delta = 3;
+    Usage     usage = 4;
+    Completed completed = 5;
+    Errored   errored = 6;
+    StreamCancelled cancelled = 7;
+  }
+}
+
+message Accepted  { uint32 queue_position = 1; uint32 eta_ms = 2; }
+message Completed { string finish_reason = 1; JobReceipt receipt = 2; }
+message Errored   { string code = 1; string message = 2; bool retryable_peer_hint = 3; }
+message StreamCancelled { string reason = 1; }

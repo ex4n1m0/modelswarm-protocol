@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://modelswarm.deepflux.space/schemas/catalog-v1.json",
+  "title": "ModelSwarm catalog v1",
+  "type": "object",
+  "$defs": {
+    "ModelProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profileId", "displayName", "hfRepo", "hfRevision", "filename",
+        "sha256", "bytes", "quantization", "runtime", "contextTokens",
+        "maxOutputTokens", "licenseId", "status"
+      ],
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "pattern": "^msp:[a-z0-9][a-z0-9-]*:[a-z0-9][a-z0-9_-]*:v[0-9]+$",
+          "description": "Immutable id. Any artifact change = new id (ADR-005)."
+        },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "hfRepo": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+          "description": "Hugging Face org/repo."
+        },
+        "hfRevision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "FULL 40-char commit hash. Branches/tags forbidden."
+        },
+        "filename": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+\\.gguf$"
+        },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "bytes": { "type": "integer", "minimum": 1 },
+        "quantization": { "type": "string", "minLength": 1 },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "minBuild"],
+          "properties": {
+            "name": { "const": "llama.cpp" },
+            "minBuild": {
+              "type": "string",
+              "description": "Pinned, tested build tag/hash of the sidecar."
+            }
+          }
+        },
+        "contextTokens": { "type": "integer", "minimum": 1024 },
+        "maxOutputTokens": { "type": "integer", "minimum": 1 },
+        "licenseId": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "enum": ["candidate", "active", "deprecated"] },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "resolvedBy": { "type": "string", "description": "Resolver script version." },
+            "resolvedAt": { "type": "string", "format": "date-time" },
+            "reviewedBy": { "type": "string", "description": "Human approver." },
+            "licenseEvidenceUrl": { "type": "string", "format": "uri" }
+          }
+        }
+      }
+    },
+    "CatalogEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["catalogVersion", "generatedAt", "profiles", "signature"],
+      "properties": {
+        "catalogVersion": { "type": "integer", "minimum": 1 },
+        "generatedAt": { "type": "string", "format": "date-time" },
+        "profiles": { "type": "array", "minItems": 0, "items": { "$ref": "#/$defs/ModelProfile" } },
+        "signature": { "type": "string", "description": "ed25519 over canonical JSON of the other fields." }
+      }
+    }
+  },
+  "$ref": "#/$defs/CatalogEnvelope"
+}

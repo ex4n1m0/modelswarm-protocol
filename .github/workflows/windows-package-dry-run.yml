@@ -1,0 +1,28 @@
+name: windows-package-dry-run
+
+# Packaging dry run: prove the release build of the node daemon compiles and
+# runs on a clean Windows runner. The real NSIS/Tauri packaging job is added
+# in Phase 6 (ADR-008).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["apps/**", "crates/**", "Cargo.toml", ".github/workflows/windows-package-dry-run.yml"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Release build (node)
+        run: cargo build --release -p modelswarm-node
+      - name: Smoke run
+        run: ./target/release/modelswarm-node.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modelswarm-node-win-x64
+          path: target/release/modelswarm-node.exe
+          if-no-files-found: error

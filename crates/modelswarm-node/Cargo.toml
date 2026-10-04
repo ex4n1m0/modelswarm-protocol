@@ -1,0 +1,14 @@
+[package]
+name = "modelswarm-node"
+description = "ModelSwarm Windows background node daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+modelswarm-types = { path = "../modelswarm-types" }
+
+[lints]
+workspace = true

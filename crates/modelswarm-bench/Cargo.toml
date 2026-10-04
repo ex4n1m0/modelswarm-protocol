@@ -1,0 +1,13 @@
+[package]
+name = "modelswarm-bench"
+description = "Repeatable benchmark harness and network-emulation bindings per ADR-013"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

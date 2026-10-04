@@ -83,7 +83,7 @@ notes), not cryptographic, in v0.1.
 | Sidecar reachable from LAN | 127.0.0.1-only bind + random bearer secret |
 | Key theft from disk | Windows Credential Manager/DPAPI; never in webview or config files |
 | Malicious local app using the gateway | Gateway is loopback-only; v0.1 accepts any local client (documented limitation; local auth token is a candidate hardening) |
-| Log leakage of prompts | `ms-telemetry` redaction is mandatory; QA test asserts absence |
+| Log leakage of prompts | `modelswarm-telemetry` redaction is mandatory; QA test asserts absence |
 | Malicious GGUF/runtime | Only catalog-approved, digest-pinned artifacts from HF; pinned llama.cpp build with checksum |
 
 ### 4.4 Supply chain

@@ -1,18 +1,21 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ms-core",
-    "crates/ms-crypto",
-    "crates/ms-catalog",
-    "crates/ms-runtime",
-    "crates/ms-p2p",
-    "crates/ms-scheduler",
-    "crates/ms-store",
-    "crates/ms-gateway",
-    "crates/ms-telemetry",
-    "apps/modelswarm-node",
-    "apps/modelswarm-desktop",
-    "apps/modelswarm-sim",
+    "crates/modelswarm-types",
+    "crates/modelswarm-identity",
+    "crates/modelswarm-transport",
+    "crates/modelswarm-tracker-api",
+    "crates/modelswarm-eligibility",
+    "crates/modelswarm-runtime",
+    "crates/modelswarm-scheduler",
+    "crates/modelswarm-session",
+    "crates/modelswarm-speculation",
+    "crates/modelswarm-store",
+    "crates/modelswarm-gateway",
+    "crates/modelswarm-telemetry",
+    "crates/modelswarm-bench",
+    "crates/modelswarm-node",
+    "crates/modelswarm-desktop",
 ]
 
 [workspace.package]

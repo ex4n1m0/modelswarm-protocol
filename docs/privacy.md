@@ -9,7 +9,7 @@ the QA privacy audit (Phase 7).
 |---|---|---|
 | Node SQLite (`ms-store`) | Installation state, license acceptances, profile cache, EWMA performance observations, job accounting (timings/outcomes only) | Prompts, completions, conversation text |
 | Hub Postgres | Accounts, installations, public keys, profile catalog, leases, challenges, capability-token records, signed job-result events (timings/outcomes) | Prompts, completions, HF tokens, raw IPs beyond lease lifetime |
-| Node logs | Structured events with mandatory redaction via `ms-telemetry` | Prompt/completion text, keys, tokens, bearer secrets |
+| Node logs | Structured events with mandatory redaction via `modelswarm-telemetry` | Prompt/completion text, keys, tokens, bearer secrets |
 | Windows credential store | Ed25519 private key, internal sidecar secret, (optional) HF token | — |
 | Hugging Face | Receives authenticated artifact downloads only, direct from the node | Prompts, completions, swarm metadata |
 
@@ -23,7 +23,7 @@ the QA privacy audit (Phase 7).
 5. When the stream ends, plaintext is gone: no persistence at either peer,
    no logging at either peer, no hub visibility at any point.
 
-Redaction is enforced centrally in `ms-telemetry`; crates do not implement
+Redaction is enforced centrally in `modelswarm-telemetry`; crates do not implement
 their own logging. QA asserts absence of prompt text in hub DB, node SQLite,
 and logs (Phase 7 acceptance).
 

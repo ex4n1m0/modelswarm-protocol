@@ -1,9 +1,15 @@
-# Phase 1 Acceptance Tests — Tracker Hub
+# Phase 1 Acceptance Tests — Tracker (now Phase B scope)
 
-Exact, executable criteria. Phase 1 is not done until every test below passes
-with recorded evidence in `docs/verification/phase-1.md`. Contract:
-`protocol/msp-v1.md` §3–§5. Environment: disposable Postgres (docker or Neon
-branch), `npm run test:integration` inside `hub/`.
+> Phase A note (ADR-010/015): `hub/` → `apps/tracker/`; service name
+> `modelswarm-hub` → `modelswarm-tracker`; original "Phase 1" is absorbed by
+> **Phase B** of the A–G program. Content below is otherwise unchanged and
+> remains the tracker's acceptance source, extended by the Phase B lease
+> vectors (ADR-012).
+
+Exact, executable criteria. The tracker phase is not done until every test
+below passes with recorded evidence in `docs/verification/phase-b.md`.
+Contract: `protocol/msp-v1.md` §3–§5. Environment: disposable Postgres
+(docker or Neon branch), `npm run test:integration` inside `apps/tracker/`.
 
 ## A. Schema & migrations
 
@@ -19,7 +25,7 @@ branch), `npm run test:integration` inside `hub/`.
 
 ## B. Public endpoints
 
-- **B1** `GET /api/v1/health` → `200 {"status":"ok","service":"modelswarm-hub","protocol":"1"}`.
+- **B1** `GET /api/v1/health` → `200 {"status":"ok","service":"modelswarm-tracker","protocol":"1"}`.
 - **B2** `GET /api/v1/catalog` → `200` with a CatalogEnvelope
   (`catalog/schema.json`) whose `signature` verifies against the hub public
   key and fails verification after flipping any byte of `profiles`.

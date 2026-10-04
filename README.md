@@ -34,25 +34,27 @@ it begins only on approval of that response.
 
 | Path | Purpose |
 |---|---|
-| `docs/` | Architecture, threat model, privacy model, ADRs, risk register, verification reports |
-| `protocol/` | MSP v1 protocol draft (`msp-v1.md`), message schema (`messages.proto`) |
-| `catalog/` | Immutable model-profile JSON schema + reviewed candidate profiles |
-| `crates/` | Rust workspace libraries (core, crypto, catalog, runtime, p2p, scheduler, store, gateway, telemetry) |
-| `apps/` | Windows node daemon, desktop UI (Phase 6), multi-peer simulator |
-| `hub/` | Next.js tracker application deployed on Vercel (control plane only) |
+| `docs/` | Architecture, threat model, privacy model, ADRs, risk register, research specs, verification reports |
+| `protocol/` | MSP v1 contract (`msp-v1.md`), message schema (`messages.proto`), golden vectors (`vectors/`) |
+| `catalog/` | Model-profile schemas (v1; manifest-based v2 per ADR-011) + reviewed candidates |
+| `crates/` | Rust workspace: `modelswarm-{types, identity, transport, tracker-api, eligibility, runtime, scheduler, session, speculation, store, gateway, telemetry, bench, node, desktop}` |
+| `apps/tracker/` | Next.js tracker on Vercel (control plane only) |
+| `apps/modelswarm-sim/` | Multi-peer simulator |
+| `experiments/` | Benchmark manifests, frozen metric schemas, raw/processed results, reports |
 | `tests/` | Integration and Windows E2E tests |
-| `installer/` | Windows packaging (NSIS via Tauri, Phase 6) |
-| `.github/workflows/` | CI: Rust checks, hub checks, packaging dry run |
+| `installer/` | Windows packaging (NSIS via Tauri, Phase G) |
+| `.github/workflows/` | CI: rust, tracker, schemas, packaging dry run |
 
 ## Development
 
 ```text
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Hub (Phase 1+): `cd hub && npm ci && npm run typecheck && npm run build`
+Tracker (Phase B+): `cd apps/tracker && npm ci && npm run typecheck && npm run build`
+Vectors: `cd apps/tracker && npm run validate:vectors`
 
 Read `AGENTS.md` before contributing. The authoritative build plan lives in
 `docs/build-plan.md`.

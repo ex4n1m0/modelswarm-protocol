@@ -3,52 +3,64 @@
 version = 4
 
 [[package]]
+name = "modelswarm-bench"
+version = "0.1.0"
+
+[[package]]
 name = "modelswarm-desktop"
+version = "0.1.0"
+
+[[package]]
+name = "modelswarm-eligibility"
+version = "0.1.0"
+
+[[package]]
+name = "modelswarm-gateway"
+version = "0.1.0"
+
+[[package]]
+name = "modelswarm-identity"
 version = "0.1.0"
 
 [[package]]
 name = "modelswarm-node"
 version = "0.1.0"
 dependencies = [
- "ms-core",
+ "modelswarm-types",
 ]
 
 [[package]]
-name = "modelswarm-sim"
+name = "modelswarm-runtime"
 version = "0.1.0"
 
 [[package]]
-name = "ms-catalog"
+name = "modelswarm-scheduler"
 version = "0.1.0"
 
 [[package]]
-name = "ms-core"
+name = "modelswarm-session"
 version = "0.1.0"
 
 [[package]]
-name = "ms-crypto"
+name = "modelswarm-speculation"
 version = "0.1.0"
 
 [[package]]
-name = "ms-gateway"
+name = "modelswarm-store"
 version = "0.1.0"
 
 [[package]]
-name = "ms-p2p"
+name = "modelswarm-telemetry"
 version = "0.1.0"
 
 [[package]]
-name = "ms-runtime"
+name = "modelswarm-tracker-api"
 version = "0.1.0"
 
 [[package]]
-name = "ms-scheduler"
+name = "modelswarm-transport"
 version = "0.1.0"
 
 [[package]]
-name = "ms-store"
-version = "0.1.0"
-
-[[package]]
-name = "ms-telemetry"
+name = "modelswarm-types"
 version = "0.1.0"

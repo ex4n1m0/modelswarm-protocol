@@ -5,7 +5,7 @@
 
 fn main() {
     println!(
-        "modelswarm-sim {} — multi-peer simulator arrives in Phase 3",
+        "modelswarm-sim {} — multi-peer simulator arrives in Phase C",
         env!("CARGO_PKG_VERSION")
     );
 }

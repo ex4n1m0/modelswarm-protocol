@@ -64,20 +64,28 @@ signaling, never as a relay.
 
 ## 4. Node components (Rust workspace)
 
+Naming and phases updated Phase A per ADR-010/015 (A–G phases).
+
 | Crate | Role | Phase |
 |---|---|---|
-| `ms-core` | Protocol version, typed IDs, canonical validation | 0 |
-| `ms-crypto` | Ed25519 identity, signatures, nonces, capability verification | 2, 5 |
-| `ms-catalog` | Signed-catalog fetch/verify, profile immutability | 1, 2 |
-| `ms-runtime` | llama.cpp sidecar lifecycle, loopback bind, health, metrics | 2 |
-| `ms-p2p` | libp2p QUIC/Noise transport, request protocol, streaming | 3 |
-| `ms-scheduler` | Candidate filtering, probing, completion-time scoring | 4 |
-| `ms-store` | SQLite state, migrations, EWMA observations, accounting | 2 |
-| `ms-gateway` | OpenAI-compatible loopback API, SSE, retry policy | 4 |
-| `ms-telemetry` | Redacted structured logs, metrics | 2+ |
+| `modelswarm-types` | Protocol version, typed IDs, manifest types (ADR-011), canonical validation | 0, B |
+| `modelswarm-identity` | Ed25519 identity, signatures, nonces, lease verification | B |
+| `modelswarm-transport` | libp2p QUIC/Noise transport, request protocol, streaming; relay/DCUtR in F (ADR-014) | C, F |
+| `modelswarm-tracker-api` | Typed client for the tracker REST API | B |
+| `modelswarm-eligibility` | Eligibility leases, capacity classes, audit epochs, suspension | B |
+| `modelswarm-runtime` | Runtime trait + llama.cpp sidecar; HF artifact acquisition | C |
+| `modelswarm-scheduler` | Candidate filtering, cost model v2 (ADR-013), mode selection | C+ |
+| `modelswarm-session` | Cooperative session state machine, commits, rollback, peer replacement | D |
+| `modelswarm-speculation` | Exact proposer/verifier algorithms, candidate trees | D–E |
+| `modelswarm-store` | SQLite state, migrations, EWMA observations, accounting | B |
+| `modelswarm-gateway` | OpenAI-compatible loopback API, SSE, retry policy | C |
+| `modelswarm-telemetry` | Redacted structured logs, metrics | B+ |
+| `modelswarm-bench` | Benchmark harness + network emulation (ADR-013 schemas) | C |
+| `modelswarm-node` | Windows daemon composition | B+ |
+| `modelswarm-desktop` | Tauri 2 UI | G |
 
-Apps: `modelswarm-node` (daemon), `modelswarm-desktop` (Tauri 2 UI, Phase 6),
-`modelswarm-sim` (multi-peer simulator, Phase 3).
+Apps: `apps/tracker` (control plane), `apps/modelswarm-sim` (multi-peer
+simulator, Phase C).
 
 ## 5. Identity model
 
@@ -183,7 +191,7 @@ out of scope. Details: `docs/privacy.md`.
 
 ## 13. Deployment topology
 
-- **Hub**: Next.js on Vercel, project `modelswarm-hub`, custom domain
+- **Tracker**: Next.js on Vercel (project `modelswarm-tracker`, formerly `modelswarm-hub`), custom domain
   `modelswarm.deepflux.space` (CNAME target read from the Vercel project
   settings, never guessed). Postgres via a managed provider (e.g. Neon) through
   the Vercel Marketplace.

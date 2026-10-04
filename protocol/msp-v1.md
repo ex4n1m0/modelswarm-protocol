@@ -3,7 +3,7 @@
 Status: Phase 0 draft. **Once Phase 1 starts this document is frozen**; changes
 require an ADR. No implementation may invent fields not defined here.
 
-Protocol version constant: `"1"` (`ms_core::MSP_PROTOCOL_VERSION`).
+Protocol version constant: `"1"` (`modelswarm_types::MSP_PROTOCOL_VERSION`).
 
 ## 1. Actors and trust
 
@@ -79,7 +79,7 @@ routes).
 
 | Endpoint | Purpose | Notes |
 |---|---|---|
-| `GET /health` | Liveness + protocol version | `{status:"ok", service:"modelswarm-hub", protocol:"1"}` |
+| `GET /health` | Liveness + protocol version | `{status:"ok", service:"modelswarm-tracker", protocol:"1"}` |
 | `GET /catalog` | Signed catalog envelope (§4) | |
 | `GET /catalog/{profileId}` | Signed single-profile envelope | `200` body is a CatalogEnvelope containing exactly that profile; `404 unknown_profile` |
 

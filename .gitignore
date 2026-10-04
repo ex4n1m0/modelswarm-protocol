@@ -4,9 +4,9 @@
 
 # Node / Next.js
 node_modules/
-hub/.next/
-hub/out/
-hub/.vercel
+.next/
+out/
+.vercel
 npm-debug.log*
 *.tsbuildinfo
 
@@ -22,7 +22,7 @@ secrets/
 *.sqlite
 *.sqlite3
 *.db
-hub/data/
+apps/tracker/data/
 
 # Model artifacts (never commit weights)
 *.gguf

@@ -91,18 +91,22 @@ Windows integration). It does **not** modify the rules above; it adds:
 
 ## Ownership map
 
+Updated Phase A to the revision roster (ADR-010/015):
+
 | Agent | Owned paths | Output required |
 |---|---|---|
-| Architect | `docs/`, `protocol/`, `AGENTS.md` | ADRs, threat model, protocol contracts |
-| Rust Core | `crates/ms-core`, `crates/ms-crypto`, `crates/ms-store` | Versioned types, canonical encoding, key handling, tests |
-| Tracker | `hub/` | Vercel app, migrations, catalog + rendezvous APIs |
-| P2P | `crates/ms-p2p` | Direct encrypted transport, peer protocol, NAT notes |
-| Runtime | `crates/ms-runtime`, `crates/ms-catalog`, `scripts/` | llama.cpp lifecycle, HF download, verification, metrics |
-| Gateway/Scheduler | `crates/ms-gateway`, `crates/ms-scheduler` | OpenAI-compatible proxy, scoring, retries, affinity |
-| Windows UX | `apps/modelswarm-desktop`, `installer/` | Onboarding, model management, tray, installer |
-| QA/Security | `tests/`, `.github/workflows/`, security docs | E2E harness, fuzz/property tests, abuse tests, release checklist |
+| Prior-Art Auditor | `docs/research/` | Verified comparison matrices, differentiation evidence |
+| Protocol Architect | `protocol/`, `catalog/`, `crates/modelswarm-types`, `crates/modelswarm-session`, `crates/modelswarm-eligibility` | Contracts, ADRs, golden vectors, state machines |
+| Runtime Engineer | `crates/modelswarm-runtime`, `scripts/` | Runtime trait, llama.cpp adapter, HF acquisition, metrics |
+| Network Engineer | `crates/modelswarm-transport` | Transport, NAT/relay (ADR-014), limits, diagnostics |
+| Scheduler Scientist | `crates/modelswarm-scheduler`, `crates/modelswarm-bench`, `experiments/` | Cost model v2, harness, honest (incl. negative) results |
+| Security Engineer | threat model, adversarial/fuzz tests, identity review | Adversary matrices, challenge/audit flows, gates |
+| Tracker Engineer | `apps/tracker/`, `crates/modelswarm-tracker-api` | API, migrations, content-blind enforcement |
+| Windows Product Engineer | `crates/modelswarm-desktop`, `crates/modelswarm-node`, `installer/` | UI, daemon composition, installer, disclosures |
+| Test and Release Engineer | `.github/workflows/`, `tests/` | CI, golden/property tests, release gates |
+| Integrator | `AGENTS.md`, merges, `crates/modelswarm-store`, `crates/modelswarm-gateway`, `crates/modelswarm-telemetry` (held pending ADR reassignment) | Cross-cutting decisions, sequential integration |
 
-`apps/modelswarm-node` is owned by Rust Core; `apps/modelswarm-sim` is owned by QA/Security.
+`apps/modelswarm-sim` is owned by Test and Release.
 
 ## Coordination rules
 
@@ -115,7 +119,7 @@ Windows integration). It does **not** modify the rules above; it adds:
   `catalog/schema.json` needs an ADR first.
 - Every agent runs `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`,
   `cargo test --workspace`, and its owned integration tests before handoff
-  (hub work: `npm run typecheck` + `npm run build` inside `hub/`).
+  (tracker work: `npm run typecheck` + `npm run build` inside `apps/tracker/`).
 - No agent may claim success without executable test evidence.
 - Never disable a failing test to pass CI. Never commit real secrets, tokens, keys,
   prompts, or model weights.

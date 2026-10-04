@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://modelswarm.deepflux.space/schemas/experiments/mode-result-v1.json",
+  "title": "ModelSwarm benchmark mode-result record (frozen Phase A, ADR-013)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["record_type", "run_manifest_id", "mode", "peers", "metrics", "outcome"],
+  "properties": {
+    "record_type": { "const": "mode-result/v1" },
+    "run_manifest_id": { "type": "string", "pattern": "^run-[0-9a-f]{16}$" },
+    "mode": { "enum": ["single", "hedged", "speculative_exact", "search_verified", "map_reduce"] },
+    "peers": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ttft_ms", "per_output_token_ms", "completion_ms", "prompt_tokens", "output_tokens"],
+      "properties": {
+        "ttft_ms": { "type": "number", "minimum": 0 },
+        "per_output_token_ms": { "type": "number", "minimum": 0 },
+        "completion_ms": { "type": "number", "minimum": 0 },
+        "prompt_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "fastest_single_prediction_ms": { "type": "number", "minimum": 0 },
+        "fastest_single_actual_ms": { "type": "number", "minimum": 0 },
+        "cooperative_prediction_ms": { "type": "number", "minimum": 0 },
+        "proposal_window_tokens": { "type": "integer", "minimum": 0 },
+        "accepted_tokens_per_round": { "type": "number", "minimum": 0 },
+        "acceptance_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "mean_acceptance_length": { "type": "number", "minimum": 0 },
+        "verification_steps": { "type": "integer", "minimum": 0 },
+        "rollback_count": { "type": "integer", "minimum": 0 },
+        "bytes_per_accepted_token": { "type": "number", "minimum": 0 },
+        "aggregate_model_tokens": { "type": "integer", "minimum": 0 },
+        "compute_ms_by_role": {
+          "type": "object",
+          "additionalProperties": { "type": "number", "minimum": 0 },
+          "propertyNames": { "enum": ["coordinator", "proposer", "verifier", "standby"] }
+        },
+        "rtt_ms_p50": { "type": "number", "minimum": 0 },
+        "jitter_ms": { "type": "number", "minimum": 0 },
+        "packet_loss_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "nat_path": { "enum": ["direct", "hole_punched", "relayed"] },
+        "exactness": { "enum": ["greedy_equal", "distribution_tested", "approximate_declared", "n/a"] }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["completed", "fell_back_to_single", "failed", "invalid_cell"] },
+        "fallback_reason": { "type": "string" },
+        "failure_reason": { "type": "string" }
+      }
+    }
+  }
+}

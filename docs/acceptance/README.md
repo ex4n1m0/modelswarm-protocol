@@ -23,7 +23,7 @@ Mapping to the older numbering (formalized in ADR-015):
 
 | Revision phase | Contains (from older plans) | Acceptance home |
 |---|---|---|
-| A — Audit & rebaseline | Prior-art matrix, ADR-009…016, manifest schema v2, fastest-single harness *frozen* | `phase-a.md` (draft in first response) |
+| A — Audit & rebaseline | Prior-art matrix, ADR-009…015, manifest schema v2, fastest-single harness *frozen* | `phase-a.md` — **executed 2026-10-04, see `docs/verification/phase-a.md`** |
 | B — Protocol foundation | Original Phase 1 (tracker) + canonical serialization, leases, golden vectors; property gates | `phase-b.md` |
 | C — Single & hedged | Original Phases 2–4 (runtime, transport, gateway) + racing; first real benchmark *runs* | `phase-c.md` |
 | D — Exact two-peer speculation | Cooperative P1–P3 (internals lab, local spec, two-node protocol) | `phase-d.md` |

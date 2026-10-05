@@ -36,3 +36,11 @@ Thumbs.db
 # IDE
 .idea/
 .vscode/
+
+# Installers are deploy-time artifacts only (published to
+# modelswarm.deepflux.space via Vercel), never tracked in git — the repo
+# ships raw code only (owner directive 2026-10-05). Checksums stay tracked.
+apps/tracker/public/downloads/*.exe
+apps/tracker/public/downloads/*.deb
+apps/tracker/public/downloads/*.AppImage
+apps/tracker/public/downloads/*.dmg

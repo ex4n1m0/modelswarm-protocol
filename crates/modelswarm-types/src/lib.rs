@@ -1,8 +1,19 @@
 //! Fundamental types shared by every ModelSwarm crate: the protocol version
-//! constant and the typed identifiers already frozen by `protocol/msp-v1.md`.
+//! constant, the typed identifiers already frozen by `protocol/msp-v1.md`,
+//! the canonical JSON encoding (§2.2) and the manifest-derived
+//! `ModelProfileId` (ADR-011, `catalog/schema-v2.json`).
 //!
-//! Phase 0 scope is deliberately minimal. Anything not frozen in the protocol
-//! document belongs to a later phase and must not be added here without an ADR.
+//! Anything not frozen in the protocol document or an ADR must not be added
+//! here without an ADR.
+
+pub mod canonical;
+pub mod manifest;
+
+pub use canonical::{canonical_json, CanonicalError};
+pub use manifest::{
+    ArtifactHash, ManifestError, ModelProfileManifest, QuantizationDescriptor, RuntimeDescriptor,
+    SpecCapability, MANIFEST_SCHEMA_VERSION, PROFILE_ID_PREFIX,
+};
 
 use std::fmt;
 

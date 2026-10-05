@@ -201,7 +201,7 @@ pub fn hardware_requirements(download_bytes: Option<u64>) -> Option<serde_json::
     let download_mb = bytes / 1_000_000;
     const KV_CACHE_MB: u64 = 128; // <=0.5B params @ 4k ctx, f16 K+V
     const RUNTIME_OVERHEAD_MB: u64 = 256; // llama-server + webview + app
-    let ram_mb = ((download_mb + KV_CACHE_MB + RUNTIME_OVERHEAD_MB + 127) / 128) * 128;
+    let ram_mb = (download_mb + KV_CACHE_MB + RUNTIME_OVERHEAD_MB).div_ceil(128) * 128;
     Some(serde_json::json!({
         "download_mb": download_mb,
         "ram_mb_est": ram_mb,
@@ -239,7 +239,7 @@ pub fn render_chatml(messages: &[ChatTurn]) -> String {
 
 #[tauri::command]
 async fn get_status(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Value, String> {
-    let mut inner = state.inner.lock().await;
+    let inner = state.inner.lock().await;
     let engine = engine_binary_path();
     let node_running = inner.node.is_some();
     let (gateway_addr, installation_id, engine_port) = match &inner.node {
@@ -307,7 +307,7 @@ async fn accept_privacy(state: tauri::State<'_, DesktopState>) -> Result<(), Str
 async fn list_models(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let inner = state.inner.lock().await;
+    let mut inner = state.inner.lock().await;
     let tracker = tracker_client(&inner.tracker_url, &inner.data_dir).await?;
     let profiles = catalog::active_profiles(&tracker)
         .await
@@ -725,7 +725,7 @@ mod tests {
 
         let hw = hardware_requirements(Some(491_400_032)).unwrap();
         assert_eq!(hw["download_mb"], 491);
-        assert_eq!(hw["ram_mb_est"], 1024);
+        assert_eq!(hw["ram_mb_est"], 896);
 
         // Unknown size -> no invented numbers (fail-closed display).
         assert!(hardware_requirements(None).is_none());

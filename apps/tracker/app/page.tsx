@@ -10,6 +10,12 @@ const DOWNLOAD = {
   sha256: "44c9f7e8a67d928a3ebfaf78f86ea78aace4961e3362a67e47cf6c80853493b6",
 };
 
+// Dedicated community room — the room word is fixed here and nowhere else on
+// this page, so the site never offers a room choice. The chat is OnlyHumans'
+// sealed service; the browser talks to it directly, never through the tracker.
+const CHAT_JOIN = "https://onlyhumans.deepflux.space/join#room=ModelSwarm";
+const CHAT_SERVICE = "https://onlyhumans.deepflux.space";
+
 
 const ENDPOINTS: Array<{ method: string; path: string; note: string }> = [
   { method: "GET", path: "/api/v1/health", note: "liveness + protocol version" },
@@ -72,6 +78,11 @@ const css = `
   .model-row .mname { font-weight: 600; }
   .model-row .mmeta { font-size: 0.72rem; color: #9fb8d8; font-family: ui-monospace, Consolas, monospace; margin-top: 2px; word-break: break-all; }
   .mcount { font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; color: #7fe0b8; border: 1px solid #43c78f55; border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
+  .chat-meta { color: #9fb8d8; font-size: 0.8rem; margin-bottom: 0.9rem; }
+  .chat-meta b { color: #e8f4ff; }
+  .chat-frame { width: 100%; height: 640px; border: 1px solid #1c2b52; border-radius: 12px; background: #0e1518; display: block; }
+  @media (max-width: 720px) { .chat-frame { height: 540px; } }
+  .chat-note { font-size: 0.72rem; color: #7d95b8; margin-top: 0.7rem; }
   footer { color: #7d95b8; font-size: 0.75rem; padding: 2.4rem 0 2rem; text-align: center; }
 `;
 
@@ -144,6 +155,29 @@ export default function Home() {
             Counts are installations with a live lease right now (GET /api/v1/stats);
             each model is its own exact-profile swarm.
           </p>
+        </section>
+
+        <section aria-labelledby="chat-h">
+          <h2 id="chat-h">Community chat · dedicated ModelSwarm room</h2>
+          <div className="card">
+            <p className="chat-meta">
+              Type a name to join — the room word is preset to this site&rsquo;s
+              dedicated <b>ModelSwarm</b> room. No other room is offered here.
+            </p>
+            <iframe
+              className="chat-frame"
+              src={CHAT_JOIN}
+              title="ModelSwarm community chat (OnlyHumans)"
+              loading="lazy"
+            />
+            <p className="chat-note">
+              Sealed end-to-end by{" "}
+              <a href={CHAT_SERVICE} target="_blank" rel="noopener noreferrer">OnlyHumans</a>{" "}
+              — a separate service from the tracker; chat content never touches the
+              ModelSwarm control plane.{" "}
+              <a href={CHAT_JOIN} target="_blank" rel="noopener noreferrer">Open the room in a new tab</a>
+            </p>
+          </div>
         </section>
 
         <section aria-labelledby="what-heading">

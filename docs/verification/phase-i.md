@@ -83,3 +83,82 @@ together.
 Known boundary (now visible, not silent): roster registration 401s until
 the installation is device-enrolled AND admin-approved (tracker ops gate);
 hosting is local-only until the Phase F listener, as before.
+
+## I7 — v0.2.4: complete installs on every OS + closed-loop device approval
+
+Owner directive (2026-10-06): every OS installer must carry everything the
+app needs, setup must be automatic, and state must be legible to the user.
+
+**Packaging.** The v0.2.3 engine fix was Windows-shaped: on deb/AppImage the
+resources land in `/usr/lib/<name>/`, on dmg in `Contents/Resources` — never
+next to the exe. `engine_binary_path()` now resolves via Tauri's
+`resource_dir()` (with exe-relative dev fallbacks), the v0.2.3 `*.dll/*.exe`
+resource glob (which matched NOTHING on Linux/macOS) is back to `engine/*`,
+the engine dir is fully gitignored (no dotfiles can ship), and WebView2
+`downloadBootstrapper` is explicit so fresh Windows machines self-install.
+**CI now opens every built artifact** (7z / dpkg-deb / appimage-extract /
+hdiutil) and FAILS unless the pinned engine binary is inside — first run
+caught its own SIGPIPE bug in the deb check; fixed, all three OSes green.
+
+**First run is now closed-loop.** Hosting start auto-enrolls: device/start →
+pairing code shown in Setup ("code EA6SSRMF — ask the owner to approve it at
+modelswarm.deepflux.space/verify") → device/complete polled every 30 s →
+session → roster register; 401s re-enroll, everything logged (`enroll.*`,
+`roster.error`). New owner-controlled approval page `/verify` +
+`POST /admin/devices/approve {userCode}` (X-MSP-Admin gated; knowing the
+code alone approves nothing — verified live with a wrong token: 403).
+msp-v1 §3.2 documents the endpoint.
+
+**Production bug found and fixed by this work**: `/auth/device/start` 500'd
+with an EMPTY body on real Postgres — `upsertInstallation`'s peer_keys
+insert targeted `ON CONFLICT (installation_id)` but that table's only unique
+constraint is `(installation_id, added_at)`; the statement could never plan
+against the declared schema (42P10). The MemoryStore suite cannot see SQL
+breakage, so it survived from Phase B. peer_keys is now `ON CONFLICT DO
+NOTHING` (append-only history; current key lives in installations), and the
+env-gated real-Pg suite the tracker README always claimed now exists
+(`tests/pg-enrollment.test.ts`: start → retry → approve-by-code → complete →
+register on Postgres; also caught `insertProfile` sending NULL provenance
+against a NOT NULL DEFAULT column). Live proof after deploy: the running
+client went from `enroll.error` to `enroll.pending user_code=EA6SSRMF` on
+its next 30 s retry, and the UI shows the code + verify URL + honest roster
+note. Approval is the owner's one action at /verify; the device joins the
+roster within 30 s of it.
+
+**Per-OS first-run notes** are on the download card (SmartScreen, Gatekeeper
+right-click-open/xattr, deb apt-install, AppImage chmod). Same version
+number on every OS = same build (all-OS rule restored).
+
+## I8 — v0.2.5: the §2.3 envelope fix (found by live enrollment)
+
+v0.2.4's client could never register: `SignedEnvelope` serialized
+`installation_id`/`body_digest` (snake_case) while msp-v1 §2.3 and the
+tracker's strict zod schema define `installationId`/`bodyDigest`
+(camelCase) — the signature payload had the same mismatch, so every
+Rust-client signed request died as `401 unsigned_request` ("missing or
+malformed MSP1 authorization envelope"). Invisible since Phase B: the TS
+and Rust sides were never integration-tested against each other.
+
+Live diagnosis trail (all reproducible): running client logged
+`enroll.error` with an empty-body parse failure → Vercel function logs
+showed the Postgres 42P10 (I7 fix) → after that fix, probe showed
+`401 unsigned_request` → header dump + zod schema comparison found the
+casing split. After the fix, `device/complete` returns the correct
+`403 pending` (probe, 2026-10-05 ~17:55Z). Rebuilt + republished all OSes
+as v0.2.5 (the v0.2.4 installers carried the broken envelope).
+`finish()` now names the HTTP status on unparseable bodies — the empty
+500 previously surfaced as a bare serde EOF error.
+
+## I9 — v0.2.6: empty-reply poisoning (found while verifying I8)
+
+A single failed generation left an EMPTY assistant turn in the ChatML
+history; the model then imitated it — every later reply returned 0 tokens
+in ~60 ms until an app restart (observed live; the same gateway answered
+fresh-history requests with 256 tokens at 193 tok/s simultaneously).
+Empty replies no longer enter the rendered history. Also recorded from
+tonight's E2E: force-killing the app (taskkill /F) orphans the engine
+child — the supervisor needs a graceful exit; several overlapping
+node/engine instances during testing produced a transient no_eligible_peer
+window that fully recovered after cleanup + restart (verified across four
+paths: app gateway, node CLI, H3 real-engine selftest at 143 tok/s, and
+direct engine HTTP).

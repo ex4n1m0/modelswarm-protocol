@@ -1,6 +1,6 @@
 [package]
 name = "modelswarm-sim"
-description = "Local multi-peer simulator and load generator for MSP testing"
+description = "Local multi-peer loopback simulator for MSP transport testing (Phase C)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+modelswarm-identity = { path = "../../crates/modelswarm-identity" }
+modelswarm-transport = { path = "../../crates/modelswarm-transport" }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+anyhow = "1"
 
 [lints]
 workspace = true

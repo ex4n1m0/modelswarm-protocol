@@ -1,6 +1,6 @@
 [package]
 name = "modelswarm-transport"
-description = "rust-libp2p encrypted direct transport and the MSP request/stream protocol"
+description = "Signed-frame loopback transport (ADR-018 Phase C staging); libp2p at Phase F"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,16 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+modelswarm-identity = { path = "../modelswarm-identity" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+# Signing the P2P handshake. Key material and id derivation come from
+# modelswarm-identity (whose raw-sign helper is crate-private); we rebuild the
+# ed25519 SigningKey from the identity seed, so no identity logic is duplicated.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64 = "0.22"
 
 [lints]
 workspace = true

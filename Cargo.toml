@@ -16,6 +16,7 @@ members = [
     "crates/modelswarm-bench",
     "crates/modelswarm-node",
     "crates/modelswarm-desktop",
+    "apps/modelswarm-sim",
 ]
 
 [workspace.package]

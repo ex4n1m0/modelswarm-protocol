@@ -98,6 +98,7 @@ export default function Home() {
           <span className="spacer" />
           <a href="/api/v1/health">status</a>
           <a href="/api/v1/catalog">catalog</a>
+          <a href="https://github.com/ex4n1m0/modelswarm-protocol" aria-label="ModelSwarm Protocol source code on GitHub">github</a>
         </nav>
       </div>
 
@@ -272,8 +273,10 @@ export default function Home() {
           }}
         />
       <footer>
-          ModelSwarm Protocol · control plane only — never carries prompts,
-          completions, or model files (ADR-001) · protocol v1
+          ModelSwarm Protocol · source:{" "}
+          <a href="https://github.com/ex4n1m0/modelswarm-protocol">github.com/ex4n1m0/modelswarm-protocol</a>{" "}
+          · control plane only — never carries prompts, completions, or model
+          files (ADR-001) · protocol v1
         </footer>
       </div>
     </main>

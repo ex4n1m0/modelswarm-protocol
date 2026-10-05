@@ -52,6 +52,13 @@
     .banner.gate { border: 1px solid var(--warn); background: rgba(224,169,62,.10); }
     .banner.error { border: 1px solid var(--err); background: rgba(224,101,101,.10); font-family: var(--mono); font-size: 12px; display: none; }
     .note { color: var(--muted); font-size: 12px; font-style: italic; }
+    .cards { display: flex; flex-direction: column; gap: 8px; }
+    .card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; display: flex; justify-content: space-between; gap: 10px; align-items: center; cursor: pointer; }
+    .card:hover { border-color: var(--accent); }
+    .card.selected { border-color: var(--ok); }
+    .card .name { font-weight: 600; }
+    .card .meta { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+    pre.snippet { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-family: var(--mono); font-size: 11px; overflow-x: auto; margin: 6px 0 0; white-space: pre; }
     footer { color: var(--muted); font-size: 11px; padding: 8px 18px 18px; text-align: center; }
   </style>
 </head>
@@ -75,19 +82,26 @@
     </div>
     <div class="banner error" id="error-banner" role="alert"></div>
 
+    <section aria-labelledby="models-h">
+      <h2 id="models-h">Models</h2>
+      <div id="model-cards" class="cards" role="listbox" aria-label="Available model profiles">
+        <div class="note">loading catalog…</div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div class="bar" aria-hidden="true"><div id="dl-progress"></div></div>
+        <span class="note" id="dl-label"></span>
+      </div>
+    </section>
+
     <section aria-labelledby="setup-h">
       <h2 id="setup-h">Setup</h2>
       <dl class="kv">
         <dt>Tracker</dt><dd><input type="text" id="tracker-url" aria-label="Tracker base URL"></dd>
-        <dt>Model profile</dt><dd id="model-line">—</dd>
         <dt>Engine</dt><dd id="engine-line">—</dd>
-        <dt>Artifact</dt><dd id="artifact-line">not downloaded</dd>
       </dl>
       <div class="row" style="margin-top:10px">
         <button class="ghost" id="save-tracker">save tracker</button>
-        <button id="download-btn">download model</button>
-        <div class="bar" aria-hidden="true"><div id="dl-progress"></div></div>
-        <span class="note" id="dl-label"></span>
+        <button class="ghost" id="stop-btn">stop hosting</button>
       </div>
     </section>
 
@@ -117,8 +131,15 @@
       </table>
     </section>
 
+    <section aria-labelledby="api-h">
+      <h2 id="api-h">Local API — integrate anywhere</h2>
+      <p class="note" style="margin:0 0 6px">OpenAI-compatible endpoint served by your node on loopback:</p>
+      <div class="row"><code id="api-base" style="font-family:var(--mono);font-size:13px">—</div></code></div>
+      <pre class="snippet" id="api-snippet">curl <span id="curl-url">http://127.0.0.1:11435/v1/chat/completions</span>   -H "content-type: application/json"   -d '{"model": "<span id="curl-model">msp1:…</span>", "messages": [{"role": "user", "content": "Hello"}]}'</pre>
+    </section>
+
     <section aria-labelledby="chat-h">
-      <h2 id="chat-h">Chat (local swarm gateway)</h2>
+      <h2 id="chat-h">Test box — chat with the hosted model</h2>
       <div id="chat">
         <div id="transcript" aria-live="polite"></div>
         <form id="chat-form">
@@ -159,28 +180,56 @@
 
     function error(msg) { const b = $("error-banner"); b.textContent = msg; b.style.display = msg ? "block" : "none"; }
 
+    async function refreshModels() {
+      let models = [];
+      try { models = await invoke("list_models"); error(""); } catch (e) { $("model-cards").innerHTML = '<div class="note">catalog unreachable</div>'; return; }
+      $("model-cards").innerHTML = models.map(m => `
+        <div class="card ${m.selected ? "selected" : ""}" role="option" aria-selected="${!!m.selected}"
+             data-id="${m.profile_id}" tabindex="0">
+          <div><div class="name">${m.display_name}</div>
+               <div class="meta">profile ${m.profile_id.slice(0, 26)}… · ${m.quantization} · engine ${m.runtime}</div></div>
+          <div class="meta">${m.downloaded ? (m.downloaded.bytes > 0 ? "downloaded · " + (m.downloaded.bytes / 1e6).toFixed(0) + " MB" : "present") : "not downloaded"}</div>
+        </div>`).join("");
+      for (const card of document.querySelectorAll(".card")) {
+        const pick = async () => selectModel(card.dataset.id);
+        card.onclick = pick;
+        card.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } };
+      }
+    }
+
+    async function selectModel(profileId) {
+      if (busy || hostingOn) return; busy = true; error("");
+      $("dl-label").textContent = "preparing…";
+      try {
+        const r = await invoke("select_model", { profileId });
+        $("dl-label").textContent = r.hosting ? "swarm running · " + r.gateway_addr : "";
+      } catch (e) { error(String(e)); $("dl-label").textContent = ""; }
+      busy = false; refresh(); refreshModels();
+    }
+
     async function refresh() {
       let s;
       try { s = await invoke("get_status"); $("conn-note").textContent = "live"; error(""); }
       catch (e) { $("conn-note").textContent = "ipc error"; return; }
       $("tracker-url").value = s.tracker;
       $("engine-line").textContent = s.engine_available ? "pinned llama.cpp — present" : "MISSING (install incomplete)";
-      $("model-line").textContent = s.profile_id || "(from catalog at download)";
-      $("artifact-line").textContent = s.artifact ? `verified · ${(s.artifact.bytes / 1e6).toFixed(0)} MB` : "not downloaded";
-      $("profile-line").textContent = s.profile_id || "—";
-      $("gateway-line").textContent = s.node.running ? s.node.gateway_addr : "—";
-      $("install-line").textContent = s.node.installation_id || "—";
       $("privacy-gate").hidden = s.license_accepted;
       hostingOn = s.node.hosting;
       $("hosting-switch").dataset.on = hostingOn;
       $("hosting-switch").setAttribute("aria-checked", hostingOn);
       $("hosting-word").dataset.on = hostingOn;
       $("hosting-word").textContent = hostingOn ? "ON" : "OFF";
+      $("profile-line").textContent = s.profile_id || "—";
+      $("gateway-line").textContent = s.node.running ? s.node.gateway_addr : "—";
+      $("install-line").textContent = s.node.installation_id || "—";
       $("chip-engine").dataset.state = s.engine_available ? "inactive" : "active";
-      $("chip-model").dataset.state = s.artifact ? "inactive" : "active";
       $("chip-hosting").dataset.state = hostingOn ? "inactive" : "active";
       $("chip-direct").dataset.state = hostingOn ? "active" : "inactive";
-      if (hostingOn) {
+      if (hostingOn && s.node.gateway_addr) {
+        const base = "http://" + s.node.gateway_addr + "/v1";
+        $("api-base").textContent = base;
+        $("curl-url").textContent = base + "/chat/completions";
+        $("curl-model").textContent = s.profile_id || "msp1:…";
         try {
           const peers = await invoke("lookup_peers");
           $("chip-tracker").dataset.state = "inactive";
@@ -189,34 +238,24 @@
             : '<tr><td colspan="3" class="note">registered — no other exact-profile peers seen yet</td></tr>';
         } catch (e) { $("chip-tracker").dataset.state = "active"; }
       } else {
-        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">hosting off — roster empty</td></tr>';
+        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">pick a model above — the swarm starts on selection</td></tr>';
       }
     }
 
     $("save-tracker").onclick = async () => { try { await invoke("set_tracker", { url: $("tracker-url").value }); error(""); } catch (e) { error(String(e)); } };
+    $("stop-btn").onclick = async () => { try { await invoke("set_hosting", { on: false }); } catch (e) { error(String(e)); } refresh(); };
     $("accept-btn").onclick = async () => { try { await invoke("accept_privacy"); } catch (e) { error(String(e)); } refresh(); };
-    $("download-btn").onclick = async () => {
-      if (busy) return; busy = true; $("download-btn").disabled = true; $("dl-label").textContent = "resolving catalog…";
-      try {
-        const r = await invoke("download_model");
-        $("dl-label").textContent = `verified · ${(r.bytes / 1e6).toFixed(0)} MB`;
-      } catch (e) { error(String(e)); $("dl-label").textContent = ""; }
-      $("download-btn").disabled = false; busy = false; refresh();
-    };
     listen("download", (e) => {
       const { done, total } = e.payload;
       const pct = total ? Math.round((done / total) * 100) : 0;
       $("dl-progress").style.width = pct + "%";
       $("dl-label").textContent = total ? `${(done / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB (${pct}%)` : `${(done / 1e6).toFixed(0)} MB`;
     });
-    async function toggleHosting() {
+    $("hosting-switch").onclick = async () => {
       if (busy) return; busy = true; error("");
-      try { await invoke("set_hosting", { on: !hostingOn }); }
-      catch (e) { error(String(e)); }
+      try { await invoke("set_hosting", { on: !hostingOn }); } catch (e) { error(String(e)); }
       busy = false; refresh();
-    }
-    $("hosting-switch").onclick = toggleHosting;
-    $("hosting-switch").onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleHosting(); } };
+    };
 
     function addMsg(role, content, meta) {
       const div = document.createElement("div");
@@ -240,7 +279,7 @@
       $("send-btn").disabled = false; busy = false; $("chat-input").focus();
     };
 
-    refresh(); setInterval(refresh, 2000);
+    refresh(); refreshModels(); setInterval(refresh, 2000); setInterval(refreshModels, 15000);
   </script>
 </body>
 </html>

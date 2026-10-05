@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use modelswarm_gateway::DEFAULT_PORT;
 use modelswarm_node::artifact::{ArtifactManager, EnsuredArtifact};
 use modelswarm_node::{catalog, load_or_create_identity, Node, NodeConfig, NodeHandle};
 use modelswarm_telemetry::Telemetry;
@@ -71,7 +72,7 @@ impl DesktopState {
             inner: Mutex::new(Inner {
                 data_dir,
                 tracker_url: config.tracker,
-                profile_id: None,
+                profile_id: config.profile_id,
                 license_accepted,
                 artifact: None,
                 node: None,
@@ -100,6 +101,8 @@ async fn license_accepted(tracker_url: &str, data_dir: &std::path::Path) -> bool
 struct PersistedConfig {
     #[serde(default = "default_tracker")]
     tracker: String,
+    #[serde(default)]
+    profile_id: Option<String>,
 }
 
 fn default_tracker() -> String {
@@ -146,19 +149,39 @@ async fn tracker_client(
     )))
 }
 
-/// Resolves the one active profile from the verified catalog.
+/// Resolves a profile from the verified catalog: by id when given, else the
+/// first active one.
 async fn resolve_profile(
     tracker_url: &str,
     data_dir: &std::path::Path,
+    profile_id: Option<&str>,
 ) -> Result<catalog::ProfileListing, String> {
     let tracker = tracker_client(tracker_url, data_dir).await?;
     let profiles = catalog::active_profiles(&tracker)
         .await
         .map_err(|e| e.to_string())?;
+    if let Some(id) = profile_id {
+        return profiles
+            .into_iter()
+            .find(|p| p.profile_id == id)
+            .ok_or_else(|| format!("profile {id} is not in the active catalog"));
+    }
     profiles
         .into_iter()
         .next()
         .ok_or_else(|| "catalog has no active profile".to_string())
+}
+
+fn persist_config(inner: &Inner) -> Result<(), String> {
+    std::fs::write(
+        inner.data_dir.join("config.json"),
+        serde_json::to_string_pretty(&PersistedConfig {
+            tracker: inner.tracker_url.clone(),
+            profile_id: inner.profile_id.clone(),
+        })
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 // ---- ChatML rendering (Qwen/ChatML family; the profile pins the template) ----
@@ -220,6 +243,7 @@ async fn set_tracker(state: tauri::State<'_, DesktopState>, url: String) -> Resu
     inner.tracker_url = url.trim_end_matches('/').to_string();
     let config = PersistedConfig {
         tracker: inner.tracker_url.clone(),
+        profile_id: inner.profile_id.clone(),
     };
     std::fs::write(
         inner.data_dir.join("config.json"),
@@ -251,17 +275,32 @@ async fn list_models(
     let profiles = catalog::active_profiles(&tracker)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(profiles
-        .into_iter()
-        .map(|p| {
-            serde_json::json!({
-                "profile_id": p.profile_id,
-                "display_name": p.display_name,
-                "quantization": format!("{} ({} bit)", p.manifest.quantization().method(), p.manifest.quantization().bits()),
-                "runtime": p.manifest.runtime().version(),
-            })
-        })
-        .collect())
+    let store = modelswarm_store::Store::open(inner.data_dir.join("state.sqlite")).ok();
+    let manager = ArtifactManager::new(&inner.data_dir);
+    let mut out = Vec::new();
+    for p in profiles {
+        let downloaded = store
+            .as_ref()
+            .and_then(|s| s.get_artifact(&p.profile_id).ok())
+            .flatten()
+            .map(|(_, _, bytes, _state)| serde_json::json!({ "bytes": bytes }))
+            .or_else(|| {
+                manager
+                    .artifact_path(&p.manifest)
+                    .ok()
+                    .filter(|path| path.exists())
+                    .map(|_| serde_json::json!({ "bytes": 0 }))
+            });
+        out.push(serde_json::json!({
+            "profile_id": p.profile_id,
+            "display_name": p.display_name,
+            "quantization": format!("{} ({} bit)", p.manifest.quantization().method(), p.manifest.quantization().bits()),
+            "runtime": p.manifest.runtime().version(),
+            "downloaded": downloaded,
+            "selected": inner.profile_id.as_deref() == Some(p.profile_id.as_str()),
+        }));
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -273,7 +312,7 @@ async fn download_model(
         let inner = state.inner.lock().await;
         (inner.data_dir.clone(), inner.tracker_url.clone())
     };
-    let profile = resolve_profile(&tracker_url, &data_dir).await?;
+    let profile = resolve_profile(&tracker_url, &data_dir, None).await?;
     let manager = ArtifactManager::new(&data_dir);
     let store = std::sync::Mutex::new(
         modelswarm_store::Store::open(data_dir.join("state.sqlite")).map_err(|e| e.to_string())?,
@@ -301,6 +340,15 @@ async fn download_model(
 #[tauri::command]
 async fn set_hosting(
     state: tauri::State<'_, DesktopState>,
+    window: tauri::Window,
+    on: bool,
+) -> Result<serde_json::Value, String> {
+    set_hosting_inner(&state, &window, on).await
+}
+
+async fn set_hosting_inner(
+    state: &tauri::State<'_, DesktopState>,
+    _window: &tauri::Window,
     on: bool,
 ) -> Result<serde_json::Value, String> {
     let mut inner = state.inner.lock().await;
@@ -323,9 +371,13 @@ async fn set_hosting(
             engine.display()
         ));
     }
-    let listing = resolve_profile(&inner.tracker_url, &inner.data_dir)
-        .await
-        .map_err(|e| format!("catalog: {e}"))?;
+    let listing = resolve_profile(
+        &inner.tracker_url,
+        &inner.data_dir,
+        inner.profile_id.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("catalog: {e}"))?;
     let manager = ArtifactManager::new(&inner.data_dir);
     let store = std::sync::Mutex::new(
         modelswarm_store::Store::open(inner.data_dir.join("state.sqlite"))
@@ -336,10 +388,12 @@ async fn set_hosting(
         .await
         .map_err(|e| format!("artifact: {e}"))?;
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let config = NodeConfig {
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let mut config = NodeConfig {
         tracker_base: Some(inner.tracker_url.clone()),
-        gateway_port: 0, // ephemeral; the UI and send_chat learn it
+        // Stable local API first (DEFAULT_PORT 11435); fall back to an
+        // ephemeral port when it is taken so a second installation runs too.
+        gateway_port: DEFAULT_PORT,
         data_dir: inner.data_dir.clone(),
         profile_id: Some(listing.profile_id.clone()),
         mock: false,
@@ -347,9 +401,15 @@ async fn set_hosting(
         engine_model: Some(ensured.path.clone()),
         engine_threads: None,
     };
-    let handle = Node::start(config, shutdown_rx)
-        .await
-        .map_err(|e| e.to_string())?;
+    let handle = match Node::start(config.clone(), shutdown_tx.subscribe()).await {
+        Ok(handle) => handle,
+        Err(_) => {
+            config.gateway_port = 0;
+            Node::start(config, shutdown_tx.subscribe())
+                .await
+                .map_err(|e| e.to_string())?
+        }
+    };
 
     // Roster heartbeat: register + heartbeat so exact-profile peers see this
     // machine (with the honest no-listener address until transport lands).
@@ -418,6 +478,29 @@ async fn set_hosting(
         heartbeat,
     });
     Ok(status)
+}
+
+/// The picker's single action (owner UX spec): select a model → download or
+/// load it → the swarm starts working (node up, registered, local API live).
+#[tauri::command]
+async fn select_model(
+    state: tauri::State<'_, DesktopState>,
+    window: tauri::Window,
+    profile_id: String,
+) -> Result<serde_json::Value, String> {
+    {
+        let mut inner = state.inner.lock().await;
+        if !inner.license_accepted {
+            return Err("accept the privacy disclosure first".into());
+        }
+        if inner.node.is_some() {
+            return Err("stop hosting before switching models".into());
+        }
+        inner.profile_id = Some(profile_id.clone());
+        persist_config(&inner)?;
+    }
+    let result = set_hosting_inner(&state, &window, true).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -548,6 +631,7 @@ pub fn run() {
             list_models,
             download_model,
             set_hosting,
+            select_model,
             lookup_peers,
             send_chat
         ])

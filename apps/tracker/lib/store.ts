@@ -216,6 +216,8 @@ export interface TrackerStore {
   listPeers(filter: { profileId?: string; limit: number }): Promise<PeerView[]>;
   /** Distinct peers with a live, non-draining lease (public counter). */
   countOnlinePeers(): Promise<number>;
+  /** Same population, per hosted profile id (public per-model counter). */
+  countOnlinePeersByProfile(): Promise<Record<string, number>>;
   /** Authoritative audit epoch for a peer (0 default). Leases pin the epoch at
    *  registration; sweeps bump this counter only (ADR-012). */
   peerEpoch(peerId: string): Promise<number>;
@@ -466,6 +468,22 @@ export class MemoryStore implements TrackerStore {
       if (this.isLive(rec, now) && !live.has(rec.peerId)) live.add(rec.peerId);
     }
     return live.size;
+  }
+
+  async countOnlinePeersByProfile(): Promise<Record<string, number>> {
+    const now = this.clock();
+    const perProfile = new Map<string, Set<string>>();
+    for (const rec of this.leases.values()) {
+      if (!this.isLive(rec, now)) continue;
+      for (const profile of rec.profiles) {
+        const set = perProfile.get(profile) ?? new Set<string>();
+        set.add(rec.peerId);
+        perProfile.set(profile, set);
+      }
+    }
+    const out: Record<string, number> = {};
+    for (const [profile, peers] of perProfile) out[profile] = peers.size;
+    return out;
   }
 
   async peerEpoch(peerId: string): Promise<number> {
@@ -982,6 +1000,21 @@ export class PgStore implements TrackerStore {
       [PgStore.iso(this.clock())],
     );
     return Number((rows[0] as { n: string | number }).n);
+  }
+
+  async countOnlinePeersByProfile(): Promise<Record<string, number>> {
+    const rows = await this.query(
+      `SELECT p.profile AS profile_id, COUNT(DISTINCT l.peer_id) AS n
+       FROM peer_leases l, jsonb_array_elements_text(l.profiles) AS p(profile)
+       WHERE l.expires_at > $1 AND l.draining = false
+       GROUP BY p.profile`,
+      [PgStore.iso(this.clock())],
+    );
+    const out: Record<string, number> = {};
+    for (const row of rows as Record<string, unknown>[]) {
+      out[row.profile_id as string] = Number(row.n);
+    }
+    return out;
   }
 
   async peerEpoch(peerId: string): Promise<number> {

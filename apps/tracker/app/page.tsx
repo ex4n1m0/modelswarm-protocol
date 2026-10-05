@@ -64,6 +64,11 @@ const css = `
   table { width: 100%; border-collapse: collapse; font-size: 0.8rem; color: #9fb8d8; }
   td { padding: 0.28rem 0.6rem 0.28rem 0; border-bottom: 1px solid #101a38; }
   td:first-child { color: #2fd4ff; white-space: nowrap; }
+  .models { display: flex; flex-direction: column; gap: 10px; }
+  .model-row { border: 1px solid #1c2b52; background: #0a1030; border-radius: 10px; padding: 12px 14px; display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+  .model-row .mname { font-weight: 600; }
+  .model-row .mmeta { font-size: 0.72rem; color: #9fb8d8; font-family: ui-monospace, Consolas, monospace; margin-top: 2px; word-break: break-all; }
+  .mcount { font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; color: #7fe0b8; border: 1px solid #43c78f55; border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
   footer { color: #7d95b8; font-size: 0.75rem; padding: 2.4rem 0 2rem; text-align: center; }
 `;
 
@@ -134,6 +139,17 @@ export default function Home() {
           </div>
         </section>
 
+        <section aria-labelledby="models-h">
+          <h2 id="models-h">Models · live swarm census</h2>
+          <div className="models" id="model-rows" aria-live="polite">
+            <p className="sum">loading catalog…</p>
+          </div>
+          <p className="sum" style={{ marginTop: 10 }}>
+            Counts are installations with a live lease right now (GET /api/v1/stats);
+            each model is its own exact-profile swarm.
+          </p>
+        </section>
+
         <section aria-labelledby="what-heading">
           <h2 id="what-heading">What it is</h2>
           <div className="rule">
@@ -194,13 +210,32 @@ export default function Home() {
             __html: `
 (async () => {
   const badge = document.getElementById('online-badge');
+  const rows = document.getElementById('model-rows');
+  let names = null;
+  const catalogNames = async () => {
+    if (names) return names;
+    const c = await fetch('/api/v1/catalog');
+    if (!c.ok) throw 0;
+    const env = await c.json();
+    names = Object.fromEntries(env.profiles.map(p => [p.profile_id, p]));
+    return names;
+  };
   const update = async () => {
     try {
       const r = await fetch('/api/v1/stats');
       if (!r.ok) throw 0;
-      const { peersOnline } = await r.json();
+      const { peersOnline, models } = await r.json();
       badge.textContent = peersOnline + (peersOnline === 1 ? ' peer online' : ' peers online');
-    } catch { badge.textContent = '— online'; }
+      const byProfile = Object.fromEntries((models || []).map(m => [m.profileId, m.peers]));
+      const cat = await catalogNames();
+      rows.innerHTML = Object.entries(cat).map(([id, p]) => {
+        const n = byProfile[id] ?? 0;
+        const quant = p.manifest?.quantization;
+        return '<div class="model-row"><div><div class="mname">' + p.display_name + '</div>' +
+          '<div class="mmeta">' + id + ' · ' + (quant ? quant.method + ' · ' + quant.bits + '-bit' : '') + ' · engine ' + (p.manifest?.runtime?.version || '') + '</div></div>' +
+          '<span class="mcount">' + n + (n === 1 ? ' online' : ' online') + '</span></div>';
+      }).join('');
+    } catch { badge.textContent = '— online'; rows.innerHTML = '<p class="sum">census unavailable</p>'; }
   };
   await update(); setInterval(update, 30000);
 })();`,

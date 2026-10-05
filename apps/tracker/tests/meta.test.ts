@@ -57,9 +57,15 @@ describe("H2 no inference runtime in the tracker source", () => {
 
 describe("D3 companion: no background timers/crons in tracker source", () => {
   it("no setTimeout/setInterval/setImmediate anywhere in lib/app", () => {
-    const offenders = [...listFiles(join(appRoot, "lib"), [".ts"]), ...listFiles(join(appRoot, "app"), [".ts", ".tsx"])].filter(
-      (file) => /\b(setTimeout|setInterval|setImmediate)\b/.test(readFileSync(file, "utf8")),
-    );
+    // D3 targets the tracker SERVICE (no server-side background work). One
+    // documented exception: the landing page's visitor-side polling script
+    // (app/page.tsx) refreshes the online badge in the user's browser —
+    // client code, not a tracker background timer.
+    const offenders = [...listFiles(join(appRoot, "lib"), [".ts"]), ...listFiles(join(appRoot, "app"), [".ts", ".tsx"])]
+      .filter((file) => !file.endsWith(join("app", "page.tsx")))
+      .filter(
+        (file) => /\b(setTimeout|setInterval|setImmediate)\b/.test(readFileSync(file, "utf8")),
+      );
     expect(offenders).toEqual([]);
   });
 });

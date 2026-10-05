@@ -147,6 +147,34 @@ Suite locations and outcomes, per `docs/acceptance/phase-f.md`:
   labeling) on the real protocol flow, not the production relay protocol.
 - **F11 libp2p backend (bounded stretch attempt)** — see the next section.
 
+
+### F11 resolution (2026-10-05, integrator follow-up)
+
+FIXED — the round trip now completes in <0.2 s (tests `libp2p_loopback_round_trip_framed_json`
+and `libp2p_listener_serves_two_sessions`, feature `libp2p-backend`, `#[ignore]` removed).
+Root causes, found by instrumented diagnosis rather than the version matrix:
+
+1. **The listener transport must be polled continuously.** libp2p-quic's
+   server-side handshake only progresses while `Transport::poll` is being
+   driven; polling merely while a caller awaits `accept` loses the window
+   (a racing `select!` proved the handshake finishes in <100 ms whenever an
+   idle poller exists). Fix: each listener owns a dedicated driver task
+   pumping `TransportEvent`s through a channel; `accept` is a channel read.
+2. **QUIC streams are lazily visible to the peer.** The server's
+   `poll_inbound` cannot complete until the client's first frame arrives,
+   so awaiting it inside `accept` deadlocks (the dialer speaks first in
+   every real libp2p protocol). Fix: `accept` returns on connection
+   upgrade; the server session materializes its inbound stream lazily on
+   first send/recv (`Role::Server`).
+
+The version-pin matrix below is therefore moot. Remaining honest scope:
+the D/E session suites still bind to `SignedFrameTransport` inside
+`spec.rs`; reparameterizing them over this backend is recorded as the
+follow-up wiring task (the message codec is already identical — the
+backend round-trips the same framed `WireMessage`s).
+
+--- (original bounded-attempt record below)
+
 ### F11 libp2p backend attempt (verbatim outcome)
 
 Attempted: optional `libp2p-backend` feature on `modelswarm-transport`

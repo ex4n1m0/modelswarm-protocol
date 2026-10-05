@@ -1,7 +1,7 @@
-//! F11 (Phase F, stretch): a minimal rust-libp2p backend behind the same
-//! surface [`crate::SignedFrameTransport`] exposes — QUIC (peer
-//! authentication is built into QUIC's libp2p TLS handshake), framed
-//! send/recv of the same JSON messages.
+//! F11 (Phase F): a minimal rust-libp2p backend behind the same surface
+//! [`crate::SignedFrameTransport`] exposes — QUIC (peer authentication is
+//! built into QUIC's libp2p TLS handshake), framed send/recv of the same
+//! JSON messages.
 //!
 //! Loopback-only listeners are STILL enforced (the ADR-018 honesty guard
 //! applies to every backend until the full Phase F ops set — public relay,
@@ -10,20 +10,25 @@
 //! derivation byte for byte, and `dial` verifies the connected peer's
 //! QUIC-authenticated PeerId against the expected derivation.
 //!
+//! Driving model (the F11 fix): libp2p-quic's transport must be polled
+//! **continuously** for the server side of the handshake to progress —
+//! polling only while a caller awaits `accept` loses the connection
+//! window. Each listener therefore owns a dedicated driver task pumping
+//! `TransportEvent`s into a channel; `accept` is a channel read.
+//!
 //! This backend is experimental and feature-gated (`libp2p-backend`); the
 //! workspace stays green without it (ADR-018: the trait is the swap point).
 
-use std::future::poll_fn;
-use std::pin::pin;
 use std::time::Duration;
 
 use futures::AsyncReadExt as _;
 use futures::AsyncWriteExt as _;
+use futures::StreamExt as _;
 use libp2p::core::muxing::StreamMuxer as _;
 use libp2p::core::transport::{DialOpts, ListenerId, PortUse, TransportEvent};
 use libp2p::identity::Keypair;
 use libp2p::quic;
-use libp2p::{Multiaddr, Transport as _};
+use libp2p::{Multiaddr, Transport};
 use modelswarm_identity::InstallationIdentity;
 
 use crate::error::{invalid_data, TransportError};
@@ -46,14 +51,66 @@ fn io_err(what: &'static str, e: impl std::error::Error + Send + Sync + 'static)
 /// send/recv, deadline-bounded), minus the Ed25519 handshake exchange — the
 /// channel itself is cryptographically bound to the peer's key by QUIC.
 pub struct Libp2pSession {
-    stream: quic::Stream,
+    role: Role,
     #[allow(dead_code)]
     peer_id: libp2p::PeerId,
 }
 
+enum Role {
+    /// Dialer side: the stream exists immediately (opened via
+    /// `poll_outbound`).
+    Client { stream: quic::Stream },
+    /// Listener side: QUIC streams only become visible to the peer when
+    /// first used, so the inbound stream is materialized lazily on the
+    /// first send/recv — by then the client's first frame has arrived and
+    /// `poll_inbound` completes. (Awaiting it inside `accept` deadlocks
+    /// until the client speaks; libp2p's swarms always let the dialer
+    /// speak first.)
+    Server {
+        connection: quic::Connection,
+        stream: Option<quic::Stream>,
+    },
+}
+
 impl Libp2pSession {
-    fn new(stream: quic::Stream, peer_id: libp2p::PeerId) -> Self {
-        Self { stream, peer_id }
+    fn new_client(stream: quic::Stream, peer_id: libp2p::PeerId) -> Self {
+        Self {
+            role: Role::Client { stream },
+            peer_id,
+        }
+    }
+
+    fn new_server(connection: quic::Connection, peer_id: libp2p::PeerId) -> Self {
+        Self {
+            role: Role::Server {
+                connection,
+                stream: None,
+            },
+            peer_id,
+        }
+    }
+
+    async fn stream_pin(
+        &mut self,
+        deadline: Duration,
+    ) -> Result<std::pin::Pin<&mut quic::Stream>, TransportError> {
+        match &mut self.role {
+            Role::Client { stream } => Ok(std::pin::Pin::new(stream)),
+            Role::Server { connection, stream } => {
+                if stream.is_none() {
+                    let mut conn = std::pin::Pin::new(connection);
+                    let opened = tokio::time::timeout(
+                        deadline,
+                        std::future::poll_fn(|cx| conn.as_mut().poll_inbound(cx)),
+                    )
+                    .await
+                    .map_err(|_| TransportError::Timeout)?
+                    .map_err(|e| io_err("libp2p inbound stream", e))?;
+                    *stream = Some(opened);
+                }
+                Ok(std::pin::Pin::new(stream.as_mut().expect("just set")))
+            }
+        }
     }
 
     /// Sends one typed message, deadline-bounded.
@@ -67,11 +124,12 @@ impl Libp2pSession {
         let mut framed = Vec::with_capacity(4 + payload.len());
         framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         framed.extend_from_slice(&payload);
-        let mut write = pin!(self.stream.write_all(&framed));
+        let mut stream = self.stream_pin(deadline).await?;
+        let mut write = stream.write_all(&framed);
         tokio::time::timeout(deadline, &mut write)
             .await
             .map_err(|_| TransportError::Timeout)??;
-        self.stream.flush().await?;
+        stream.flush().await?;
         Ok(())
     }
 
@@ -79,8 +137,9 @@ impl Libp2pSession {
     /// validated against [`MAX_FRAME_BYTES`] BEFORE the body is read or
     /// allocated (same rule as the staged frame codec).
     pub async fn recv(&mut self, deadline: Duration) -> Result<WireMessage, TransportError> {
+        let mut stream = self.stream_pin(deadline).await?;
         let mut prefix = [0u8; 4];
-        let mut read = pin!(self.stream.read_exact(&mut prefix));
+        let mut read = stream.read_exact(&mut prefix);
         tokio::time::timeout(deadline, &mut read)
             .await
             .map_err(|_| TransportError::Timeout)??;
@@ -92,13 +151,20 @@ impl Libp2pSession {
             )));
         }
         let mut body = vec![0u8; len];
-        let mut read = pin!(self.stream.read_exact(&mut body));
+        let mut stream = self.stream_pin(deadline).await?;
+        let mut read = stream.read_exact(&mut body);
         tokio::time::timeout(deadline, &mut read)
             .await
             .map_err(|_| TransportError::Timeout)??;
         serde_json::from_slice(&body)
             .map_err(|e| TransportError::Io(invalid_data("frame decode", e)))
     }
+}
+
+/// Events the listener driver forwards to [`Libp2pListener`].
+enum DriverEvent {
+    Bound(Multiaddr),
+    Incoming(<quic::tokio::Transport as Transport>::ListenerUpgrade),
 }
 
 /// The libp2p (QUIC) backend, feature-gated `libp2p-backend` (F11).
@@ -130,6 +196,9 @@ impl Libp2pTransport {
     /// Binds `bind` (e.g. `"127.0.0.1:0"`). Refuses any address whose IP is
     /// not loopback with [`TransportError::NonLoopbackDenied`] — the ADR-018
     /// honesty guard applies to this backend too.
+    ///
+    /// Spawns the transport's driver task (see the module docs for why
+    /// continuous polling is required).
     pub async fn listen(&self, bind: &str) -> Result<Libp2pListener, TransportError> {
         let addr: std::net::SocketAddr = bind
             .parse()
@@ -142,27 +211,63 @@ impl Libp2pTransport {
         let multiaddr: Multiaddr = format!("/{family}/{ip}/udp/{}/quic-v1", addr.port())
             .parse()
             .map_err(|e| TransportError::Io(invalid_data("multiaddr", e)))?;
+
         let mut transport = quic::tokio::Transport::new(quic::Config::new(&self.keypair));
         transport
             .listen_on(ListenerId::next(), multiaddr)
             .map_err(|e| io_err("libp2p listen", e))?;
-        // Poll the transport until it announces the concrete listen address
-        // (":0" binds an ephemeral port).
-        let bound: Multiaddr = tokio::time::timeout(
-            Duration::from_secs(10),
-            poll_fn(|cx| {
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DriverEvent>(16);
+        let driver = tokio::spawn(async move {
+            let mut events = futures::stream::poll_fn(move |cx| {
+                use std::pin::Pin;
                 use std::task::Poll;
-                match std::pin::Pin::new(&mut transport).poll(cx) {
-                    Poll::Ready(TransportEvent::NewAddress { listen_addr, .. }) => {
-                        Poll::Ready(listen_addr)
-                    }
-                    Poll::Ready(_) | Poll::Pending => Poll::Pending,
+                match Pin::new(&mut transport).poll(cx) {
+                    Poll::Ready(event) => Poll::Ready(Some(event)),
+                    Poll::Pending => Poll::Pending,
                 }
-            }),
-        )
-        .await
-        .map_err(|_| TransportError::Timeout)?;
-        Ok(Libp2pListener { transport, bound })
+            });
+            while let Some(event) = events.next().await {
+                let forwarded = match event {
+                    TransportEvent::NewAddress { listen_addr, .. } => {
+                        Some(DriverEvent::Bound(listen_addr))
+                    }
+                    TransportEvent::Incoming { upgrade, .. } => {
+                        Some(DriverEvent::Incoming(upgrade))
+                    }
+                    // AddressChange/ListenerError/ListenerClosed: surfaced
+                    // via `bound_addr()`/error paths; not forwarded.
+                    _ => None,
+                };
+                if let Some(ev) = forwarded {
+                    if tx.send(ev).await.is_err() {
+                        break; // listener dropped
+                    }
+                }
+            }
+        });
+
+        // Wait for the concrete bound address (":0" binds an ephemeral
+        // port), then hand the event stream to the listener.
+        let bound = loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                Err(_) => {
+                    driver.abort();
+                    return Err(TransportError::Timeout);
+                }
+                Ok(None) => {
+                    driver.abort();
+                    return Err(TransportError::Closed);
+                }
+                Ok(Some(DriverEvent::Bound(addr))) => break addr,
+                Ok(Some(DriverEvent::Incoming(_))) => continue,
+            }
+        };
+        Ok(Libp2pListener {
+            _driver: driver,
+            events: rx,
+            bound,
+        })
     }
 
     /// Dials `addr` (a `/ip/../udp/../quic-v1` multiaddr) and opens one
@@ -199,18 +304,20 @@ impl Libp2pTransport {
         }
         let stream = tokio::time::timeout(
             deadline,
-            poll_fn(|cx| std::pin::Pin::new(&mut connection).poll_outbound(cx)),
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut connection).poll_outbound(cx)),
         )
         .await
         .map_err(|_| TransportError::Timeout)?
         .map_err(|e| io_err("libp2p stream open", e))?;
-        Ok(Libp2pSession::new(stream, peer_id))
+        Ok(Libp2pSession::new_client(stream, peer_id))
     }
 }
 
-/// Loopback-only libp2p listener yielding framed sessions.
+/// Loopback-only libp2p listener yielding framed sessions. Dropping it
+/// stops the driver task.
 pub struct Libp2pListener {
-    transport: quic::tokio::Transport,
+    _driver: tokio::task::JoinHandle<()>,
+    events: tokio::sync::mpsc::Receiver<DriverEvent>,
     bound: Multiaddr,
 }
 
@@ -224,36 +331,21 @@ impl Libp2pListener {
     /// The QUIC handshake authenticates the remote; the returned session
     /// carries the remote's verified PeerId.
     pub async fn accept(&mut self, deadline: Duration) -> Result<Libp2pSession, TransportError> {
-        let incoming = tokio::time::timeout(
-            deadline,
-            poll_fn(|cx| {
-                use std::task::Poll;
-                loop {
-                    match std::pin::Pin::new(&mut self.transport).poll(cx) {
-                        Poll::Ready(TransportEvent::Incoming { upgrade, .. }) => {
-                            return Poll::Ready(Some(upgrade))
-                        }
-                        Poll::Ready(_) => continue,
-                        Poll::Pending => return Poll::Pending,
-                    }
+        let incoming = loop {
+            match tokio::time::timeout(deadline, self.events.recv()).await {
+                Err(_) => {
+                    return Err(TransportError::Timeout);
                 }
-            }),
-        )
-        .await
-        .map_err(|_| TransportError::Timeout)?
-        .ok_or(TransportError::Closed)?;
-        let (peer_id, mut connection) = tokio::time::timeout(deadline, incoming)
+                Ok(None) => return Err(TransportError::Closed),
+                Ok(Some(DriverEvent::Incoming(upgrade))) => break upgrade,
+                Ok(Some(DriverEvent::Bound(_))) => continue,
+            }
+        };
+        let (peer_id, connection) = tokio::time::timeout(deadline, incoming)
             .await
             .map_err(|_| TransportError::Timeout)?
             .map_err(|e| io_err("libp2p accept", e))?;
-        let stream = tokio::time::timeout(
-            deadline,
-            poll_fn(|cx| std::pin::Pin::new(&mut connection).poll_inbound(cx)),
-        )
-        .await
-        .map_err(|_| TransportError::Timeout)?
-        .map_err(|e| io_err("libp2p inbound stream", e))?;
-        Ok(Libp2pSession::new(stream, peer_id))
+        Ok(Libp2pSession::new_server(connection, peer_id))
     }
 }
 
@@ -295,18 +387,10 @@ mod tests {
     }
 
     /// One loopback QUIC round trip: listener + dial + framed typed exchange,
-    /// with the dial verifying the PeerId binding.
-    ///
-    /// IGNORED (F11 bounded attempt, see docs/research/fuzz-targets.md):
-    /// dependency resolution and compilation of the libp2p backend SUCCEEDED
-    /// (libp2p 0.57.0, QUIC transport composition), and the PeerId-equality
-    /// + honesty-guard tests above pass — but this end-to-end round trip
-    /// times out: the listener never surfaces `TransportEvent::Incoming`
-    /// within 10 s while the dial-side `GenTransport::dial` future is polled
-    /// concurrently against the announced `/ip4/127.0.0.1/udp/<port>/quic-v1`
-    /// address. Remaining work is recorded in the fuzz-targets results.
+    /// with the dial verifying the PeerId binding. FIXED by the dedicated
+    /// driver task (see module docs): with the transport polled
+    /// continuously, the handshake completes in well under a second.
     #[tokio::test]
-    #[ignore = "listener never yields Incoming on loopback QUIC; diagnosis plan in docs/research/fuzz-targets.md"]
     async fn libp2p_loopback_round_trip_framed_json() {
         let server_identity = InstallationIdentity::from_bytes(&[5u8; 32]);
         let client_identity = InstallationIdentity::from_bytes(&[6u8; 32]);
@@ -336,5 +420,48 @@ mod tests {
             .unwrap();
         let received = session_server.recv(Duration::from_secs(5)).await.unwrap();
         assert_eq!(received, msg);
+
+        // Echo back over the same QUIC stream to prove bidirectionality.
+        session_server
+            .send(&msg, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let echoed = session_client.recv(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(echoed, msg);
+    }
+
+    /// Two sequential sessions on one listener: the driver task survives an
+    /// accept/drop cycle and serves the next dial.
+    #[tokio::test]
+    async fn libp2p_listener_serves_two_sessions() {
+        let server_identity = InstallationIdentity::from_bytes(&[7u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let mut listener = server.listen("127.0.0.1:0").await.unwrap();
+        for i in 0..2u8 {
+            let client_identity = InstallationIdentity::from_bytes(&[20u8 + i; 32]);
+            let client = Libp2pTransport::new(&client_identity).unwrap();
+            let bound = listener.bound_addr().clone();
+            let expected = server.peer_id();
+            let dialing = tokio::spawn(async move {
+                client
+                    .dial(
+                        bound.to_string().as_str(),
+                        &expected,
+                        Duration::from_secs(10),
+                    )
+                    .await
+            });
+            let mut session_server = listener.accept(Duration::from_secs(10)).await.unwrap();
+            let mut session_client = dialing.await.unwrap().unwrap();
+            let msg = WireMessage::Control(crate::Control::ping());
+            session_client
+                .send(&msg, Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!(
+                session_server.recv(Duration::from_secs(5)).await.unwrap(),
+                msg
+            );
+        }
     }
 }

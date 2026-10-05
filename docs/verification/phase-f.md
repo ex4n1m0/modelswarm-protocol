@@ -68,3 +68,15 @@ engineering item Phase F leaves.
 
 Public relay hosting (paid), DNS/production credentials, code signing —
 none attempted.
+
+## Addendum 2026-10-05 (integrator follow-up): F11 RESOLVED
+
+The libp2p round-trip is fixed (both root causes and the fix recorded in
+`docs/research/fuzz-targets.md` §F11 resolution): dedicated listener driver
+task + lazy server-side stream materialization. Gates re-run by the
+integrator: feature tests **36/0** (round trip + two-session reuse in
+<0.2 s), workspace **271/0**, clippy `-D warnings` clean **with and
+without** the `libp2p-backend` feature. F11 status moves from
+partial → **functional at the transport surface**; reparameterizing the
+D/E session suites over this backend remains recorded follow-up wiring
+(identical message codec proven by the round-trip tests).

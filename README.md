@@ -11,24 +11,33 @@ is actively and verifiably hosting the exact same profile P.
 
 ## Status
 
-Phase 0 — design and scaffold. See `docs/verification/phase-0.md` for the current
-verification report. No runtime functionality exists yet, by design.
+Execution status 2026-10-05 (phases A–G of `docs/competitive-revision-plan.md`;
+verification reports under `docs/verification/`):
 
-**Plan of record:** the project has three planning documents, newest governs
-where they conflict (formal map pending ADR-015):
+| Phase | Status | Evidence |
+|---|---|---|
+| 0 scaffold + contracts | done | `phase-0.md` (commit 76397b6) |
+| A audit & rebaseline | done | `phase-a.md` (9d5a3a3) |
+| B protocol foundation + tracker | done | `phase-b.md` (e61b652, 070e8f6) |
+| C runtime/scheduler/gateway/transport/bench | done | `phase-c.md` (e6834e3, f792fa0) |
+| D exact two-peer speculation | done | `phase-d.md` (e9b48a8, ad675d2) |
+| E multi-proposer token trees | done | `phase-e.md` (248aa05, e5420c6) |
+| F hostile-swarm hardening | in execution | `phase-f.md` |
+| G node + Tauri shell (unsigned) | done | `phase-g.md` (d27cf78) |
 
-1. `docs/build-plan.md` — original prototype plan (phases 0–7). Phase 0 done.
-2. `docs/cooperative-plan.md` — cooperative-inference research (phases P0–P8),
-   gated on the original prototype's completion.
-3. `docs/competitive-revision-plan.md` — competitive-learnings revision
-   (phases A–G): repositions ModelSwarm as network-aware micro-swarms of
-   exact-profile peers cooperatively accelerating one request; renames the
-   workspace layout; derives `ModelProfileId` from a manifest.
+Workspace: **256+ tests, 0 failures, clippy `-D warnings` clean**; tracker:
+78 vitest + typecheck/build/vector-parity green. The correctness contracts
+hold end-to-end on loopback (greedy speculative == plain decoding under
+adversarial drafts, proposers, and fallback; sampled distribution
+preservation proven at unit level). **Every performance number is
+TEST-ONLY mock/loopback** (ADR-019): no real-model claim exists; real
+claims await the research runtime + an approved GGUF profile (stop
+conditions intact). Known deployment gaps: live-Postgres CI run (R22),
+libp2p backend swap + ADR-020 completion (F), code signing (G stop).
 
-The revision's Phase A first response (repository audit, unchanged/redesign
-map, p2ptokens recommendation, proposed ADR-009…016, task graph) is at
-`docs/reviews/phase-a-first-response.md`. **No Phase A work has started** —
-it begins only on approval of that response.
+**Plans:** `docs/build-plan.md` (original 0–7) → `docs/cooperative-plan.md`
+(P0–P8) → `docs/competitive-revision-plan.md` (**A–G governs**; map in
+ADR-015).
 
 ## Repository map
 

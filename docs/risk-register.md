@@ -35,3 +35,18 @@ evidence. Severity = impact × likelihood (H/M/L).
 - Any new endpoint in `protocol/msp-v1.md` → abuse case row added in
   `docs/threat-model.md`.
 - Any red/failed phase acceptance item → risk added or escalated before merge.
+
+## Status snapshot 2026-10-05 (phases A–G executed; evidence links)
+
+| Risk | Current state |
+|---|---|
+| R1 HF drift splits swarm | Mitigated structurally: manifest-derived `msp1:` IDs (ADR-011), triple-parity vectors; no live catalog yet |
+| R5 free-riders | Lease machinery shipped + tested (ADR-012: lease+60s cap, audit epochs, suspension table); live-network evidence pending |
+| R7/R8 malicious artifacts / sidecar exposure | Catalog empty by policy; loopback-only bind enforced + tested (transport, gateway, node); chunk challenges designed (ADR-011) |
+| R9 fake metrics | Measured-dominance scoring tested (scheduler); F6 extends with relay penalty |
+| R10 agent drift | Held: 20 ADRs, per-phase verification reports, every agent claim independently re-run by the integrator |
+| R12 scope creep | Held: non-goals intact (no economy, no weights redistribution, mock never user-facing) |
+| R16/R21 differentiation & honesty | Prior-art matrix verified; TEST-ONLY discipline enforced in bench records + reports; D8/E9 recorded as performance-unproven |
+| R17 multi-peer prompt exposure | UI disclosure shipped (G3); docs/privacy.md planned-change note stands |
+| R20 runtime hooks gap | Open — Phase D entry ADR still required before any real speculative claim |
+| R22/R23 | Open — CI Postgres run pending; ADR-020 migration in Phase F execution |

@@ -768,10 +768,13 @@ export class PgStore implements TrackerStore {
        ON CONFLICT (installation_id) DO UPDATE SET public_key_b58 = EXCLUDED.public_key_b58`,
       [rec.installationId, rec.pubKeyB58, PgStore.iso(rec.createdAt)],
     );
+    // peer_keys is append-only history (PK = installation_id, added_at);
+    // the CURRENT key lives in installations. A retry with the same
+    // timestamp is a no-op — never an upsert target by installation_id.
     await this.query(
       `INSERT INTO peer_keys (installation_id, public_key_b58, added_at)
        VALUES ($1, $2, $3)
-       ON CONFLICT (installation_id) DO UPDATE SET public_key_b58 = EXCLUDED.public_key_b58`,
+       ON CONFLICT DO NOTHING`,
       [rec.installationId, rec.pubKeyB58, PgStore.iso(rec.createdAt)],
     );
   }

@@ -55,6 +55,9 @@ pub async fn run(data_dir: &Path, port: u16) -> Result<SelfTestReport, String> {
         data_dir: data_dir.to_path_buf(),
         profile_id: Some(SELFTEST_PROFILE.to_string()),
         mock: true,
+        engine_binary: None,
+        engine_model: None,
+        engine_threads: None,
     };
     let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = Node::start(config, shutdown_rx)

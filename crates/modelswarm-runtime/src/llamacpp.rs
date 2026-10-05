@@ -21,7 +21,7 @@
 //! process supervision live elsewhere (ADR-019).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -31,6 +31,16 @@ use serde_json::json;
 use crate::{
     Handle, KvCommitment, RuntimeDescriptor, RuntimeError, RuntimeMetrics, SamplingParams, TaskId,
 };
+
+/// Pinned-engine identity (from `runtime-pins.json`): what `id()` reports so
+/// telemetry/handshakes carry the true engine build.
+#[derive(Debug, Clone)]
+pub struct EngineIdentity {
+    /// llama.cpp release tag, e.g. `b11407`.
+    pub version: String,
+    /// sha256 of the pinned engine zip (ADR-022 §6).
+    pub build_hash: String,
+}
 
 /// Builder-style configuration for [`LlamaCppAdapter`].
 #[derive(Debug, Clone)]
@@ -42,6 +52,13 @@ pub struct LlamaCppConfig {
     /// Per-request timeout for adapter calls. Decode paths compute the
     /// remaining budget from the caller's deadline, bounded by this value.
     pub request_timeout: Duration,
+    /// Pinned-engine identity for `id()`; when `None` a placeholder
+    /// descriptor is reported (dev/test setups without a pin).
+    pub engine: Option<EngineIdentity>,
+    /// Exact bytes→id vocabulary from the model's GGUF (enables lossless
+    /// token-id recovery via logprob byte sequences, incl. byte-fallback
+    /// tokens that detokenized text cannot represent).
+    pub vocab: Option<Arc<modelswarm_types::TokenVocab>>,
 }
 
 impl LlamaCppConfig {
@@ -51,7 +68,21 @@ impl LlamaCppConfig {
             base_url: base_url.into(),
             bearer_token: bearer_token.into(),
             request_timeout: Duration::from_secs(60),
+            engine: None,
+            vocab: None,
         }
+    }
+
+    /// Attaches a pinned-engine identity.
+    pub fn with_engine(mut self, engine: EngineIdentity) -> Self {
+        self.engine = Some(engine);
+        self
+    }
+
+    /// Attaches the exact token vocabulary.
+    pub fn with_vocab(mut self, vocab: Arc<modelswarm_types::TokenVocab>) -> Self {
+        self.vocab = Some(vocab);
+        self
     }
 }
 
@@ -247,6 +278,22 @@ struct CompletionsResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     text: String,
+    #[serde(default)]
+    logprobs: Option<ChoiceLogprobs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChoiceLogprobs {
+    #[serde(default)]
+    content: Vec<LogprobEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogprobEntry {
+    /// Raw UTF-8 bytes of the generated token — exact id recovery including
+    /// byte-fallback tokens that invalid-UTF-8 text cannot represent.
+    #[serde(default)]
+    bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -259,14 +306,39 @@ struct Usage {
     completion_tokens: u64,
 }
 
+/// Sampling → request body per the determinism contract: `SamplingParams`
+/// equal to the default maps to temperature 0 (greedy) — "the runtime's
+/// default-sampling decode is a deterministic function of the prefix" —
+/// while any explicit override is forwarded verbatim (with its seed).
+fn sampling_body(sampling: &SamplingParams) -> serde_json::Value {
+    if sampling == &SamplingParams::default() {
+        json!({ "temperature": 0.0 })
+    } else {
+        let mut body = json!({
+            "temperature": sampling.temperature,
+            "top_p": sampling.top_p,
+            "top_k": sampling.top_k,
+        });
+        if let Some(seed) = sampling.seed {
+            body["seed"] = json!(seed);
+        }
+        body
+    }
+}
+
 #[async_trait]
 impl crate::InferenceRuntime for LlamaCppAdapter {
     fn id(&self) -> RuntimeDescriptor {
-        // The pinned build hash is supplied by the node supervisor; the
-        // adapter itself only knows its endpoint, so it reports a zero
-        // digest-derived placeholder identity that the node re-stamps.
-        RuntimeDescriptor::new("llama.cpp", "adapter-http-v1", "0".repeat(64))
-            .expect("static descriptor is valid")
+        match &self.config.engine {
+            Some(engine) => {
+                RuntimeDescriptor::new("llama.cpp", &engine.version, &engine.build_hash)
+                    .expect("pinned descriptor is valid")
+            }
+            // Dev/test setups without a pin report a zero placeholder that
+            // the node supervisor would re-stamp; never a claimed build.
+            None => RuntimeDescriptor::new("llama.cpp", "adapter-http-v1", "0".repeat(64))
+                .expect("static descriptor is valid"),
+        }
     }
 
     async fn load(&self, profile_id: &str) -> Result<Handle, RuntimeError> {
@@ -343,38 +415,60 @@ impl crate::InferenceRuntime for LlamaCppAdapter {
             ));
         }
         let started = Instant::now();
+        let mut body = json!({
+            "prompt": prefix,
+            "max_tokens": 1,
+            "stream": false,
+        });
+        // Exact id recovery needs the logprob byte sequence; harmless when
+        // no vocab is attached (falls back to the text round-trip below).
+        if self.config.vocab.is_some() {
+            body["logprobs"] = json!(true);
+        }
+        if let Some(sampling) = sampling_body(sampling).as_object() {
+            for (key, value) in sampling {
+                body[key] = value.clone();
+            }
+        }
         let response: CompletionsResponse = self
-            .post_json(
-                "/v1/completions",
-                &json!({
-                    "prompt": prefix,
-                    "max_tokens": 1,
-                    "stream": false,
-                    "temperature": sampling.temperature,
-                    "top_p": sampling.top_p,
-                    "top_k": sampling.top_k,
-                }),
-                self.config.request_timeout,
-            )
+            .post_json("/v1/completions", &body, self.config.request_timeout)
             .await?;
-        let text = response
-            .choices
-            .first()
-            .ok_or_else(|| {
-                RuntimeError::MalformedResponse("completions response had no choices".to_string())
-            })?
-            .text
-            .clone();
+        let choice = response.choices.first().ok_or_else(|| {
+            RuntimeError::MalformedResponse("completions response had no choices".to_string())
+        })?;
+
+        // Preferred path: exact id from the generated token's raw bytes.
+        if let (Some(vocab), Some(entries)) = (&self.config.vocab, choice.logprobs.as_ref()) {
+            if let Some(bytes) = entries.content.first().and_then(|e| e.bytes.as_ref()) {
+                let id = vocab.bytes_to_id.get(bytes.as_slice()).copied();
+                return match id {
+                    Some(id) => {
+                        self.record_decode_rate(1, started.elapsed());
+                        Ok(id)
+                    }
+                    None => Err(RuntimeError::MalformedResponse(format!(
+                        "generated token bytes {:?} not in the pinned vocabulary",
+                        bytes
+                    ))),
+                };
+            }
+        }
+
+        // Fallback (no vocab attached): recover the id through the tokenizer.
+        // Documented approximation — byte-fallback tokens are unrecoverable
+        // from text; attach a vocab for the exact path.
+        let text = &choice.text;
         if text.is_empty() {
             return Err(RuntimeError::MalformedResponse(
                 "completions response produced empty text".to_string(),
             ));
         }
-        // Recover the token id deterministically through the tokenizer.
         let tokens: TokenizeResponse = self
             .post_json(
                 "/tokenize",
-                &json!(TokenizeRequest { content: text }),
+                &json!(TokenizeRequest {
+                    content: text.to_string()
+                }),
                 self.config.request_timeout,
             )
             .await?;
@@ -384,6 +478,72 @@ impl crate::InferenceRuntime for LlamaCppAdapter {
             .first()
             .copied()
             .ok_or_else(|| RuntimeError::MalformedResponse("tokenize returned no ids".to_string()))
+    }
+
+    async fn decode_stream(
+        &self,
+        handle: &Handle,
+        prefix: &[u32],
+        sampling: &SamplingParams,
+        max_tokens: u32,
+        deadline: Duration,
+    ) -> Result<Vec<u32>, RuntimeError> {
+        // One-token-per-call loop with EOS awareness: llama-server caches the
+        // prompt server-side, so each step re-sends the growing prefix
+        // cheaply. Stops at EOS (when the vocab pins one), max_tokens, or the
+        // deadline — whichever comes first.
+        let started = Instant::now();
+        let mut out = Vec::with_capacity(max_tokens.min(1024) as usize);
+        let mut prefix = prefix.to_vec();
+        while out.len() < max_tokens as usize {
+            let elapsed = started.elapsed();
+            if elapsed >= deadline {
+                return Err(RuntimeError::Timeout {
+                    after_ms: crate::duration_ms_u64(elapsed),
+                });
+            }
+            let token = self.decode_step(handle, &prefix, sampling).await?;
+            if Some(token) == self.config.vocab.as_ref().and_then(|v| v.eos_id) {
+                break;
+            }
+            prefix.push(token);
+            out.push(token);
+        }
+        Ok(out)
+    }
+
+    /// Greedy self-continuation (ADR-021 salvageable unforked subset): the
+    /// draft window is what this same model would greedily produce, so a
+    /// proposer peer needs no separate draft model or server hooks.
+    async fn propose(
+        &self,
+        handle: &Handle,
+        prefix: &[u32],
+        window: u32,
+    ) -> Result<Vec<u32>, RuntimeError> {
+        if window == 0 {
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let default = SamplingParams::default();
+        let deadline = self.config.request_timeout;
+        let mut draft = Vec::with_capacity(window as usize);
+        let mut prefix = prefix.to_vec();
+        while draft.len() < window as usize {
+            let elapsed = started.elapsed();
+            if elapsed >= deadline {
+                return Err(RuntimeError::Timeout {
+                    after_ms: crate::duration_ms_u64(elapsed),
+                });
+            }
+            let token = self.decode_step(handle, &prefix, &default).await?;
+            if Some(token) == self.config.vocab.as_ref().and_then(|v| v.eos_id) {
+                break;
+            }
+            prefix.push(token);
+            draft.push(token);
+        }
+        Ok(draft)
     }
 
     fn metrics(&self) -> RuntimeMetrics {
@@ -553,6 +713,8 @@ mod tests {
             base_url: format!("http://{addr}"),
             bearer_token: "internal-secret".to_string(),
             request_timeout: timeout,
+            engine: None,
+            vocab: None,
         })
         .unwrap()
     }
@@ -729,6 +891,195 @@ mod tests {
             .unwrap();
         assert_eq!(out, vec![72, 72, 72, 72]);
         assert_eq!(step.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn exact_id_recovery_uses_logprob_bytes_not_text() {
+        // Vocab maps bytes [0xC3,0x80] ("À") to id 99 — the generated token
+        // is recovered from logprobs.bytes without any /tokenize call.
+        let completions_hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = completions_hits.clone();
+        let tokenize_hits = Arc::new(AtomicUsize::new(0));
+        let tokenize_server = tokenize_hits.clone();
+        let addr = start_canned_server(Arc::new(Mutex::new(move |req: &str| {
+            let first = req.split_whitespace().nth(1).unwrap_or("");
+            if first.starts_with("/v1/completions") {
+                hits_server.fetch_add(1, Ordering::Relaxed);
+                Canned::ok(
+                    r#"{"choices":[{"text":"?","logprobs":{"content":[{"token":"?","bytes":[195,128]}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+                )
+            } else if first == "/tokenize" {
+                tokenize_server.fetch_add(1, Ordering::Relaxed);
+                Canned::ok(TOK_TOKENS)
+            } else {
+                Canned::ok(MODELS)
+            }
+        })))
+        .await
+        .unwrap();
+
+        let mut vocab = modelswarm_types::TokenVocab {
+            bytes_to_id: std::collections::HashMap::new(),
+            eos_id: None,
+        };
+        vocab.bytes_to_id.insert(vec![0xC3, 0x80], 99);
+        let runtime = LlamaCppAdapter::new(
+            LlamaCppConfig::new(format!("http://{addr}"), "internal-secret")
+                .with_vocab(Arc::new(vocab)),
+        )
+        .unwrap();
+        let handle = runtime.load("msp1:aa").await.unwrap();
+        let token = runtime
+            .decode_step(&handle, &[1, 2], &SamplingParams::default())
+            .await
+            .unwrap();
+        assert_eq!(token, 99);
+        assert_eq!(completions_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            tokenize_hits.load(Ordering::Relaxed),
+            0,
+            "no text round-trip"
+        );
+
+        // An unknown byte sequence fails closed rather than guessing an id.
+        let mut bad = modelswarm_types::TokenVocab {
+            bytes_to_id: std::collections::HashMap::new(),
+            eos_id: None,
+        };
+        bad.bytes_to_id.insert(vec![1, 2, 3], 5);
+        let runtime = LlamaCppAdapter::new(
+            LlamaCppConfig::new(format!("http://{addr}"), "internal-secret")
+                .with_vocab(Arc::new(bad)),
+        )
+        .unwrap();
+        let handle = runtime.load("msp1:aa").await.unwrap();
+        assert!(matches!(
+            runtime
+                .decode_step(&handle, &[1, 2], &SamplingParams::default())
+                .await
+                .unwrap_err(),
+            RuntimeError::MalformedResponse(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_sampling_maps_to_greedy_temperature_zero() {
+        // The determinism contract: default sampling => temperature 0.
+        let seen_bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_server = seen_bodies.clone();
+        let addr = start_canned_server(Arc::new(Mutex::new(move |req: &str| {
+            let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+            let body = &req[body_start..];
+            if req.starts_with("POST /v1/completions") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                    bodies_server.lock().unwrap().push(v);
+                }
+                Canned::ok(COMPLETIONS_A)
+            } else if req.starts_with("POST /tokenize") {
+                Canned::ok(TOK_TOKENS)
+            } else {
+                Canned::ok(MODELS)
+            }
+        })))
+        .await
+        .unwrap();
+        let runtime = adapter(addr, Duration::from_secs(5));
+        let handle = runtime.load("msp1:aa").await.unwrap();
+        runtime
+            .decode_step(&handle, &[1], &SamplingParams::default())
+            .await
+            .unwrap();
+        // Explicit sampling is forwarded verbatim.
+        let explicit = SamplingParams {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 50,
+            seed: Some(42),
+        };
+        runtime.decode_step(&handle, &[1], &explicit).await.unwrap();
+
+        let bodies = seen_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["temperature"], serde_json::json!(0.0));
+        assert_eq!(bodies[1]["temperature"].as_f64().unwrap() as f32, 0.7f32);
+        assert_eq!(bodies[1]["seed"], serde_json::json!(42));
+    }
+
+    #[tokio::test]
+    async fn propose_is_greedy_self_continuation_and_stream_stops_at_eos() {
+        // Vocab: byte 0x41 -> id 72, eos -> 73. The server emits byte 0x41
+        // (id 72) for every call and 0x49 (id 73 = EOS) never; decode_stream
+        // runs to max_tokens. Then flip: eos emitted -> stream stops empty
+        // and propose returns no eos token.
+        fn vocab_with(eos: Option<u32>) -> Arc<modelswarm_types::TokenVocab> {
+            let mut map = std::collections::HashMap::new();
+            map.insert(vec![0x41], 72u32);
+            map.insert(vec![0x49], 73u32);
+            Arc::new(modelswarm_types::TokenVocab {
+                bytes_to_id: map,
+                eos_id: eos,
+            })
+        }
+
+        let step = Arc::new(AtomicUsize::new(0));
+        let step_server = step.clone();
+        let addr = start_canned_server(Arc::new(Mutex::new(move |req: &str| {
+            let first = req.split_whitespace().nth(1).unwrap_or("");
+            if first.starts_with("/v1/completions") {
+                step_server.fetch_add(1, Ordering::Relaxed);
+                Canned::ok(
+                    r#"{"choices":[{"text":"A","logprobs":{"content":[{"token":"A","bytes":[65]}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+                )
+            } else {
+                Canned::ok(MODELS)
+            }
+        })))
+        .await
+        .unwrap();
+
+        let runtime = LlamaCppAdapter::new(
+            LlamaCppConfig::new(format!("http://{addr}"), "internal-secret")
+                .with_vocab(vocab_with(None)),
+        )
+        .unwrap();
+        let handle = runtime.load("msp1:aa").await.unwrap();
+        let draft = runtime.propose(&handle, &[1, 2], 3).await.unwrap();
+        assert_eq!(draft, vec![72, 72, 72]);
+        assert_eq!(step.load(Ordering::Relaxed), 3);
+
+        let out = runtime
+            .decode_stream(
+                &handle,
+                &[1],
+                &SamplingParams::default(),
+                5,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, vec![72, 72, 72, 72, 72]);
+
+        // EOS-awareness: with eos pinned to the emitted token, both propose
+        // and decode_stream stop without emitting it.
+        let runtime_eos = LlamaCppAdapter::new(
+            LlamaCppConfig::new(format!("http://{addr}"), "internal-secret")
+                .with_vocab(vocab_with(Some(72))),
+        )
+        .unwrap();
+        let handle = runtime_eos.load("msp1:aa").await.unwrap();
+        let draft = runtime_eos.propose(&handle, &[1, 2], 3).await.unwrap();
+        assert!(draft.is_empty());
+        let out = runtime_eos
+            .decode_stream(
+                &handle,
+                &[1],
+                &SamplingParams::default(),
+                5,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_empty());
     }
 
     // Multi-thread flavor: `cancel` blocks the calling thread on a helper

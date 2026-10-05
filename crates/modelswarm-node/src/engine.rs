@@ -1,0 +1,397 @@
+//! llama-server sidecar supervision (Phase H3; ADR-008 engine bundling,
+//! ADR-021 accepted engine decision).
+//!
+//! The node owns the pinned, unmodified `llama-server.exe` lifecycle:
+//!
+//! - every bundled engine file is hash-verified against the compile-time
+//!   `runtime-pins.json` before launch (ADR-022 §6),
+//! - the process is spawned loopback-only with a random per-run API key
+//!   (ADR-002 internal bearer), `--no-webui`, and stdout/stderr discarded
+//!   (engine logs may echo prompts — they are never persisted),
+//! - a supervisor task restarts it on unexpected exit (bounded retries) and
+//!   kills it when the node's shutdown channel flips,
+//! - startup blocks until `/health` answers (model load) or times out.
+//!
+//! [`EngineHandle::runtime_config`] yields a ready
+//! [`modelswarm_runtime::llamacpp::LlamaCppConfig`] including the pinned
+//! engine identity and the exact token vocabulary parsed from the verified
+//! GGUF (lossless token-id recovery, ADR-022 vocab).
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use modelswarm_runtime::llamacpp::{EngineIdentity, LlamaCppConfig};
+use modelswarm_types::{read_metadata, token_vocab, TokenVocab};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tokio::process::{Child, Command};
+
+/// The pinned engine manifest, baked in at compile time from the repo root.
+pub const RUNTIME_PINS_JSON: &str = include_str!("../../../runtime-pins.json");
+
+#[derive(Debug, Deserialize)]
+struct RuntimePins {
+    tag: String,
+    zip_sha256: String,
+    #[serde(default)]
+    bundle: Vec<String>,
+    files: std::collections::BTreeMap<String, String>,
+}
+
+fn parse_pins() -> Result<RuntimePins, EngineError> {
+    serde_json::from_str(RUNTIME_PINS_JSON)
+        .map_err(|e| EngineError::Pins(format!("embedded runtime-pins.json invalid: {e}")))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EngineError {
+    #[error("engine pin verification failed: {0}")]
+    Pins(String),
+    #[error("engine io: {0}")]
+    Io(String),
+    #[error("engine spawn: {0}")]
+    Spawn(String),
+    #[error("engine health: server did not become ready within {timeout_ms} ms")]
+    HealthTimeout { timeout_ms: u64 },
+    #[error("engine vocabulary: {0}")]
+    Vocab(String),
+}
+
+/// Everything needed to launch the engine sidecar.
+#[derive(Debug, Clone)]
+pub struct EngineSpec {
+    /// Path to `llama-server.exe` (the pinned bundle directory).
+    pub exe: PathBuf,
+    /// Path to the verified GGUF artifact.
+    pub model: PathBuf,
+    /// Compute threads; `None` lets llama-server decide.
+    pub threads: Option<u32>,
+    /// KV context window (prompt + generation budget).
+    pub ctx: u32,
+    /// How long to wait for `/health` after spawn.
+    pub startup_timeout: Duration,
+}
+
+impl Default for EngineSpec {
+    fn default() -> Self {
+        Self {
+            exe: PathBuf::new(),
+            model: PathBuf::new(),
+            threads: None,
+            ctx: 4096,
+            startup_timeout: Duration::from_secs(120),
+        }
+    }
+}
+
+/// A running, health-verified engine sidecar. Dropping the node's shutdown
+/// channel (or flipping it) terminates the child. `bearer` stays in the node
+/// process — it never crosses into any UI.
+pub struct EngineHandle {
+    /// Loopback base URL, e.g. `http://127.0.0.1:8137`.
+    pub base_url: String,
+    /// The per-run random API key.
+    pub bearer: String,
+    pub port: u16,
+    /// The pinned-engine identity (verified at launch).
+    pub identity: EngineIdentity,
+    /// Exact token vocabulary from the verified GGUF.
+    pub vocab: Arc<TokenVocab>,
+}
+
+/// Verifies the engine directory against the embedded pins and returns the
+/// pinned identity. `exe`'s parent directory must contain every `bundle[]`
+/// file with the exact pinned sha256 (extras are tolerated — dev machines
+/// may unpack the full zip).
+pub fn verify_engine_dir(exe: &Path) -> Result<EngineIdentity, EngineError> {
+    let pins = parse_pins()?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| EngineError::Pins("engine exe has no parent directory".into()))?;
+    if !dir.is_dir() {
+        return Err(EngineError::Pins(format!(
+            "engine directory missing: {}",
+            dir.display()
+        )));
+    }
+    for file in &pins.bundle {
+        let path = dir.join(file);
+        let bytes = std::fs::read(&path)
+            .map_err(|e| EngineError::Pins(format!("bundled file {file}: {e}")))?;
+        let actual = hex::encode(Sha256::digest(&bytes));
+        let expected = pins.files.get(file).ok_or_else(|| {
+            EngineError::Pins(format!("pins have no hash for bundled file {file}"))
+        })?;
+        if actual != *expected {
+            return Err(EngineError::Pins(format!(
+                "bundled file {file}: sha256 {actual} != pinned {expected}"
+            )));
+        }
+    }
+    Ok(EngineIdentity {
+        version: pins.tag.clone(),
+        build_hash: pins.zip_sha256.clone(),
+    })
+}
+
+/// Picks a free loopback port by briefly binding and dropping a listener.
+fn ephemeral_port() -> Result<u16, EngineError> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| EngineError::Io(e.to_string()))?;
+    Ok(listener
+        .local_addr()
+        .map_err(|e| EngineError::Io(e.to_string()))?
+        .port())
+}
+
+/// Spawns and supervises the engine. Returns once `/health` is green; the
+/// supervisor task keeps the child alive (bounded restarts) until
+/// `shutdown` fires or all senders drop, then kills it.
+pub async fn start_engine(
+    spec: EngineSpec,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<EngineHandle, EngineError> {
+    let identity = verify_engine_dir(&spec.exe)?;
+    let port = ephemeral_port()?;
+    let bearer = modelswarm_identity::new_nonce();
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    spawn_supervised(
+        &spec,
+        port,
+        &bearer,
+        shutdown.clone(),
+        3, // bounded restart attempts per session
+    );
+
+    // Block until healthy (model load) or timeout.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| EngineError::Io(e.to_string()))?;
+    let started = Instant::now();
+    loop {
+        if *shutdown.borrow() {
+            return Err(EngineError::Spawn(
+                "node shut down while engine loaded".into(),
+            ));
+        }
+        if started.elapsed() >= spec.startup_timeout {
+            return Err(EngineError::HealthTimeout {
+                timeout_ms: spec.startup_timeout.as_millis() as u64,
+            });
+        }
+        let healthy = client
+            .get(format!("{base_url}/health"))
+            .bearer_auth(&bearer)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if healthy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Ok(EngineHandle {
+        base_url,
+        bearer,
+        port,
+        vocab: load_vocab(&spec.model)?,
+        identity,
+    })
+}
+
+fn spawn_supervised(
+    spec: &EngineSpec,
+    port: u16,
+    bearer: &str,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    max_restarts: u32,
+) {
+    let spec = spec.clone();
+    let bearer = bearer.to_string();
+    tokio::spawn(async move {
+        let mut restarts_left = max_restarts;
+        loop {
+            let mut child = match launch(&spec, port, &bearer) {
+                Ok(child) => child,
+                Err(e) => {
+                    eprintln!("modelswarm-node: engine spawn failed: {e}");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    let _ = child.kill().await;
+                    return;
+                }
+                status = child.wait() => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                    if restarts_left == 0 {
+                        eprintln!("modelswarm-node: engine exited ({status:?}); restart budget exhausted");
+                        return;
+                    }
+                    restarts_left -= 1;
+                    eprintln!("modelswarm-node: engine exited unexpectedly; restarting ({restarts_left} left)");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    });
+}
+
+fn launch(spec: &EngineSpec, port: u16, bearer: &str) -> Result<Child, EngineError> {
+    let mut command = Command::new(&spec.exe);
+    command
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("-m")
+        .arg(&spec.model)
+        .arg("-c")
+        .arg(spec.ctx.to_string())
+        .arg("--no-webui")
+        .arg("--api-key")
+        .arg(bearer)
+        // Engine stdout/stderr are discarded by policy: they may echo prompt
+        // text, and prompts are structurally never persisted (ADR-001).
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(threads) = spec.threads {
+        command.arg("-t").arg(threads.to_string());
+    }
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW: no console flash for the GUI-supervised node.
+        // (tokio::process::Command has an inherent creation_flags on Windows.)
+        command.creation_flags(0x0800_0000);
+    }
+    command
+        .spawn()
+        .map_err(|e| EngineError::Spawn(format!("{}: {e}", spec.exe.display())))
+}
+
+impl EngineHandle {
+    /// Adapter configuration carrying the pinned identity + exact vocab.
+    pub fn runtime_config(&self) -> LlamaCppConfig {
+        LlamaCppConfig::new(&self.base_url, &self.bearer)
+            .with_engine(self.identity.clone())
+            .with_vocab(Arc::clone(&self.vocab))
+    }
+}
+
+/// Loads the exact token vocabulary (bytes→id + EOS) from a GGUF artifact.
+pub fn load_vocab(model: &Path) -> Result<Arc<TokenVocab>, EngineError> {
+    let metadata = read_metadata(model)
+        .map_err(|e| EngineError::Vocab(format!("{}: {e}", model.display())))?;
+    let vocab = token_vocab(&metadata)
+        .ok_or_else(|| EngineError::Vocab("GGUF has no tokenizer.ggml.tokens array".into()))?;
+    Ok(Arc::new(vocab))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_pins_parse_and_cover_the_bundle() {
+        let pins = parse_pins().expect("pins parse");
+        assert!(pins.tag.starts_with('b'), "tag: {}", pins.tag);
+        assert_eq!(pins.zip_sha256.len(), 64);
+        assert!(!pins.bundle.is_empty());
+        for file in &pins.bundle {
+            assert!(
+                pins.files.contains_key(file),
+                "bundle file {file} not hashed"
+            );
+        }
+        // The exact pinned engine (Phase H1).
+        assert_eq!(pins.tag, "b11407");
+        assert_eq!(
+            pins.zip_sha256,
+            "353c4aab423bff5cb6dc0e1d32e41a447990ab3d69a411b7f58ff48187c91a03"
+        );
+    }
+
+    #[test]
+    fn verify_engine_dir_fails_closed_on_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        // Empty dir: every bundle file missing -> error.
+        let err = verify_engine_dir(&dir.path().join("llama-server.exe"));
+        assert!(matches!(err, Err(EngineError::Pins(_))), "{err:?}");
+
+        // A file with the right name but wrong bytes -> error.
+        let pins = parse_pins().unwrap();
+        let first = pins.bundle.first().unwrap().clone();
+        std::fs::write(dir.path().join(&first), b"tampered").unwrap();
+        let err = verify_engine_dir(&dir.path().join("llama-server.exe"));
+        assert!(matches!(err, Err(EngineError::Pins(_))), "{err:?}");
+    }
+
+    /// Real-engine smoke (Phase H3 gate): set MSP_LLAMA_SERVER + MSP_REAL_GGUF
+    /// to the pinned llama-server.exe and the verified Qwen GGUF.
+    #[test]
+    #[ignore = "set MSP_LLAMA_SERVER and MSP_REAL_GGUF"]
+    fn real_engine_starts_serves_and_dies() {
+        let exe = std::env::var("MSP_LLAMA_SERVER").expect("MSP_LLAMA_SERVER");
+        let model = std::env::var("MSP_REAL_GGUF").expect("MSP_REAL_GGUF");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let (_tx, rx) = tokio::sync::watch::channel(false);
+            let spec = EngineSpec {
+                exe: exe.into(),
+                model: model.into(),
+                ..EngineSpec::default()
+            };
+            let engine = start_engine(spec, rx).await.expect("engine starts");
+            let config = engine.runtime_config();
+            assert_eq!(engine.identity.version, "b11407");
+            let adapter = modelswarm_runtime::llamacpp::LlamaCppAdapter::new(config).unwrap();
+
+            use modelswarm_runtime::InferenceRuntime;
+            let handle = adapter.load("msp1:real").await.unwrap();
+            let ids = adapter.tokenize("Hello, swarm.").await.unwrap();
+            assert!(!ids.is_empty());
+            let sampling = modelswarm_runtime::SamplingParams::default();
+            let a = adapter
+                .decode_stream(&handle, &ids, &sampling, 8, Duration::from_secs(60))
+                .await
+                .unwrap();
+            let b = adapter
+                .decode_stream(&handle, &ids, &sampling, 8, Duration::from_secs(60))
+                .await
+                .unwrap();
+            assert_eq!(a, b, "greedy decode must be deterministic");
+            assert!(!a.is_empty());
+            let text = adapter.detokenize(&a).await.unwrap();
+            assert!(!text.is_empty());
+            let metrics = adapter.metrics();
+            assert!(
+                metrics.decode_tokens_per_ms > 0.0,
+                "measured decode rate required"
+            );
+            println!(
+                "generated {text:?} at {:.1} tok/s",
+                metrics.decode_tokens_per_ms * 1000.0
+            );
+
+            // Shutdown kills the child.
+            let port = engine.port;
+            drop(engine);
+            _tx.send(true).ok();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let gone = reqwest::Client::new()
+                .get(format!("http://127.0.0.1:{port}/health"))
+                .send()
+                .await;
+            assert!(gone.is_err(), "engine must be dead after shutdown");
+        });
+    }
+}

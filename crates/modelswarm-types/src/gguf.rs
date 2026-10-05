@@ -65,9 +65,100 @@ pub enum GgufValue {
     F32Bits(u32),
     Bool(bool),
     Str(String),
-    StrArray(Vec<String>),
+    /// String array: lossy UTF-8 text (hash inputs, ADR-022) plus the raw
+    /// bytes (exact-vocab lookups; byte-fallback tokens are invalid UTF-8).
+    StrArray(Vec<String>, Vec<Vec<u8>>),
     I32Array(Vec<i32>),
     Other,
+}
+
+/// Exact bytes→id vocabulary plus EOS, for lossless token-id recovery in
+/// runtimes (Phase H3). Built from `tokenizer.ggml.tokens` raw bytes.
+#[derive(Debug, Clone)]
+pub struct TokenVocab {
+    pub bytes_to_id: std::collections::HashMap<Vec<u8>, u32>,
+    pub eos_id: Option<u32>,
+}
+
+/// Builds a [`TokenVocab`] from GGUF metadata (`tokenizer.ggml.tokens` +
+/// `tokenizer.ggml.eos_token_id`). `None` when the token array is missing.
+///
+/// For `tokenizer.ggml.model == "gpt2"` (byte-level BPE: Qwen, GPT-2,
+/// Llama 3, …) GGUF stores tokens in the GPT-2 byte-to-unicode alphabet
+/// (`" I"` as `"ĠI"`), while inference servers report generated tokens as
+/// real UTF-8 bytes — so each token string is decoded back through the
+/// GPT-2 byte decoder before indexing. Tokens containing characters outside
+/// the mapping are skipped (they are not part of the byte alphabet).
+pub fn token_vocab(metadata: &BTreeMap<String, GgufValue>) -> Option<TokenVocab> {
+    let gpt2 = matches!(
+        metadata.get("tokenizer.ggml.model"),
+        Some(GgufValue::Str(model)) if model == "gpt2"
+    );
+    let decoder = gpt2.then(gpt2_byte_decoder);
+    let raw = match metadata.get("tokenizer.ggml.tokens")? {
+        GgufValue::StrArray(_, raw) => raw.clone(),
+        _ => return None,
+    };
+    let mut bytes_to_id = std::collections::HashMap::with_capacity(raw.len());
+    for (id, token) in raw.into_iter().enumerate() {
+        let Some(id) = u32::try_from(id).ok() else {
+            continue;
+        };
+        let bytes = match &decoder {
+            Some(decoder) => {
+                let mut decoded = Vec::with_capacity(token.len());
+                let mut ok = true;
+                for ch in String::from_utf8_lossy(&token).chars() {
+                    match decoder.get(&ch) {
+                        Some(byte) => decoded.push(*byte),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                decoded
+            }
+            None => token,
+        };
+        // On byte collisions keep the lowest id (stable, deterministic).
+        bytes_to_id.entry(bytes).or_insert(id);
+    }
+    let eos_id = match metadata.get("tokenizer.ggml.eos_token_id") {
+        Some(GgufValue::U32(v)) => Some(*v),
+        _ => None,
+    };
+    Some(TokenVocab {
+        bytes_to_id,
+        eos_id,
+    })
+}
+
+/// The GPT-2 byte-to-unicode table, inverted: printable/latin self-mapped
+/// bytes identity, every other byte assigned a distinct char ≥ U+0100
+/// (the reversible mapping from the GPT-2 encoder; `Ġ` = space).
+fn gpt2_byte_decoder() -> std::collections::HashMap<char, u8> {
+    let mut decoder = std::collections::HashMap::with_capacity(256);
+    let mut next = 0u32;
+    for byte in 0u16..=255 {
+        let keep = (33..=126).contains(&byte)
+            || (161..=172).contains(&byte)
+            || (174..=255).contains(&byte);
+        let code = if keep {
+            u32::from(byte)
+        } else {
+            let code = 256 + next;
+            next += 1;
+            code
+        };
+        if let Some(ch) = char::from_u32(code) {
+            decoder.insert(ch, byte as u8);
+        }
+    }
+    decoder
 }
 
 /// The three ADR-022 identity hashes (lowercase hex).
@@ -135,9 +226,13 @@ fn read_u64<R: Read>(r: &mut R) -> Result<u64, GgufError> {
     ]))
 }
 
-fn read_string<R: Read>(r: &mut R) -> Result<String, GgufError> {
+fn read_string_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, GgufError> {
     let n = read_u64(r)? as usize;
-    let bytes = read_exact_n(r, n, "string")?;
+    read_exact_n(r, n, "string")
+}
+
+fn read_string<R: Read>(r: &mut R) -> Result<String, GgufError> {
+    let bytes = read_string_bytes(r)?;
     // Lossy UTF-8 (U+FFFD) — matches the Node reader (ADR-022 §1).
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -172,10 +267,15 @@ fn read_value<R: Read>(r: &mut R, value_type: u32) -> Result<GgufValue, GgufErro
             let element_type = read_u32(r)?;
             let n = read_u64(r)? as usize;
             let mut strings = Vec::new();
+            let mut raw = Vec::new();
             let mut ints = Vec::new();
             for _ in 0..n {
                 match element_type {
-                    8 => strings.push(read_string(r)?),
+                    8 => {
+                        let bytes = read_string_bytes(r)?;
+                        strings.push(String::from_utf8_lossy(&bytes).into_owned());
+                        raw.push(bytes);
+                    }
                     5 => {
                         let b = read_exact_n(r, 4, "i32 element")?;
                         ints.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
@@ -186,7 +286,7 @@ fn read_value<R: Read>(r: &mut R, value_type: u32) -> Result<GgufValue, GgufErro
                 }
             }
             if element_type == 8 {
-                Ok(GgufValue::StrArray(strings))
+                Ok(GgufValue::StrArray(strings, raw))
             } else if element_type == 5 {
                 Ok(GgufValue::I32Array(ints))
             } else {
@@ -364,7 +464,7 @@ fn get_str_array(
     key: &str,
 ) -> Result<Vec<String>, GgufError> {
     match get(metadata, key)? {
-        GgufValue::StrArray(v) => Ok(v.clone()),
+        GgufValue::StrArray(v, _) => Ok(v.clone()),
         _ => Err(GgufError::BadValue(key.to_string())),
     }
 }
@@ -453,6 +553,18 @@ mod tests {
             }
         }
 
+        fn str_array_raw(&mut self, k: &str, values: &[Vec<u8>]) {
+            self.key(k);
+            self.buf.extend_from_slice(&9u32.to_le_bytes());
+            self.buf.extend_from_slice(&8u32.to_le_bytes());
+            self.buf
+                .extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for v in values {
+                self.buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                self.buf.extend_from_slice(v);
+            }
+        }
+
         fn i32_array(&mut self, k: &str, values: &[i32]) {
             self.key(k);
             self.buf.extend_from_slice(&9u32.to_le_bytes());
@@ -515,6 +627,71 @@ mod tests {
             assert_eq!(h.len(), 64);
             assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
         }
+    }
+
+    #[test]
+    fn token_vocab_raw_bytes_for_sentencepiece_and_gpt2_decoding() {
+        // --- sentencepiece-style: tokens are raw bytes (no gpt2 model tag
+        // here), so an invalid-UTF-8 token maps EXACTLY with no lossiness.
+        let bytes = {
+            let mut w = GgufWriter::new();
+            write_all_identity_keys(&mut w);
+            w.str_array_raw(
+                "tokenizer.ggml.tokens",
+                &[b"ok".to_vec(), vec![0xFF], b"a".to_vec()],
+            );
+            w.str("tokenizer.ggml.model", "llama");
+            w.i32_array("tokenizer.ggml.token_type", &[1, 6, 1]);
+            w.str_array("tokenizer.ggml.merges", &["a b"]);
+            w.finish(21)
+        };
+        let metadata = read_metadata_bytes(&bytes).unwrap();
+        let vocab = token_vocab(&metadata).expect("vocab");
+        assert_eq!(vocab.bytes_to_id.get(b"ok".as_slice()), Some(&0));
+        assert_eq!(vocab.bytes_to_id.get(&[0xFF][..]), Some(&1));
+        assert_eq!(vocab.bytes_to_id.get(b"a".as_slice()), Some(&2));
+        assert_eq!(vocab.eos_id, Some(7));
+
+        // --- gpt2 byte-level BPE: GGUF stores the remapped alphabet, so
+        // "ĠI" (U+0120 'I' = 0xC4 0xA0 0x49) must decode to real bytes " I"
+        // [32, 73] — the form inference servers report.
+        let bytes = {
+            let mut w = GgufWriter::new();
+            write_all_identity_keys(&mut w);
+            w.str_array_raw(
+                "tokenizer.ggml.tokens",
+                &["ĠI".as_bytes().to_vec(), b"<|im_end|>".to_vec()],
+            );
+            w.str("tokenizer.ggml.model", "gpt2");
+            w.i32_array("tokenizer.ggml.token_type", &[1, 3]);
+            w.str_array("tokenizer.ggml.merges", &["a b"]);
+            w.finish(21)
+        };
+        let metadata = read_metadata_bytes(&bytes).unwrap();
+        let vocab = token_vocab(&metadata).expect("vocab");
+        assert_eq!(vocab.bytes_to_id.get(b" I".as_slice()), Some(&0));
+        assert_eq!(vocab.bytes_to_id.get(b"<|im_end|>".as_slice()), Some(&1));
+    }
+
+    /// Writes every ADR-022 identity key once (shared by vocab tests).
+    fn write_all_identity_keys(w: &mut GgufWriter) {
+        w.str("general.architecture", "qwen2");
+        w.u32("qwen2.attention.head_count", 14);
+        w.u32("qwen2.attention.head_count_kv", 2);
+        w.f32("qwen2.attention.layer_norm_rms_epsilon", 1);
+        w.u32("qwen2.block_count", 24);
+        w.u32("qwen2.context_length", 32);
+        w.u32("qwen2.embedding_length", 896);
+        w.u32("qwen2.feed_forward_length", 4_864);
+        w.u32("general.file_type", 15);
+        w.f32("qwen2.rope.freq_base", 1);
+        w.boolean("tokenizer.ggml.add_bos_token", false);
+        w.u32("tokenizer.ggml.bos_token_id", 0);
+        w.u32("tokenizer.ggml.eos_token_id", 7);
+        w.str("tokenizer.ggml.model", "gpt2");
+        w.u32("tokenizer.ggml.padding_token_id", 0);
+        w.str("tokenizer.ggml.pre", "qwen2");
+        w.str("tokenizer.chat_template", "tpl");
     }
 
     #[test]

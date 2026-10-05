@@ -49,6 +49,7 @@
 
 pub mod artifact;
 pub mod catalog;
+pub mod engine;
 mod executor;
 
 #[cfg(any(test, feature = "node-selftest"))]
@@ -101,6 +102,15 @@ pub struct NodeConfig {
     /// compiled with `cfg(test)` or the `node-selftest` feature; otherwise
     /// [`Node::start`] fails with [`NodeError::MockRuntimeNotCompiled`].
     pub mock: bool,
+    /// Path to the pinned `llama-server.exe` (Phase H3). When set together
+    /// with [`NodeConfig::engine_model`], the node spawns and supervises the
+    /// engine and serves through it; takes precedence over the sidecar env
+    /// vars.
+    pub engine_binary: Option<PathBuf>,
+    /// Path to the verified GGUF artifact the engine loads.
+    pub engine_model: Option<PathBuf>,
+    /// Compute threads for the engine; `None` = engine default.
+    pub engine_threads: Option<u32>,
 }
 
 impl Default for NodeConfig {
@@ -111,6 +121,9 @@ impl Default for NodeConfig {
             data_dir: default_data_dir(),
             profile_id: None,
             mock: false,
+            engine_binary: None,
+            engine_model: None,
+            engine_threads: None,
         }
     }
 }
@@ -152,6 +165,9 @@ pub enum NodeError {
     /// The configured sidecar base URL is not loopback (ADR-002 / AGENTS.md 4).
     #[error("llama.cpp sidecar base URL must be loopback (127.0.0.1), got: {0}")]
     LlamaSidebackNotLoopback(String),
+    /// The pinned engine failed to verify, start, or become healthy.
+    #[error("engine error: {0}")]
+    Engine(#[from] engine::EngineError),
 }
 
 /// Composition entry point. `Node` is a namespace, not a running value: the
@@ -191,8 +207,36 @@ impl Node {
             &[("installation_id", &installation_id), ("key", "ed25519")],
         );
 
+        // Pinned engine (Phase H3): spawn + supervise when configured.
+        let engine = match (&config.engine_binary, &config.engine_model) {
+            (Some(exe), Some(model)) => {
+                let spec = engine::EngineSpec {
+                    exe: exe.clone(),
+                    model: model.clone(),
+                    threads: config.engine_threads,
+                    ..engine::EngineSpec::default()
+                };
+                let handle = engine::start_engine(spec, shutdown.clone()).await?;
+                telemetry.info(
+                    "engine.started",
+                    &[
+                        ("port", &handle.port.to_string()),
+                        ("version", handle.identity.version.as_str()),
+                        ("build_hash", handle.identity.build_hash.as_str()),
+                    ],
+                );
+                Some(handle)
+            }
+            (None, None) => None,
+            _ => {
+                return Err(NodeError::LlamaSidecarMisconfigured(
+                    "engine_binary and engine_model must be set together".to_string(),
+                ))
+            }
+        };
+
         // Runtime selection (ADR-019).
-        let runtime = select_runtime(&config, &telemetry)?;
+        let runtime = select_runtime(&config, &telemetry, engine.as_ref())?;
         if let Some(runtime) = &runtime {
             let descriptor = runtime.id();
             telemetry.info(
@@ -289,6 +333,7 @@ impl Node {
             mock: config.mock,
             data_dir: config.data_dir,
             tracker,
+            engine_port: engine.as_ref().map(|e| e.port),
             server,
         })
     }
@@ -310,6 +355,8 @@ pub struct NodeHandle {
     /// secret material in its public surface; the identity seed stays in the
     /// node process.
     pub tracker: Option<Arc<TrackerClient>>,
+    /// The supervised engine's loopback port, when one was started.
+    pub engine_port: Option<u16>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -335,6 +382,7 @@ impl NodeHandle {
 fn select_runtime(
     config: &NodeConfig,
     telemetry: &Telemetry,
+    engine: Option<&engine::EngineHandle>,
 ) -> Result<Option<Arc<dyn InferenceRuntime>>, NodeError> {
     if config.mock {
         #[cfg(any(test, feature = "node-selftest"))]
@@ -367,6 +415,13 @@ fn select_runtime(
             let _ = telemetry;
             return Err(NodeError::MockRuntimeNotCompiled);
         }
+    }
+
+    // A supervised pinned engine takes precedence over ambient env vars.
+    if let Some(engine) = engine {
+        let adapter = LlamaCppAdapter::new(engine.runtime_config())
+            .map_err(|e| NodeError::LlamaSidecarMisconfigured(e.to_string()))?;
+        return Ok(Some(Arc::new(adapter)));
     }
 
     let url = std::env::var(ENV_LLAMACPP_URL);

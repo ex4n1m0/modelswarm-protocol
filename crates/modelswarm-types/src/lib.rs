@@ -12,7 +12,8 @@ pub mod manifest;
 
 pub use canonical::{canonical_json, CanonicalError};
 pub use gguf::{
-    identity_hashes, read_metadata, read_metadata_bytes, GgufError, GgufIdentityHashes, GgufValue,
+    identity_hashes, read_metadata, read_metadata_bytes, token_vocab, GgufError,
+    GgufIdentityHashes, GgufValue, TokenVocab,
 };
 pub use manifest::{
     ArtifactHash, ManifestError, ModelProfileManifest, QuantizationDescriptor, RuntimeDescriptor,

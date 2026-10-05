@@ -21,7 +21,8 @@ modelswarm-node — ModelSwarm background node daemon
 
 USAGE:
     modelswarm-node run [--port N] [--data-dir DIR] [--tracker URL]
-                        [--profile MSP1_ID] [--allow-mock-runtime] [--check-tracker]
+                        [--profile MSP1_ID] [--engine EXE] [--model GGUF] [--threads N]
+                        [--allow-mock-runtime] [--check-tracker]
     modelswarm-node self-test [--port N]
     modelswarm-node --version
 
@@ -33,6 +34,10 @@ OPTIONS (run):
     --allow-mock-runtime   TEST-ONLY (ADR-019): requires a build with
                            --features node-selftest; loopback-only, never
                            serves remote peers
+    --engine EXE           Path to the pinned llama-server.exe; with --model,
+                           the node spawns and supervises the engine (Phase H3)
+    --model GGUF           Path to the verified GGUF artifact to host
+    --threads N            Engine compute threads (default: engine decides)
     --check-tracker        After startup, issue one read-only GET /health to
                            the configured tracker and log the outcome
 
@@ -46,6 +51,9 @@ enum Command {
         data_dir: Option<PathBuf>,
         tracker: Option<String>,
         profile: Option<String>,
+        engine: Option<PathBuf>,
+        model: Option<PathBuf>,
+        threads: Option<u32>,
         allow_mock: bool,
         check_tracker: bool,
     },
@@ -63,6 +71,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut data_dir: Option<PathBuf> = None;
     let mut tracker: Option<String> = None;
     let mut profile: Option<String> = None;
+    let mut engine: Option<PathBuf> = None;
+    let mut model: Option<PathBuf> = None;
+    let mut threads: Option<u32> = None;
     let mut allow_mock = false;
     let mut check_tracker = false;
     let mut rest = args[1..].iter();
@@ -80,6 +91,15 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
             "--tracker" => tracker = Some(value()?),
             "--profile" => profile = Some(value()?),
+            "--engine" => engine = Some(PathBuf::from(value()?)),
+            "--model" => model = Some(PathBuf::from(value()?)),
+            "--threads" => {
+                threads = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| "bad --threads value".to_string())?,
+                )
+            }
             "--allow-mock-runtime" => allow_mock = true,
             "--check-tracker" => check_tracker = true,
             other => return Err(format!("unknown flag {other:?}\n\n{USAGE}")),
@@ -91,6 +111,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             data_dir,
             tracker,
             profile,
+            engine,
+            model,
+            threads,
             allow_mock,
             check_tracker,
         }),
@@ -116,9 +139,22 @@ fn main() -> ExitCode {
             data_dir,
             tracker,
             profile,
+            engine,
+            model,
+            threads,
             allow_mock,
             check_tracker,
-        }) => run_cli(port, data_dir, tracker, profile, allow_mock, check_tracker),
+        }) => run_cli(
+            port,
+            data_dir,
+            tracker,
+            profile,
+            engine,
+            model,
+            threads,
+            allow_mock,
+            check_tracker,
+        ),
         Ok(Command::SelfTest { port }) => self_test_cli(port),
         Err(message) => {
             eprintln!("{message}");
@@ -127,11 +163,15 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cli(
     port: Option<u16>,
     data_dir: Option<PathBuf>,
     tracker: Option<String>,
     profile: Option<String>,
+    engine: Option<PathBuf>,
+    model: Option<PathBuf>,
+    threads: Option<u32>,
     allow_mock: bool,
     check_tracker: bool,
 ) -> ExitCode {
@@ -145,6 +185,9 @@ fn run_cli(
     config.tracker_base = tracker;
     config.profile_id = profile;
     config.mock = allow_mock;
+    config.engine_binary = engine;
+    config.engine_model = model;
+    config.engine_threads = threads;
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     match runtime.block_on(run_node(config, check_tracker)) {
         Ok(()) => ExitCode::SUCCESS,

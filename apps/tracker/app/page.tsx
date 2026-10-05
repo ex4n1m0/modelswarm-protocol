@@ -42,7 +42,7 @@ const css = `
   nav .brand { color: #e8f4ff; font-weight: 700; letter-spacing: 0.08em; }
   nav .spacer { flex: 1; }
   .badge { border: 1px solid #2fd4ff55; color: #2fd4ff; border-radius: 999px; padding: 0.1rem 0.65rem; font-size: 0.72rem; letter-spacing: 0.1em; }
-  .hero { width: 100%; display: block; }
+  .hero { width: 100%; height: auto; display: block; }
   .tagline { text-align: center; color: #9fb8d8; padding: 1.4rem 1rem 0.2rem; font-size: 0.95rem; }
   .tagline b { color: #e8f4ff; font-weight: 600; }
   section { padding: 2.2rem 0 0.6rem; }
@@ -86,8 +86,8 @@ export default function Home() {
         src="/hero.png"
         alt="ModelSwarm — Decentralized Cooperative Inference Protocol: a glowing network of peer nodes converging into a central verification tree above a laptop"
         className="hero"
-        width={1685}
-        height={950}
+        width={1672}
+        height={941}
       />
 
       <p className="tagline">

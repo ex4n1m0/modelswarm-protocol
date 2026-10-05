@@ -902,10 +902,15 @@ async fn send_chat(
 
     let mut inner = state.inner.lock().await;
     inner.chat_log = log;
-    inner.chat_log.push(ChatTurn {
-        role: "assistant".into(),
-        content: content.clone(),
-    });
+    // An empty reply (engine hiccup, gateway error) must NOT enter the
+    // rendered history: an empty assistant turn teaches the model to emit
+    // EOS immediately and every later turn comes back empty too.
+    if !content.is_empty() {
+        inner.chat_log.push(ChatTurn {
+            role: "assistant".into(),
+            content: content.clone(),
+        });
+    }
     Ok(serde_json::json!({
         "content": content,
         "completion_tokens": completion_tokens,

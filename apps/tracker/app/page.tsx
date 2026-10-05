@@ -1,16 +1,16 @@
 // Every installer bundles the full pinned inference engine; the model
-// weights download from HuggingFace on first use. v0.2.5 restores the
+// weights download from HuggingFace on first use. v0.2.6 restores the
 // all-OS release rule: same version number on every OS = same build.
 const DOWNLOADS = [
-  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.5-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
-  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.5-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
-  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.5-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
-  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.5-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
+  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.6-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
+  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.6-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
+  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.6-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
+  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.6-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
 ];
 const DOWNLOAD = {
-  version: "0.2.5",
+  version: "0.2.6",
   sums: "/downloads/SHA256SUMS.txt",
-  sha256: "2f3ef259880e4680f44987668ec35aa553e54ea2f8a7035a92728a0214010f4e",
+  sha256: "5b1801189fd9baa58838d4853ace54d9a3ffaff1d26cd90809058f1f1ca71268",
 };
 
 // Dedicated community room — the room word is fixed here and nowhere else on

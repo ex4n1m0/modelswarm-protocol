@@ -44,6 +44,8 @@ struct Inner {
     data_dir: PathBuf,
     tracker_url: String,
     profile_id: Option<String>,
+    /// Cached HF artifact sizes for requirement hints: profile -> (bytes, fetched_unix_ms).
+    size_cache: std::collections::HashMap<String, (u64, u64)>,
     license_accepted: bool,
     artifact: Option<EnsuredArtifact>,
     node: Option<RunningNode>,
@@ -72,6 +74,7 @@ impl DesktopState {
             inner: Mutex::new(Inner {
                 data_dir,
                 tracker_url: config.tracker,
+                size_cache: Default::default(),
                 profile_id: config.profile_id,
                 license_accepted,
                 artifact: None,
@@ -189,6 +192,35 @@ fn persist_config(inner: &Inner) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// Basic hardware requirements for a model card — honest estimates, labeled
+/// as such: download size is exact (HF HEAD, cached); RAM adds a conservative
+/// KV-cache + runtime overhead on top of the weights; the pinned engine is a
+/// CPU build, so no GPU is required (or used).
+pub fn hardware_requirements(download_bytes: Option<u64>) -> Option<serde_json::Value> {
+    let bytes = download_bytes?;
+    let download_mb = bytes / 1_000_000;
+    const KV_CACHE_MB: u64 = 128; // <=0.5B params @ 4k ctx, f16 K+V
+    const RUNTIME_OVERHEAD_MB: u64 = 256; // llama-server + webview + app
+    let ram_mb = ((download_mb + KV_CACHE_MB + RUNTIME_OVERHEAD_MB + 127) / 128) * 128;
+    Some(serde_json::json!({
+        "download_mb": download_mb,
+        "ram_mb_est": ram_mb,
+        "gpu": "not required (CPU engine)",
+        "note": "estimates; RAM = weights + KV cache + runtime overhead",
+    }))
+}
+
+/// Exact artifact size via HEAD (redirect-following), 10-minute cache.
+async fn artifact_size(http: &reqwest::Client, url: &str) -> Option<u64> {
+    let response = http
+        .head(url)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    response.content_length()
+}
+
 // ---- ChatML rendering (Qwen/ChatML family; the profile pins the template) ----
 
 pub fn render_chatml(messages: &[ChatTurn]) -> String {
@@ -207,7 +239,7 @@ pub fn render_chatml(messages: &[ChatTurn]) -> String {
 
 #[tauri::command]
 async fn get_status(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Value, String> {
-    let inner = state.inner.lock().await;
+    let mut inner = state.inner.lock().await;
     let engine = engine_binary_path();
     let node_running = inner.node.is_some();
     let (gateway_addr, installation_id, engine_port) = match &inner.node {
@@ -282,6 +314,12 @@ async fn list_models(
         .map_err(|e| e.to_string())?;
     let store = modelswarm_store::Store::open(inner.data_dir.join("state.sqlite")).ok();
     let manager = ArtifactManager::new(&inner.data_dir);
+    let head_client = reqwest::Client::new();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    const SIZE_TTL_MS: u64 = 10 * 60 * 1000;
     let mut out = Vec::new();
     for p in profiles {
         let downloaded = store
@@ -296,12 +334,42 @@ async fn list_models(
                     .filter(|path| path.exists())
                     .map(|_| serde_json::json!({ "bytes": 0 }))
             });
+        // Exact artifact size: store row when downloaded, else cached HEAD.
+        let size_bytes = match &downloaded {
+            Some(d) if d["bytes"].as_u64().unwrap_or(0) > 0 => {
+                Some(d["bytes"].as_u64().unwrap_or(0))
+            }
+            _ => {
+                let fresh = inner
+                    .size_cache
+                    .get(&p.profile_id)
+                    .is_some_and(|(_, at)| now_ms.saturating_sub(*at) < SIZE_TTL_MS);
+                if fresh {
+                    inner.size_cache.get(&p.profile_id).map(|(bytes, _)| *bytes)
+                } else {
+                    let url = format!(
+                        "https://huggingface.co/{}/resolve/{}/{}",
+                        p.manifest.hf_repo(),
+                        p.manifest.hf_revision(),
+                        p.manifest.artifact_hashes()[0].path(),
+                    );
+                    let bytes = artifact_size(&head_client, &url).await;
+                    if let Some(bytes) = bytes {
+                        inner
+                            .size_cache
+                            .insert(p.profile_id.clone(), (bytes, now_ms));
+                    }
+                    bytes
+                }
+            }
+        };
         out.push(serde_json::json!({
             "profile_id": p.profile_id,
             "display_name": p.display_name,
             "quantization": format!("{} ({} bit)", p.manifest.quantization().method(), p.manifest.quantization().bits()),
             "runtime": p.manifest.runtime().version(),
             "downloaded": downloaded,
+            "hw": hardware_requirements(size_bytes),
             "selected": inner.profile_id.as_deref() == Some(p.profile_id.as_str()),
         }));
     }
@@ -647,6 +715,21 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardware_requirements_are_conservative_and_labeled() {
+        let hw = hardware_requirements(Some(105_454_432)).unwrap();
+        assert_eq!(hw["download_mb"], 105);
+        assert_eq!(hw["ram_mb_est"], 512);
+        assert!(hw["note"].as_str().unwrap().contains("estimates"));
+
+        let hw = hardware_requirements(Some(491_400_032)).unwrap();
+        assert_eq!(hw["download_mb"], 491);
+        assert_eq!(hw["ram_mb_est"], 1024);
+
+        // Unknown size -> no invented numbers (fail-closed display).
+        assert!(hardware_requirements(None).is_none());
+    }
 
     #[test]
     fn chatml_renders_full_conversation_with_generation_prompt() {

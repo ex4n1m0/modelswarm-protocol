@@ -187,7 +187,8 @@
         <div class="card ${m.selected ? "selected" : ""}" role="option" aria-selected="${!!m.selected}"
              data-id="${m.profile_id}" tabindex="0">
           <div><div class="name">${m.display_name}</div>
-               <div class="meta">profile ${m.profile_id.slice(0, 26)}… · ${m.quantization} · engine ${m.runtime}</div></div>
+               <div class="meta">profile ${m.profile_id.slice(0, 26)}… · ${m.quantization} · engine ${m.runtime}</div>
+               <div class="meta" style="margin-top:2px">${m.hw ? 'needs ≈ ' + (m.hw.ram_mb_est/1024).toFixed(1) + ' GB RAM · ' + m.hw.download_mb + ' MB download · ' + m.hw.gpu + ' (est.)' : 'requirements: unknown size'}</div></div>
           <div class="meta">${m.downloaded ? (m.downloaded.bytes > 0 ? "downloaded · " + (m.downloaded.bytes / 1e6).toFixed(0) + " MB" : "present") : "not downloaded"}</div>
         </div>`).join("");
       for (const card of document.querySelectorAll(".card")) {

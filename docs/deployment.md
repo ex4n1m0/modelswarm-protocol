@@ -15,26 +15,29 @@ modelswarm.deepflux.space you can create it").
 | App | `apps/tracker` (Next.js); verified live: health (frozen body), signed catalog envelope, 401 on unauthenticated register |
 | Preview alias | https://tracker-tau-three.vercel.app (same deployment) |
 
-## Current environment (preview-grade — by design)
+## Current environment (production-partial since 2026-10-05)
 
-- **No `DATABASE_URL`** → in-memory store: registrations/leases work but
-  reset on cold starts. Fine for smoke tests and protocol demos; not for
-  real nodes.
-- **Ephemeral `HUB_SIGNING_KEY`** → regenerated per boot; a catalog
-  signature verifies only against the instance that signed it. Real
-  clients pin the hub public key, so this must become a stable env secret
-  before any node trusts the catalog.
-- **No `ADMIN_TOKEN`** → admin endpoints return 403 (catalog promotion is
-  blocked until set — matching the catalog-stays-empty policy).
+- **Stable `MSP_HUB_SEED` set (production)** — the tracker now signs every
+  catalog with the pinned identity; verified live: the catalog signature
+  cryptographically verifies against `apps/tracker/keys/hub-public.hex`
+  and fails against a wrong key. Rotation procedure: new seed → new env →
+  update the pinned file → release → coordinated catalog bump.
+- **`ADMIN_TOKEN` set (production)** — admin endpoints active; verified
+  live (no token → 403; valid token + invalid body → 400 `invalid_body`).
+  Owner holds the token; rotate via `vercel env remove/add` + redeploy.
+- **No `DATABASE_URL` yet** → in-memory store: registrations/leases work
+  but reset on cold starts. The ONLY remaining owner step (below).
 
 ## To reach production grade (owner actions)
 
-1. Create a managed Postgres (Neon via Vercel Marketplace recommended) and
-   set `DATABASE_URL`; run `npm run db:migrate` against it.
-2. Generate a stable Ed25519 hub keypair; set `HUB_SIGNING_KEY` (and
-   publish/pin the public key in the node builds).
-3. Set `ADMIN_TOKEN` when the first catalog profile is ready for
-   promotion.
+1. **Create the Neon database** (the one remaining step):
+   neon.tech → sign up → New Project (`modelswarm`) → copy the pooled
+   connection string → either set it yourself
+   (`cd apps/tracker && printf '%s' "URL" | vercel env add DATABASE_URL
+   production && vercel deploy --prod`) or paste it to the engineer, who
+   runs the migration and verifies.
+2. ~~Stable hub key~~ done (pinned at `apps/tracker/keys/hub-public.hex`).
+3. ~~`ADMIN_TOKEN`~~ done.
 4. Optional: connect the GitHub repo to the Vercel project for
    push-to-deploy (currently deploys are manual via CLI).
 

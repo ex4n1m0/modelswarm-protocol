@@ -218,6 +218,10 @@ export interface TrackerStore {
   countOnlinePeers(): Promise<number>;
   /** Same population, per hosted profile id (public per-model counter). */
   countOnlinePeersByProfile(): Promise<Record<string, number>>;
+  /** Increment + return the download counter for one installer file. */
+  bumpDownloadCount(file: string): Promise<number>;
+  /** All download counters (public, for the website buttons). */
+  downloadCounts(): Promise<Record<string, number>>;
   /** Authoritative audit epoch for a peer (0 default). Leases pin the epoch at
    *  registration; sweeps bump this counter only (ADR-012). */
   peerEpoch(peerId: string): Promise<number>;
@@ -292,6 +296,7 @@ export class MemoryStore implements TrackerStore {
   private deviceAuths = new Map<string, DeviceAuthRecord>();
   private sessions = new Map<string, SessionRecord>();
   private nonces = new Map<string, Map<string, number>>();
+  private downloads = new Map<string, { count: number; lastAt: number }>();
   private leases = new Map<string, LeaseRecord>();
   private challenges = new Map<string, ChallengeRecord>();
   private tokens = new Map<string, TokenRecord>();
@@ -468,6 +473,20 @@ export class MemoryStore implements TrackerStore {
       if (this.isLive(rec, now) && !live.has(rec.peerId)) live.add(rec.peerId);
     }
     return live.size;
+  }
+
+  async bumpDownloadCount(file: string): Promise<number> {
+    const entry = this.downloads.get(file) ?? { count: 0, lastAt: this.clock() };
+    entry.count += 1;
+    entry.lastAt = this.clock();
+    this.downloads.set(file, entry);
+    return entry.count;
+  }
+
+  async downloadCounts(): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+    for (const [file, entry] of this.downloads) out[file] = entry.count;
+    return out;
   }
 
   async countOnlinePeersByProfile(): Promise<Record<string, number>> {
@@ -1013,6 +1032,26 @@ export class PgStore implements TrackerStore {
     const out: Record<string, number> = {};
     for (const row of rows as Record<string, unknown>[]) {
       out[row.profile_id as string] = Number(row.n);
+    }
+    return out;
+  }
+
+  async bumpDownloadCount(file: string): Promise<number> {
+    const rows = await this.query(
+      `INSERT INTO download_counts (file, count, last_at)
+       VALUES ($1, 1, now())
+       ON CONFLICT (file) DO UPDATE SET count = download_counts.count + 1, last_at = now()
+       RETURNING count`,
+      [file],
+    );
+    return Number((rows[0] as { count: string | number }).count);
+  }
+
+  async downloadCounts(): Promise<Record<string, number>> {
+    const rows = await this.query(`SELECT file, count FROM download_counts`, []);
+    const out: Record<string, number> = {};
+    for (const row of rows as Record<string, unknown>[]) {
+      out[row.file as string] = Number(row.count);
     }
     return out;
   }

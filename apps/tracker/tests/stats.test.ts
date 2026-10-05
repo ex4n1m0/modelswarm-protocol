@@ -19,7 +19,7 @@ const count = () => stats().then((s) => s.peersOnline);
 
 describe("I1 GET /api/v1/stats", () => {
   it("counts zero with no leases", async () => {
-    expect(await stats()).toEqual({ peersOnline: 0, models: [] });
+    expect(await stats()).toEqual({ peersOnline: 0, models: [], downloads: {} });
   });
 
   it("counts distinct live peers and excludes draining ones", async () => {

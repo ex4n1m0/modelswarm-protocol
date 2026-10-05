@@ -131,8 +131,8 @@ export default function Home() {
               </div>
               <div>
                 {DOWNLOADS.map((d) => (
-                  <a className="btn ghost" style={{ marginRight: 8, marginBottom: 6, display: "inline-block" }} href={"/downloads/" + d.file} download={d.file} aria-label={"Download ModelSwarm " + DOWNLOAD.version + " for " + d.os}>
-                    {d.os}
+                  <a className="btn ghost" data-file={d.file} style={{ marginRight: 8, marginBottom: 6, display: "inline-block" }} href={"/api/download/" + d.file} download={d.file} aria-label={"Download ModelSwarm " + DOWNLOAD.version + " for " + d.os}>
+                    {d.os} <span className="dl-count" data-count-for={d.file} style={{ opacity: 0.75 }}>· ↓0</span>
                   </a>
                 ))}
                 <a className="btn ghost" href={DOWNLOAD.sums} download="SHA256SUMS.txt">checksums</a>
@@ -255,10 +255,15 @@ export default function Home() {
     try {
       const r = await fetch('/api/v1/stats');
       if (!r.ok) throw 0;
-      const { peersOnline, models } = await r.json();
+      const { peersOnline, models, downloads } = await r.json();
       badge.textContent = peersOnline + (peersOnline === 1 ? ' peer online' : ' peers online');
       const byProfile = Object.fromEntries((models || []).map(m => [m.profileId, m.peers]));
       const cat = await catalogNames();
+      const counts = document.querySelectorAll('[data-count-for]');
+      for (const el of counts) {
+        const n = (downloads || {})[el.dataset.countFor] ?? 0;
+        el.textContent = '· ↓' + n;
+      }
       rows.innerHTML = Object.entries(cat).map(([id, p]) => {
         const n = byProfile[id] ?? 0;
         const quant = p.manifest?.quantization;

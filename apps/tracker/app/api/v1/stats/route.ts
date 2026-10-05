@@ -16,10 +16,11 @@ export async function GET(req: Request) {
   if (!ctx.limiter.hit(`public:${ip}`, ctx.limits.publicPerIp)) {
     return jsonError(429, "rate_limited", "rate limit exceeded", true);
   }
-  const [peersOnline, byProfile] = await Promise.all([
+  const [peersOnline, byProfile, downloads] = await Promise.all([
     ctx.store.countOnlinePeers(),
     ctx.store.countOnlinePeersByProfile(),
+    ctx.store.downloadCounts(),
   ]);
   const models = Object.entries(byProfile).map(([profileId, peers]) => ({ profileId, peers }));
-  return jsonOk({ peersOnline, models });
+  return jsonOk({ peersOnline, models, downloads });
 }

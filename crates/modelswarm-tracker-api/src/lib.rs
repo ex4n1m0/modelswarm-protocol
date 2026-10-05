@@ -417,8 +417,14 @@ impl TrackerClient {
             .text()
             .await
             .map_err(|e| TrackerError::Network(e.to_string()))?;
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| TrackerError::InvalidResponse(format!("{path}: {e}")))?;
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            // Empty/garbage bodies happen (a crashed route returns an empty
+            // 500); name the status so the cause is diagnosable from logs.
+            TrackerError::InvalidResponse(format!(
+                "{path}: HTTP {status}, unparseable body ({} bytes): {e}",
+                text.len()
+            ))
+        })?;
         if (200..300).contains(&status) {
             Ok(v)
         } else if let Some(err) = v.get("error").cloned() {

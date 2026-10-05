@@ -16,10 +16,11 @@ use crate::installation::{installation_id_for, InstallationIdentity};
 
 /// The signed envelope traveling in the `Authorization: MSP1 …` header.
 ///
-/// Field names are snake_case as in the rest of the Rust surface; the wire
-/// encoding is produced by the transport layer.
+/// Wire field names are camelCase EXACTLY as msp-v1 §2.3 writes them
+/// (`installationId`, `bodyDigest`, …) — the tracker's strict zod schema
+/// rejects anything else. The signature payload uses the same names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct SignedEnvelope {
     /// Signer's installation id (base58 SHA-256 of the public key).
     pub installation_id: String,
@@ -114,12 +115,12 @@ fn payload_canonical_json(
     body_digest: &str,
 ) -> String {
     let value = json!({
-        "installation_id": installation_id,
+        "installationId": installation_id,
         "method": method,
         "path": path,
         "ts": ts,
         "nonce": nonce,
-        "body_digest": body_digest,
+        "bodyDigest": body_digest,
     });
     canonical_json(&value).expect("payload contains only strings; no floats possible")
 }
@@ -192,8 +193,8 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "body_digest",
-                "installation_id",
+                "bodyDigest",
+                "installationId",
                 "method",
                 "nonce",
                 "path",

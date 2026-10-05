@@ -1,0 +1,65 @@
+# Phase H5: build the NSIS desktop installer (ADR-008).
+# The pinned llama.cpp engine (runtime-pins.json) is hash-verified before it
+# is bundled; model weights are NEVER bundled (first-run download per ADR-008).
+# Artifacts: ModelSwarm_<version>_x64-setup.exe + SHA256SUMS. Publishing to
+# modelswarm.deepflux.space/downloads is a manual owner step from the artifact.
+name: desktop-installer
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths: ["crates/modelswarm-desktop/**", "runtime-pins.json", ".github/workflows/desktop-installer.yml"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch pinned engine (b11407 CPU x64)
+        shell: bash
+        run: |
+          mkdir -p crates/modelswarm-desktop/engine
+          curl -sSL -o engine.zip \
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-win-cpu-x64.zip"
+          echo "353c4aab423bff5cb6dc0e1d32e41a447990ab3d69a411b7f58ff48187c91a03  engine.zip" | sha256sum -c -
+          unzip -j -o engine.zip -d crates/modelswarm-desktop/engine \
+            llama-server.exe llama-server-impl.dll llama-common.dll llama.dll \
+            ggml.dll ggml-base.dll ggml-cpu-x64.dll ggml-cpu-alderlake.dll ggml-cpu-cannonlake.dll \
+            ggml-cpu-cascadelake.dll ggml-cpu-cooperlake.dll ggml-cpu-haswell.dll ggml-cpu-icelake.dll \
+            ggml-cpu-ivybridge.dll ggml-cpu-piledriver.dll ggml-cpu-sandybridge.dll \
+            ggml-cpu-sapphirerapids.dll ggml-cpu-skylakex.dll ggml-cpu-sse42.dll ggml-cpu-zen4.dll \
+            libomp.dll mtmd.dll
+      - name: Verify every engine file against runtime-pins.json
+        shell: pwsh
+        run: |
+          $pins = Get-Content runtime-pins.json -Raw | ConvertFrom-Json
+          $dir = "crates/modelswarm-desktop/engine"
+          foreach ($f in $pins.bundle) {
+            $actual = (Get-FileHash "$dir/$f" -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $pins.files.$f) { throw "engine file $f hash mismatch" }
+          }
+          Write-Host "engine verified: $($pins.bundle.Count) files, $($pins.tag)"
+      - name: Install tauri-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tauri
+      - name: Build NSIS installer
+        shell: bash
+        run: |
+          cd crates/modelswarm-desktop
+          cargo tauri build --bundles nsis -- --features tauri-shell
+      - name: Smoke + hash
+        shell: bash
+        run: |
+          ls target/release/bundle/nsis/
+          cd target/release/bundle/nsis && sha256sum *-setup.exe | tee SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modelswarm-installer-win-x64
+          path: |
+            target/release/bundle/nsis/*-setup.exe
+            target/release/bundle/nsis/SHA256SUMS.txt
+          if-no-files-found: error

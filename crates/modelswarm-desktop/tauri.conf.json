@@ -1,16 +1,16 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ModelSwarm",
-  "version": "0.1.0",
+  "version": "0.1.0-internal-test-unsigned",
   "identifier": "space.deepflux.modelswarm",
   "build": {
     "frontendDist": "ui"
   },
   "app": {
-"withGlobalTauri": true,
+    "withGlobalTauri": true,
     "windows": [
       {
-        "title": "ModelSwarm — INTERNAL TEST (UNSIGNED)",
+        "title": "ModelSwarm \u2014 INTERNAL TEST (UNSIGNED)",
         "label": "main",
         "width": 800,
         "height": 600,
@@ -24,7 +24,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["icons/icon.ico"]
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "engine/*"
+    ]
   }
 }

@@ -22,6 +22,7 @@
 pub mod acceptance;
 pub mod metrics;
 pub mod rng;
+pub mod trie;
 
 pub use acceptance::{
     sample_from, simulate_greedy, verify_greedy, verify_sampled, verify_sampled_full_q,
@@ -30,3 +31,7 @@ pub use acceptance::{
 // re-exported for tests that draw honest drafts from q
 pub use metrics::AcceptanceStats;
 pub use rng::SplitMix64;
+pub use trie::{
+    branch_assignment, simulate_tree_greedy, verify_tree_greedy, BranchBlock, CandidateTrie,
+    TreeOutcome, TrieLimits,
+};

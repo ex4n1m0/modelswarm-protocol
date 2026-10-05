@@ -13,10 +13,29 @@ build = "build.rs"
 # (the tauri/wry dependency tree is heavy and platform-specific). Enable with
 # `cargo check -p modelswarm-desktop --features tauri-shell`. See
 # docs/verification/phase-g-notes.md for the Phase G attempt outcome.
-tauri-shell = ["dep:tauri", "dep:tauri-build"]
+tauri-shell = [
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:modelswarm-node",
+    "dep:modelswarm-tracker-api",
+    "dep:modelswarm-store",
+    "dep:modelswarm-telemetry",
+    "dep:tokio",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+]
 
 [dependencies]
 tauri = { version = "2", optional = true, default-features = false, features = ["wry"] }
+modelswarm-node = { path = "../modelswarm-node", optional = true }
+modelswarm-tracker-api = { path = "../modelswarm-tracker-api", optional = true }
+modelswarm-store = { path = "../modelswarm-store", optional = true }
+modelswarm-telemetry = { path = "../modelswarm-telemetry", optional = true }
+tokio = { version = "1", optional = true, features = ["macros", "rt", "sync", "time"] }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
 
 [build-dependencies]
 tauri-build = { version = "2", optional = true, default-features = false }

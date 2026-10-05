@@ -130,7 +130,7 @@ impl Default for NodeConfig {
 
 /// `%LOCALAPPDATA%\ModelSwarm` on Windows, `~/.modelswarm` elsewhere,
 /// `.modelswarm` when neither is resolvable.
-fn default_data_dir() -> PathBuf {
+pub fn default_data_dir() -> PathBuf {
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local).join("ModelSwarm");
     }
@@ -455,7 +455,7 @@ fn is_loopback_url(url: &str) -> bool {
 
 /// Loads `<data_dir>/identity.seed` (exactly 32 bytes) or generates a fresh
 /// identity and persists it. Never logs the seed; logs only load-vs-create.
-fn load_or_create_identity(
+pub fn load_or_create_identity(
     data_dir: &Path,
     telemetry: &Telemetry,
 ) -> Result<InstallationIdentity, NodeError> {

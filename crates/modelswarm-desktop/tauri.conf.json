@@ -7,9 +7,10 @@
     "frontendDist": "ui"
   },
   "app": {
+"withGlobalTauri": true,
     "windows": [
       {
-        "title": "ModelSwarm",
+        "title": "ModelSwarm — INTERNAL TEST (UNSIGNED)",
         "label": "main",
         "width": 800,
         "height": 600,

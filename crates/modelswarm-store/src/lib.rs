@@ -231,6 +231,19 @@ impl Store {
         Ok(())
     }
 
+    /// Whether this installation accepted the given profile's license.
+    pub fn has_license(&self, installation_id: &str, profile_id: &str) -> Result<bool> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM license_acceptances WHERE installation_id = ?1 AND profile_id = ?2",
+                rusqlite::params![installation_id, profile_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// The recorded artifact row for a profile, if any, as
     /// `(path, sha256, bytes, state)`.
     pub fn get_artifact(&self, profile_id: &str) -> Result<Option<(String, String, i64, String)>> {

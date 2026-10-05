@@ -14,10 +14,11 @@
 //!   still the deliverable and opens in any browser.
 
 #[cfg(feature = "tauri-shell")]
+mod app;
+
+#[cfg(feature = "tauri-shell")]
 fn main() {
-    tauri::Builder::default()
-        .run(tauri::generate_context!())
-        .expect("modelswarm desktop shell failed to start");
+    app::run();
 }
 
 #[cfg(not(feature = "tauri-shell"))]

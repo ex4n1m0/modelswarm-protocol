@@ -6,242 +6,241 @@
   <title>ModelSwarm</title>
   <style>
     :root {
-      --bg: #10141c;
-      --panel: #1a2130;
-      --panel-2: #202a3d;
-      --ink: #e8edf7;
-      --muted: #9aa7bf;
-      --accent: #5aa2ff;
-      --ok: #43c78f;
-      --warn: #e0a93e;
-      --err: #e06565;
-      --idle: #5b6779;
-      --border: #2c3850;
+      --bg: #10141c; --panel: #1a2130; --panel-2: #202a3d; --ink: #e8edf7;
+      --muted: #9aa7bf; --accent: #5aa2ff; --ok: #43c78f; --warn: #e0a93e;
+      --err: #e06565; --idle: #5b6779; --border: #2c3850;
       --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
     }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font: 14px/1.5 system-ui, "Segoe UI", sans-serif;
-      color: var(--ink);
-      background: var(--bg);
-    }
-    header {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 10px 18px;
-      background: var(--panel);
-      border-bottom: 1px solid var(--border);
-    }
+    body { margin: 0; font: 14px/1.5 system-ui, "Segoe UI", sans-serif; color: var(--ink); background: var(--bg); }
+    header { display: flex; align-items: center; gap: 12px; padding: 10px 18px; background: var(--panel); border-bottom: 1px solid var(--border); }
     header h1 { font-size: 16px; margin: 0; }
-    header .build-tag {
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--warn);
-      border: 1px solid var(--warn);
-      border-radius: 4px;
-      padding: 1px 6px;
-    }
+    .build-tag { font-family: var(--mono); font-size: 11px; color: var(--warn); border: 1px solid var(--warn); border-radius: 4px; padding: 1px 6px; }
     main { padding: 16px 18px; max-width: 760px; margin: 0 auto; }
-    section {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px 14px;
-      margin-bottom: 14px;
-    }
+    section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
     h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; }
-    .static-note { color: var(--muted); font-size: 12px; font-style: italic; }
-
-    /* Hosting toggle: CSS-only visual, static in this pass */
+    dl.kv { display: grid; grid-template-columns: 190px 1fr; gap: 4px 12px; margin: 0; }
+    dl.kv dt { color: var(--muted); } dl.kv dd { margin: 0; font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+    button { background: var(--accent); color: #0b1220; border: 0; border-radius: 6px; padding: 8px 14px; font-weight: 600; cursor: pointer; }
+    button:disabled { background: var(--idle); color: var(--muted); cursor: default; }
+    button.ghost { background: transparent; border: 1px solid var(--border); color: var(--ink); font-weight: 500; }
+    button.stop { background: var(--err); color: #fff; }
+    input[type=text] { background: var(--bg); color: var(--ink); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; width: 100%; font-family: var(--mono); font-size: 13px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .bar { flex: 1; height: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    .bar > div { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--ok)); transition: width .2s; }
     .hosting-row { display: flex; align-items: center; gap: 10px; }
-    .switch {
-      width: 44px; height: 24px; border-radius: 12px;
-      background: var(--idle); position: relative; border: 1px solid var(--border);
-    }
-    .switch[data-on="false"] .knob { left: 3px; }
-    .switch[data-on="true"]  .knob { left: 23px; }
-    .switch[data-on="true"]  { background: var(--ok); }
-    .knob {
-      position: absolute; top: 2px; left: 3px; width: 18px; height: 18px;
-      border-radius: 50%; background: #fff; transition: left .15s ease;
-    }
-    .state-word { font-weight: 600; }
-    .state-word[data-on="true"] { color: var(--ok); }
-    .state-word[data-on="false"] { color: var(--muted); }
-
-    dl.kv { display: grid; grid-template-columns: 200px 1fr; gap: 4px 12px; margin: 0; }
-    dl.kv dt { color: var(--muted); }
-    dl.kv dd { margin: 0; font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
-
+    .switch { width: 44px; height: 24px; border-radius: 12px; background: var(--idle); position: relative; border: 1px solid var(--border); cursor: pointer; }
+    .switch .knob { position: absolute; top: 2px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: left .15s ease; }
+    .switch[data-on="true"] { background: var(--ok); } .switch[data-on="true"] .knob { left: 23px; }
+    .state-word { font-weight: 600; } .state-word[data-on="true"] { color: var(--ok); } .state-word[data-on="false"] { color: var(--muted); }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); }
-    th { color: var(--muted); font-weight: 600; }
-    td.mono { font-family: var(--mono); }
-
-    ul.events { list-style: none; margin: 0; padding: 0; }
-    ul.events li { padding: 4px 0; border-bottom: 1px dashed var(--border); display: flex; gap: 10px; }
-    ul.events li:last-child { border-bottom: none; }
-    .evt-time { color: var(--muted); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
-    .evt-kind { font-family: var(--mono); font-size: 12px; }
-
-    /* Degraded-state chips: CSS-only states via data-state */
+    th { color: var(--muted); font-weight: 600; } td.mono { font-family: var(--mono); font-size: 12px; }
     .chips { display: flex; flex-wrap: wrap; gap: 8px; }
-    .chip {
-      font-size: 12px; font-family: var(--mono);
-      padding: 3px 10px; border-radius: 999px;
-      border: 1px solid var(--border); color: var(--muted);
-    }
-    .chip[data-state="active"]   { color: var(--err);  border-color: var(--err);  background: rgba(224,101,101,.12); }
-    .chip[data-state="active"][data-level="warn"] { color: var(--warn); border-color: var(--warn); background: rgba(224,169,62,.12); }
-    .chip[data-state="inactive"] { color: var(--muted); border-color: var(--border); background: transparent; }
-
-    .banner {
-      border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;
-      font-size: 13px;
-    }
-    .banner.first-run {
-      border: 1px solid var(--warn); background: rgba(224,169,62,.10);
-    }
-    .banner.unsigned {
-      border: 1px solid var(--err); background: rgba(224,101,101,.10);
-      font-family: var(--mono); text-align: center;
-    }
-    .banner h2 { color: inherit; text-transform: none; letter-spacing: 0; font-size: 13px; margin: 0 0 4px; }
-    .privacy-list { margin: 8px 0 0; padding-left: 20px; }
-    .privacy-list li { margin-bottom: 4px; }
+    .chip { font-size: 12px; font-family: var(--mono); padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+    .chip[data-state="active"] { color: var(--warn); border-color: var(--warn); background: rgba(224,169,62,.12); }
+    #chat { display: flex; flex-direction: column; gap: 8px; }
+    #transcript { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+    .msg { border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; white-space: pre-wrap; }
+    .msg.user { background: var(--panel-2); }
+    .msg.assistant { background: var(--bg); }
+    .msg .meta { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 4px; }
+    #chat-form { display: flex; gap: 8px; }
+    #chat-input { flex: 1; }
+    .banner { border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; font-size: 13px; }
+    .banner.gate { border: 1px solid var(--warn); background: rgba(224,169,62,.10); }
+    .banner.error { border: 1px solid var(--err); background: rgba(224,101,101,.10); font-family: var(--mono); font-size: 12px; display: none; }
+    .note { color: var(--muted); font-size: 12px; font-style: italic; }
     footer { color: var(--muted); font-size: 11px; padding: 8px 18px 18px; text-align: center; }
-    .visually-hidden {
-      position: absolute; width: 1px; height: 1px; margin: -1px;
-      clip: rect(0 0 0 0); overflow: hidden; white-space: nowrap;
-    }
   </style>
 </head>
 <body>
   <header>
     <h1>ModelSwarm</h1>
-    <span class="build-tag" role="note" aria-label="Build label">INTERNAL TEST BUILD &mdash; UNSIGNED</span>
-    <span class="static-note" role="note">static state model &mdash; no live data in this build</span>
+    <span class="build-tag" role="note" aria-label="Build label">INTERNAL TEST BUILD — UNSIGNED</span>
+    <span class="note" id="conn-note" role="status">connecting…</span>
   </header>
 
   <main>
-    <!-- G3: first-run privacy warning (peers can read prompts) -->
-    <div class="banner first-run" role="alert" aria-label="First-run privacy warning">
-      <h2>Before you host: privacy first-run warning</h2>
-      <p style="margin:0">
-        When this installation serves the swarm, <strong>peers that serve your requests can read
-        the prompts they serve</strong>. Hosting is your choice and can be turned off at any time.
-      </p>
-      <ul class="privacy-list">
-        <li>No telemetry is sent by default; diagnostics export is opt-in and structurally
-            excludes prompt and completion content.</li>
-        <li>Cooperative execution modes deliver the prompt to the <em>whole micro-swarm roster</em>:
-            the mode and the peer count are shown <strong>before</strong> every such request
-            (see the roster disclosure on the request card below).</li>
+    <div class="banner gate" id="privacy-gate" role="alert" aria-label="First-run privacy warning" hidden>
+      <h2 style="color:inherit;text-transform:none;letter-spacing:0">Before you host: privacy first-run warning</h2>
+      <p style="margin:6px 0">When this installation serves the swarm, <strong>peers that serve your requests can read
+      the prompts they serve</strong>. Hosting is your choice and can be turned off at any time.</p>
+      <ul style="margin:6px 0 10px;padding-left:20px;font-size:13px">
+        <li>No telemetry by default; diagnostics export is opt-in and excludes prompt/completion content.</li>
+        <li>Cooperative modes deliver the prompt to the whole micro-swarm roster (mode + peer count shown before each request).</li>
       </ul>
+      <button id="accept-btn">I understand — activate this installation</button>
     </div>
+    <div class="banner error" id="error-banner" role="alert"></div>
 
-    <!-- G2: hosting on/off + profile identity -->
+    <section aria-labelledby="setup-h">
+      <h2 id="setup-h">Setup</h2>
+      <dl class="kv">
+        <dt>Tracker</dt><dd><input type="text" id="tracker-url" aria-label="Tracker base URL"></dd>
+        <dt>Model profile</dt><dd id="model-line">—</dd>
+        <dt>Engine</dt><dd id="engine-line">—</dd>
+        <dt>Artifact</dt><dd id="artifact-line">not downloaded</dd>
+      </dl>
+      <div class="row" style="margin-top:10px">
+        <button class="ghost" id="save-tracker">save tracker</button>
+        <button id="download-btn">download model</button>
+        <div class="bar" aria-hidden="true"><div id="dl-progress"></div></div>
+        <span class="note" id="dl-label"></span>
+      </div>
+    </section>
+
     <section aria-labelledby="hosting-h">
       <h2 id="hosting-h">Hosting</h2>
       <div class="hosting-row">
-        <span class="switch" data-on="false" role="img" aria-label="Hosting toggle: off (static preview)">
+        <span class="switch" id="hosting-switch" data-on="false" role="switch" aria-checked="false" aria-label="Hosting toggle" tabindex="0">
           <span class="knob"></span>
         </span>
-        <span class="state-word" data-on="false" aria-label="Hosting state">OFF</span>
-        <span class="static-note">serving peers: 0 of 1 slot</span>
+        <span class="state-word" id="hosting-word" data-on="false">OFF</span>
       </div>
       <dl class="kv" style="margin-top:10px">
-        <dt>Profile id</dt><dd aria-label="Profile identifier">msp1:…&nbsp;<span class="static-note">(placeholder)</span></dd>
-        <dt>Artifact verification</dt><dd aria-label="Artifact verification state">not started&nbsp;<span class="static-note">(SHA-256 + revision pinned)</span></dd>
-        <dt>Serving health</dt><dd aria-label="Serving health">idle&nbsp;<span class="static-note">(no runtime attached in this build)</span></dd>
+        <dt>Profile id</dt><dd id="profile-line">—</dd>
+        <dt>Gateway</dt><dd id="gateway-line">—</dd>
+        <dt>Installation</dt><dd id="install-line">—</dd>
       </dl>
+      <p class="note" style="margin:8px 0 0">Beta boundary, never hidden: this build hosts and serves <strong>locally</strong>;
+      remote peers appear in the roster below but cannot be served until the transport listener ships (shown as
+      direct-connect fail).</p>
     </section>
 
-    <!-- G2: earned eligibility (lease + capacity class) -->
-    <section aria-labelledby="elig-h">
-      <h2 id="elig-h">Earned eligibility</h2>
-      <dl class="kv">
-        <dt>Lease status</dt><dd aria-label="Lease status">none&nbsp;<span class="static-note">(no tracker configured)</span></dd>
-        <dt>Lease expires</dt><dd aria-label="Lease expiry">&mdash;</dd>
-        <dt>Capacity class</dt><dd aria-label="Capacity class">unclassified&nbsp;<span class="static-note">(measured at enrollment)</span></dd>
-      </dl>
-      <p class="static-note" style="margin:8px 0 0">
-        Hosting the exact same profile you consume is what earns eligibility (AGENTS.md project rule).
-      </p>
-    </section>
-
-    <!-- G2: peers + NAT path -->
     <section aria-labelledby="peers-h">
       <h2 id="peers-h">Peers &amp; NAT path</h2>
-      <table aria-label="Peer list and NAT path types">
-        <thead>
-          <tr><th scope="col">Peer</th><th scope="col">Profile match</th><th scope="col">NAT path</th><th scope="col">State</th></tr>
-        </thead>
-        <tbody>
-          <tr><td class="mono">12D3Koo…aa31 <span class="static-note">(example row)</span></td><td>exact</td><td>direct (UDP)</td><td>connected</td></tr>
-          <tr><td class="mono">12D3Koo…c7e0 <span class="static-note">(example row)</span></td><td>exact</td><td>relay (no relay deployed &mdash; unreachable)</td><td>direct-connect failed</td></tr>
-          <tr><td class="mono">12D3Koo…09bd <span class="static-note">(example row)</span></td><td>mismatch</td><td>direct (TCP)</td><td>rejected: profile mismatch</td></tr>
-        </tbody>
+      <table aria-label="Peer roster">
+        <thead><tr><th scope="col">Peer</th><th scope="col">Capacity</th><th scope="col">Path</th></tr></thead>
+        <tbody id="peer-rows"><tr><td colspan="3" class="note">hosting off — roster empty</td></tr></tbody>
       </table>
-      <p class="static-note" style="margin:8px 0 0">
-        Rows are placeholders. Direct-connect failure is reported explicitly &mdash; no claim of
-        universal NAT traversal until a relay exists and is tested (AGENTS.md 7).
-      </p>
     </section>
 
-    <!-- G2: per-request mode + fallback events, with the G3 roster disclosure -->
-    <section aria-labelledby="req-h">
-      <h2 id="req-h">Requests</h2>
-      <dl class="kv">
-        <dt>Last request mode</dt><dd aria-label="Last request execution mode">single&nbsp;<span class="static-note">(local loopback)</span></dd>
-        <dt>Roster disclosure</dt>
-        <dd aria-label="Cooperative roster disclosure">
-          cooperative modes will show <strong>mode + peer count here before the request is sent</strong>
-        </dd>
-        <dt>Measured speedup / slowdown</dt>
-        <dd aria-label="Measured speedup or slowdown">&mdash;&nbsp;<span class="static-note">no theoretical numbers; measured-only when a real profile is approved (ADR-013)</span></dd>
-      </dl>
-      <h2 style="margin-top:12px" id="fb-h">Fallback events</h2>
-      <ul class="events" aria-label="Fallback event list">
-        <li><span class="evt-time">--:--:--</span><span class="evt-kind">example:</span><span>peer lost before first token &rarr; retried on next peer (ADR-007)</span></li>
-        <li><span class="evt-time">--:--:--</span><span class="evt-kind">example:</span><span>acceptance collapse &rarr; fell back to plain single decode (ADR-013 mandatory fallback)</span></li>
-      </ul>
+    <section aria-labelledby="chat-h">
+      <h2 id="chat-h">Chat (local swarm gateway)</h2>
+      <div id="chat">
+        <div id="transcript" aria-live="polite"></div>
+        <form id="chat-form">
+          <input type="text" id="chat-input" placeholder="Ask the hosted model…" aria-label="Message" autocomplete="off" maxlength="4000">
+          <button type="submit" id="send-btn">send</button>
+        </form>
+      </div>
     </section>
 
-    <!-- G4: degraded states -->
     <section aria-labelledby="deg-h">
       <h2 id="deg-h">Degraded states</h2>
       <div class="chips" role="list" aria-label="Degraded state chips">
-        <span class="chip" role="listitem" data-state="inactive" aria-label="Tracker unreachable: inactive">tracker unreachable</span>
-        <span class="chip" role="listitem" data-state="inactive" aria-label="Ineligible: inactive">ineligible</span>
-        <span class="chip" role="listitem" data-state="inactive" aria-label="Draining: inactive">draining</span>
-        <span class="chip" role="listitem" data-state="inactive" aria-label="Updating: inactive">updating</span>
-        <span class="chip" role="listitem" data-state="inactive" aria-label="Model mismatch: inactive">model mismatch</span>
-        <span class="chip" role="listitem" data-state="active" data-level="warn" aria-label="Direct-connect failure: active in this static preview">direct-connect fail</span>
+        <span class="chip" role="listitem" id="chip-tracker" data-state="inactive">tracker unreachable</span>
+        <span class="chip" role="listitem" id="chip-engine" data-state="inactive">engine missing</span>
+        <span class="chip" role="listitem" id="chip-model" data-state="inactive">model missing</span>
+        <span class="chip" role="listitem" id="chip-direct" data-state="inactive">direct-connect fail (no listener)</span>
+        <span class="chip" role="listitem" id="chip-hosting" data-state="inactive">not hosting</span>
       </div>
-      <p class="static-note" style="margin:8px 0 0">
-        CSS-only states: <code>data-state="active"</code> renders a chip in its warning/error
-        state; <code>data-state="inactive"</code> renders it dormant. No scripting involved.
-      </p>
     </section>
 
-    <!-- G3: privacy disclosure summary -->
     <section aria-labelledby="priv-h">
       <h2 id="priv-h">Privacy</h2>
-      <ul class="privacy-list" aria-label="Privacy disclosures">
-        <li>Prompts/completions are redacted from all node logs by a structural redactor (never a convention).</li>
-        <li>The control plane is content-blind; it never sees prompts or completions.</li>
-        <li>Diagnostics export is opt-in and excludes prompt/completion content by schema.</li>
-        <li>Secrets (identity seed, tokens, lease secrets) stay in the node process &mdash; they never enter this webview.</li>
+      <ul style="margin:0;padding-left:20px;font-size:13px">
+        <li>Prompts/completions are structurally redacted from all node logs.</li>
+        <li>The tracker is content-blind: it never sees prompts or completions.</li>
+        <li>Secrets (identity seed, engine key, lease tokens) stay in the node process — never in this UI.</li>
       </ul>
     </section>
   </main>
 
-  <footer>
-    ModelSwarm internal test shell (Phase G) &mdash; static state model, dependency-free,
-    no frameworks. IPC surface: none wired yet (audited plan in docs/verification/phase-g-notes.md).
-  </footer>
+  <footer>ModelSwarm internal test shell (Phase H) — every number in this UI is measured, never theoretical.</footer>
+
+  <script>
+    const { invoke } = window.__TAURI__.core;
+    const listen = window.__TAURI__.event.listen;
+    const $ = (id) => document.getElementById(id);
+    let hostingOn = false, busy = false;
+
+    function error(msg) { const b = $("error-banner"); b.textContent = msg; b.style.display = msg ? "block" : "none"; }
+
+    async function refresh() {
+      let s;
+      try { s = await invoke("get_status"); $("conn-note").textContent = "live"; error(""); }
+      catch (e) { $("conn-note").textContent = "ipc error"; return; }
+      $("tracker-url").value = s.tracker;
+      $("engine-line").textContent = s.engine_available ? "pinned llama.cpp — present" : "MISSING (install incomplete)";
+      $("model-line").textContent = s.profile_id || "(from catalog at download)";
+      $("artifact-line").textContent = s.artifact ? `verified · ${(s.artifact.bytes / 1e6).toFixed(0)} MB` : "not downloaded";
+      $("profile-line").textContent = s.profile_id || "—";
+      $("gateway-line").textContent = s.node.running ? s.node.gateway_addr : "—";
+      $("install-line").textContent = s.node.installation_id || "—";
+      $("privacy-gate").hidden = s.license_accepted;
+      hostingOn = s.node.hosting;
+      $("hosting-switch").dataset.on = hostingOn;
+      $("hosting-switch").setAttribute("aria-checked", hostingOn);
+      $("hosting-word").dataset.on = hostingOn;
+      $("hosting-word").textContent = hostingOn ? "ON" : "OFF";
+      $("chip-engine").dataset.state = s.engine_available ? "inactive" : "active";
+      $("chip-model").dataset.state = s.artifact ? "inactive" : "active";
+      $("chip-hosting").dataset.state = hostingOn ? "inactive" : "active";
+      $("chip-direct").dataset.state = hostingOn ? "active" : "inactive";
+      if (hostingOn) {
+        try {
+          const peers = await invoke("lookup_peers");
+          $("chip-tracker").dataset.state = "inactive";
+          $("peer-rows").innerHTML = peers.length
+            ? peers.map(p => `<tr><td class="mono">${p.peer_id.slice(0, 22)}…</td><td>${p.capacity_class || "unclassified"}</td><td class="mono">${p.nat_path}</td></tr>`).join("")
+            : '<tr><td colspan="3" class="note">registered — no other exact-profile peers seen yet</td></tr>';
+        } catch (e) { $("chip-tracker").dataset.state = "active"; }
+      } else {
+        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">hosting off — roster empty</td></tr>';
+      }
+    }
+
+    $("save-tracker").onclick = async () => { try { await invoke("set_tracker", { url: $("tracker-url").value }); error(""); } catch (e) { error(String(e)); } };
+    $("accept-btn").onclick = async () => { try { await invoke("accept_privacy"); } catch (e) { error(String(e)); } refresh(); };
+    $("download-btn").onclick = async () => {
+      if (busy) return; busy = true; $("download-btn").disabled = true; $("dl-label").textContent = "resolving catalog…";
+      try {
+        const r = await invoke("download_model");
+        $("dl-label").textContent = `verified · ${(r.bytes / 1e6).toFixed(0)} MB`;
+      } catch (e) { error(String(e)); $("dl-label").textContent = ""; }
+      $("download-btn").disabled = false; busy = false; refresh();
+    };
+    listen("download", (e) => {
+      const { done, total } = e.payload;
+      const pct = total ? Math.round((done / total) * 100) : 0;
+      $("dl-progress").style.width = pct + "%";
+      $("dl-label").textContent = total ? `${(done / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB (${pct}%)` : `${(done / 1e6).toFixed(0)} MB`;
+    });
+    async function toggleHosting() {
+      if (busy) return; busy = true; error("");
+      try { await invoke("set_hosting", { on: !hostingOn }); }
+      catch (e) { error(String(e)); }
+      busy = false; refresh();
+    }
+    $("hosting-switch").onclick = toggleHosting;
+    $("hosting-switch").onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleHosting(); } };
+
+    function addMsg(role, content, meta) {
+      const div = document.createElement("div");
+      div.className = "msg " + role;
+      div.textContent = content;
+      if (meta) { const m = document.createElement("div"); m.className = "meta"; m.textContent = meta; div.appendChild(m); }
+      $("transcript").appendChild(div);
+      $("transcript").scrollTop = $("transcript").scrollHeight;
+    }
+    $("chat-form").onsubmit = async (e) => {
+      e.preventDefault();
+      const text = $("chat-input").value.trim();
+      if (!text || busy) return;
+      $("chat-input").value = ""; busy = true; $("send-btn").disabled = true;
+      addMsg("user", text);
+      try {
+        const r = await invoke("send_chat", { message: text });
+        addMsg("assistant", r.content || "(empty)",
+          `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms`);
+      } catch (err) { addMsg("assistant", "error: " + err); }
+      $("send-btn").disabled = false; busy = false; $("chat-input").focus();
+    };
+
+    refresh(); setInterval(refresh, 2000);
+  </script>
 </body>
 </html>

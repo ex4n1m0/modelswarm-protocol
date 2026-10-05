@@ -118,6 +118,11 @@ impl TrackerClient {
         }
     }
 
+    /// The installation identity this client signs with (public view).
+    pub fn identity(&self) -> &Arc<InstallationIdentity> {
+        &self.identity
+    }
+
     pub fn set_session(&self, token: String) {
         *self.session_token.try_write().expect("session lock") = Some(token);
     }

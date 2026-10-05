@@ -92,7 +92,7 @@ impl ArtifactManager {
     pub async fn ensure_artifact(
         &self,
         manifest: &ModelProfileManifest,
-        store: &Store,
+        store: &std::sync::Mutex<Store>,
         mut progress: impl FnMut(u64, Option<u64>),
     ) -> Result<EnsuredArtifact, ArtifactError> {
         let dest = self.artifact_path(manifest)?;
@@ -198,7 +198,7 @@ impl ArtifactManager {
         &self,
         manifest: &ModelProfileManifest,
         dest: &std::path::Path,
-        store: &Store,
+        store: &std::sync::Mutex<Store>,
     ) -> Result<u64, ArtifactError> {
         let hashes = {
             let dest = dest.to_path_buf();
@@ -229,7 +229,11 @@ impl ArtifactManager {
         let bytes = std::fs::metadata(dest)
             .map_err(|e| ArtifactError::Io(e.to_string()))?
             .len();
+        // Short lock scope; no await while held (rusqlite Connection is
+        // Send but not Sync).
         store
+            .lock()
+            .map_err(|_| ArtifactError::Io("store lock poisoned".into()))?
             .record_artifact(
                 &manifest.derive_profile_id(),
                 &dest.display().to_string(),
@@ -468,8 +472,8 @@ mod tests {
         .unwrap()
     }
 
-    fn temp_store(dir: &std::path::Path) -> Store {
-        Store::open(dir.join("state.sqlite")).unwrap()
+    fn temp_store(dir: &std::path::Path) -> std::sync::Mutex<Store> {
+        std::sync::Mutex::new(Store::open(dir.join("state.sqlite")).unwrap())
     }
 
     #[tokio::test]
@@ -496,7 +500,11 @@ mod tests {
         assert_eq!(ensured.bytes, gguf.len() as u64);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        let row = store.get_artifact(&manifest.derive_profile_id()).unwrap();
+        let row = store
+            .lock()
+            .unwrap()
+            .get_artifact(&manifest.derive_profile_id())
+            .unwrap();
         assert!(row.is_some());
 
         // Second call re-verifies from disk without another download.
@@ -529,6 +537,8 @@ mod tests {
         // No finalized artifact, no .part left behind.
         assert!(!manager.artifact_path(&manifest).unwrap().exists());
         assert!(store
+            .lock()
+            .unwrap()
             .get_artifact(&manifest.derive_profile_id())
             .unwrap()
             .is_none());

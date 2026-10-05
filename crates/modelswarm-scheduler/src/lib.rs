@@ -31,6 +31,16 @@ pub const MAX_STALE_ADVERTISEMENT_PENALTY_MS: f64 = 1_000.0;
 pub const MIN_CAPACITY_CLASS: CapacityClass = CapacityClass::Cpu;
 /// EWMA smoothing factor for requester-measured observations.
 pub const EWMA_ALPHA: f64 = 0.3;
+/// Additive scoring penalty for hole-punched paths (ADR-014 rule 4: NAT path
+/// type is a scheduler input and relayed paths carry a cost penalty — a
+/// punched path still pays extra coordination/synchronization cost versus
+/// direct). Milliseconds added to [`predicted_single_ms`].
+pub const HOLEPUNCHED_PATH_PENALTY_MS: f64 = 10.0;
+/// Additive scoring penalty for relayed paths (ADR-014 rule 4): a relay adds
+/// at least one extra network hop each way plus relay queuing, so an
+/// otherwise-equal relayed candidate must rank strictly below the direct one.
+/// Milliseconds added to [`predicted_single_ms`].
+pub const RELAYED_PATH_PENALTY_MS: f64 = 40.0;
 
 /// Hardware capacity classes, ordered weakest → strongest (matches the
 /// `hardware_class_peers` vocabulary of the run-manifest schema).
@@ -106,7 +116,7 @@ pub enum SchedulerError {
 }
 
 /// `predicted_ms` for a single host, v1 formula
-/// (`docs/architecture.md` §10):
+/// (`docs/architecture.md` §10) plus the ADR-014 NAT-path penalty:
 ///
 /// ```text
 /// measured_rtt_ms
@@ -115,6 +125,7 @@ pub enum SchedulerError {
 /// + output_tokens / measured_decode_tokens_per_ms
 /// + failure_penalty_ms
 /// + stale_advertisement_penalty_ms
+/// + nat_path_penalty_ms(candidate.nat_path)
 /// ```
 ///
 /// A non-positive measured rate yields `INFINITY` (an unusable peer ranks
@@ -126,6 +137,19 @@ pub fn predicted_single_ms(candidate: &Candidate, prompt_tokens: u32, output_tok
         + tokens_over_rate(output_tokens, candidate.decode_tokens_per_ms)
         + candidate.failure_penalty_ms
         + candidate.stale_advertisement_penalty_ms
+        + nat_path_penalty_ms(candidate.nat_path)
+}
+
+/// The ADR-014 NAT-path cost penalty: direct pays nothing, hole-punched pays
+/// [`HOLEPUNCHED_PATH_PENALTY_MS`], relayed pays [`RELAYED_PATH_PENALTY_MS`].
+/// Deterministic, monotone in path indirection — a relayed candidate never
+/// outscores an otherwise-equal direct one.
+pub fn nat_path_penalty_ms(nat_path: NatPath) -> f64 {
+    match nat_path {
+        NatPath::Direct => 0.0,
+        NatPath::HolePunched => HOLEPUNCHED_PATH_PENALTY_MS,
+        NatPath::Relayed => RELAYED_PATH_PENALTY_MS,
+    }
 }
 
 fn tokens_over_rate(tokens: u32, rate_per_ms: f64) -> f64 {
@@ -388,6 +412,118 @@ mod tests {
             predicted_single_ms(&honest, 1024, 512) * 3.0
                 < predicted_single_ms(&fake_fast, 1024, 512),
             "measured fields should dominate by a wide margin"
+        );
+    }
+
+    /// F6 (Phase F gate): a candidate ADVERTISING 10× better throughput than
+    /// the requester ever measured is still ranked by the measured values —
+    /// advertised fields carry no token-rate term, so the lie changes
+    /// nothing. Only the advertised queue moves the score, and 10× claims
+    /// cannot outrank measured reality.
+    #[test]
+    fn ten_x_advertised_lies_never_outrank_measured_reality() {
+        // The liar advertises a 0 ms queue; the honest peer 80 ms. The liar's
+        // MEASURED decode is 10× worse (0.1 vs 1.0 tokens/ms) — exactly the
+        // "advertise huge decode rate" abuse of docs/threat-model.md §6.
+        let liar = candidate("liar-10x", 20.0, 0.0, 1.0, 0.1);
+        let honest = candidate("honest", 30.0, 80.0, 2.0, 1.0);
+        let peers = vec![liar.clone(), honest.clone()];
+        let picked = select_microswarm(&peers, &profile(), 512, 1024, 2);
+        assert_eq!(
+            picked[0].peer_id, "honest",
+            "measured decode/rtt must dominate advertised queue"
+        );
+        // And the dominance is exactly the measured term: predicted uses ONLY
+        // measured rates, so swapping the advertised queues (0 <-> 80) cannot
+        // flip the ordering.
+        let swapped = [
+            Candidate {
+                advertised_queue_ms: 80.0,
+                ..liar.clone()
+            },
+            Candidate {
+                advertised_queue_ms: 0.0,
+                ..honest.clone()
+            },
+        ];
+        let picked_swapped = select_microswarm(&swapped, &profile(), 512, 1024, 2);
+        assert_eq!(picked_swapped[0].peer_id, "honest");
+        // Identity check: the formula is a pure function of the measured +
+        // penalty fields once the advertised queue is equalized.
+        let liar_norm = predicted_single_ms(
+            &Candidate {
+                advertised_queue_ms: 0.0,
+                ..liar
+            },
+            512,
+            1024,
+        );
+        let honest_norm = predicted_single_ms(
+            &Candidate {
+                advertised_queue_ms: 0.0,
+                ..honest
+            },
+            512,
+            1024,
+        );
+        assert!(
+            honest_norm * 2.0 < liar_norm,
+            "10x worse measured decode must cost more than any advertised queue can hide"
+        );
+    }
+
+    /// F6/ADR-014 rule 4: the relayed NAT path scores strictly worse than
+    /// the direct path all-else-equal; hole-punched sits between them; and a
+    /// relayed candidate is demoted in selection even when its measured
+    /// fields are marginally better (within the penalty).
+    #[test]
+    fn nat_path_penalty_orders_relayed_below_direct_all_else_equal() {
+        let direct = candidate("direct", 20.0, 10.0, 2.0, 0.5);
+        let punched = Candidate {
+            nat_path: NatPath::HolePunched,
+            ..candidate("punched", 20.0, 10.0, 2.0, 0.5)
+        };
+        let relayed = Candidate {
+            nat_path: NatPath::Relayed,
+            ..candidate("relayed", 20.0, 10.0, 2.0, 0.5)
+        };
+
+        // Monotone penalties.
+        assert_eq!(nat_path_penalty_ms(NatPath::Direct), 0.0);
+        assert!(nat_path_penalty_ms(NatPath::HolePunched) < nat_path_penalty_ms(NatPath::Relayed));
+
+        // All-else-equal ordering: direct < hole-punched < relayed.
+        let d = predicted_single_ms(&direct, 256, 128);
+        let h = predicted_single_ms(&punched, 256, 128);
+        let r = predicted_single_ms(&relayed, 256, 128);
+        assert!(d < h, "direct {d} must beat hole-punched {h}");
+        assert!(h < r, "hole-punched {h} must beat relayed {r}");
+        assert!((r - d - RELAYED_PATH_PENALTY_MS).abs() < 1e-9);
+        assert!((h - d - HOLEPUNCHED_PATH_PENALTY_MS).abs() < 1e-9);
+
+        // Selection order flips only because of nat_path, and a relayed peer
+        // with slightly better measured RTT still loses inside the penalty
+        // band (the relay cost is priced in, ADR-014).
+        let peers = vec![
+            Candidate {
+                nat_path: NatPath::Relayed,
+                ..candidate("relayed-fast", 5.0, 0.0, 4.0, 1.0)
+            },
+            candidate("direct-slower", 20.0, 10.0, 2.0, 0.5),
+        ];
+        let picked = select_microswarm(&peers, &profile(), 64, 64, 2);
+        assert_eq!(picked[0].peer_id, "relayed-fast"); // 15 ms better > 40 ms penalty
+        let near_tie = vec![
+            Candidate {
+                nat_path: NatPath::Relayed,
+                ..candidate("relayed-near", 35.0, 10.0, 2.0, 0.5)
+            },
+            candidate("direct-near", 20.0, 10.0, 2.0, 0.5),
+        ];
+        let picked = select_microswarm(&near_tie, &profile(), 64, 64, 2);
+        assert_eq!(
+            picked[0].peer_id, "direct-near",
+            "a relayed peer only 15 ms 'better' on paper loses to the relay penalty"
         );
     }
 

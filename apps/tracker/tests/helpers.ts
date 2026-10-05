@@ -8,6 +8,7 @@ import { RateLimiter } from "@/lib/ratelimit";
 import {
   bs58Encode,
   deriveKeyId,
+  derivePeerId,
   publicKeyOf,
   sha256Hex,
   base64UrlDecode,
@@ -65,10 +66,10 @@ export function makeKeypair(): KeyPair {
   return { secretKey, publicKey: publicKeyOf(secretKey) };
 }
 
+/** installationId = base58(sha256(pubKey)); peerId = ADR-020 multihash derivation. */
 export function keyPairIds(keys: KeyPair): { installationId: string; peerId: string; pubKeyB58: string } {
   const pubKeyB58 = bs58Encode(keys.publicKey);
-  const id = deriveKeyId(keys.publicKey);
-  return { installationId: id, peerId: id, pubKeyB58 };
+  return { installationId: deriveKeyId(keys.publicKey), peerId: derivePeerId(keys.publicKey), pubKeyB58 };
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +183,7 @@ export async function enroll(rig: TestRig, ip?: string): Promise<Enrollment> {
   return {
     keys,
     installationId,
-    peerId: installationId,
+    peerId: derivePeerId(keys.publicKey),
     pubKeyB58,
     session: session.token,
     sessionExpiresAt: session.expiresAt,

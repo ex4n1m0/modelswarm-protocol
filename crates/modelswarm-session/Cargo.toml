@@ -26,6 +26,7 @@ modelswarm-transport = { path = "../modelswarm-transport" }
 proptest = "1"
 tokio = { version = "1", features = ["full"] }
 modelswarm-runtime = { path = "../modelswarm-runtime", features = ["mock-runtime"] }
+modelswarm-telemetry = { path = "../modelswarm-telemetry" }
 
 [lints]
 workspace = true

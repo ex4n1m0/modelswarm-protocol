@@ -486,6 +486,25 @@ impl Listener {
         self.inner.local_addr()
     }
 
+    /// Accepts one RAW TCP connection WITHOUT performing the §6.1 handshake.
+    ///
+    /// Phase F relay exercise (ADR-014/F13): an intermediary that forwards
+    /// frames verbatim between two terminal peers needs byte-level pipes,
+    /// not a terminated session. The end-to-end Ed25519 handshake and the
+    /// session-layer commit/receipt signatures still authenticate the
+    /// terminal peers — the relay is deliberately unauthenticated and cannot
+    /// alter, forge, or observe beyond what the length-prefixed frames carry.
+    /// The loopback-only bind rule still applies (this listener itself came
+    /// from [`SignedFrameTransport::listen`]; the real Circuit-Relay-v2
+    /// arrives with the libp2p backend).
+    pub async fn accept_raw(&self, deadline: Duration) -> Result<TcpStream, TransportError> {
+        let (stream, _peer_addr) = timeout(deadline, self.inner.accept())
+            .await
+            .map_err(|_| TransportError::Timeout)??;
+        let _ = stream.set_nodelay(true);
+        Ok(stream)
+    }
+
     /// Accepts one connection and performs the handshake exchange against a
     /// single expected client key. Equivalent to
     /// [`Listener::accept_with`] with a one-key resolver.

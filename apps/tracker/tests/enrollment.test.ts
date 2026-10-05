@@ -212,6 +212,40 @@ describe("register validation", () => {
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe("invalid_body");
   });
 
+  it("ADR-020 hard switch: the placeholder peerId==installationId is rejected; only the multihash derivation registers", async () => {
+    const who = await enroll(rig, "198.51.100.9");
+    // Shape checks on the helper derivation (pure TS mirrors the Rust
+    // peer_id_for: base58(identity-multihash of the protobuf-encoded key)).
+    expect(who.peerId.startsWith("12D3Koo")).toBe(true);
+    expect(who.peerId.length).toBe(52);
+    expect(who.peerId).not.toBe(who.installationId);
+
+    const placeholderBody = JSON.stringify({
+      peerId: who.installationId, // the retired Phase B–E placeholder equality
+      addresses: ["/ip4/10.0.0.1/tcp/4001"],
+      profiles: [profileId],
+      maxSlots: 2,
+      runtime: { name: "r", build: "b" },
+    });
+    const rejected = await registerRoute.POST(
+      signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/register", placeholderBody, rig.ctx.now),
+    );
+    expect(rejected.status).toBe(400);
+    expect(((await rejected.json()) as { error: { code: string } }).error.code).toBe("invalid_body");
+
+    // The multihash derivation of the same key registers cleanly.
+    const ok = await registerRoute.POST(
+      signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/register", JSON.stringify({
+        peerId: who.peerId,
+        addresses: ["/ip4/10.0.0.1/tcp/4001"],
+        profiles: [profileId],
+        maxSlots: 2,
+        runtime: { name: "r", build: "b" },
+      }), rig.ctx.now),
+    );
+    expect(ok.status).toBe(200);
+  });
+
   it("unknown profile -> 400 unknown_profile; bad multiaddr -> 400; maxSlots out of range -> 400", async () => {
     const who = await enroll(rig, "198.51.100.8");
     const base = (overrides: Record<string, unknown>) =>

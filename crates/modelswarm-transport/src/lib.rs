@@ -30,6 +30,8 @@
 pub mod error;
 pub mod frame;
 pub mod handshake;
+#[cfg(feature = "libp2p-backend")]
+pub mod libp2p_backend;
 pub mod message;
 pub mod transport;
 
@@ -38,7 +40,7 @@ pub mod transport;
 /// depending on ed25519-dalek directly.
 pub use ed25519_dalek;
 pub use error::{FrameError, HandshakeError, TransportError, P2P_ERROR_CODES};
-pub use frame::{read_frame, write_frame, MAX_FRAME_BYTES};
+pub use frame::{read_frame, read_frame_raw, write_frame, write_frame_raw, MAX_FRAME_BYTES};
 pub use handshake::verify_handshake;
 pub use message::{
     Cancel, Cancelled, ChatMessage, Completed, Control, Handshake, HandshakeAck, InferenceRequest,

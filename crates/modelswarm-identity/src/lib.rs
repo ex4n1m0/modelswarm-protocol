@@ -4,8 +4,8 @@
 //!
 //! Capability-token/lease verification lives in `modelswarm-eligibility`
 //! (ADR-012). The libp2p `PeerId` type arrives with `modelswarm-transport`;
-//! until then [`InstallationIdentity::peer_id_label`] provides the identical
-//! base58(SHA-256(pubkey)) string.
+//! its string derivation is [`InstallationIdentity::peer_id`] (ADR-020:
+//! base58(0x12 0x20 ‖ SHA-256(pubkey)), distinct from the installation id).
 
 pub mod canonical;
 pub mod envelope;
@@ -14,7 +14,9 @@ pub mod timestamp;
 
 pub use canonical::canonical_json;
 pub use envelope::SignedEnvelope;
-pub use installation::{installation_id_for, InstallationIdentity};
+pub use installation::{
+    installation_id_for, peer_id_for, InstallationIdentity, PEER_ID_MULTIHASH_PREFIX,
+};
 pub use timestamp::{
     empty_body_digest, new_nonce, new_nonce_with, rfc3339_now, within_window, REPLAY_WINDOW_SECS,
 };

@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# F11 (Phase F stretch): rust-libp2p backend — QUIC (peer-authenticated by
+# its libp2p TLS handshake) with keys from the InstallationIdentity seed.
+# Optional and experimental; the workspace stays green without it (ADR-018:
+# the trait is the swap point).
+libp2p-backend = ["dep:libp2p", "dep:futures"]
+
 [dependencies]
 modelswarm-identity = { path = "../modelswarm-identity" }
 tokio = { version = "1", features = ["full"] }
@@ -18,6 +25,16 @@ bytes = "1"
 # ed25519 SigningKey from the identity seed, so no identity logic is duplicated.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
+futures = { version = "0.3", optional = true }
+libp2p = { version = "0.57", optional = true, features = [
+    "tokio",
+    "quic",
+    "noise",
+    "yamux",
+    "identify",
+    "ping",
+    "macros",
+] }
 
 [lints]
 workspace = true

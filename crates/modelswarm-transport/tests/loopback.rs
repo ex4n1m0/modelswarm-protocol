@@ -405,7 +405,7 @@ async fn four_concurrent_sessions_on_one_listener() {
         .iter()
         .map(|&seed| {
             let identity = ident(seed);
-            (identity.peer_id_label(), identity.verifying_key())
+            (identity.peer_id(), identity.verifying_key())
         })
         .collect();
     let listener = make_listener().await;

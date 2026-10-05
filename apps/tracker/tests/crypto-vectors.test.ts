@@ -10,6 +10,7 @@ import {
   bs58Decode,
   bs58Encode,
   canonicalJson,
+  derivePeerId,
   deriveProfileId,
   publicKeyOf,
   randomId128,
@@ -48,6 +49,23 @@ describe("golden vector parity (ADR-011)", () => {
       runtime: { ...(doc.manifest.runtime as object), version: "b1-test" },
     };
     expect(deriveProfileId(mutated)).not.toBe(deriveProfileId(doc.manifest));
+  });
+});
+
+describe("ADR-020 peerId derivation", () => {
+  it("seed [9u8;32] matches the Rust peer_id_for golden (12D3Koo form)", () => {
+    const seed = Buffer.alloc(32, 9);
+    const peerId = derivePeerId(publicKeyOf(seed));
+    // Same literal asserted by modelswarm-identity installation tests.
+    expect(peerId).toBe("12D3KooWSrKnMZUcSxK8G7wmBbXdU8nFEfWGhLu6H8xjn8LmCSJb");
+  });
+  it("decodes to the identity multihash of the protobuf-encoded key", () => {
+    const seed = Buffer.alloc(32, 9);
+    const publicKey = publicKeyOf(seed);
+    const decoded = bs58Decode(derivePeerId(publicKey))!;
+    expect(decoded!.length).toBe(38);
+    expect([...decoded.slice(0, 6)]).toEqual([0x00, 0x24, 0x08, 0x01, 0x12, 0x20]);
+    expect([...decoded.slice(6)]).toEqual([...publicKey]);
   });
 });
 

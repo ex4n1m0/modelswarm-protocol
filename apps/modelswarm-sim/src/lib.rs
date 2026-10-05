@@ -24,12 +24,19 @@
 //!   candidate-trie session plus, for the same prompt, plain single decoding;
 //!   reports the greedy-equality verdict plus trie telemetry (duplicate work,
 //!   pruning, stragglers).
+//! - [`relay`]: Phase F — three nodes A (relay) B (coordinator) C
+//!   (verifier+proposer); BOTH of B's speculative sessions dial A, which
+//!   forwards every length-prefixed frame verbatim to C (B→A→C and
+//!   C→A→B). The end-to-end handshake/commit signatures still authenticate
+//!   B↔C through the relay; the session must stay token-exact vs plain
+//!   single decoding (F13; the local stand-in for libp2p Circuit-Relay-v2).
 //!
 //! [`pair`]: run_pair
 //! [`mesh`]: run_mesh
 //! [`kill`]: run_kill
 //! [`spec`]: run_spec
 //! [`spec_multi`]: run_spec_multi
+//! [`relay`]: run_relay
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -48,6 +55,7 @@ use modelswarm_session::spec::{
 };
 use modelswarm_speculation::TrieLimits;
 use modelswarm_transport::ed25519_dalek::VerifyingKey;
+use modelswarm_transport::frame::{read_frame_raw, write_frame_raw};
 use modelswarm_transport::{
     ChatMessage, Completed, Handshake, InferenceRequest, Listener, Sampling, Session,
     SignedFrameTransport, Stats, TokenDelta, TransportError, Usage, WireMessage,
@@ -238,7 +246,7 @@ pub async fn run_pair(rtt_samples: usize) -> Result<Value> {
     Ok(json!({
         "scenario": "pair",
         "ok": true,
-        "client_peer_id": client.peer_id_label(),
+        "client_peer_id": client.peer_id(),
         "request_id": "sim-pair-0001",
         "profile_id": SIM_PROFILE,
         "text": text,
@@ -263,7 +271,7 @@ pub async fn run_pair(rtt_samples: usize) -> Result<Value> {
 pub async fn run_mesh(n: usize, rtt_samples: usize) -> Result<Value> {
     anyhow::ensure!((2..=16).contains(&n), "mesh needs 2..=16 peers, got {n}");
     let identities: Vec<InstallationIdentity> = (0..n).map(|i| sim_identity(i as u8 + 1)).collect();
-    let peer_ids: Vec<String> = identities.iter().map(|p| p.peer_id_label()).collect();
+    let peer_ids: Vec<String> = identities.iter().map(|p| p.peer_id()).collect();
 
     let mut listeners = Vec::with_capacity(n);
     let mut addrs = Vec::with_capacity(n);
@@ -284,7 +292,7 @@ pub async fn run_mesh(n: usize, rtt_samples: usize) -> Result<Value> {
     // verifying key, shared by every accepting side.
     let directory: HashMap<String, VerifyingKey> = identities
         .iter()
-        .map(|p| (p.peer_id_label(), p.verifying_key()))
+        .map(|p| (p.peer_id(), p.verifying_key()))
         .collect();
 
     // Peer j accepts exactly j incoming connections (from peers i < j) and
@@ -900,20 +908,266 @@ pub async fn run_spec_multi(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// relay (Phase F, F13)
+// ---------------------------------------------------------------------------
+
+/// Output length of the `relay` scenario (shorter than `spec`: the point is
+/// the path, not the volume).
+pub const RELAY_TOKENS: u32 = 24;
+/// How long the relay node waits for the next inbound relayed connection.
+pub const RELAY_ACCEPT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Node A of the `relay` scenario: accepts RAW (unterminated-handshake)
+/// connections on a loopback-only listener and pumps every length-prefixed
+/// frame verbatim to `backend` — one TCP session per relayed connection,
+/// both directions forwarded. This is the local stand-in for libp2p
+/// Circuit-Relay-v2 (ADR-014): the frame layer is opaque to the relay, and
+/// the terminal peers' end-to-end Ed25519 handshake + session-layer commit
+/// signatures are what authenticate the traffic (the relay cannot forge or
+/// silently alter either).
+async fn serve_relay(listener: Listener, backend: String) -> Result<u64> {
+    let mut forwarded_frames = 0u64;
+    loop {
+        // Two relayed connections are expected (verifier + proposer session);
+        // the third accept timing out ends the relay cleanly.
+        let inbound = match listener.accept_raw(RELAY_ACCEPT_DEADLINE).await {
+            Ok(stream) => stream,
+            Err(_) => return Ok(forwarded_frames),
+        };
+        let upstream = tokio::net::TcpStream::connect(&backend)
+            .await
+            .context("relay dial backend")?;
+        let (mut client_read, mut client_write) = inbound.into_split();
+        let (mut up_read, mut up_write) = upstream.into_split();
+        let up_task = tokio::spawn(async move {
+            // C -> A -> B (server answers travel back through the relay).
+            // Owned halves moved in: the pump lives until either side EOFs.
+            while let Ok(bytes) = read_frame_raw(&mut up_read).await {
+                if write_frame_raw(&mut client_write, &bytes).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // B -> A -> C (client frames forwarded verbatim).
+        while let Ok(bytes) = read_frame_raw(&mut client_read).await {
+            if write_frame_raw(&mut up_write, &bytes).await.is_err() {
+                break;
+            }
+            forwarded_frames += 1;
+        }
+        let _ = up_task.await;
+    }
+}
+
+/// The measured facts of one `relay` run.
+#[derive(Debug, Clone)]
+pub struct RelayCase {
+    pub prompt_seed: u64,
+    pub tokens_equal_to_single: bool,
+    pub rounds: u64,
+    pub fallback: Option<&'static str>,
+    pub receipts_verified: bool,
+    pub relayed_frames: u64,
+    pub elapsed_ms: f64,
+}
+
+/// `relay <prompt_seed>`: node B runs the full Phase-D speculative flow, but
+/// BOTH dial addresses point at node A (relay), which forwards frames to
+/// node C's verifier/proposer listeners. The committed output must still be
+/// token-identical to plain single decoding of the same prompt (the relay is
+/// transport-only; correctness is end-to-end).
+async fn relay_case(prompt_seed: u64) -> Result<RelayCase> {
+    // Node C: verifier + proposer on distinct loopback listeners.
+    let coordinator = sim_identity(170);
+    let verifier_id = sim_identity(171);
+    let proposer_id = sim_identity(172);
+    let prompt: Vec<u32> = (0..8u64)
+        .map(|k| (prompt_seed.wrapping_mul(k + 3) % 256) as u32)
+        .collect();
+    let verifier_runtime = Arc::new(MockRuntime::new(prompt_seed, 0.7));
+    let proposer_runtime = Arc::new(MockRuntime::new(prompt_seed, 0.7));
+    let client_runtime: Arc<dyn InferenceRuntime> = Arc::new(MockRuntime::new(prompt_seed, 0.7));
+
+    let verifier_listener = SignedFrameTransport::listen("127.0.0.1:0")
+        .await
+        .context("relay verifier listener")?;
+    let verifier_addr = verifier_listener
+        .local_addr()
+        .context("relay verifier addr")?
+        .to_string();
+    let verifier_key = coordinator.verifying_key();
+    let verifier_task = tokio::spawn(serve_speculative(
+        verifier_listener,
+        verifier_runtime.clone(),
+        SIM_PROFILE,
+        verifier_id.clone(),
+        verifier_key,
+        1,
+    ));
+
+    let proposer_listener = SignedFrameTransport::listen("127.0.0.1:0")
+        .await
+        .context("relay proposer listener")?;
+    let proposer_addr = proposer_listener
+        .local_addr()
+        .context("relay proposer addr")?
+        .to_string();
+    let proposer_task = tokio::spawn(serve_proposer(
+        proposer_listener,
+        proposer_runtime,
+        SIM_PROFILE,
+        proposer_id.clone(),
+        verifier_key,
+        1,
+    ));
+
+    // Node A: one relay listener per backend service. B dials these two
+    // addresses instead of C's real ones.
+    let relay_v_listener = SignedFrameTransport::listen("127.0.0.1:0")
+        .await
+        .context("relay-v listener")?;
+    let relay_v_addr = relay_v_listener
+        .local_addr()
+        .context("relay-v addr")?
+        .to_string();
+    let relay_v_task = tokio::spawn(serve_relay(relay_v_listener, verifier_addr));
+    let relay_p_listener = SignedFrameTransport::listen("127.0.0.1:0")
+        .await
+        .context("relay-p listener")?;
+    let relay_p_addr = relay_p_listener
+        .local_addr()
+        .context("relay-p addr")?
+        .to_string();
+    let relay_p_task = tokio::spawn(serve_relay(relay_p_listener, proposer_addr));
+
+    // Node B: the coordinator, dialing A (relay) for both peers.
+    let started = Instant::now();
+    let outcome: SpecOutcome = speculate(
+        &relay_v_addr,
+        &relay_p_addr,
+        client_runtime,
+        SIM_PROFILE,
+        &prompt,
+        4,
+        RELAY_TOKENS,
+        &coordinator,
+        &verifier_id.verifying_key(),
+        FallbackPolicy::default(),
+    )
+    .await
+    .context("relay speculate")?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+    // Plain single decode of the same prompt on the verifier's runtime.
+    let handle = verifier_runtime.load(SIM_PROFILE).await?;
+    let single = verifier_runtime
+        .decode_stream(
+            &handle,
+            &prompt,
+            &SamplingParams::default(),
+            RELAY_TOKENS,
+            DEADLINE,
+        )
+        .await
+        .context("relay single decode")?;
+
+    let verifier_reports = verifier_task
+        .await
+        .context("verifier task")?
+        .context("verifier served")?
+        .len();
+    let proposer_reports = proposer_task
+        .await
+        .context("proposer task")?
+        .context("proposer served")?
+        .len();
+    anyhow::ensure!(verifier_reports == 1 && proposer_reports == 1);
+    // The relays see the connections close; accept the next inbound until
+    // the deadline passes and return the forwarded-frame counts.
+    let relayed_v = relay_v_task
+        .await
+        .context("relay-v task")?
+        .context("relay-v flow")?;
+    let relayed_p = relay_p_task
+        .await
+        .context("relay-p task")?
+        .context("relay-p flow")?;
+
+    Ok(RelayCase {
+        prompt_seed,
+        tokens_equal_to_single: outcome.tokens == single,
+        rounds: outcome.rounds,
+        fallback: outcome.fallback.map(|reason| reason.as_str()),
+        receipts_verified: outcome.receipts_verified,
+        relayed_frames: relayed_v + relayed_p,
+        elapsed_ms,
+    })
+}
+
+/// `relay <prompt_seed>`: three nodes (A relay, B coordinator, C
+/// verifier+proposer); B's whole speculative session is routed B→A→C.
+/// Reports the exactness verdict, the round count, and how many frames the
+/// relay node forwarded (the observable relay-path cost).
+pub async fn run_relay(prompt_seed: u64) -> Result<Value> {
+    let case = relay_case(prompt_seed).await?;
+    Ok(json!({
+        "scenario": "relay",
+        "ok": true,
+        "prompt_seed": case.prompt_seed,
+        "tokens": RELAY_TOKENS,
+        "tokens_equal_to_single": case.tokens_equal_to_single,
+        "rounds": case.rounds,
+        "fallback": case.fallback,
+        "receipts_verified": case.receipts_verified,
+        "relayed_frames": case.relayed_frames,
+        "topology": "B(coordinator)->A(relay)->C(verifier+proposer), 2 TCP sessions",
+        "elapsed_ms": round2(case.elapsed_ms),
+        "note": "local Circuit-Relay stand-in; libp2p Circuit-Relay-v2 replaces this at the backend swap (ADR-014/018)",
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn sim_identities_are_deterministic() {
-        assert_eq!(
-            sim_identity(1).peer_id_label(),
-            sim_identity(1).peer_id_label()
-        );
-        assert_ne!(
-            sim_identity(1).peer_id_label(),
-            sim_identity(2).peer_id_label()
-        );
+        assert_eq!(sim_identity(1).peer_id(), sim_identity(1).peer_id());
+        assert_ne!(sim_identity(1).peer_id(), sim_identity(2).peer_id());
+        // F12: the wire identity is the ADR-020 multihash derivation.
+        assert!(sim_identity(1).peer_id().starts_with("12D3Koo"));
+        assert_eq!(sim_identity(1).peer_id().len(), 52);
+        assert_ne!(sim_identity(1).peer_id(), sim_identity(1).installation_id());
+    }
+
+    /// F13: the relayed path (B→A→C, both of B's sessions forwarded by node
+    /// A) completes the full speculative flow with output token-exact
+    /// against plain single decoding — the relay is transport-only, and both
+    /// peers' end-to-end authentication survives it. Bounded by a 30 s
+    /// timeout; the relay must have forwarded real traffic (> 0 frames).
+    #[tokio::test]
+    async fn relay_path_is_end_to_end_exact() {
+        const CASE_TIMEOUT: Duration = Duration::from_secs(30);
+        for seed in [5u64, 21] {
+            let case = tokio::time::timeout(CASE_TIMEOUT, relay_case(seed))
+                .await
+                .expect("relay case is bounded")
+                .expect("relay case runs");
+            assert!(
+                case.tokens_equal_to_single,
+                "seed={seed}: relayed path must stay token-exact"
+            );
+            assert!(
+                case.receipts_verified,
+                "seed={seed}: receipt through the relay"
+            );
+            assert_eq!(case.fallback, None, "seed={seed}: healthy relayed session");
+            assert!(
+                case.relayed_frames > 0,
+                "seed={seed}: the relay must have forwarded frames"
+            );
+        }
     }
 
     /// D1/D5/D6 sweep: 20 seeds × windows {2,4,8} × draft accuracy

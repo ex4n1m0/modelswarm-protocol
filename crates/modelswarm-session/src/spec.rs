@@ -1811,7 +1811,13 @@ pub async fn speculate(
         round_batches.push(single_tokens);
     }
 
-    // 6. Two-phase close with the verifier.
+    // 6. Auditor cross-check (F7): the coordinator re-verifies the whole
+    // committed chain against its own runtime BEFORE emitting or closing —
+    // a verifier whose accepted tokens diverge from the plain target
+    // continuation fails the session here, garbage never reaches the output.
+    audit_final_chain(&runtime_client, profile_id, prompt_tokens, &tokens).await?;
+
+    // 7. Two-phase close with the verifier.
     send_spec(
         &mut verifier,
         &SpecMessage::SessionClose {
@@ -1895,6 +1901,43 @@ async fn expect_prefill_ready(
             "expected prefill_ready, got {other:?}"
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Auditor cross-check (F7)
+// ---------------------------------------------------------------------------
+
+/// Re-verifies the final committed chain locally with the coordinator's own
+/// runtime before the outcome is emitted — the F7 auditor pattern: a
+/// malicious or faulty verifier that returns hash-consistent results over
+/// garbage tokens (defeating the per-round prefix-chain check) is still
+/// caught here, because the plain target continuation is a pure function of
+/// the prompt under default sampling. Divergence fails the session
+/// explicitly; garbage never reaches [`SpecOutcome`].
+///
+/// Cost: one load plus `committed.len()` decode steps per session on the
+/// requester (the ADR-013 security overhead the cost model prices).
+async fn audit_final_chain(
+    runtime: &Arc<dyn InferenceRuntime>,
+    profile_id: &str,
+    prompt_tokens: &[u32],
+    committed: &[u32],
+) -> Result<(), SpecError> {
+    let handle = runtime.load(profile_id).await?;
+    let mut prefix = prompt_tokens.to_vec();
+    for (index, expected) in committed.iter().enumerate() {
+        let token = runtime
+            .decode_step(&handle, &prefix, &SamplingParams::default())
+            .await?;
+        if token != *expected {
+            return Err(SpecError::Protocol(format!(
+                "auditor divergence at committed token {index}: verifier committed {expected}, \
+                 the local target continuation is {token}"
+            )));
+        }
+        prefix.push(token);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2582,7 +2625,11 @@ pub async fn speculate_multi(
         round_batches.push(single_tokens);
     }
 
-    // 8. Two-phase close with the verifier, then the proposers.
+    // 8. Auditor cross-check (F7): re-verify the committed chain against the
+    // coordinator's own runtime before emitting (same rule as Phase D).
+    audit_final_chain(&runtime_client, profile_id, prompt_tokens, &tokens).await?;
+
+    // 9. Two-phase close with the verifier, then the proposers.
     send_spec(
         &mut verifier,
         &SpecMessage::SessionClose {

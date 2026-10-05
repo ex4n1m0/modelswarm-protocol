@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use ed25519_dalek::{Signature, SigningKey};
 use modelswarm_identity::{
-    canonical_json, installation_id_for, new_nonce, rfc3339_now, InstallationIdentity,
+    canonical_json, installation_id_for, new_nonce, peer_id_for, rfc3339_now, InstallationIdentity,
 };
 use serde_json::json;
 
@@ -23,8 +23,9 @@ use crate::message::{Handshake, WireMessage, MSP_PROTOCOL_VERSION};
 
 impl Handshake {
     /// Builds and signs a handshake from `identity` (ADR-004 installation
-    /// key). `peer_id`/`installation_id` derive from the key; `ts` is now
-    /// (RFC 3339 UTC); `nonce` is fresh.
+    /// key). `peer_id` is the ADR-020 identity-multihash derivation and
+    /// `installation_id` the hub-side derivation (both from the same key);
+    /// `ts` is now (RFC 3339 UTC); `nonce` is fresh.
     pub fn build(
         identity: &InstallationIdentity,
         profile_id: &str,
@@ -33,7 +34,7 @@ impl Handshake {
     ) -> Self {
         let mut handshake = Self {
             protocol_version: MSP_PROTOCOL_VERSION.to_string(),
-            peer_id: identity.peer_id_label(),
+            peer_id: identity.peer_id(),
             installation_id: identity.installation_id(),
             profile_id: profile_id.to_string(),
             runtime_name: runtime_name.to_string(),
@@ -121,9 +122,14 @@ pub fn verify_handshake(
         return Err(HandshakeError::MissingFields);
     }
 
-    // Peer binding (§6.6): both public labels must derive from the expected key.
-    let expected_label = installation_id_for(&expected_pubkey.to_bytes());
-    if h.installation_id != expected_label || h.peer_id != expected_label {
+    // Peer binding (§6.6, ADR-020): both public labels must derive from the
+    // expected key — `installation_id` = base58(sha256(pubkey)) and `peer_id`
+    // = base58(0x12 0x20 ‖ sha256(pubkey)). The Phase B–E placeholder
+    // equality (peer_id == installation_id) is gone; the multihash binding
+    // is the contract now.
+    let expected_installation = installation_id_for(&expected_pubkey.to_bytes());
+    let expected_peer = peer_id_for(&expected_pubkey.to_bytes());
+    if h.installation_id != expected_installation || h.peer_id != expected_peer {
         return Err(HandshakeError::WrongPeer);
     }
 

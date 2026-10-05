@@ -161,12 +161,37 @@ export function bs58Decode(text: string): Uint8Array | null {
 
 /**
  * Derive the id the protocol binds to a raw Ed25519 public key:
- * base58(SHA-256(pubKey)) — used for both `installationId` (msp-v1 §2.1) and
- * the `peerId`↔`pubKey` validation at registration (the Rust side derives
- * peers ids with bs58(sha256(pubkey)) the same way).
+ * base58(SHA-256(pubKey)) — used for `installationId` (msp-v1 §2.1).
  */
 export function deriveKeyId(publicKey: Uint8Array): string {
   return bs58Encode(sha256(publicKey));
+}
+
+/**
+ * Derive the wire `peerId` from a raw Ed25519 public key (ADR-020): the
+ * libp2p identity-multihash PeerId — base58(0x00 0x24 ‖ protobuf(pubKey))
+ * where protobuf(pubKey) is the 36-byte libp2p `PublicKey` proto
+ * (0x08 0x01 = Type Ed25519, 0x12 0x20 = Data tag + length 32, then the key).
+ * The result is the "12D3Koo…" form (52 chars) — byte-identical to the Rust
+ * `modelswarm_identity::peer_id_for` AND to `libp2p::PeerId::from_public_key`
+ * (cross-checked by the F11 libp2p-backend test). Registration validates the
+ * peerId↔pubKey binding with THIS derivation; the old
+ * `peerId == installationId` equality was the Phase B–E placeholder and is
+ * gone (hard switch, nothing deployed).
+ */
+export function derivePeerId(publicKey: Uint8Array): string {
+  if (publicKey.length !== 32) return ""; // Ed25519 keys are exactly 32 bytes
+  const protobuf = new Uint8Array(4 + publicKey.length);
+  protobuf[0] = 0x08; // field 1 (Type) varint tag
+  protobuf[1] = 0x01; // Ed25519
+  protobuf[2] = 0x12; // field 2 (Data) length-delimited tag
+  protobuf[3] = 0x20; // length 32 (the key bytes)
+  protobuf.set(publicKey, 4);
+  const multihash = new Uint8Array(2 + protobuf.length);
+  multihash[0] = 0x00; // identity-multihash code
+  multihash[1] = 0x24; // digest length (36 = the protobuf)
+  multihash.set(protobuf, 2);
+  return bs58Encode(multihash);
 }
 
 // ---------------------------------------------------------------------------

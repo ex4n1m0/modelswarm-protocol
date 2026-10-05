@@ -56,7 +56,7 @@ struct RunningNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChatTurn {
+pub struct ChatTurn {
     role: String,
     content: String,
 }
@@ -305,7 +305,7 @@ async fn set_hosting(
 ) -> Result<serde_json::Value, String> {
     let mut inner = state.inner.lock().await;
     if !on {
-        if let Some(mut running) = inner.node.take() {
+        if let Some(running) = inner.node.take() {
             let _ = running.shutdown.send(true);
             running.heartbeat.abort();
             let _ = running.handle.stopped().await;
@@ -370,7 +370,7 @@ async fn set_hosting(
             }
             let result = match &lease_id {
                 Some(id) => heartbeat_tracker
-                    .heartbeat(id, &[profile_id.clone()], 1, 0, false)
+                    .heartbeat(id, std::slice::from_ref(&profile_id), 1, 0, false)
                     .await
                     .map(|_| ())
                     .or_else(|_| {
@@ -382,7 +382,7 @@ async fn set_hosting(
                     .register(
                         &peer_id,
                         &[ADDR_NO_LISTENER.to_string()],
-                        &[profile_id.clone()],
+                        std::slice::from_ref(&profile_id),
                         1,
                         runtime_desc.clone(),
                     )

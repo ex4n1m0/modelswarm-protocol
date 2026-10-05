@@ -42,7 +42,7 @@ const css = `
   nav .brand { color: #e8f4ff; font-weight: 700; letter-spacing: 0.08em; }
   nav .spacer { flex: 1; }
   .badge { border: 1px solid #2fd4ff55; color: #2fd4ff; border-radius: 999px; padding: 0.1rem 0.65rem; font-size: 0.72rem; letter-spacing: 0.1em; }
-  .hero { width: 100%; height: auto; display: block; }
+  .hero { width: 75%; height: auto; display: block; margin: 0 auto; }
   .tagline { text-align: center; color: #9fb8d8; padding: 1.4rem 1rem 0.2rem; font-size: 0.95rem; }
   .tagline b { color: #e8f4ff; font-weight: 600; }
   section { padding: 2.2rem 0 0.6rem; }

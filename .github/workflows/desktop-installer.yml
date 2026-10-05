@@ -65,7 +65,7 @@ jobs:
         shell: pwsh
         run: |
           $pins = Get-Content runtime-pins.json -Raw | ConvertFrom-Json
-          $entry = $pins.platforms.${{ matrix.platform }}
+          $entry = $pins.platforms.'${{ matrix.platform }}'
           $dir = "crates/modelswarm-desktop/engine"
           $verified = 0
           foreach ($prop in $entry.files.PSObject.Properties) {

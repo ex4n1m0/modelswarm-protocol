@@ -102,7 +102,9 @@ jobs:
             echo "engine present in $f"
           done
           for f in *.deb; do
-            dpkg-deb -c "$f" | grep -q "engine/llama-server$" || { echo "::error::engine missing in $f"; exit 1; }
+            # Not piped into grep -q: early pipe-close kills tar (SIGPIPE).
+            dpkg-deb -c "$f" > deb-contents.txt
+            grep -q "engine/llama-server$" deb-contents.txt || { echo "::error::engine missing in $f"; exit 1; }
             echo "engine present in $f"
           done
           for f in *.AppImage; do

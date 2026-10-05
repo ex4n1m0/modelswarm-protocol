@@ -1265,7 +1265,10 @@ export class PgStore implements TrackerStore {
         JSON.stringify(rec.manifest),
         rec.displayName,
         rec.status,
-        rec.provenance ? JSON.stringify(rec.provenance) : null,
+        // MemoryStore treats provenance as optional; the column is NOT NULL
+        // DEFAULT '{}' — an explicit NULL would defeat the default (and did,
+        // in the first real-Pg suite run).
+        rec.provenance ? JSON.stringify(rec.provenance) : "{}",
         PgStore.iso(rec.createdAt),
       ],
     );

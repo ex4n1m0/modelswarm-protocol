@@ -1,10 +1,10 @@
 const DOWNLOAD = {
-  file: "modelswarm-node-windows-x64.exe",
-  url: "/downloads/modelswarm-node-windows-x64.exe",
-  sums: "/downloads/SHA256SUMS.txt",
-  version: "0.1.0",
-  commit: "207279f",
-  size: "6.3 MB",
+  file: "ModelSwarm-Setup-0.1.0-internal-test-unsigned.exe",
+  url: "/downloads/ModelSwarm-Setup-0.1.0-internal-test-unsigned.exe",
+  sums: "/downloads/ModelSwarm-Setup-SHA256SUMS.txt",
+  version: "0.1.0 (desktop app + engine)",
+  commit: "Phase H",
+  size: "13.2 MB",
   sha256: "7ead2a5020214e87ba55c65da212270cd3bb8d2249e5fd0bbf397148f64a7628",
 };
 
@@ -101,11 +101,12 @@ export default function Home() {
           <div className="card">
             <div className="dl">
               <div>
-                <h3>ModelSwarm Node — Windows x64</h3>
+                <h3>ModelSwarm Desktop — Windows x64 installer</h3>
                 <p className="meta">
                   v{DOWNLOAD.version} · build {DOWNLOAD.commit} · {DOWNLOAD.size} ·
-                  serves an OpenAI-compatible gateway on 127.0.0.1:11435 · run{" "}
-                  <code>modelswarm-node --help</code> after download
+                  windowed app hosting Qwen2.5-0.5B (Q4_K_M): first-run model download
+                  with SHA-256 verification, sharing toggle, chat. The model (~470 MB)
+                  downloads from HuggingFace on first launch — never bundled
                 </p>
               </div>
               <div>
@@ -115,7 +116,7 @@ export default function Home() {
                   download={DOWNLOAD.file}
                   aria-label={`Download ModelSwarm Node version ${DOWNLOAD.version} for Windows x64`}
                 >
-                  Download .exe
+                  Download installer
                 </a>
                 <a className="btn ghost" href={DOWNLOAD.sums} download="SHA256SUMS.txt">
                   checksums

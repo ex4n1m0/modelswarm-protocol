@@ -7,7 +7,22 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# TEST-ONLY deterministic toy decoder (ADR-019): off by default; the node
+# binary never enables it. `modelswarm-bench` enables it via its path dep.
+mock-runtime = []
+
 [dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
 
 [lints]
 workspace = true

@@ -1,13 +1,25 @@
 [package]
 name = "modelswarm-desktop"
-description = "ModelSwarm desktop UI shell (Tauri 2 arrives in Phase 6)"
+description = "ModelSwarm desktop UI shell (Tauri 2, ADR-008)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+build = "build.rs"
+
+[features]
+# The real Tauri 2 shell. OFF by default so the workspace builds anywhere
+# (the tauri/wry dependency tree is heavy and platform-specific). Enable with
+# `cargo check -p modelswarm-desktop --features tauri-shell`. See
+# docs/verification/phase-g-notes.md for the Phase G attempt outcome.
+tauri-shell = ["dep:tauri", "dep:tauri-build"]
 
 [dependencies]
+tauri = { version = "2", optional = true, default-features = false, features = ["wry"] }
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true, default-features = false }
 
 [lints]
 workspace = true

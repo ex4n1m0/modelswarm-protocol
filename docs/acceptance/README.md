@@ -29,7 +29,7 @@ Mapping to the older numbering (formalized in ADR-015):
 | D — Exact two-peer speculation | Cooperative P1–P3 (internals lab, local spec, two-node protocol) | `phase-d.md` — **executed 2026-10-05, see `docs/verification/phase-d.md`** |
 | E — Multi-proposer trees | Cooperative P4 (+`search_verified` from P6 behind its own gate) | `phase-e.md` |
 | F — Public hostile swarm | Cooperative P7 + NAT/relay (amends ADR-003) + original Phase 5 hardening | `phase-f.md` |
-| G — Windows beta | Original Phases 6–7 + cooperative P8; signed installers | `phase-g.md` |
+| G — Windows beta | Original Phases 6–7 + cooperative P8; signed installers | `phase-g.md` — **executed 2026-10-05 (composition+shell; signing/VM stops recorded), see `docs/verification/phase-g.md`** |
 
 Nothing in A–G has started. The Phase A exit gate (differentiation paragraph
 + approved ADRs + frozen harness/schemas) is defined in

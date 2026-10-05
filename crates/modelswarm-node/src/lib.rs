@@ -1,0 +1,627 @@
+//! Node composition: the Windows background daemon as a library.
+//!
+//! [`Node::start`] is the single composition point that wires every
+//! prior-phase crate into one process (Phase G, ADR-010 ownership map):
+//!
+//! - **Telemetry** — one [`Telemetry`] over a JSONL [`FileSink`] under
+//!   `<data_dir>/logs/node.jsonl`; every field passes the mandatory redactor
+//!   (`modelswarm_telemetry::redact`), so prompts/tokens/secrets cannot reach
+//!   the file by construction. The self-test proves it with a canary grep.
+//! - **Store** — SQLite at `<data_dir>/state.sqlite` (ADR-017); the schema is
+//!   privacy-shaped (no prompt/completion/secret columns, enforced by the
+//!   store's own schema audit and re-checked here on the file the node
+//!   actually created).
+//! - **Identity** — per-installation Ed25519 key (ADR-004). The 32-byte seed
+//!   is persisted at `<data_dir>/identity.seed`. **Honest boundary:** the file
+//!   is written with 0600 permissions on Unix and plain file permissions on
+//!   Windows; the ADR-004 destination is DPAPI / Windows Credential Manager,
+//!   which is the recorded Phase F hardening replacement (see
+//!   `docs/verification/phase-g-notes.md`). The seed is never logged,
+//!   returned by `NodeHandle`, or sent to the webview.
+//! - **Tracker** — a [`TrackerClient`] is constructed when `tracker_base` is
+//!   configured, but [`Node::start`] makes **no network calls**; the CLI's
+//!   opt-in `--check-tracker` is the only thing that pings it (a read-only
+//!   `GET /health`).
+//! - **Runtime** — selection is explicit (ADR-019): the TEST-ONLY
+//!   [`MockRuntime`] compiles solely under `cfg(test)` or the off-by-default
+//!   `node-selftest` feature (the binary's `--allow-mock-runtime` flag is
+//!   refused loudly when the feature is absent). Mock is **local-loopback-only
+//!   by policy**: the only executor wired in this phase serves the loopback
+//!   gateway, the node constructs no P2P [`modelswarm_transport`] listener at
+//!   all, and no tracker registration path exists — a mock node cannot appear
+//!   in any roster. The production baseline is `LlamaCppAdapter` pointed at a
+//!   loopback llama.cpp sidecar (ADR-002); sidecar *supervision* (download,
+//!   spawn, health) is later work, so a non-mock node without a configured
+//!   sidecar starts honestly runtime-less: the gateway answers
+//!   `no_peer`/503 instead of pretending.
+//! - **Gateway** — the OpenAI-compatible loopback server from
+//!   `modelswarm-gateway`, driven here through its public `build_router` +
+//!   `assert_loopback` surface. Loopback-only is structural: the node builds
+//!   the `127.0.0.1` socket itself and re-asserts [`assert_loopback`] before
+//!   binding (tested: a spawned node's address is loopback; non-loopback IPs
+//!   are refused).
+//!
+//! What is deliberately NOT here yet: the full swarm executor
+//! (`modelswarm_session::spec::SpeculativeExecutor`), transport listeners,
+//! eligibility heartbeats, and lease acquisition arrive with the Phase H/F
+//! wiring; this node serves only **local single-peer inference** through
+//! [`SingleLocalExecutor`].
+
+mod executor;
+
+#[cfg(any(test, feature = "node-selftest"))]
+pub mod selftest;
+
+pub use executor::SingleLocalExecutor;
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use modelswarm_gateway::{
+    assert_loopback, build_router, GatewayError, GatewayState, ModelInfo, ProfileProvider,
+    StaticProfiles, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_PORT,
+};
+use modelswarm_identity::InstallationIdentity;
+use modelswarm_runtime::llamacpp::{LlamaCppAdapter, LlamaCppConfig};
+use modelswarm_runtime::InferenceRuntime;
+use modelswarm_telemetry::{FileSink, Telemetry};
+use modelswarm_tracker_api::TrackerClient;
+
+/// Log file (JSONL, redacted) under `<data_dir>/logs/`.
+pub const LOG_RELATIVE_PATH: &str = "logs/node.jsonl";
+/// SQLite state file under `<data_dir>/`.
+pub const STATE_FILE_NAME: &str = "state.sqlite";
+/// Ed25519 seed file under `<data_dir>/` (SECRET; see the crate docs on the
+/// DPAPI/Credential Manager Phase F hardening).
+pub const SEED_FILE_NAME: &str = "identity.seed";
+/// Env var naming a loopback llama.cpp sidecar base URL (ADR-002), e.g.
+/// `http://127.0.0.1:8123`. The node does not spawn the sidecar (later
+/// phase); when set, `run` serves through it.
+pub const ENV_LLAMACPP_URL: &str = "MSP_LLAMACPP_URL";
+/// Env var carrying the sidecar's internal bearer secret (ADR-002). Required
+/// together with [`ENV_LLAMACPP_URL`]; the node never invents a secret.
+pub const ENV_LLAMACPP_TOKEN: &str = "MSP_LLAMACPP_TOKEN";
+
+/// Node startup configuration (see the crate docs for field semantics).
+#[derive(Debug, Clone)]
+pub struct NodeConfig {
+    /// Tracker base URL; when `None` the node is fully offline.
+    pub tracker_base: Option<String>,
+    /// Loopback gateway port; `0` asks the OS for an ephemeral port (tests).
+    pub gateway_port: u16,
+    /// Root directory for logs, state, and the identity seed.
+    pub data_dir: PathBuf,
+    /// The profile this installation hosts/serves (`msp1:…`); `None` serves
+    /// nothing (`GET /v1/models` lists empty).
+    pub profile_id: Option<String>,
+    /// Select the TEST-ONLY mock runtime (ADR-019). Honored only when
+    /// compiled with `cfg(test)` or the `node-selftest` feature; otherwise
+    /// [`Node::start`] fails with [`NodeError::MockRuntimeNotCompiled`].
+    pub mock: bool,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            tracker_base: None,
+            gateway_port: DEFAULT_PORT,
+            data_dir: default_data_dir(),
+            profile_id: None,
+            mock: false,
+        }
+    }
+}
+
+/// `%LOCALAPPDATA%\ModelSwarm` on Windows, `~/.modelswarm` elsewhere,
+/// `.modelswarm` when neither is resolvable.
+fn default_data_dir() -> PathBuf {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local).join("ModelSwarm");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".modelswarm");
+    }
+    PathBuf::from(".modelswarm")
+}
+
+/// Failures of node composition.
+#[derive(Debug, thiserror::Error)]
+pub enum NodeError {
+    /// Filesystem failure (data dir, log file, seed file).
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    /// SQLite/store failure.
+    #[error("store error: {0}")]
+    Store(#[from] modelswarm_store::StoreError),
+    /// Gateway bind/serve failure.
+    #[error("gateway error: {0}")]
+    Gateway(#[from] GatewayError),
+    /// `mock: true` was requested but the mock runtime is not compiled in
+    /// (ADR-019 compile gate).
+    #[error(
+        "mock runtime requested but not compiled in: rebuild with --features node-selftest \
+         (TEST-ONLY, ADR-019); production nodes never enable it"
+    )]
+    MockRuntimeNotCompiled,
+    /// A llama.cpp sidecar was half-configured via env vars.
+    #[error("llama.cpp sidecar misconfigured: {0} — set both {ENV_LLAMACPP_URL} and {ENV_LLAMACPP_TOKEN} or neither")]
+    LlamaSidecarMisconfigured(String),
+    /// The configured sidecar base URL is not loopback (ADR-002 / AGENTS.md 4).
+    #[error("llama.cpp sidecar base URL must be loopback (127.0.0.1), got: {0}")]
+    LlamaSidebackNotLoopback(String),
+}
+
+/// Composition entry point. `Node` is a namespace, not a running value: the
+/// returned [`NodeHandle`] is the running node.
+pub struct Node;
+
+impl Node {
+    /// Wires telemetry, store, identity, (optional) tracker client, runtime,
+    /// and the loopback gateway, then spawns the gateway server task.
+    ///
+    /// `shutdown` is the process-wide stop signal: the server exits
+    /// gracefully when it flips to `true` (or when every sender is dropped).
+    /// Makes no network calls of its own — the tracker client is only
+    /// constructed.
+    pub async fn start(
+        config: NodeConfig,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<NodeHandle, NodeError> {
+        std::fs::create_dir_all(&config.data_dir)?;
+        let logs_dir = config.data_dir.join("logs");
+        std::fs::create_dir_all(&logs_dir)?;
+
+        // Telemetry first: everything after this can be logged.
+        let sink = FileSink::open(&logs_dir.join("node.jsonl"))?;
+        let telemetry = Arc::new(Telemetry::with_sink(Box::new(sink)));
+
+        // Store (ADR-017) — privacy-shaped schema, migrations applied.
+        let store = modelswarm_store::Store::open(config.data_dir.join(STATE_FILE_NAME))?;
+        telemetry.info("store.opened", &[("file", STATE_FILE_NAME)]);
+
+        // Identity (ADR-004) — load-or-create; seed file, never logged.
+        let identity = Arc::new(load_or_create_identity(&config.data_dir, &telemetry)?);
+        let installation_id = identity.installation_id();
+        store.upsert_installation(&installation_id, &identity.public_key_bytes())?;
+        telemetry.info(
+            "identity.ready",
+            &[("installation_id", &installation_id), ("key", "ed25519")],
+        );
+
+        // Runtime selection (ADR-019).
+        let runtime = select_runtime(&config, &telemetry)?;
+        if let Some(runtime) = &runtime {
+            let descriptor = runtime.id();
+            telemetry.info(
+                "runtime.selected",
+                &[
+                    ("name", descriptor.name()),
+                    ("version", descriptor.version()),
+                    ("build_hash", descriptor.build_hash()),
+                ],
+            );
+        } else {
+            telemetry.info(
+                "runtime.unavailable",
+                &[(
+                    "reason",
+                    "no llama.cpp sidecar configured; gateway will answer no_peer until one is",
+                )],
+            );
+        }
+
+        // Tracker client (constructed only; no calls — see crate docs).
+        let tracker = config
+            .tracker_base
+            .as_deref()
+            .map(|base| Arc::new(TrackerClient::new(base, Arc::clone(&identity))));
+        if config.mock && tracker.is_some() {
+            telemetry.warn(
+                "tracker.mock_mode",
+                &[(
+                    "policy",
+                    "mock node will never register or serve remote peers (ADR-019)",
+                )],
+            );
+        }
+        if let Some(base) = &config.tracker_base {
+            telemetry.info("tracker.configured", &[("base", base.as_str())]);
+        }
+
+        // Gateway wiring.
+        let executor = Arc::new(SingleLocalExecutor::new(runtime, config.profile_id.clone()));
+        let profiles: Arc<dyn ProfileProvider> = match &config.profile_id {
+            Some(profile) => Arc::new(StaticProfiles::new(vec![ModelInfo {
+                id: profile.clone(),
+                max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            }])),
+            None => Arc::new(StaticProfiles::new(Vec::new())),
+        };
+        let state = GatewayState::new(executor, profiles);
+
+        // Loopback bind — structural, re-asserted (tested).
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.gateway_port);
+        assert_loopback(addr.ip())?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+
+        let mut shutdown_rx = shutdown;
+        let server_telemetry = Arc::clone(&telemetry);
+        let server = tokio::spawn(async move {
+            let app = build_router(state);
+            let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+                loop {
+                    if shutdown_rx.changed().await.is_err() {
+                        break; // all senders dropped → stop
+                    }
+                    if *shutdown_rx.borrow_and_update() {
+                        break;
+                    }
+                }
+            });
+            if let Err(error) = serve.await {
+                server_telemetry.error("gateway.failed", &[("error", &error.to_string())]);
+            }
+        });
+
+        telemetry.metrics.incr("node.starts");
+        telemetry.info(
+            "node.started",
+            &[
+                ("installation_id", &installation_id),
+                ("gateway_addr", &local_addr.to_string()),
+                (
+                    "profile_id",
+                    config.profile_id.as_deref().unwrap_or("(none)"),
+                ),
+                ("mock", &config.mock.to_string()),
+                ("tracker", &(config.tracker_base.is_some()).to_string()),
+            ],
+        );
+
+        Ok(NodeHandle {
+            local_addr,
+            installation_id,
+            profile_id: config.profile_id,
+            mock: config.mock,
+            data_dir: config.data_dir,
+            tracker,
+            server,
+        })
+    }
+}
+
+/// A running node composition.
+pub struct NodeHandle {
+    /// The bound gateway address (always loopback; asserted at bind).
+    pub local_addr: SocketAddr,
+    /// `installationId` (base58(SHA-256(pubkey))) — public label only.
+    pub installation_id: String,
+    /// The configured profile id, if any.
+    pub profile_id: Option<String>,
+    /// Whether the TEST-ONLY mock runtime is active (ADR-019 labeling).
+    pub mock: bool,
+    /// The node's data directory (logs, state, seed live under it).
+    pub data_dir: PathBuf,
+    /// The tracker client, when `tracker_base` was configured. Carries NO
+    /// secret material in its public surface; the identity seed stays in the
+    /// node process.
+    pub tracker: Option<Arc<TrackerClient>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl NodeHandle {
+    /// Resolves when the gateway server task has exited (graceful shutdown
+    /// completed or the task failed). Consumes the handle (the server task
+    /// is joined exactly once).
+    pub async fn stopped(self) {
+        let _ = self.server.await;
+    }
+}
+
+/// Picks the runtime per ADR-019:
+///
+/// - `mock` → `MockRuntime`, **only** when compiled under `cfg(test)` or the
+///   `node-selftest` feature; otherwise a loud [`NodeError`]. When active the
+///   selection prints a stderr banner and logs a warning: the mock runtime is
+///   TEST-ONLY and local-loopback-only — it never serves remote peers (the
+///   node wires no transport listener and no registration path).
+/// - otherwise → `LlamaCppAdapter` over the loopback sidecar named by
+///   [`ENV_LLAMACPP_URL`]/[`ENV_LLAMACPP_TOKEN`], or `None` (honest
+///   runtime-less node; the gateway answers `no_peer`).
+fn select_runtime(
+    config: &NodeConfig,
+    telemetry: &Telemetry,
+) -> Result<Option<Arc<dyn InferenceRuntime>>, NodeError> {
+    if config.mock {
+        #[cfg(any(test, feature = "node-selftest"))]
+        {
+            const BANNER: &str = "\n\
+                *****************************************************************\n\
+                *  WARNING: MOCK RUNTIME ACTIVE (TEST-ONLY, ADR-019)            *\n\
+                *  This node serves synthetic output ONLY on loopback.          *\n\
+                *  It refuses to serve prompts to remote peers and never joins   *\n\
+                *  any swarm roster. Do not use for real inference.              *\n\
+                *****************************************************************";
+            eprintln!("{BANNER}");
+            telemetry.warn(
+                "runtime.mock_active",
+                &[
+                    (
+                        "policy",
+                        "ADR-019: TEST-ONLY, excluded from any product claim",
+                    ),
+                    ("scope", "local-loopback-only; no remote serving"),
+                ],
+            );
+            return Ok(Some(Arc::new(modelswarm_runtime::MockRuntime::new(
+                0x5EED_0000_0000_0001,
+                1.0,
+            ))));
+        }
+        #[cfg(not(any(test, feature = "node-selftest")))]
+        {
+            let _ = telemetry;
+            return Err(NodeError::MockRuntimeNotCompiled);
+        }
+    }
+
+    let url = std::env::var(ENV_LLAMACPP_URL);
+    let token = std::env::var(ENV_LLAMACPP_TOKEN);
+    match (url, token) {
+        (Ok(url), Ok(token)) => {
+            if !is_loopback_url(&url) {
+                return Err(NodeError::LlamaSidebackNotLoopback(url));
+            }
+            let adapter = LlamaCppAdapter::new(LlamaCppConfig::new(url, token))
+                .map_err(|e| NodeError::LlamaSidecarMisconfigured(e.to_string()))?;
+            Ok(Some(Arc::new(adapter)))
+        }
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => Err(NodeError::LlamaSidecarMisconfigured(
+            "exactly one of the sidecar env vars is set".to_string(),
+        )),
+        (Err(_), Err(_)) => Ok(None),
+    }
+}
+
+/// Accepts only `http://127.0.0.1…` or `http://localhost…` (ADR-002 loopback).
+fn is_loopback_url(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("http://127.0.0.1")
+        .or_else(|| url.strip_prefix("http://localhost"));
+    match rest {
+        Some(suffix) => suffix.is_empty() || suffix.starts_with(':') || suffix.starts_with('/'),
+        None => false,
+    }
+}
+
+/// Loads `<data_dir>/identity.seed` (exactly 32 bytes) or generates a fresh
+/// identity and persists it. Never logs the seed; logs only load-vs-create.
+fn load_or_create_identity(
+    data_dir: &Path,
+    telemetry: &Telemetry,
+) -> Result<InstallationIdentity, NodeError> {
+    let seed_path = data_dir.join(SEED_FILE_NAME);
+    match std::fs::read(&seed_path) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            telemetry.info("identity.loaded", &[("file", SEED_FILE_NAME)]);
+            Ok(InstallationIdentity::from_bytes(&seed))
+        }
+        Ok(wrong_len) => {
+            // Corrupt seed: refuse rather than silently replace an identity
+            // the user may care about (lost key = re-enroll, ADR-004).
+            Err(NodeError::Io(std::io::Error::other(format!(
+                "{} has {} bytes; expected exactly 32 — move it aside to re-enroll",
+                seed_path.display(),
+                wrong_len.len()
+            ))))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let identity = InstallationIdentity::generate();
+            persist_seed(&seed_path, &identity.to_bytes())?;
+            telemetry.info("identity.created", &[("file", SEED_FILE_NAME)]);
+            Ok(identity)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Persists the seed with owner-only permissions where the platform has them.
+///
+/// Windows honesty (recorded in `docs/verification/phase-g-notes.md`): NTFS
+/// has no POSIX mode bits; this write relies on the user-profile directory
+/// ACL. The ADR-004 destination — DPAPI (`CryptProtectData`) or Windows
+/// Credential Manager — is the recorded Phase F hardening replacement.
+fn persist_seed(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
+    std::fs::write(path, seed)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use modelswarm_gateway::GatewayError;
+
+    fn config(data_dir: &Path) -> NodeConfig {
+        NodeConfig {
+            gateway_port: 0, // ephemeral: parallel tests must not share 11435
+            data_dir: data_dir.to_path_buf(),
+            ..NodeConfig::default()
+        }
+    }
+
+    async fn start_stopped_node(cfg: NodeConfig) -> (NodeHandle, tokio::sync::watch::Sender<bool>) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = Node::start(cfg, rx).await.expect("node starts");
+        (handle, tx)
+    }
+
+    #[test]
+    fn default_config_shape() {
+        let cfg = NodeConfig::default();
+        assert_eq!(cfg.gateway_port, DEFAULT_PORT);
+        assert!(!cfg.mock);
+        assert!(cfg.tracker_base.is_none());
+        assert!(cfg.profile_id.is_none());
+        assert!(cfg.data_dir.ends_with("ModelSwarm") || cfg.data_dir.ends_with(".modelswarm"));
+    }
+
+    #[test]
+    fn loopback_url_guard() {
+        assert!(is_loopback_url("http://127.0.0.1:8123"));
+        assert!(is_loopback_url("http://localhost:8123"));
+        assert!(is_loopback_url("http://127.0.0.1"));
+        assert!(!is_loopback_url("http://0.0.0.0:8123"));
+        assert!(!is_loopback_url("http://192.168.1.5:8123"));
+        assert!(!is_loopback_url("https://127.0.0.1:8123"));
+        assert!(!is_loopback_url("http://127.0.0.1.evil.test:8123"));
+    }
+
+    #[tokio::test]
+    async fn gateway_binds_loopback_only_and_refuses_non_loopback() {
+        // The guard itself refuses external addresses.
+        for refused in ["0.0.0.0", "192.168.1.5", "8.8.8.8", "::"] {
+            let ip: IpAddr = refused.parse().unwrap();
+            assert!(
+                matches!(assert_loopback(ip), Err(GatewayError::NotLoopback(_))),
+                "{refused} must be refused"
+            );
+        }
+        // And a spawned node is structurally loopback: the node builds the
+        // socket address itself; the config only carries a port.
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, tx) = start_stopped_node(config(dir.path())).await;
+        assert!(handle.local_addr.ip().is_loopback());
+        assert_eq!(handle.local_addr.ip().to_string(), "127.0.0.1");
+        tx.send(true).unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn identity_survives_restart_and_is_recorded_in_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, tx) = start_stopped_node(config(dir.path())).await;
+        let first = handle.installation_id.clone();
+        tx.send(true).unwrap();
+        handle.stopped().await;
+
+        let (handle, tx) = start_stopped_node(config(dir.path())).await;
+        assert_eq!(
+            handle.installation_id, first,
+            "identity must persist across restarts"
+        );
+        tx.send(true).unwrap();
+        handle.stopped().await;
+
+        // Seed file: present, exactly 32 bytes.
+        let seed = std::fs::read(dir.path().join(SEED_FILE_NAME)).unwrap();
+        assert_eq!(seed.len(), 32);
+
+        // Store recorded the installation row.
+        let conn = rusqlite::Connection::open(dir.path().join(STATE_FILE_NAME)).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM installations WHERE id = ?1",
+                rusqlite::params![first],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_seed_is_refused_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join(SEED_FILE_NAME), b"short").unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let error = match Node::start(config(dir.path()), rx).await {
+            Ok(_) => panic!("a corrupt seed file must be refused, not replaced"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, NodeError::Io(_)), "got: {error:?}");
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn self_test_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = selftest::run(dir.path(), 0)
+            .await
+            .expect("self-test passes");
+        assert!(report.tokens > 0, "some SSE tokens must arrive");
+        assert!(report.redacted_logs);
+        assert!(handle_redaction_canary_absent(dir.path()));
+
+        // Identity persisted (32-byte seed) + store opened by the node.
+        let seed = std::fs::read(dir.path().join(SEED_FILE_NAME)).unwrap();
+        assert_eq!(seed.len(), 32);
+        assert!(dir.path().join(STATE_FILE_NAME).exists());
+
+        assert_privacy_columns(dir.path().join(STATE_FILE_NAME));
+    }
+
+    /// Re-reads the node's own log file and asserts the canary is absent —
+    /// the redaction gate checked independently of the report object.
+    fn handle_redaction_canary_absent(data_dir: &Path) -> bool {
+        let logs = std::fs::read_to_string(data_dir.join(LOG_RELATIVE_PATH)).unwrap();
+        !logs.contains(selftest::CANARY)
+    }
+
+    /// The store the node created has no privacy-forbidden column names in
+    /// ANY table (mirrors the store crate's own schema audit, run against the
+    /// file this node actually opened).
+    fn assert_privacy_columns(db: PathBuf) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!tables.is_empty(), "migrations must have created tables");
+        const FORBIDDEN: &[&str] = &[
+            "prompt",
+            "completion",
+            "message",
+            "content",
+            "conversation",
+            "secret",
+            "token",
+            "api_key",
+            "password",
+            "private",
+        ];
+        for table in &tables {
+            let columns: Vec<String> = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for column in columns {
+                let lower = column.to_ascii_lowercase();
+                for forbidden in FORBIDDEN {
+                    assert!(
+                        !lower.contains(forbidden),
+                        "privacy-forbidden column {column:?} in table {table:?}"
+                    );
+                }
+            }
+        }
+    }
+}

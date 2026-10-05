@@ -7,8 +7,34 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Self-test path (ADR-019): turns on the TEST-ONLY mock runtime and the
+# `self-test` CLI subcommand. OFF by default — production node builds never
+# enable the mock runtime. `cargo test -p modelswarm-node` gets the same
+# feature through the dev-dependency below, so the self-test unit test runs
+# without extra flags.
+node-selftest = ["modelswarm-runtime/mock-runtime"]
+
 [dependencies]
+async-trait = "0.1"
+axum = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+modelswarm-gateway = { path = "../modelswarm-gateway" }
+modelswarm-identity = { path = "../modelswarm-identity" }
+modelswarm-runtime = { path = "../modelswarm-runtime" }
+modelswarm-store = { path = "../modelswarm-store" }
+modelswarm-telemetry = { path = "../modelswarm-telemetry" }
+modelswarm-tracker-api = { path = "../modelswarm-tracker-api" }
 modelswarm-types = { path = "../modelswarm-types" }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+modelswarm-runtime = { path = "../modelswarm-runtime", features = ["mock-runtime"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
 
 [lints]
 workspace = true

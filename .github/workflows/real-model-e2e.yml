@@ -1,0 +1,31 @@
+# Phase H5: env-gated real-model E2E (manual only — downloads 470MB from HF).
+# Re-runs the cross-language GGUF parity test and the real-engine smoke gate
+# against the pinned llama.cpp b11407 + Qwen2.5-0.5B Q4_K_M on a clean runner.
+name: real-model-e2e
+on: workflow_dispatch: {}
+jobs:
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download model + engine
+        shell: bash
+        run: |
+          curl -sSL --retry 5 -o model.gguf \
+            "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+          echo "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db  model.gguf" | sha256sum -c -
+          mkdir -p engine && curl -sSL -o engine.zip \
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-win-cpu-x64.zip"
+          echo "353c4aab423bff5cb6dc0e1d32e41a447990ab3d69a411b7f58ff48187c91a03  engine.zip" | sha256sum -c -
+          unzip -j -q engine.zip -d engine llama-server.exe llama-server-impl.dll llama-common.dll llama.dll ggml.dll ggml-base.dll ggml-cpu-*.dll libomp.dll mtmd.dll
+      - name: GGUF identity-hash parity (manifest vs re-derivation)
+        env: { MSP_REAL_GGUF: model.gguf }
+        run: cargo test -p modelswarm-types real_artifact -- --ignored --nocapture
+      - name: Real-engine smoke (determinism, exact ids, measured rate)
+        env:
+          MSP_REAL_GGUF: model.gguf
+          MSP_LLAMA_SERVER: engine/llama-server.exe
+        run: cargo test -p modelswarm-node real_engine -- --ignored --nocapture

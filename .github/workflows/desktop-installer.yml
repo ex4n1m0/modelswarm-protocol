@@ -1,6 +1,8 @@
 # Phase I3: one release, all OSes together (owner directive 2026-10-05).
 # Every change bumps tauri.conf.json version AND builds Windows + Linux +
-# macOS in the same run. The pinned llama.cpp engine (runtime-pins.json,
+# macOS in the same run. (Intel-mac dropped: GitHub retired the macos-13
+# runners — the macos-x64 engine pins remain in runtime-pins.json for when
+# a cross-compile target is wired up.) The pinned llama.cpp engine (runtime-pins.json,
 # platforms{}) is hash-verified per OS before bundling; model weights are
 # NEVER bundled (first-run download per ADR-008).
 name: desktop-installer
@@ -31,11 +33,6 @@ jobs:
             bundles: dmg
             archive: https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-macos-arm64.tar.gz
             archive_sha: 23dc51ce360ffaf0753cb3257b4020b9d7d9da2215198a81ce187d29aa7801f7
-          - os: macos-13
-            platform: macos-x64
-            bundles: dmg
-            archive: https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-macos-x64.tar.gz
-            archive_sha: b39cc89a605373dcf7a429b12edf4361c3b385d2f908587891e8ba7c84b12d49
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:

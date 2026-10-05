@@ -1,12 +1,15 @@
+const DOWNLOADS = [
+  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.0-windows-x64.exe", size: "14 MB" },
+  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.0-linux-amd64.deb", size: "34 MB" },
+  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.0-linux-amd64.AppImage", size: "101 MB" },
+  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.0-macos-arm64.dmg", size: "34 MB" },
+];
 const DOWNLOAD = {
-  file: "ModelSwarm-Setup-0.1.0-internal-test-unsigned.exe",
-  url: "/downloads/ModelSwarm-Setup-0.1.0-internal-test-unsigned.exe",
-  sums: "/downloads/ModelSwarm-Setup-SHA256SUMS.txt",
-  version: "0.1.0 (desktop app + engine)",
-  commit: "Phase H",
-  size: "13.2 MB",
-  sha256: "7ead2a5020214e87ba55c65da212270cd3bb8d2249e5fd0bbf397148f64a7628",
+  version: "0.2.0",
+  sums: "/downloads/SHA256SUMS.txt",
+  sha256: "44c9f7e8a67d928a3ebfaf78f86ea78aace4961e3362a67e47cf6c80853493b6",
 };
+
 
 const ENDPOINTS: Array<{ method: string; path: string; note: string }> = [
   { method: "GET", path: "/api/v1/health", note: "liveness + protocol version" },
@@ -103,38 +106,31 @@ export default function Home() {
 
       <div className="wrap">
         <section aria-labelledby="download-heading">
-          <h2 id="download-heading">Download the client</h2>
+          <h2 id="download-heading">Download the client — v{DOWNLOAD.version}, all platforms released together</h2>
           <div className="card">
             <div className="dl">
               <div>
-                <h3>ModelSwarm Desktop — Windows x64 installer</h3>
+                <h3>ModelSwarm Desktop — {DOWNLOAD.version} (internal test)</h3>
                 <p className="meta">
-                  v{DOWNLOAD.version} · build {DOWNLOAD.commit} · {DOWNLOAD.size} ·
-                  windowed app hosting Qwen2.5-0.5B (Q4_K_M): first-run model download
-                  with SHA-256 verification, sharing toggle, chat. The model (~470 MB)
-                  downloads from HuggingFace on first launch — never bundled
+                  windowed app hosting one of three model profiles: model-picker first page,
+                  download-or-load on selection, swarm starts, local OpenAI-compatible API +
+                  test box. The model downloads from HuggingFace on first use — never bundled.
                 </p>
               </div>
               <div>
-                <a
-                  className="btn"
-                  href={DOWNLOAD.url}
-                  download={DOWNLOAD.file}
-                  aria-label={`Download ModelSwarm Node version ${DOWNLOAD.version} for Windows x64`}
-                >
-                  Download installer
-                </a>
-                <a className="btn ghost" href={DOWNLOAD.sums} download="SHA256SUMS.txt">
-                  checksums
-                </a>
+                {DOWNLOADS.map((d) => (
+                  <a className="btn ghost" style={{ marginRight: 8, marginBottom: 6, display: "inline-block" }} href={"/downloads/" + d.file} download={d.file} aria-label={"Download ModelSwarm " + DOWNLOAD.version + " for " + d.os}>
+                    {d.os}
+                  </a>
+                ))}
+                <a className="btn ghost" href={DOWNLOAD.sums} download="SHA256SUMS.txt">checksums</a>
               </div>
             </div>
-            <p className="sum">sha256&nbsp; {DOWNLOAD.sha256}</p>
+            <p className="sum">windows sha256&nbsp; {DOWNLOAD.sha256}</p>
             <div className="warn" role="note">
-              INTERNAL TEST BUILD — UNSIGNED. Windows SmartScreen will warn about an
-              unverified publisher; choose “More info → Run anyway” only after verifying
-              the SHA-256 above. Cooperative modes in this build are test-labeled and
-              make no performance claims (ADR-019).
+              INTERNAL TEST BUILD — UNSIGNED. Verify the SHA-256 above before running; expect
+              OS warnings (SmartScreen / Gatekeeper) for an unverified publisher. Same version
+              number on every OS = same build.
             </div>
           </div>
         </section>

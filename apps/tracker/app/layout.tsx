@@ -2,8 +2,9 @@ import type { Metadata } from "next";
 import type { ReactNode } from "react";
 
 export const metadata: Metadata = {
-  title: "ModelSwarm Hub",
-  description: "Control plane for the ModelSwarm protocol. Never carries prompts or model files.",
+  title: "ModelSwarm — Decentralized Cooperative Inference",
+  description:
+    "Network-aware micro-swarms of peers hosting the same immutable model profile. Lossless cooperative inference with fastest-host fallback. Download the Windows client.",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

@@ -1538,6 +1538,10 @@ pub async fn speculate(
     let mut consecutive_full: u32 = 0;
     let mut rejection_streak: u32 = 0;
     let mut rtt_streak: u32 = 0;
+    // Warm-up round wall times (ms): calibrates the RTT-spike baseline to
+    // THIS machine's real speed so a uniformly slow runner (CI) does not
+    // trip the detector on healthy acceptance (Phase-F CI incident).
+    let mut warmup_round_ms: Vec<f64> = Vec::new();
     let mut rate_history: VecDeque<(u64, u64)> = VecDeque::new();
     let mut fallback: Option<FallbackReason> = None;
     let mut proposer_alive = true;
@@ -1722,19 +1726,27 @@ pub async fn speculate(
         }
         if decode_tps > 0.0 && rate_history.len() >= fallback_policy.rate_window_rounds {
             // Sustained synchronization overrun, not a single scheduling
-            // hiccup: the round must cost more than the multiplier × the
-            // single-decode estimate on two consecutive rounds after the
-            // warm-up window (ADR-013: measured synchronization crossing the
-            // predicted budget).
-            let estimate_ms = committed_round.len() as f64 / decode_tps;
+            // hiccup (ADR-013: measured synchronization crossing the
+            // predicted budget). Baseline = max(synthetic estimate, the
+            // median of THIS session's warm-up round wall times) so a
+            // uniformly slow machine (CI runners) calibrates a slow
+            // baseline instead of tripping on healthy acceptance.
             let round_ms = round_started.elapsed().as_secs_f64() * 1_000.0;
-            if round_ms > fallback_policy.rtt_multiplier * estimate_ms {
-                rtt_streak += 1;
-                if rtt_streak >= RTT_SPIKE_STREAK {
-                    fallback = Some(FallbackReason::RttSpike);
-                }
+            if warmup_round_ms.len() < fallback_policy.rate_window_rounds {
+                warmup_round_ms.push(round_ms);
             } else {
-                rtt_streak = 0;
+                let mut calibration = warmup_round_ms.clone();
+                calibration.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let calibrated_ms = calibration[calibration.len() / 2];
+                let estimate_ms = (committed_round.len() as f64 / decode_tps).max(calibrated_ms);
+                if round_ms > fallback_policy.rtt_multiplier * estimate_ms {
+                    rtt_streak += 1;
+                    if rtt_streak >= RTT_SPIKE_STREAK {
+                        fallback = Some(FallbackReason::RttSpike);
+                    }
+                } else {
+                    rtt_streak = 0;
+                }
             }
         }
     }
@@ -2273,6 +2285,10 @@ pub async fn speculate_multi(
     let mut consecutive_full: u32 = 0;
     let mut rejection_streak: u32 = 0;
     let mut rtt_streak: u32 = 0;
+    // Warm-up round wall times (ms): calibrates the RTT-spike baseline to
+    // THIS machine's real speed so a uniformly slow runner (CI) does not
+    // trip the detector on healthy acceptance (Phase-F CI incident).
+    let mut warmup_round_ms: Vec<f64> = Vec::new();
     let mut rate_history: VecDeque<(u64, u64)> = VecDeque::new();
     let mut fallback: Option<FallbackReason> = None;
     let decode_tps = runtime_client.metrics().decode_tokens_per_ms;
@@ -2541,9 +2557,17 @@ pub async fn speculate_multi(
                 fallback = Some(FallbackReason::AcceptanceCollapse);
             }
         }
-        if decode_tps > 0.0 && rate_history.len() >= fallback_policy.rate_window_rounds {
-            let estimate_ms = committed_round.len() as f64 / decode_tps;
-            let round_ms = round_started.elapsed().as_secs_f64() * 1_000.0;
+        let round_ms = round_started.elapsed().as_secs_f64() * 1_000.0;
+        if warmup_round_ms.len() < fallback_policy.rate_window_rounds {
+            // Warm-up: record this machine's real round cost.
+            warmup_round_ms.push(round_ms);
+        } else if decode_tps > 0.0 {
+            // Baseline: max(synthetic estimate, median of this session's
+            // warm-up rounds) — environment-adaptive (Phase-F CI incident).
+            let mut calibration = warmup_round_ms.clone();
+            calibration.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let calibrated_ms = calibration[calibration.len() / 2];
+            let estimate_ms = (committed_round.len() as f64 / decode_tps).max(calibrated_ms);
             if round_ms > fallback_policy.rtt_multiplier * estimate_ms {
                 rtt_streak += 1;
                 if rtt_streak >= RTT_SPIKE_STREAK {

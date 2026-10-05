@@ -26,7 +26,7 @@ modelswarm-store = { path = "../modelswarm-store" }
 modelswarm-telemetry = { path = "../modelswarm-telemetry" }
 modelswarm-tracker-api = { path = "../modelswarm-tracker-api" }
 modelswarm-types = { path = "../modelswarm-types" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 sha2 = "0.10"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }

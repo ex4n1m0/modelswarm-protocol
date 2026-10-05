@@ -7,9 +7,13 @@
 //! here without an ADR.
 
 pub mod canonical;
+pub mod gguf;
 pub mod manifest;
 
 pub use canonical::{canonical_json, CanonicalError};
+pub use gguf::{
+    identity_hashes, read_metadata, read_metadata_bytes, GgufError, GgufIdentityHashes, GgufValue,
+};
 pub use manifest::{
     ArtifactHash, ManifestError, ModelProfileManifest, QuantizationDescriptor, RuntimeDescriptor,
     SpecCapability, MANIFEST_SCHEMA_VERSION, PROFILE_ID_PREFIX,

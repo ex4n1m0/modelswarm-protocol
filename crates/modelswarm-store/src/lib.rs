@@ -48,9 +48,10 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// Embedded migrations, applied in order by schema version
 /// (`PRAGMA user_version`). Append-only: never edit an applied entry, only
 /// add `(next_version, sql)` at the end.
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        r#"
 CREATE TABLE IF NOT EXISTS installations (
     id         TEXT PRIMARY KEY,
     pub_key    BLOB NOT NULL,
@@ -82,7 +83,21 @@ CREATE TABLE IF NOT EXISTS job_accounting (
     usage_digest TEXT NOT NULL
 );
 "#,
-)];
+    ),
+    (
+        2,
+        r#"
+CREATE TABLE IF NOT EXISTS artifacts (
+    profile_id  TEXT PRIMARY KEY,
+    path        TEXT NOT NULL,
+    sha256      TEXT NOT NULL,
+    bytes       INTEGER NOT NULL,
+    state       TEXT NOT NULL,
+    verified_at TEXT NOT NULL
+);
+"#,
+    ),
+];
 
 /// The SQLite-backed node-local store.
 pub struct Store {
@@ -195,6 +210,46 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM job_accounting", [], |row| row.get(0))?;
         Ok(count)
+    }
+
+    /// Records a verified model artifact (idempotent per profile; the latest
+    /// verification wins). Columns mirror the Phase H artifact subsystem.
+    pub fn record_artifact(
+        &self,
+        profile_id: &str,
+        path: &str,
+        sha256: &str,
+        bytes: i64,
+        state: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO artifacts
+                 (profile_id, path, sha256, bytes, state, verified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![profile_id, path, sha256, bytes, state, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// The recorded artifact row for a profile, if any, as
+    /// `(path, sha256, bytes, state)`.
+    pub fn get_artifact(&self, profile_id: &str) -> Result<Option<(String, String, i64, String)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT path, sha256, bytes, state FROM artifacts WHERE profile_id = ?1",
+                rusqlite::params![profile_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 }
 

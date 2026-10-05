@@ -26,10 +26,12 @@ modelswarm-store = { path = "../modelswarm-store" }
 modelswarm-telemetry = { path = "../modelswarm-telemetry" }
 modelswarm-tracker-api = { path = "../modelswarm-tracker-api" }
 modelswarm-types = { path = "../modelswarm-types" }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+sha2 = "0.10"
+hex = "0.4"
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
 modelswarm-runtime = { path = "../modelswarm-runtime", features = ["mock-runtime"] }

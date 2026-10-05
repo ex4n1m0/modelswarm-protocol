@@ -10,8 +10,9 @@
 //! Phase B scope: transport + signing + core peer lifecycle. Rendezvous
 //! mailbox helpers arrive with the Phase D/F wiring that uses them.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+use base64::engine::general_purpose::{STANDARD as B64STD, URL_SAFE_NO_PAD as B64URL};
 use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use modelswarm_identity::{InstallationIdentity, SignedEnvelope};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -130,6 +131,18 @@ impl TrackerClient {
     /// (hub pubkey pinning policy per ADR-011).
     pub async fn fetch_catalog(&self) -> Result<serde_json::Value, TrackerError> {
         self.get_json(&format!("{API_PREFIX}/catalog"), None).await
+    }
+
+    /// GET /catalog + Ed25519 signature verification against a pinned hub
+    /// public key (64 lowercase hex, e.g. `protocol/keys/hub-public.hex`).
+    /// Returns only after the detached signature over the canonical payload
+    /// verifies (msp-v1 §4; ADR-011 pinning policy).
+    pub async fn fetch_catalog_verified(
+        &self,
+        hub_pubkey_hex: &str,
+    ) -> Result<VerifiedCatalog, TrackerError> {
+        let value = self.fetch_catalog().await?;
+        verify_catalog_envelope(&value, hub_pubkey_hex)
     }
 
     /// POST /peers/register (signed).
@@ -387,6 +400,70 @@ fn serde_decode<T: DeserializeOwned>(v: serde_json::Value) -> Result<T, TrackerE
     serde_json::from_value(v).map_err(|e| TrackerError::InvalidResponse(e.to_string()))
 }
 
+/// A signature-verified catalog (msp-v1 §4 envelope, ADR-011 pinning).
+#[derive(Debug, Clone)]
+pub struct VerifiedCatalog {
+    pub catalog_version: u64,
+    pub generated_at: String,
+    /// ProfileRecords in schema-v2 wire form; `manifest` inside each is
+    /// parseable as `modelswarm_types::ModelProfileManifest`.
+    pub profiles: Vec<serde_json::Value>,
+}
+
+/// Verifies a fetched `/catalog` envelope: rebuilds
+/// `{catalogVersion, generatedAt, profiles}` canonically from the parsed
+/// body and checks the detached standard-base64 Ed25519 signature against
+/// the pinned hub public key. Any tampering or missing field fails closed.
+pub fn verify_catalog_envelope(
+    value: &serde_json::Value,
+    hub_pubkey_hex: &str,
+) -> Result<VerifiedCatalog, TrackerError> {
+    let invalid = |what: &str| TrackerError::InvalidResponse(what.to_string());
+
+    let signature_b64 = value
+        .get("signature")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| invalid("catalog envelope missing signature"))?;
+    let payload = serde_json::json!({
+        "catalogVersion": value.get("catalogVersion").ok_or_else(|| invalid("missing catalogVersion"))?,
+        "generatedAt": value.get("generatedAt").ok_or_else(|| invalid("missing generatedAt"))?,
+        "profiles": value.get("profiles").ok_or_else(|| invalid("missing profiles"))?,
+    });
+    let canonical = modelswarm_identity::canonical_json(&payload)
+        .ok_or_else(|| invalid("canonical serialization rejected a value"))?;
+
+    let pubkey_bytes =
+        hex::decode(hub_pubkey_hex.trim()).map_err(|e| invalid(&format!("hub pubkey hex: {e}")))?;
+    let pubkey_bytes: [u8; 32] = pubkey_bytes
+        .try_into()
+        .map_err(|_| invalid("hub pubkey must be 32 bytes"))?;
+    let verifying = VerifyingKey::from_bytes(&pubkey_bytes)
+        .map_err(|e| invalid(&format!("hub pubkey: {e}")))?;
+    let signature_bytes = B64STD
+        .decode(signature_b64)
+        .map_err(|e| invalid(&format!("signature base64: {e}")))?;
+    let signature_bytes: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| invalid("signature must be 64 bytes"))?;
+    verifying
+        .verify(canonical.as_bytes(), &Signature::from(signature_bytes))
+        .map_err(|_| invalid("catalog signature verification FAILED"))?;
+
+    Ok(VerifiedCatalog {
+        catalog_version: payload["catalogVersion"]
+            .as_u64()
+            .ok_or_else(|| invalid("catalogVersion not a number"))?,
+        generated_at: payload["generatedAt"]
+            .as_str()
+            .ok_or_else(|| invalid("generatedAt not a string"))?
+            .to_string(),
+        profiles: payload["profiles"]
+            .as_array()
+            .ok_or_else(|| invalid("profiles not an array"))?
+            .clone(),
+    })
+}
+
 /// Parses a `base64url(json).base64url(sig)` lease token into its JSON
 /// payload (signature verification happens in modelswarm-eligibility).
 pub fn split_lease_token(token: &str) -> Result<serde_json::Value, TrackerError> {
@@ -402,6 +479,7 @@ pub fn split_lease_token(token: &str) -> Result<serde_json::Value, TrackerError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
     fn lease_token_roundtrip() {
@@ -413,5 +491,59 @@ mod tests {
         );
         assert_eq!(split_lease_token(&token).unwrap(), json);
         assert!(split_lease_token("no-dot").is_err());
+    }
+
+    fn signed_envelope(profiles: serde_json::Value) -> (serde_json::Value, SigningKey) {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let payload = serde_json::json!({
+            "catalogVersion": 3,
+            "generatedAt": "2026-10-05T00:00:00Z",
+            "profiles": profiles,
+        });
+        let canonical = modelswarm_identity::canonical_json(&payload).unwrap();
+        let signature = B64STD.encode(key.sign(canonical.as_bytes()).to_bytes());
+        let mut envelope = payload.clone();
+        envelope["signature"] = serde_json::json!(signature);
+        (envelope, key)
+    }
+
+    #[test]
+    fn catalog_envelope_verifies() {
+        let profiles = serde_json::json!([
+            { "profile_id": "msp1:aa", "display_name": "Test", "status": "active",
+              "manifest": { "schema_version": 2 } }
+        ]);
+        let (envelope, key) = signed_envelope(profiles);
+        let verified =
+            verify_catalog_envelope(&envelope, &hex::encode(key.verifying_key().as_bytes()))
+                .expect("verify");
+        assert_eq!(verified.catalog_version, 3);
+        assert_eq!(verified.profiles.len(), 1);
+    }
+
+    #[test]
+    fn catalog_envelope_rejects_tampering_and_wrong_key() {
+        let profiles = serde_json::json!([]);
+        let (envelope, key) = signed_envelope(profiles);
+        let good_hex = hex::encode(key.verifying_key().as_bytes());
+        assert!(verify_catalog_envelope(&envelope, &good_hex).is_ok());
+
+        // Wrong key.
+        let other = SigningKey::from_bytes(&[8u8; 32]);
+        assert!(
+            verify_catalog_envelope(&envelope, &hex::encode(other.verifying_key().as_bytes()))
+                .is_err()
+        );
+
+        // Tampered payload (display_name flipped after signing).
+        let mut tampered = envelope.clone();
+        tampered["profiles"] = serde_json::json!([{ "profile_id": "msp1:aa", "display_name": "Evil", "status": "active", "manifest": {} }]);
+        assert!(verify_catalog_envelope(&tampered, &good_hex).is_err());
+
+        // Missing signature / missing fields.
+        let mut unsigned = envelope.clone();
+        unsigned.as_object_mut().unwrap().remove("signature");
+        assert!(verify_catalog_envelope(&unsigned, &good_hex).is_err());
+        assert!(verify_catalog_envelope(&serde_json::json!({}), &good_hex).is_err());
     }
 }

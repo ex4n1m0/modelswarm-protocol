@@ -47,6 +47,8 @@
 //! wiring; this node serves only **local single-peer inference** through
 //! [`SingleLocalExecutor`].
 
+pub mod artifact;
+pub mod catalog;
 mod executor;
 
 #[cfg(any(test, feature = "node-selftest"))]

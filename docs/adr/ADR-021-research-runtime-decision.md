@@ -1,8 +1,22 @@
 # ADR-021: Research runtime for real speculative-decoding measurements (Phase D entry)
 
-Status: **Proposed — awaiting owner decision** (hardware/environment input
-required; this ADR opens the decision per the plans; it decides nothing
-unilaterally). Context: ADR-019 §3 (research adapter needs its own ADR),
+Status: **Accepted for the beta engine (Phase H, 2026-10-05); research path
+partially decided.** The owner's Phase H direction (a real small model shipped
+to test machines) closes the immediate-runtime question: the pinned,
+**unforked** llama.cpp `llama-server` (CPU x64, `runtime-pins.json`) behind
+the existing HTTP `LlamaCppAdapter` is the beta/production engine — this is
+Option B's salvageable subset plus the stock server, with **no fork**:
+`propose()` is implemented as greedy self-continuation through the standard
+completion API, and the first real profile (Qwen2.5-0.5B-Instruct Q4_K_M,
+`msp1:eb0a0d21…d8120c`) is registered and active. Option A (vLLM, CUDA)
+remains the research-grade path for performance-envelope experiments once a
+CUDA box exists; Option C is no longer the immediate next step (the beta uses
+a real model instead). Option B as a *fork* stays rejected. **No performance
+claims exist yet**: every number stays TEST-ONLY/labeled until Option A (or
+measured Option-B-subset records) lands with reproducible experiment records
+(ADR-013). Historical proposal below.
+
+Context: ADR-019 §3 (research adapter needs its own ADR),
 `docs/research/runtime-trait-spec.md` gap map, D8/E9 open posture.
 
 ## The decision to make

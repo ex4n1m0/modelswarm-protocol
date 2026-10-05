@@ -1,13 +1,13 @@
 const DOWNLOADS = [
-  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.1-windows-x64.exe", size: "14 MB" },
-  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.1-linux-amd64.deb", size: "34 MB" },
-  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.1-linux-amd64.AppImage", size: "101 MB" },
-  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.1-macos-arm64.dmg", size: "34 MB" },
+  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.2-windows-x64.exe", size: "14 MB" },
+  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.2-linux-amd64.deb", size: "34 MB" },
+  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.2-linux-amd64.AppImage", size: "101 MB" },
+  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.2-macos-arm64.dmg", size: "34 MB" },
 ];
 const DOWNLOAD = {
-  version: "0.2.1",
+  version: "0.2.2",
   sums: "/downloads/SHA256SUMS.txt",
-  sha256: "4e7006b441c5628dcda1d70764a276c16b6035cee470c4e032b0ca701a273644",
+  sha256: "b8bc929ea3f1c6f9e7bac9864e2e166f8d916dd69073522ce0de6f17c4c56598",
 };
 
 // Dedicated community room — the room word is fixed here and nowhere else on

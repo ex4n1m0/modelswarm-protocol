@@ -25,13 +25,14 @@
 pub mod spec;
 
 pub use spec::{
-    default_sampling_params_hash, sign_commit, sign_receipt, sign_receipt_ack, speculate,
-    verify_commit_signature, verify_receipt_ack, verify_receipt_signature, FallbackPolicy,
-    FallbackReason, ProposerReport, SpecError, SpecMessage, SpecOutcome, SpecPeer,
-    SpeculativeExecutor, VerifierReport, ACCEPT_DEADLINE, GENESIS_PREFIX_HASH, ROUND_DEADLINE,
+    default_sampling_params_hash, serve_proposer_multi, sign_commit, sign_receipt,
+    sign_receipt_ack, speculate, speculate_multi, verify_commit_signature, verify_receipt_ack,
+    verify_receipt_signature, FallbackPolicy, FallbackReason, ProposerPeerReport, ProposerReport,
+    ProposerRuntimeFactory, SpecError, SpecMessage, SpecMode, SpecOutcome, SpecPeer,
+    SpeculativeExecutor, VerifierReport, ACCEPT_DEADLINE, DEFAULT_PROPOSAL_DEADLINE,
+    GENESIS_PREFIX_HASH, MULTI_PROPOSERS_MAX, MULTI_PROPOSERS_MIN, ROUND_DEADLINE,
     RTT_SPIKE_STREAK, SERVER_IDLE, WINDOW_GROW_STREAK, WINDOW_MAX, WINDOW_SHRINK_STREAK,
 };
-
 use std::collections::{HashMap, VecDeque};
 
 use sha2::{Digest, Sha256};

@@ -6,8 +6,8 @@ mod common;
 
 use common::{load_schema, validate};
 use modelswarm_bench::{
-    aggregate, bootstrap_ci, write_records, write_run_manifest, BenchEngine, Mode, ModeMetrics,
-    ModeResultRecord, NetworkCell, RunStatus, TEST_ONLY_MOCK_LABEL,
+    aggregate, bootstrap_ci, write_records, write_run_manifest, BenchEngine, Exactness, Mode,
+    ModeMetrics, ModeResultRecord, NetworkCell, RunStatus, TEST_ONLY_MOCK_LABEL,
 };
 use modelswarm_runtime::MockRuntime;
 use serde_json::Value;
@@ -356,6 +356,79 @@ async fn validator_actually_rejects_malformed_records() {
         .unwrap()
         .remove("ttft_ms");
     assert!(!validate(&schema, &missing).is_empty());
+}
+
+/// Phase E: multi-proposer candidate-tree records validate against the
+/// frozen (closed) schema with mode `speculative_exact` and `peers = N`,
+/// carry acceptance measured from real tree rounds, and include the
+/// duplicate-draft waste in `aggregate_model_tokens` /
+/// `bytes_per_accepted_token` (the documented adjustment — the schema
+/// has no dedicated duplicate-work field). Deterministic per seed.
+#[tokio::test]
+async fn multi_proposer_records_validate_against_the_frozen_schema() {
+    let engine = engine();
+    let schema = load_schema("mode-result.schema.json");
+    let records = engine
+        .run_cell_multi(&NetworkCell::LOOPBACK, 4, 3, 0xE00E)
+        .await;
+    assert_eq!(records.len(), 3);
+    let mut engaged = 0usize;
+    for record in &records {
+        assert_eq!(record.mode, Mode::SpeculativeExact);
+        assert_eq!(record.peers, 4);
+        let json = serde_json::to_value(record).unwrap();
+        let errors = validate(&schema, &json);
+        assert!(
+            errors.is_empty(),
+            "multi record failed schema validation:\n  {}\nrecord: {json}",
+            errors.join("\n  ")
+        );
+        // Honest outcome either way: engaged tree rounds, or a visible
+        // cost-model fallback (negative results are first-class).
+        match record.outcome.status {
+            RunStatus::Completed => engaged += 1,
+            RunStatus::FellBackToSingle => {
+                assert!(record.outcome.fallback_reason.is_some());
+                assert!(record.metrics.cooperative_prediction_ms.is_some());
+                continue;
+            }
+            other => panic!("unexpected multi record status: {other:?}"),
+        }
+        let metrics = &record.metrics;
+        assert_eq!(metrics.exactness, Some(Exactness::GreedyEqual));
+        assert_eq!(metrics.proposal_window_tokens, Some(8));
+        // Acceptance from real rounds: every metric present and sane.
+        assert!(metrics.verification_steps.unwrap() >= 1);
+        let acceptance = metrics.acceptance_rate.unwrap();
+        assert!((0.0..=1.0).contains(&acceptance));
+        assert!(metrics.mean_acceptance_length.unwrap() >= 0.0);
+        assert!(metrics.rollback_count.unwrap() <= metrics.verification_steps.unwrap());
+        // Waste included: 4 slots × window 8 drafts per round vs the
+        // accepted tokens — the aggregate strictly exceeds the output.
+        assert!(
+            metrics.aggregate_model_tokens.unwrap() > metrics.output_tokens,
+            "duplicate drafts must inflate aggregate model tokens"
+        );
+        assert!(metrics.bytes_per_accepted_token.unwrap() > 0.0);
+    }
+    assert!(
+        engaged >= 1,
+        "loopback should exercise the engaged multi path: {:?}",
+        records.iter().map(|r| r.outcome.status).collect::<Vec<_>>()
+    );
+    // Same seed ⇒ byte-identical multi records.
+    let again = engine
+        .run_cell_multi(&NetworkCell::LOOPBACK, 4, 3, 0xE00E)
+        .await;
+    let a: Vec<String> = records
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
+        .collect();
+    let b: Vec<String> = again
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
+        .collect();
+    assert_eq!(a, b);
 }
 
 #[tokio::test]

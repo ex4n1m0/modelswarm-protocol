@@ -11,6 +11,7 @@ rust-version.workspace = true
 hex = "0.4"
 modelswarm-runtime = { path = "../modelswarm-runtime", features = ["mock-runtime"] }
 modelswarm-scheduler = { path = "../modelswarm-scheduler" }
+modelswarm-speculation = { path = "../modelswarm-speculation" }
 modelswarm-types = { path = "../modelswarm-types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

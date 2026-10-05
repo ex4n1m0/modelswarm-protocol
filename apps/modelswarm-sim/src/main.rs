@@ -8,21 +8,26 @@
 //! modelswarm-sim mesh <n>
 //! modelswarm-sim kill <at_ms>
 //! modelswarm-sim spec <prompt_seed> [window] [draft_accuracy]
+//! modelswarm-sim spec_multi <prompt_seed> [proposers] [draft_accuracy]
 //! ```
 //!
 //! Each run prints exactly one JSON object on stdout and exits. Exit code 0
 //! means the scenario itself ran (including `kill`, whose JSON documents the
 //! observed peer failure); exit code 2 is a usage error; exit code 1 means
 //! the scenario errored before producing its event (also as one JSON line).
+//!
+//! `spec_multi` honors `MODELSWARM_SIM_STRAGGLER_MS=<ms>`: it delays
+//! proposer 0's first proposal by `<ms>` (a straggler the round must drop).
 
 use std::process::ExitCode;
 
 use serde_json::json;
 
-const USAGE: &str = "usage: modelswarm-sim <scenario>\n  scenarios: pair | mesh <n> | kill <at_ms> | spec <prompt_seed> [window] [draft_accuracy]";
+const USAGE: &str = "usage: modelswarm-sim <scenario>\n  scenarios: pair | mesh <n> | kill <at_ms> | spec <prompt_seed> [window] [draft_accuracy] | spec_multi <prompt_seed> [proposers] [draft_accuracy]";
 const DEFAULT_RTT_SAMPLES: usize = 8;
 const DEFAULT_SPEC_WINDOW: u32 = 4;
 const DEFAULT_SPEC_ACCURACY: f32 = 0.5;
+const DEFAULT_SPEC_MULTI_PROPOSERS: usize = 4;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -98,6 +103,50 @@ async fn run(scenario: (&str, &[String])) -> anyhow::Result<serde_json::Value> {
                 "spec: [draft_accuracy] must be in 0.0..=1.0"
             );
             modelswarm_sim::run_spec(seed, window, accuracy).await
+        }
+        ("spec_multi", [seed]) => {
+            let seed: u64 = seed
+                .parse()
+                .map_err(|_| anyhow::anyhow!("spec_multi: <prompt_seed> must be a u64"))?;
+            modelswarm_sim::run_spec_multi(
+                seed,
+                DEFAULT_SPEC_MULTI_PROPOSERS,
+                DEFAULT_SPEC_ACCURACY,
+            )
+            .await
+        }
+        ("spec_multi", [seed, proposers]) => {
+            let seed: u64 = seed
+                .parse()
+                .map_err(|_| anyhow::anyhow!("spec_multi: <prompt_seed> must be a u64"))?;
+            let proposers: usize = proposers
+                .parse()
+                .map_err(|_| anyhow::anyhow!("spec_multi: [proposers] must be a count in 2..=7"))?;
+            anyhow::ensure!(
+                (2..=7).contains(&proposers),
+                "spec_multi: [proposers] must be in 2..=7"
+            );
+            modelswarm_sim::run_spec_multi(seed, proposers, DEFAULT_SPEC_ACCURACY).await
+        }
+        ("spec_multi", [seed, proposers, accuracy]) => {
+            let seed: u64 = seed
+                .parse()
+                .map_err(|_| anyhow::anyhow!("spec_multi: <prompt_seed> must be a u64"))?;
+            let proposers: usize = proposers
+                .parse()
+                .map_err(|_| anyhow::anyhow!("spec_multi: [proposers] must be a count in 2..=7"))?;
+            anyhow::ensure!(
+                (2..=7).contains(&proposers),
+                "spec_multi: [proposers] must be in 2..=7"
+            );
+            let accuracy: f32 = accuracy.parse().map_err(|_| {
+                anyhow::anyhow!("spec_multi: [draft_accuracy] must be an f32 in 0.0..=1.0")
+            })?;
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&accuracy),
+                "spec_multi: [draft_accuracy] must be in 0.0..=1.0"
+            );
+            modelswarm_sim::run_spec_multi(seed, proposers, accuracy).await
         }
         (cmd, _) => anyhow::bail!("unknown scenario or arguments: {cmd}\n{USAGE}"),
     }

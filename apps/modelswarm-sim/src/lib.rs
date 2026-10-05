@@ -1,5 +1,5 @@
 //! `modelswarm-sim` — deterministic loopback scenario runner for the Phase C
-//! transport gate (ADR-018) and the Phase D speculative gate.
+//! transport gate (ADR-018) and the Phase D/E speculative gates.
 //!
 //! Every scenario runs against real TCP sockets on `127.0.0.1:0` and prints
 //! exactly one JSON object per line (machine-readable; timings vary, the
@@ -19,22 +19,34 @@
 //!   `SignedFrameTransport` sessions; 64 speculative tokens and, for the same
 //!   prompt, plain single decoding against the verifier runtime; reports the
 //!   greedy-equality verdict plus acceptance telemetry (Phase D).
+//! - [`spec_multi`]: Phase E — one verifier + N (2..=7) seeded proposer
+//!   servers + coordinator over real loopback TCP; the multi-proposer
+//!   candidate-trie session plus, for the same prompt, plain single decoding;
+//!   reports the greedy-equality verdict plus trie telemetry (duplicate work,
+//!   pruning, stragglers).
 //!
 //! [`pair`]: run_pair
 //! [`mesh`]: run_mesh
 //! [`kill`]: run_kill
 //! [`spec`]: run_spec
+//! [`spec_multi`]: run_spec_multi
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use modelswarm_identity::InstallationIdentity;
-use modelswarm_runtime::{InferenceRuntime, MockRuntime, SamplingParams};
-use modelswarm_session::spec::{
-    serve_proposer, serve_speculative, speculate, FallbackPolicy, SpecOutcome,
+use modelswarm_runtime::{
+    Handle, InferenceRuntime, KvCommitment, MockRuntime, RuntimeDescriptor, RuntimeError,
+    RuntimeMetrics, SamplingParams, TaskId,
 };
+use modelswarm_session::spec::{
+    serve_proposer, serve_proposer_multi, serve_speculative, speculate, speculate_multi,
+    FallbackPolicy, ProposerRuntimeFactory, SpecMode, SpecOutcome,
+};
+use modelswarm_speculation::TrieLimits;
 use modelswarm_transport::ed25519_dalek::VerifyingKey;
 use modelswarm_transport::{
     ChatMessage, Completed, Handshake, InferenceRequest, Listener, Sampling, Session,
@@ -598,6 +610,296 @@ pub async fn run_spec(prompt_seed: u64, window: u32, draft_accuracy: f32) -> Res
     }))
 }
 
+// ---------------------------------------------------------------------------
+// spec_multi (Phase E)
+// ---------------------------------------------------------------------------
+
+/// Default proposer count of the `spec_multi` scenario.
+pub const SPEC_MULTI_DEFAULT_PROPOSERS: usize = 4;
+/// Proposal window of the `spec_multi` scenario.
+pub const SPEC_MULTI_WINDOW: u32 = 4;
+/// Coordinator proposal-collection deadline used by `spec_multi`: a proposer
+/// whose block misses it is a straggler (E5) and the round proceeds without
+/// it.
+pub const SPEC_MULTI_COLLECT: Duration = Duration::from_millis(250);
+/// Delay injected into a chosen proposer's propose call (the straggler test
+/// hook; env `MODELSWARM_SIM_STRAGGLER_MS` overrides via `run_spec_multi`).
+pub const SPEC_MULTI_STRAGGLER_DELAY: Duration = Duration::from_millis(600);
+/// Env variable that injects a straggler into `spec_multi` (millisecond
+/// delay on proposer 0's first proposal; unset/0 = healthy roster).
+pub const SPEC_MULTI_STRAGGLER_ENV: &str = "MODELSWARM_SIM_STRAGGLER_MS";
+
+/// The injected straggler of a `spec_multi` case: `proposer`'s `call`-th
+/// propose (1-based) sleeps for `delay` before drafting.
+#[derive(Debug, Clone, Copy)]
+pub struct StragglerSpec {
+    pub proposer: usize,
+    pub call: usize,
+    pub delay: Duration,
+}
+
+/// TEST-ONLY wrapper delaying one `propose` call of the wrapped runtime —
+/// the sim's straggler injection point (honest: the delay is at the runtime
+/// boundary, not faked inside the protocol layer).
+struct DelayedRuntime {
+    inner: Arc<dyn InferenceRuntime>,
+    call: usize,
+    delay: Duration,
+    calls: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl InferenceRuntime for DelayedRuntime {
+    fn id(&self) -> RuntimeDescriptor {
+        self.inner.id()
+    }
+    async fn load(&self, profile_id: &str) -> Result<Handle, RuntimeError> {
+        self.inner.load(profile_id).await
+    }
+    async fn tokenize(&self, text: &str) -> Result<Vec<u32>, RuntimeError> {
+        self.inner.tokenize(text).await
+    }
+    async fn detokenize(&self, ids: &[u32]) -> Result<String, RuntimeError> {
+        self.inner.detokenize(ids).await
+    }
+    async fn prefill(&self, handle: &Handle, ids: &[u32]) -> Result<KvCommitment, RuntimeError> {
+        self.inner.prefill(handle, ids).await
+    }
+    async fn decode_step(
+        &self,
+        handle: &Handle,
+        prefix: &[u32],
+        sampling: &SamplingParams,
+    ) -> Result<u32, RuntimeError> {
+        self.inner.decode_step(handle, prefix, sampling).await
+    }
+    fn metrics(&self) -> RuntimeMetrics {
+        self.inner.metrics()
+    }
+    fn cancel(&self, task: TaskId) -> Result<(), RuntimeError> {
+        self.inner.cancel(task)
+    }
+    async fn propose(
+        &self,
+        handle: &Handle,
+        prefix: &[u32],
+        window: u32,
+    ) -> Result<Vec<u32>, RuntimeError> {
+        let call = {
+            let mut calls = self.calls.lock().expect("delay counter");
+            *calls += 1;
+            *calls
+        };
+        if call == self.call {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.propose(handle, prefix, window).await
+    }
+}
+
+/// The measured facts of one `spec_multi` run.
+#[derive(Debug, Clone)]
+pub struct SpecMultiCase {
+    pub prompt_seed: u64,
+    pub proposers: usize,
+    pub draft_accuracy: f32,
+    /// The injected straggler, if any (E5 exercise hook).
+    pub straggler: Option<StragglerSpec>,
+    pub tokens_equal_to_single: bool,
+    /// The committed token stream (determinism checks compare it directly).
+    pub tokens: Vec<u32>,
+    pub rounds: u64,
+    pub mean_acceptance_length: f32,
+    pub duplicate_work: u64,
+    pub pruned: u64,
+    pub stragglers_total: u64,
+    pub fallback: Option<&'static str>,
+    pub proposer_reports_k: usize,
+    pub elapsed_ms: f64,
+}
+
+/// Runs one `spec_multi` case: verifier + N seeded proposer servers
+/// (MockRuntime drafted from the per-round branch seed) + coordinator over
+/// real loopback TCP, 64 tokens; then plain single decoding of the same
+/// prompt against the verifier runtime for the greedy-equality verdict.
+async fn spec_multi_case(
+    prompt_seed: u64,
+    proposers: usize,
+    draft_accuracy: f32,
+    straggler: Option<StragglerSpec>,
+) -> Result<SpecMultiCase> {
+    anyhow::ensure!(
+        (2..=7).contains(&proposers),
+        "spec_multi needs 2..=7 proposers, got {proposers}"
+    );
+    let coordinator = sim_identity(160);
+    let verifier_id = sim_identity(161);
+    let prompt: Vec<u32> = (0..8u64)
+        .map(|k| (prompt_seed.wrapping_mul(k + 3) % 256) as u32)
+        .collect();
+
+    let verifier_runtime = Arc::new(MockRuntime::new(prompt_seed, draft_accuracy));
+    let client_runtime: Arc<dyn InferenceRuntime> =
+        Arc::new(MockRuntime::new(prompt_seed, draft_accuracy));
+
+    let verifier_listener = SignedFrameTransport::listen("127.0.0.1:0")
+        .await
+        .context("spec_multi verifier listener")?;
+    let verifier_addr = verifier_listener
+        .local_addr()
+        .context("spec_multi verifier addr")?
+        .to_string();
+    let verifier_key = coordinator.verifying_key();
+    let verifier_task = tokio::spawn(serve_speculative(
+        verifier_listener,
+        verifier_runtime.clone(),
+        SIM_PROFILE,
+        verifier_id.clone(),
+        verifier_key,
+        1,
+    ));
+
+    let mut proposer_addrs = Vec::with_capacity(proposers);
+    let mut proposer_tasks = Vec::with_capacity(proposers);
+    for index in 0..proposers {
+        let listener = SignedFrameTransport::listen("127.0.0.1:0")
+            .await
+            .context("spec_multi proposer listener")?;
+        let addr = listener
+            .local_addr()
+            .context("spec_multi proposer addr")?
+            .to_string();
+        let delay = straggler.filter(|spec| spec.proposer == index);
+        let calls = Arc::new(Mutex::new(0usize));
+        let factory: ProposerRuntimeFactory = Arc::new(move |seed| {
+            let inner: Arc<dyn InferenceRuntime> = Arc::new(MockRuntime::new(seed, draft_accuracy));
+            match delay {
+                Some(spec) => Arc::new(DelayedRuntime {
+                    inner,
+                    call: spec.call,
+                    delay: spec.delay,
+                    calls: Arc::clone(&calls),
+                }),
+                None => inner,
+            }
+        });
+        let identity = sim_identity(162 + index as u8);
+        let task = tokio::spawn(async move {
+            serve_proposer_multi(listener, factory, SIM_PROFILE, identity, verifier_key, 1).await
+        });
+        proposer_addrs.push(addr);
+        proposer_tasks.push(task);
+    }
+
+    let started = Instant::now();
+    let outcome: SpecOutcome = speculate_multi(
+        &verifier_addr,
+        &proposer_addrs,
+        client_runtime,
+        SIM_PROFILE,
+        &prompt,
+        SPEC_MULTI_WINDOW,
+        SPEC_TOKENS,
+        &coordinator,
+        &verifier_id.verifying_key(),
+        FallbackPolicy::default(),
+        TrieLimits::default(),
+        SPEC_MULTI_COLLECT,
+    )
+    .await
+    .context("spec_multi speculate_multi")?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+    // Plain single decode of the same prompt on the verifier's own runtime.
+    let handle = verifier_runtime.load(SIM_PROFILE).await?;
+    let single = verifier_runtime
+        .decode_stream(
+            &handle,
+            &prompt,
+            &SamplingParams::default(),
+            SPEC_TOKENS,
+            DEADLINE,
+        )
+        .await
+        .context("spec_multi single decode")?;
+
+    verifier_task
+        .await
+        .context("verifier task")?
+        .context("verifier served")?;
+    let mut proposer_reports_k = 0usize;
+    for task in proposer_tasks {
+        proposer_reports_k += task
+            .await
+            .context("proposer task")?
+            .context("proposer served")?
+            .len();
+    }
+
+    debug_assert_eq!(outcome.mode, SpecMode::MultiProposer);
+    Ok(SpecMultiCase {
+        prompt_seed,
+        proposers,
+        draft_accuracy,
+        straggler,
+        tokens_equal_to_single: outcome.tokens == single,
+        tokens: outcome.tokens,
+        rounds: outcome.rounds,
+        mean_acceptance_length: outcome.acceptance.mean_acceptance_length(),
+        duplicate_work: outcome.duplicate_work,
+        pruned: outcome.pruned,
+        stragglers_total: outcome.stragglers,
+        fallback: outcome.fallback.map(|reason| reason.as_str()),
+        proposer_reports_k,
+        elapsed_ms,
+    })
+}
+
+/// `spec_multi <prompt_seed> [proposers] [draft_accuracy]`: one Phase E
+/// multi-proposer candidate-tree session vs plain single decoding; prints
+/// the equality verdict plus trie telemetry. Setting
+/// `MODELSWARM_SIM_STRAGGLER_MS=<ms>` injects a straggler (proposer 0's
+/// first proposal delayed by `<ms>`), demonstrating the E5 round completing
+/// without it.
+pub async fn run_spec_multi(
+    prompt_seed: u64,
+    proposers: usize,
+    draft_accuracy: f32,
+) -> Result<Value> {
+    let straggler = match std::env::var(SPEC_MULTI_STRAGGLER_ENV) {
+        Ok(raw) => {
+            let ms: u64 = raw
+                .parse()
+                .with_context(|| format!("{SPEC_MULTI_STRAGGLER_ENV} must be milliseconds"))?;
+            (ms > 0).then_some(StragglerSpec {
+                proposer: 0,
+                call: 1,
+                delay: Duration::from_millis(ms),
+            })
+        }
+        Err(_) => None,
+    };
+    let case = spec_multi_case(prompt_seed, proposers, draft_accuracy, straggler).await?;
+    Ok(json!({
+        "scenario": "spec_multi",
+        "ok": true,
+        "prompt_seed": case.prompt_seed,
+        "proposers": case.proposers,
+        "draft_accuracy": case.draft_accuracy,
+        "straggler_injected": case.straggler.is_some(),
+        "tokens": SPEC_TOKENS,
+        "tokens_equal_to_single": case.tokens_equal_to_single,
+        "rounds": case.rounds,
+        "mean_acceptance_length": case.mean_acceptance_length,
+        "duplicate_work": case.duplicate_work,
+        "pruned": case.pruned,
+        "stragglers_total": case.stragglers_total,
+        "fallback": case.fallback,
+        "proposer_reports_k": case.proposer_reports_k,
+        "elapsed_ms": round2(case.elapsed_ms),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,5 +969,85 @@ mod tests {
             }
         }
         assert_eq!(cases, 180, "20 seeds × 3 windows × 3 accuracies");
+    }
+
+    /// Phase E matrix: 15 seeds × proposers {2,4,7} × accuracy {0.3, 0.8}.
+    /// The greedy contract is unconditional — multi-proposer tree output
+    /// equals plain single decoding token for token on every case. Plus one
+    /// straggler case (proposer 0's first proposal delayed past the
+    /// collection deadline): the round completes without it, exactness
+    /// holds, and every proposer server still closes cleanly. Determinism:
+    /// the same seed run twice yields the identical token stream. Every
+    /// case is bounded by a 30 s timeout: no hangs.
+    #[tokio::test]
+    async fn spec_multi_matrix_exact_straggler_and_determinism() {
+        const CASE_TIMEOUT: Duration = Duration::from_secs(30);
+        let mut cases = 0usize;
+        for seed in 0..15u64 {
+            for proposers in [2usize, 4, 7] {
+                for accuracy in [0.3f32, 0.8] {
+                    let case = tokio::time::timeout(
+                        CASE_TIMEOUT,
+                        spec_multi_case(seed, proposers, accuracy, None),
+                    )
+                    .await
+                    .expect("no hangs: every case is bounded")
+                    .expect("case runs");
+                    assert!(
+                        case.tokens_equal_to_single,
+                        "seed={seed} proposers={proposers} accuracy={accuracy}: greedy contract"
+                    );
+                    assert_eq!(case.proposer_reports_k, proposers);
+                    assert_eq!(case.stragglers_total, 0, "healthy roster: no stragglers");
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 90, "15 seeds × 3 proposer counts × 2 accuracies");
+
+        // E5 exercise: one proposer misses the round deadline; the round (and
+        // the session) completes from the remaining candidates, still exact.
+        let straggler_case = tokio::time::timeout(
+            CASE_TIMEOUT,
+            spec_multi_case(
+                3,
+                4,
+                0.8,
+                Some(StragglerSpec {
+                    proposer: 0,
+                    call: 1,
+                    delay: SPEC_MULTI_STRAGGLER_DELAY,
+                }),
+            ),
+        )
+        .await
+        .expect("straggler case is bounded")
+        .expect("straggler case runs");
+        assert!(
+            straggler_case.tokens_equal_to_single,
+            "straggler case exact"
+        );
+        assert!(
+            straggler_case.stragglers_total >= 1,
+            "the delayed proposer must be counted"
+        );
+        assert_eq!(straggler_case.proposer_reports_k, 4);
+        assert_eq!(straggler_case.straggler.map(|s| s.proposer), Some(0));
+
+        // Determinism: same seed → identical token stream. The committed
+        // stream equals plain single decoding (a pure function of the prompt
+        // + default sampling), so two runs must agree token for token even
+        // though their minted session ids (and hence branch seeds) differ.
+        let a = tokio::time::timeout(CASE_TIMEOUT, spec_multi_case(7, 4, 0.5, None))
+            .await
+            .expect("determinism A bounded")
+            .expect("determinism A runs");
+        let b = tokio::time::timeout(CASE_TIMEOUT, spec_multi_case(7, 4, 0.5, None))
+            .await
+            .expect("determinism B bounded")
+            .expect("determinism B runs");
+        assert!(a.tokens_equal_to_single && b.tokens_equal_to_single);
+        assert_eq!(a.tokens, b.tokens, "same seeds: same token stream");
+        assert_eq!(a.tokens.len(), SPEC_TOKENS as usize);
     }
 }

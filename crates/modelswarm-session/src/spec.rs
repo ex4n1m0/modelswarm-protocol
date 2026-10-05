@@ -46,6 +46,44 @@
 //! ([`modelswarm_speculation::verify_sampled_full_q`]) are pure functions
 //! exercised unit-level with synthetic distributions; wiring them needs a
 //! runtime that exposes full distributions (Phase-D entry ADR per ADR-019).
+//!
+//! # Phase E — multi-proposer candidate trees
+//!
+//! [`speculate_multi`] extends the coordinator to 2..=7 proposers. Each round
+//! the coordinator sends every proposer a [`SpecMessage::ProposalRequest`]
+//! carrying that proposer's [`branch_assignment`] seed (E1: deterministic and
+//! distinct per `(session_id, round, roster, index)`), collects
+//! [`SpecMessage::CandidateBlock`]s under an anchored per-round deadline
+//! (E5: stragglers are dropped and counted, never block the round), assembles
+//! a bounded [`CandidateTrie`] (E2/E3: pruning and duplicate-work counting),
+//! and sends one [`SpecMessage::TreeVerifyRequest`] to the verifier, which
+//! replies [`SpecMessage::TreeVerifyResult`] computed with
+//! [`modelswarm_speculation::verify_tree_greedy`]. The commit path is the
+//! SAME signed [`SpecMessage::PrefixCommit`] as Phase D, so replay/duplicate
+//! protection, receipts, and the single-decode fallback are inherited
+//! unchanged. Losing branches need no explicit cancellation: proposals are
+//! drafted statelessly per round, so not committing a branch releases all of
+//! its capacity immediately (E6 — no leaked slots).
+//!
+//! Branch distinctness (honest mechanism): [`serve_proposer_multi`] takes a
+//! runtime *factory*. On each request it builds the per-round draft runtime
+//! via `factory(branch_seed)` — for the TEST-ONLY `MockRuntime` that is
+//! `MockRuntime::new(branch_seed, accuracy)`, whose `propose` folds the
+//! runtime seed into the per-position correct/wrong draw
+//! (`prefix_hash ^ seed`). Distinct branch seeds therefore draft distinct
+//! wrong-token patterns deterministically, while every position still draws
+//! the target's true continuation with the configured draft accuracy (the
+//! accuracy semantics of Phase D are preserved; at accuracy 1.0 proposers
+//! genuinely agree and the trie counts them as `duplicate_work`).
+//!
+//! Batch-vs-sequential equivalence (E4): the mock backend has no tree
+//! attention, so the verifier's decode of `max_depth + 1` steps IS the
+//! sequential-equivalent path. A runtime declaring `tree_attention` /
+//! `batch_verify` capabilities (msp manifests, `modelswarm_types`) verifies
+//! the same trie in one batched pass; both paths must select the identical
+//! accepted prefix — proven unit-level in `tests` below by checking
+//! [`modelswarm_speculation::verify_tree_greedy`] against per-branch
+//! [`modelswarm_speculation::verify_greedy`] loops taking the max.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,7 +99,10 @@ use modelswarm_gateway::{
 };
 use modelswarm_identity::{canonical_json, installation_id_for, new_nonce, InstallationIdentity};
 use modelswarm_runtime::{Handle, InferenceRuntime, RuntimeError, SamplingParams};
-use modelswarm_speculation::{verify_greedy, AcceptanceStats};
+use modelswarm_speculation::{
+    branch_assignment, verify_greedy, verify_tree_greedy, AcceptanceStats, BranchBlock,
+    CandidateTrie, TrieLimits,
+};
 use modelswarm_transport::ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use modelswarm_transport::{Handshake, Listener, Session, SignedFrameTransport, TransportError};
 use serde::{Deserialize, Serialize};
@@ -92,6 +133,14 @@ pub const ROUND_DEADLINE: Duration = Duration::from_secs(10);
 pub const ACCEPT_DEADLINE: Duration = Duration::from_secs(10);
 /// Server-side idle deadline between messages on an open session.
 pub const SERVER_IDLE: Duration = Duration::from_secs(60);
+/// Default per-round proposal-collection deadline of [`speculate_multi`]
+/// (E5): a proposer whose candidate block misses this deadline is excluded
+/// from that round's assembly and counted as a straggler.
+pub const DEFAULT_PROPOSAL_DEADLINE: Duration = Duration::from_millis(750);
+/// Minimum proposer count of [`speculate_multi`].
+pub const MULTI_PROPOSERS_MIN: usize = 2;
+/// Maximum proposer count of [`speculate_multi`].
+pub const MULTI_PROPOSERS_MAX: usize = 7;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -172,11 +221,16 @@ pub enum SpecMessage {
         accepted_prefix_hash: String,
     },
     /// Coordinator → proposer: draft a window continuing the committed prefix.
+    /// `branch_seed` (Phase E multi-proposer mode) is the proposer's
+    /// deterministic branch assignment — see
+    /// [`branch_assignment`](modelswarm_speculation::branch_assignment). The
+    /// two-peer path leaves it `None`.
     ProposalRequest {
         session_id: String,
         round: u64,
         window: u32,
         deadline_ms: u32,
+        branch_seed: Option<u64>,
     },
     /// Proposer → coordinator (forwarded verbatim to the verifier): drafted
     /// tokens. Content-verified by the verifier against the target model — a
@@ -187,6 +241,29 @@ pub enum SpecMessage {
         parent_prefix_hash: String,
         tokens: Vec<u32>,
         proposer_id: String,
+    },
+    /// Coordinator → verifier (Phase E): the assembled candidate set for one
+    /// round — the coordinator's post-assembly branch list (already
+    /// deduplicated and bounded by its [`TrieLimits`], E2/E3). Stragglers
+    /// simply never appear in the set (E5); an empty set asks the verifier
+    /// for the one lookahead token (bonus progress).
+    TreeVerifyRequest {
+        session_id: String,
+        round: u64,
+        branches: Vec<Vec<u32>>,
+    },
+    /// Verifier → coordinator (Phase E): greedy tree-verification outcome over
+    /// a [`TreeVerifyRequest`], same commitment shape as
+    /// [`SpecMessage::VerificationResult`]: `accepted_tokens` is the winning
+    /// branch's matched prefix, `correction` the target-authoritative token
+    /// appended after it (correction on mismatch, bonus token when the whole
+    /// branch held), `new_prefix_hash` the hash of the would-be commit.
+    TreeVerifyResult {
+        session_id: String,
+        round: u64,
+        accepted_tokens: Vec<u32>,
+        correction: Option<u32>,
+        new_prefix_hash: String,
     },
     /// Verifier → coordinator: greedy verification outcome. `committed =
     /// accepted_tokens ++ [correction]` always holds: `correction` carries the
@@ -270,6 +347,8 @@ impl SpecMessage {
             | SpecMessage::PrefillReady { session_id, .. }
             | SpecMessage::ProposalRequest { session_id, .. }
             | SpecMessage::CandidateBlock { session_id, .. }
+            | SpecMessage::TreeVerifyRequest { session_id, .. }
+            | SpecMessage::TreeVerifyResult { session_id, .. }
             | SpecMessage::VerificationResult { session_id, .. }
             | SpecMessage::PrefixCommit { session_id, .. }
             | SpecMessage::CommitAck { session_id, .. }
@@ -584,6 +663,62 @@ impl std::fmt::Display for FallbackReason {
     }
 }
 
+/// Which coordinator shape produced a [`SpecOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecMode {
+    /// Phase D: one verifier + one proposer ([`speculate`]).
+    TwoPeer,
+    /// Phase E: one verifier + 2..=7 seeded proposers ([`speculate_multi`]).
+    MultiProposer,
+}
+
+impl SpecMode {
+    /// Stable wire/record label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpecMode::TwoPeer => "two_peer",
+            SpecMode::MultiProposer => "multi_proposer",
+        }
+    }
+}
+
+impl std::fmt::Display for SpecMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Coordinator-side accounting for one proposer of a multi-proposer session
+/// (Phase E). The server-side counterpart lives in [`ProposerReport`].
+#[derive(Debug, Clone)]
+pub struct ProposerPeerReport {
+    /// Roster index (position in the coordinator's proposer address list).
+    pub index: usize,
+    /// The proposer's dial address.
+    pub addr: String,
+    /// Candidate blocks that arrived in time and entered assembly.
+    pub blocks_arrived: u64,
+    /// Rounds this proposer missed the collection deadline or failed
+    /// (E5 straggler accounting).
+    pub straggler_rounds: u64,
+    /// Drafted tokens across arrived blocks.
+    pub drafted_tokens: u64,
+    /// Tokens of this proposer's branches that were accepted (winning-branch
+    /// attribution; the add-one-smoothed ratio feeds the assembly score).
+    pub accepted_tokens: u64,
+    /// Whether the connection was still alive at close.
+    pub alive: bool,
+}
+
+impl ProposerPeerReport {
+    /// The coordinator's assembly score for this proposer: add-one-smoothed
+    /// trailing acceptance rate `(accepted + 1) / (drafted + 2)` — defined
+    /// from the first round, bounded in `(0, 1)`, deterministic.
+    pub fn score(&self) -> f32 {
+        (self.accepted_tokens as f32 + 1.0) / (self.drafted_tokens as f32 + 2.0)
+    }
+}
+
 /// The coordinator's result.
 #[derive(Debug, Clone)]
 pub struct SpecOutcome {
@@ -603,6 +738,20 @@ pub struct SpecOutcome {
     pub fallback: Option<FallbackReason>,
     /// The verifier's receipt verified (signature + two-phase ack exchanged).
     pub receipts_verified: bool,
+    /// Which coordinator shape ran (Phase D two-peer vs Phase E multi).
+    pub mode: SpecMode,
+    /// Phase E: draft tokens dropped as exact duplicates across proposers
+    /// before verification (E3). Zero in two-peer mode.
+    pub duplicate_work: u64,
+    /// Phase E: branches/nodes removed by the trie bounds (E2). Zero in
+    /// two-peer mode.
+    pub pruned: u64,
+    /// Phase E: (round, proposer) deadline misses — blocks that never made
+    /// assembly (E5). Zero in two-peer mode.
+    pub stragglers: u64,
+    /// Phase E: per-proposer coordinator-side accounting, roster order.
+    /// Empty in two-peer mode.
+    pub proposer_reports: Vec<ProposerPeerReport>,
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +1015,96 @@ async fn verifier_session_flow(
                         round,
                         accepted_tokens: tokens[..outcome.accepted_draft].to_vec(),
                         correction: outcome.committed.last().copied(),
+                        new_prefix_hash: new_hash,
+                    },
+                    ROUND_DEADLINE,
+                )
+                .await?;
+            }
+            SpecMessage::TreeVerifyRequest {
+                round, branches, ..
+            } => {
+                // Phase E: tree verification of one round's assembled branch
+                // set (feature-detected on message type — linear
+                // CandidateBlock rounds keep working alongside). The wire set
+                // is the coordinator's post-assembly trie, so re-assembly
+                // with no-op bounds reproduces it exactly (dedup is
+                // first-wins on both sides, no bound can fire); the commit
+                // hash chain then pins verifier and coordinator to the same
+                // branch list.
+                if round != conversation.state.round() + 1 {
+                    send_spec(
+                        session,
+                        &SpecMessage::CancelRound {
+                            session_id: message_session,
+                            round,
+                            reason: "round_mismatch".to_string(),
+                        },
+                        ROUND_DEADLINE,
+                    )
+                    .await?;
+                    continue;
+                }
+                // Target continuation: deepest branch + 1 greedy decode with
+                // DEFAULT sampling (the E2E contract). A runtime declaring
+                // tree_attention/batch_verify executes this as one batched
+                // pass; the selected prefix is identical either way (E4,
+                // unit-tested at the speculation layer).
+                let branch_count = branches.len();
+                let blocks: Vec<BranchBlock> = branches
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, tokens)| BranchBlock {
+                        proposer: i,
+                        tokens,
+                        score: 0.0,
+                    })
+                    .collect();
+                let max_nodes: usize = blocks.iter().map(|b| b.tokens.len()).sum();
+                let trie = CandidateTrie::assemble(
+                    blocks,
+                    TrieLimits {
+                        max_branches: branch_count.max(1),
+                        max_nodes: max_nodes.max(1),
+                    },
+                );
+                let max_depth = trie
+                    .branches()
+                    .iter()
+                    .map(|b| b.tokens.len())
+                    .max()
+                    .unwrap_or(0);
+                let mut work = conversation.prefix.clone();
+                let mut target = Vec::with_capacity(max_depth + 1);
+                for _ in 0..=max_depth {
+                    let token = runtime
+                        .decode_step(&conversation.handle, &work, &SamplingParams::default())
+                        .await?;
+                    target.push(token);
+                    work.push(token);
+                }
+                let outcome = verify_tree_greedy(&trie, &target);
+                let accepted_tokens = match outcome.winning_branch {
+                    Some(index) => trie.branches()[index].tokens[..outcome.accepted_depth].to_vec(),
+                    None => Vec::new(),
+                };
+                let committed = outcome.committed.clone();
+                let new_hash =
+                    compute_prefix_hash(conversation.state.committed_prefix_hash(), &committed)?;
+                let winning_len = outcome
+                    .winning_branch
+                    .map(|index| trie.branches()[index].tokens.len());
+                conversation.pending = Some(PendingRound {
+                    accepted_draft: outcome.accepted_depth,
+                    rejected: winning_len.is_some_and(|len| outcome.accepted_depth < len),
+                });
+                send_spec(
+                    session,
+                    &SpecMessage::TreeVerifyResult {
+                        session_id: message_session,
+                        round,
+                        accepted_tokens,
+                        correction: committed.last().copied(),
                         new_prefix_hash: new_hash,
                     },
                     ROUND_DEADLINE,
@@ -1321,6 +1560,7 @@ pub async fn speculate(
                     round,
                     window: window_eff,
                     deadline_ms: ROUND_DEADLINE.as_millis().min(u128::from(u32::MAX)) as u32,
+                    branch_seed: None,
                 },
                 ROUND_DEADLINE,
             )
@@ -1620,6 +1860,11 @@ pub async fn speculate(
         acceptance: stats,
         fallback,
         receipts_verified,
+        mode: SpecMode::TwoPeer,
+        duplicate_work: 0,
+        pruned: 0,
+        stragglers: 0,
+        proposer_reports: Vec::new(),
     })
 }
 
@@ -1653,8 +1898,750 @@ async fn expect_prefill_ready(
 }
 
 // ---------------------------------------------------------------------------
-// Gateway executor (greedy/single)
+// Multi-proposer (Phase E): seeded proposer server + tree coordinator
 // ---------------------------------------------------------------------------
+
+/// Builds the per-round draft runtime for a proposer from the round's branch
+/// seed (see the crate-doc "Branch distinctness" note). Factories must be
+/// deterministic: same seed ⇒ same draft behavior.
+pub type ProposerRuntimeFactory = Arc<dyn Fn(u64) -> Arc<dyn InferenceRuntime> + Send + Sync>;
+
+/// Serves the Phase E PROPOSER role: like [`serve_proposer`], but each
+/// [`SpecMessage::ProposalRequest`] carries the round's branch seed and the
+/// draft is produced by a runtime built from that seed via `factory` — so
+/// distinct proposers (distinct seeds) draft distinct branches
+/// deterministically while keeping the runtime's draft-accuracy semantics.
+/// Commits are applied exactly as in the two-peer flow.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_proposer_multi(
+    listener: Listener,
+    factory: ProposerRuntimeFactory,
+    profile_id: &str,
+    identity: InstallationIdentity,
+    expected_requester: VerifyingKey,
+    max_sessions: usize,
+) -> Result<Vec<ProposerReport>, SpecError> {
+    let mut conversations: HashMap<String, ProposerConversation> = HashMap::new();
+    let mut reports = Vec::new();
+    for _ in 0..max_sessions {
+        let mut session = match listener.accept(&expected_requester, ACCEPT_DEADLINE).await {
+            Ok(session) => session,
+            Err(e) => {
+                if reports.is_empty() {
+                    return Err(SpecError::Transport(e));
+                }
+                break;
+            }
+        };
+        let report = proposer_multi_session_flow(
+            &mut session,
+            &mut conversations,
+            &factory,
+            profile_id,
+            &identity,
+            &expected_requester,
+        )
+        .await;
+        session.close();
+        reports.push(report);
+    }
+    Ok(reports)
+}
+
+async fn proposer_multi_session_flow(
+    session: &mut Session,
+    conversations: &mut HashMap<String, ProposerConversation>,
+    factory: &ProposerRuntimeFactory,
+    profile_id: &str,
+    identity: &InstallationIdentity,
+    expected_requester: &VerifyingKey,
+) -> ProposerReport {
+    match proposer_multi_flow(
+        session,
+        conversations,
+        factory,
+        profile_id,
+        identity,
+        expected_requester,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(e) => ProposerReport {
+            session_id: String::new(),
+            proposals_served: 0,
+            commits_applied: 0,
+            close_reason: format!("{e}"),
+        },
+    }
+}
+
+async fn proposer_multi_flow(
+    session: &mut Session,
+    conversations: &mut HashMap<String, ProposerConversation>,
+    factory: &ProposerRuntimeFactory,
+    profile_id: &str,
+    identity: &InstallationIdentity,
+    expected_requester: &VerifyingKey,
+) -> Result<ProposerReport, SpecError> {
+    let SpecMessage::PrefillRequest {
+        session_id,
+        prompt_tokens,
+        ..
+    } = recv_spec(session, SERVER_IDLE).await?
+    else {
+        return Err(SpecError::Protocol("expected prefill_request first".into()));
+    };
+    // A persistent runtime instance owns the conversation handle (prefill
+    // bookkeeping only — drafts come from the per-round seeded factories).
+    let persistent = factory(0);
+    let handle = persistent.load(profile_id).await?;
+    let conversation =
+        conversations
+            .entry(session_id.clone())
+            .or_insert_with(|| ProposerConversation {
+                prefix: prompt_tokens.clone(),
+                last_hash: GENESIS_PREFIX_HASH.to_string(),
+                handle: handle.clone(),
+                proposals_served: 0,
+                commits_applied: 0,
+            });
+    conversation.handle = handle;
+    let commitment = persistent
+        .prefill(&conversation.handle, &prompt_tokens)
+        .await?;
+    let resume_hash = conversation.last_hash.clone();
+    send_spec(
+        session,
+        &SpecMessage::PrefillReady {
+            session_id: session_id.clone(),
+            kv_commitment_digest: commitment.digest,
+            accepted_prefix_hash: resume_hash,
+        },
+        ROUND_DEADLINE,
+    )
+    .await?;
+
+    loop {
+        let msg = recv_spec(session, SERVER_IDLE).await?;
+        let message_session = msg.session_id().unwrap_or_default().to_string();
+        let Some(conversation) = conversations.get_mut(&message_session) else {
+            return Err(SpecError::Protocol(format!(
+                "message for unknown session {message_session:?}"
+            )));
+        };
+        match msg {
+            SpecMessage::ProposalRequest {
+                round,
+                window,
+                deadline_ms,
+                branch_seed,
+                ..
+            } => {
+                // E1: the branch seed from the request drives the draft —
+                // the ONLY mechanism by which proposers diverge.
+                let budget = Duration::from_millis(u64::from(deadline_ms.max(1)));
+                let seed = branch_seed.unwrap_or(0);
+                let draft_runtime = factory(seed);
+                let drafted = match draft_runtime.load(profile_id).await {
+                    Ok(handle) => {
+                        tokio::time::timeout(
+                            budget,
+                            draft_runtime.propose(&handle, &conversation.prefix, window),
+                        )
+                        .await
+                    }
+                    Err(e) => Ok(Err(e)),
+                };
+                match drafted {
+                    Ok(Ok(tokens)) => {
+                        conversation.proposals_served += 1;
+                        send_spec(
+                            session,
+                            &SpecMessage::CandidateBlock {
+                                session_id: message_session,
+                                round,
+                                parent_prefix_hash: conversation.last_hash.clone(),
+                                tokens,
+                                proposer_id: identity.installation_id(),
+                            },
+                            ROUND_DEADLINE,
+                        )
+                        .await?;
+                    }
+                    _ => {
+                        send_spec(
+                            session,
+                            &SpecMessage::CancelRound {
+                                session_id: message_session,
+                                round,
+                                reason: "proposal_failed".to_string(),
+                            },
+                            ROUND_DEADLINE,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            SpecMessage::PrefixCommit { .. } => {
+                let reason = match verify_commit_signature(&msg, expected_requester) {
+                    Err(e) => format!("{e}"),
+                    Ok(()) => {
+                        let commit = msg.commit_prefix().expect("matched prefix_commit above");
+                        let chained = commit.previous_prefix_hash == conversation.last_hash
+                            && compute_prefix_hash(
+                                &commit.previous_prefix_hash,
+                                &commit.accepted_token_ids,
+                            )
+                            .map(|h| h == commit.new_prefix_hash)
+                            .unwrap_or(false);
+                        if chained {
+                            conversation
+                                .prefix
+                                .extend_from_slice(&commit.accepted_token_ids);
+                            conversation.last_hash = commit.new_prefix_hash.clone();
+                            conversation.commits_applied += 1;
+                            "advanced".to_string()
+                        } else {
+                            "parent_mismatch".to_string()
+                        }
+                    }
+                };
+                let round = msg.commit_prefix().map(|c| c.round).unwrap_or_default();
+                let (ok, reason) = ack_result(&reason);
+                send_spec(
+                    session,
+                    &SpecMessage::CommitAck {
+                        session_id: message_session,
+                        round,
+                        ok,
+                        reason,
+                    },
+                    ROUND_DEADLINE,
+                )
+                .await?;
+            }
+            SpecMessage::CancelRound { .. } => {}
+            SpecMessage::SessionClose { .. } => {
+                return Ok(ProposerReport {
+                    session_id: message_session,
+                    proposals_served: conversation.proposals_served,
+                    commits_applied: conversation.commits_applied,
+                    close_reason: "closed".to_string(),
+                });
+            }
+            other => {
+                return Err(SpecError::Protocol(format!(
+                    "multi proposer received an unexpected message: {other:?}"
+                )))
+            }
+        }
+    }
+}
+
+/// Reads the next reply for `round`, discarding stale round-tagged messages
+/// (late candidate blocks / acks from rounds the coordinator already
+/// committed — the straggler-drain rule that keeps connections in sync after
+/// a deadline drop).
+async fn recv_round_reply(
+    session: &mut Session,
+    round: u64,
+    deadline: Duration,
+) -> Result<SpecMessage, SpecError> {
+    loop {
+        let msg = recv_spec(session, deadline).await?;
+        let stale = match &msg {
+            SpecMessage::CandidateBlock { round: r, .. }
+            | SpecMessage::CancelRound { round: r, .. }
+            | SpecMessage::CommitAck { round: r, .. } => *r < round,
+            _ => false,
+        };
+        if !stale {
+            return Ok(msg);
+        }
+    }
+}
+
+/// Drives one Phase E `speculative_exact` session with 2..=7 proposers end
+/// to end (see the crate-doc Phase E section). Same deviations from the call
+/// sketch as [`speculate`] (`profile_id`, `verifier_key`), plus two explicit
+/// knobs: `trie_limits` (E2 bounds) and `proposal_deadline` (E5 collection
+/// deadline; defaults to [`DEFAULT_PROPOSAL_DEADLINE`] at call sites).
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
+pub async fn speculate_multi(
+    addr_verifier: &str,
+    addr_proposers: &[String],
+    runtime_client: Arc<dyn InferenceRuntime>,
+    profile_id: &str,
+    prompt_tokens: &[u32],
+    window: u32,
+    max_tokens: u32,
+    identity: &InstallationIdentity,
+    verifier_key: &VerifyingKey,
+    fallback_policy: FallbackPolicy,
+    trie_limits: TrieLimits,
+    proposal_deadline: Duration,
+) -> Result<SpecOutcome, SpecError> {
+    if !(MULTI_PROPOSERS_MIN..=MULTI_PROPOSERS_MAX).contains(&addr_proposers.len()) {
+        return Err(SpecError::Protocol(format!(
+            "speculate_multi needs {MULTI_PROPOSERS_MIN}..={MULTI_PROPOSERS_MAX} proposers, got {}",
+            addr_proposers.len()
+        )));
+    }
+    let session_id = new_nonce();
+    let params_hash = default_sampling_params_hash();
+    let descriptor = runtime_client.id();
+    let handshake = Handshake::build(
+        identity,
+        profile_id,
+        descriptor.name(),
+        descriptor.version(),
+    );
+
+    let mut verifier =
+        SignedFrameTransport::connect(addr_verifier, handshake.clone(), ROUND_DEADLINE).await?;
+    let mut proposers = Vec::with_capacity(addr_proposers.len());
+    for addr in addr_proposers {
+        proposers
+            .push(SignedFrameTransport::connect(addr, handshake.clone(), ROUND_DEADLINE).await?);
+    }
+
+    // Prefill every peer (verifier + roster).
+    let prefill = SpecMessage::PrefillRequest {
+        session_id: session_id.clone(),
+        profile_id: profile_id.to_string(),
+        prompt_tokens: prompt_tokens.to_vec(),
+        generation_params_hash: params_hash.clone(),
+    };
+    send_spec(&mut verifier, &prefill, ROUND_DEADLINE).await?;
+    expect_prefill_ready(&mut verifier, &session_id, GENESIS_PREFIX_HASH).await?;
+    for proposer in &mut proposers {
+        send_spec(proposer, &prefill, ROUND_DEADLINE).await?;
+        expect_prefill_ready(proposer, &session_id, GENESIS_PREFIX_HASH).await?;
+    }
+
+    let mut state =
+        SessionStateMachine::new(&session_id, profile_id, &params_hash, GENESIS_PREFIX_HASH)?;
+    let mut stats = AcceptanceStats::default();
+    let mut tokens: Vec<u32> = Vec::with_capacity(max_tokens as usize);
+    let mut round_batches: Vec<Vec<u32>> = Vec::new();
+    let mut window_curr = window.clamp(1, WINDOW_MAX);
+    let mut consecutive_full: u32 = 0;
+    let mut rejection_streak: u32 = 0;
+    let mut rtt_streak: u32 = 0;
+    let mut rate_history: VecDeque<(u64, u64)> = VecDeque::new();
+    let mut fallback: Option<FallbackReason> = None;
+    let decode_tps = runtime_client.metrics().decode_tokens_per_ms;
+    let mut trackers: Vec<ProposerPeerReport> = addr_proposers
+        .iter()
+        .enumerate()
+        .map(|(index, addr)| ProposerPeerReport {
+            index,
+            addr: addr.clone(),
+            blocks_arrived: 0,
+            straggler_rounds: 0,
+            drafted_tokens: 0,
+            accepted_tokens: 0,
+            alive: true,
+        })
+        .collect();
+    let mut duplicate_work: u64 = 0;
+    let mut pruned: u64 = 0;
+    let mut stragglers: u64 = 0;
+
+    while (tokens.len() as u32) < max_tokens && fallback.is_none() {
+        let remaining = max_tokens - tokens.len() as u32;
+        let round = state.round() + 1;
+        let round_started = Instant::now();
+        let window_eff = window_curr.min(remaining.saturating_sub(1));
+        // E5: the collection deadline is anchored at the round start, so any
+        // number of stragglers costs at most one deadline per round.
+        let collect_by = round_started + proposal_deadline;
+
+        // 1. Fan out seeded proposal requests (E1). Dead proposers are
+        // skipped; the roster length stays the FULL roster so branch
+        // assignments remain reproducible across peer loss.
+        let roster_len = trackers.len();
+        for (i, proposer) in proposers.iter_mut().enumerate() {
+            if !trackers[i].alive {
+                continue;
+            }
+            let request = SpecMessage::ProposalRequest {
+                session_id: session_id.clone(),
+                round,
+                window: window_eff,
+                deadline_ms: proposal_deadline.as_millis().min(u128::from(u32::MAX)) as u32,
+                branch_seed: Some(branch_assignment(&session_id, round, roster_len, i)),
+            };
+            if send_spec(proposer, &request, ROUND_DEADLINE).await.is_err() {
+                trackers[i].alive = false;
+                stragglers += 1;
+                trackers[i].straggler_rounds += 1;
+            }
+        }
+        if trackers.iter().all(|tracker| !tracker.alive) {
+            // Every proposer is gone: explicit fallback (D4 posture), the
+            // verifier-backed single tail keeps the output exact.
+            fallback = Some(FallbackReason::PeerLost);
+            continue;
+        }
+
+        // 2. Collect blocks under the anchored deadline; misses are counted
+        // stragglers and the proposer stays in the roster (its late replies
+        // are drained as stale by `recv_round_reply`).
+        let mut blocks: Vec<BranchBlock> = Vec::with_capacity(roster_len);
+        for (i, proposer) in proposers.iter_mut().enumerate() {
+            if !trackers[i].alive {
+                continue;
+            }
+            let budget = collect_by
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            match tokio::time::timeout(budget, recv_round_reply(proposer, round, ROUND_DEADLINE))
+                .await
+            {
+                Ok(Ok(SpecMessage::CandidateBlock { tokens, .. })) => {
+                    trackers[i].blocks_arrived += 1;
+                    trackers[i].drafted_tokens += tokens.len() as u64;
+                    blocks.push(BranchBlock {
+                        proposer: i,
+                        score: trackers[i].score(),
+                        tokens,
+                    });
+                }
+                Ok(Ok(SpecMessage::CancelRound { .. })) => {
+                    stragglers += 1;
+                    trackers[i].straggler_rounds += 1;
+                }
+                Ok(Ok(other)) => {
+                    return Err(SpecError::Protocol(format!(
+                        "expected candidate_block, got {other:?}"
+                    )))
+                }
+                Ok(Err(_transport)) => {
+                    // Connection died mid-collection: straggler this round and
+                    // out of the roster for good (D4 explicit peer loss).
+                    stragglers += 1;
+                    trackers[i].straggler_rounds += 1;
+                    trackers[i].alive = false;
+                }
+                Err(_elapsed) => {
+                    // Deadline miss (E5): counted and excluded this round;
+                    // the proposer stays in the roster — its late reply is
+                    // drained as a stale message on the next round.
+                    stragglers += 1;
+                    trackers[i].straggler_rounds += 1;
+                }
+            }
+        }
+
+        // 3. Assemble the bounded trie (E2 bounds, E3 duplicate counting).
+        let trie = CandidateTrie::assemble(blocks, trie_limits);
+        duplicate_work += trie.duplicate_work() as u64;
+        pruned += trie.pruned() as u64;
+        let branches: Vec<Vec<u32>> = trie
+            .branches()
+            .iter()
+            .map(|block| block.tokens.clone())
+            .collect();
+
+        // 4. One tree verification round against the verifier.
+        send_spec(
+            &mut verifier,
+            &SpecMessage::TreeVerifyRequest {
+                session_id: session_id.clone(),
+                round,
+                branches,
+            },
+            ROUND_DEADLINE,
+        )
+        .await?;
+        let result = match recv_spec(&mut verifier, ROUND_DEADLINE).await {
+            Ok(SpecMessage::TreeVerifyResult {
+                round: r,
+                accepted_tokens,
+                correction,
+                new_prefix_hash,
+                ..
+            }) if r == round => (accepted_tokens, correction, new_prefix_hash),
+            Ok(SpecMessage::CancelRound { reason, .. }) => {
+                return Err(SpecError::Protocol(format!("verifier cancelled: {reason}")))
+            }
+            Ok(other) => {
+                return Err(SpecError::Protocol(format!(
+                    "expected tree_verify_result, got {other:?}"
+                )))
+            }
+            Err(_) => {
+                fallback = Some(FallbackReason::PeerLost);
+                continue;
+            }
+        };
+
+        // 5. Commit through the SAME signed PrefixCommit path as Phase D.
+        let (accepted_tokens, correction, verified_hash) = result;
+        let mut committed_round = accepted_tokens.clone();
+        committed_round.extend(correction);
+        if committed_round.is_empty() {
+            return Err(SpecError::Protocol(
+                "tree verification committed no tokens".into(),
+            ));
+        }
+        let expected_hash = compute_prefix_hash(state.committed_prefix_hash(), &committed_round)?;
+        if expected_hash != verified_hash {
+            return Err(SpecError::Protocol(
+                "tree_verify new_prefix_hash does not match the committed tokens".into(),
+            ));
+        }
+        let commit = CommitPrefix {
+            session_id: session_id.clone(),
+            round,
+            previous_prefix_hash: state.committed_prefix_hash().to_string(),
+            accepted_token_ids: committed_round.clone(),
+            new_prefix_hash: expected_hash,
+            model_profile_id: profile_id.to_string(),
+            generation_params_hash: params_hash.clone(),
+            sender: identity.installation_id(),
+        };
+        let wire_commit = SpecMessage::signed_commit(&commit, identity)?;
+        send_spec(&mut verifier, &wire_commit, ROUND_DEADLINE).await?;
+        match recv_round_reply(&mut verifier, round, ROUND_DEADLINE).await? {
+            SpecMessage::CommitAck { ok: true, .. } => {}
+            SpecMessage::CommitAck {
+                ok: false, reason, ..
+            } => {
+                return Err(SpecError::Protocol(format!(
+                    "verifier rejected commit: {reason}"
+                )))
+            }
+            other => {
+                return Err(SpecError::Protocol(format!(
+                    "expected commit_ack, got {other:?}"
+                )))
+            }
+        }
+        // Forward the commit to every live proposer (prefix reconstruction);
+        // a proposer that fails here drops out of the roster silently — the
+        // commit itself is already chained on the verifier.
+        for (i, proposer) in proposers.iter_mut().enumerate() {
+            if !trackers[i].alive {
+                continue;
+            }
+            let ack = async {
+                send_spec(proposer, &wire_commit, ROUND_DEADLINE).await?;
+                recv_round_reply(proposer, round, ROUND_DEADLINE).await
+            }
+            .await;
+            // Liveness only (Phase D posture): a failing connection drops
+            // the proposer; a received message of any kind keeps it.
+            if ack.is_err() {
+                trackers[i].alive = false;
+            }
+        }
+        if state.apply(&commit) != ApplyOutcome::Advanced {
+            return Err(SpecError::Protocol(
+                "coordinator's own commit did not advance".into(),
+            ));
+        }
+        tokens.extend_from_slice(&committed_round);
+        round_batches.push(committed_round.clone());
+
+        // 6. Telemetry: winning-branch attribution (first assembled branch
+        // having the accepted tokens as a prefix — exactly
+        // verify_tree_greedy's first-with-max-depth tie-break).
+        let winning = trie.branches().iter().find(|block| {
+            block.tokens.len() >= accepted_tokens.len()
+                && block.tokens[..accepted_tokens.len()] == accepted_tokens[..]
+        });
+        match winning {
+            Some(block) => {
+                let fully_accepted = accepted_tokens.len() == block.tokens.len();
+                trackers[block.proposer].accepted_tokens += accepted_tokens.len() as u64;
+                stats.record_round(accepted_tokens.len(), committed_round.len());
+                if fully_accepted {
+                    consecutive_full += 1;
+                    rejection_streak = 0;
+                } else {
+                    stats.record_rollback();
+                    rejection_streak += 1;
+                    consecutive_full = 0;
+                }
+                rate_history
+                    .push_back((accepted_tokens.len() as u64, committed_round.len() as u64));
+            }
+            None => {
+                // No branch survived (all stragglers): the round committed
+                // exactly the lookahead bonus token — progress without any
+                // speculative rejection.
+                stats.record_round(0, committed_round.len());
+                rate_history.push_back((0, committed_round.len() as u64));
+                consecutive_full = 0;
+                rejection_streak = 0;
+            }
+        }
+        if consecutive_full >= WINDOW_GROW_STREAK {
+            window_curr = ((f64::from(window_curr) * 1.5).floor() as u32).clamp(1, WINDOW_MAX);
+            consecutive_full = 0;
+        }
+        if rejection_streak >= WINDOW_SHRINK_STREAK {
+            window_curr = (window_curr / 2).max(1);
+            rejection_streak = 0;
+        }
+        if rate_history.len() >= fallback_policy.rate_window_rounds {
+            let accepted_sum: u64 = rate_history.iter().map(|entry| entry.0).sum();
+            let committed_sum: u64 = rate_history.iter().map(|entry| entry.1).sum();
+            if committed_sum > 0
+                && (accepted_sum as f32 / committed_sum as f32)
+                    < fallback_policy.min_acceptance_rate
+            {
+                fallback = Some(FallbackReason::AcceptanceCollapse);
+            }
+        }
+        if decode_tps > 0.0 && rate_history.len() >= fallback_policy.rate_window_rounds {
+            let estimate_ms = committed_round.len() as f64 / decode_tps;
+            let round_ms = round_started.elapsed().as_secs_f64() * 1_000.0;
+            if round_ms > fallback_policy.rtt_multiplier * estimate_ms {
+                rtt_streak += 1;
+                if rtt_streak >= RTT_SPIKE_STREAK {
+                    fallback = Some(FallbackReason::RttSpike);
+                }
+            } else {
+                rtt_streak = 0;
+            }
+        }
+    }
+
+    // 7. Single-mode tail (exact by construction; same mechanism as D).
+    let remaining = max_tokens - tokens.len() as u32;
+    if remaining > 0 && fallback.is_some() {
+        let mut prefix = prompt_tokens.to_vec();
+        prefix.extend_from_slice(&tokens);
+        send_spec(
+            &mut verifier,
+            &SpecMessage::SingleDecode {
+                session_id: session_id.clone(),
+                prefix,
+                n: remaining,
+            },
+            ROUND_DEADLINE,
+        )
+        .await?;
+        let single_tokens = match recv_spec(&mut verifier, ROUND_DEADLINE).await? {
+            SpecMessage::SingleDecodeResult { tokens, .. } => tokens,
+            other => {
+                return Err(SpecError::Protocol(format!(
+                    "expected single_decode_result, got {other:?}"
+                )))
+            }
+        };
+        if single_tokens.len() != remaining as usize {
+            return Err(SpecError::Protocol(
+                "single decode returned the wrong count".into(),
+            ));
+        }
+        let round = state.round() + 1;
+        let new_hash = compute_prefix_hash(state.committed_prefix_hash(), &single_tokens)?;
+        let commit = CommitPrefix {
+            session_id: session_id.clone(),
+            round,
+            previous_prefix_hash: state.committed_prefix_hash().to_string(),
+            accepted_token_ids: single_tokens.clone(),
+            new_prefix_hash: new_hash,
+            model_profile_id: profile_id.to_string(),
+            generation_params_hash: params_hash.clone(),
+            sender: identity.installation_id(),
+        };
+        let wire_commit = SpecMessage::signed_commit(&commit, identity)?;
+        send_spec(&mut verifier, &wire_commit, ROUND_DEADLINE).await?;
+        match recv_spec(&mut verifier, ROUND_DEADLINE).await? {
+            SpecMessage::CommitAck { ok: true, .. } => {}
+            SpecMessage::CommitAck {
+                ok: false, reason, ..
+            } => {
+                return Err(SpecError::Protocol(format!(
+                    "verifier rejected tail commit: {reason}"
+                )))
+            }
+            other => {
+                return Err(SpecError::Protocol(format!(
+                    "expected commit_ack for tail, got {other:?}"
+                )))
+            }
+        }
+        for (i, proposer) in proposers.iter_mut().enumerate() {
+            if !trackers[i].alive {
+                continue;
+            }
+            let _ = send_spec(proposer, &wire_commit, ROUND_DEADLINE).await;
+        }
+        if state.apply(&commit) != ApplyOutcome::Advanced {
+            return Err(SpecError::Protocol("tail commit did not advance".into()));
+        }
+        tokens.extend_from_slice(&single_tokens);
+        round_batches.push(single_tokens);
+    }
+
+    // 8. Two-phase close with the verifier, then the proposers.
+    send_spec(
+        &mut verifier,
+        &SpecMessage::SessionClose {
+            session_id: session_id.clone(),
+            reason: "done".to_string(),
+        },
+        ROUND_DEADLINE,
+    )
+    .await?;
+    let mut receipts_verified = false;
+    match recv_spec(&mut verifier, ROUND_DEADLINE).await? {
+        receipt @ SpecMessage::Receipt { .. } => {
+            if verify_receipt_signature(&receipt, verifier_key).is_ok() {
+                let ack = SpecMessage::ReceiptAck {
+                    requester_signature: sign_receipt_ack(&receipt, identity)?,
+                };
+                send_spec(&mut verifier, &ack, ROUND_DEADLINE).await?;
+                receipts_verified = true;
+            }
+        }
+        other => {
+            return Err(SpecError::Protocol(format!(
+                "expected receipt, got {other:?}"
+            )))
+        }
+    }
+    for (i, proposer) in proposers.iter_mut().enumerate() {
+        if trackers[i].alive {
+            let _ = send_spec(
+                proposer,
+                &SpecMessage::SessionClose {
+                    session_id: session_id.clone(),
+                    reason: "done".to_string(),
+                },
+                ROUND_DEADLINE,
+            )
+            .await;
+        }
+    }
+    verifier.close();
+    for proposer in &mut proposers {
+        proposer.close();
+    }
+
+    Ok(SpecOutcome {
+        session_id,
+        tokens,
+        round_batches,
+        rounds: state.round(),
+        acceptance: stats,
+        fallback,
+        receipts_verified,
+        mode: SpecMode::MultiProposer,
+        duplicate_work,
+        pruned,
+        stragglers,
+        proposer_reports: trackers,
+    })
+}
 
 /// One verifier/proposer pair the [`SpeculativeExecutor`] rotates through.
 #[derive(Debug, Clone)]
@@ -1917,5 +2904,154 @@ mod tests {
             default_sampling_params_hash()
         );
         assert_eq!(default_sampling_params_hash().len(), 64);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase E unit tests (E1/E4)
+    // -----------------------------------------------------------------------
+
+    /// E4: batch/tree selection equals per-branch sequential verification
+    /// taking the max — the two verifier paths (tree-attention runtime vs
+    /// sequential fallback) commit identical prefixes.
+    #[test]
+    fn tree_verify_equals_max_per_branch_linear_verify() {
+        let mut cases_with_full_match = 0usize;
+        for case in 0..200u64 {
+            let mut rng = modelswarm_speculation::SplitMix64::new(0xE4E4_0000 + case);
+            let branch_count = 1 + (rng.next_u64() % 6) as usize;
+            let depth = 1 + (rng.next_u64() % 6) as usize;
+            // Branches drawn from a small token alphabet so shared prefixes
+            // (and exact duplicates, E3) occur frequently.
+            let blocks: Vec<BranchBlock> = (0..branch_count)
+                .map(|proposer| {
+                    let tokens: Vec<u32> =
+                        (0..depth).map(|_| (rng.next_u64() % 4) as u32).collect();
+                    BranchBlock {
+                        proposer,
+                        tokens,
+                        score: (rng.next_u64() % 7) as f32,
+                    }
+                })
+                .collect();
+            // Target continuation: deepest branch + lookahead, padded so the
+            // pruning pass below (which can leave branches of up to
+            // `max_nodes` tokens) is also covered.
+            let max_depth = blocks.iter().map(|b| b.tokens.len()).max().unwrap_or(0);
+            let target: Vec<u32> = (0..max_depth + 7)
+                .map(|_| (rng.next_u64() % 4) as u32)
+                .collect();
+            // No-prune limits: the pure selection-rule comparison...
+            let trie = CandidateTrie::assemble(
+                blocks,
+                TrieLimits {
+                    max_branches: branch_count.max(1),
+                    max_nodes: 4096,
+                },
+            );
+            assert_tree_equals_linear(&trie, &target);
+            // ...and the same assertion after a real pruning pass (E2):
+            // tight bounds truncate tails, and whatever survives must still
+            // verify identically both ways.
+            let pruned_trie = CandidateTrie::assemble(
+                trie.branches().to_vec(),
+                TrieLimits {
+                    max_branches: 2,
+                    max_nodes: 5,
+                },
+            );
+            assert_tree_equals_linear(&pruned_trie, &target);
+            if trie
+                .branches()
+                .iter()
+                .any(|b| b.tokens.iter().zip(&target).all(|(a, t)| a == t))
+            {
+                cases_with_full_match += 1;
+            }
+        }
+        assert!(
+            cases_with_full_match > 0,
+            "the sweep should exercise full-acceptance rounds too"
+        );
+    }
+
+    /// The empty trie (every proposer straggled) still commits exactly the
+    /// lookahead bonus token — the E5 no-stall progress guarantee.
+    #[test]
+    fn empty_trie_commits_the_bonus_token() {
+        let trie = CandidateTrie::assemble(Vec::new(), TrieLimits::default());
+        let target = vec![7u32, 9, 11];
+        let outcome = verify_tree_greedy(&trie, &target);
+        assert_eq!(outcome.committed, vec![7]);
+        assert_eq!(outcome.winning_branch, None);
+        assert_eq!(outcome.accepted_depth, 0);
+    }
+
+    /// E1: branch assignments are reproducible, distinct per proposer, and
+    /// vary with (session, round, roster) — the coordinator's seed schedule.
+    #[test]
+    fn branch_assignments_are_deterministic_and_distinct() {
+        let roster = 7usize;
+        for round in 1..50u64 {
+            let mut seeds = Vec::with_capacity(roster);
+            for index in 0..roster {
+                let seed = branch_assignment("sess-e1", round, roster, index);
+                assert_eq!(seed, branch_assignment("sess-e1", round, roster, index));
+                seeds.push(seed);
+            }
+            let mut sorted = seeds.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), roster, "seeds must be pairwise distinct");
+            // Different round ⇒ different assignment vector (with overwhelming
+            // probability across the sweep).
+            if round > 1 {
+                let prev: Vec<u64> = (0..roster)
+                    .map(|index| branch_assignment("sess-e1", round - 1, roster, index))
+                    .collect();
+                assert_ne!(prev, seeds, "assignment must depend on the round");
+            }
+        }
+        assert_ne!(
+            branch_assignment("a", 1, 4, 0),
+            branch_assignment("b", 1, 4, 0),
+            "assignment must depend on the session id"
+        );
+        assert_ne!(
+            branch_assignment("a", 1, 4, 0),
+            branch_assignment("a", 1, 5, 0),
+            "assignment must depend on the roster length"
+        );
+    }
+
+    /// Helper for the E4 comparison: `verify_tree_greedy` on the assembled
+    /// trie vs the per-branch sequential `verify_greedy` rule taking the
+    /// longest committed run (ties commit identical tokens: the committed
+    /// stream is always `target[..d] ++ [target[d]]`).
+    fn assert_tree_equals_linear(trie: &CandidateTrie, target: &[u32]) {
+        let tree = verify_tree_greedy(trie, target);
+        let mut best_linear: Vec<u32> = Vec::new();
+        let mut best_accepted = 0usize;
+        for block in trie.branches() {
+            let window = &target[..block.tokens.len() + 1];
+            let linear = verify_greedy(&block.tokens, window);
+            if linear.committed.len() > best_linear.len() {
+                best_linear = linear.committed;
+                best_accepted = linear.accepted_draft;
+            }
+        }
+        assert_eq!(
+            tree.committed,
+            best_linear,
+            "tree vs linear committed mismatch (branches: {:?}, target: {target:?})",
+            trie.branches()
+                .iter()
+                .map(|b| &b.tokens)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(tree.accepted_depth, best_accepted);
+        if best_linear.is_empty() {
+            // No branch at all: the bonus token is the whole round.
+            assert_eq!(tree.committed, vec![target[0]]);
+        }
     }
 }

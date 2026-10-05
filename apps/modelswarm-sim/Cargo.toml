@@ -8,12 +8,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait = "0.1"
 modelswarm-identity = { path = "../../crates/modelswarm-identity" }
 modelswarm-transport = { path = "../../crates/modelswarm-transport" }
 # TEST-ONLY mock backend (ADR-019): the sim harness is exactly the sanctioned
 # non-product consumer of `mock-runtime`.
 modelswarm-runtime = { path = "../../crates/modelswarm-runtime", features = ["mock-runtime"] }
 modelswarm-session = { path = "../../crates/modelswarm-session" }
+modelswarm-speculation = { path = "../../crates/modelswarm-speculation" }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 anyhow = "1"

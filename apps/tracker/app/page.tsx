@@ -1,13 +1,16 @@
+// Windows is the lead platform while the client is an internal test; the
+// other OS builds stay frozen at the last all-OS release until the Windows
+// client is verified working end-to-end (owner directive, 2026-10-05).
 const DOWNLOADS = [
-  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.2-windows-x64.exe", size: "14 MB" },
-  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.2-linux-amd64.deb", size: "34 MB" },
-  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.2-linux-amd64.AppImage", size: "101 MB" },
-  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.2-macos-arm64.dmg", size: "34 MB" },
+  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.3-windows-x64.exe", version: "0.2.3", lead: true },
+  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.2-linux-amd64.deb", version: "0.2.2", lead: false },
+  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.2-linux-amd64.AppImage", version: "0.2.2", lead: false },
+  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.2-macos-arm64.dmg", version: "0.2.2", lead: false },
 ];
 const DOWNLOAD = {
-  version: "0.2.2",
+  version: "0.2.3",
   sums: "/downloads/SHA256SUMS.txt",
-  sha256: "b8bc929ea3f1c6f9e7bac9864e2e166f8d916dd69073522ce0de6f17c4c56598",
+  sha256: "d0e16f8c27a408572847ba1c2cc841d144f9aa3658b3f989fa85ba39808ba58d",
 };
 
 // Dedicated community room — the room word is fixed here and nowhere else on
@@ -119,11 +122,11 @@ export default function Home() {
 
       <div className="wrap">
         <section aria-labelledby="download-heading">
-          <h2 id="download-heading">Download the client — v{DOWNLOAD.version}, all platforms released together</h2>
+          <h2 id="download-heading">Download the client — Windows leads, other OSes frozen at 0.2.2</h2>
           <div className="card">
             <div className="dl">
               <div>
-                <h3>ModelSwarm Desktop — {DOWNLOAD.version} (internal test)</h3>
+                <h3>ModelSwarm Desktop — {DOWNLOAD.version} (internal test, Windows-first)</h3>
                 <p className="meta">
                   windowed app hosting one of three model profiles: model-picker first page,
                   download-or-load on selection, swarm starts, local OpenAI-compatible API +
@@ -132,8 +135,8 @@ export default function Home() {
               </div>
               <div>
                 {DOWNLOADS.map((d) => (
-                  <a className="btn ghost" data-file={d.file} style={{ marginRight: 8, marginBottom: 6, display: "inline-block" }} href={"/api/download/" + d.file} download={d.file} aria-label={"Download ModelSwarm " + DOWNLOAD.version + " for " + d.os}>
-                    {d.os} <span className="dl-count" data-count-for={d.file} style={{ opacity: 0.75 }}>· ↓0</span>
+                  <a className="btn ghost" data-file={d.file} style={{ marginRight: 8, marginBottom: 6, display: "inline-block" }} href={"/api/download/" + d.file} download={d.file} aria-label={"Download ModelSwarm " + d.version + " for " + d.os}>
+                    {d.os} · v{d.version}{d.lead ? "" : " (paused)"} <span className="dl-count" data-count-for={d.file} style={{ opacity: 0.75 }}>· ↓0</span>
                   </a>
                 ))}
                 <a className="btn ghost" href={DOWNLOAD.sums} download="SHA256SUMS.txt">checksums</a>
@@ -142,8 +145,9 @@ export default function Home() {
             <p className="sum">windows sha256&nbsp; {DOWNLOAD.sha256}</p>
             <div className="warn" role="note">
               INTERNAL TEST BUILD — UNSIGNED. Verify the SHA-256 above before running; expect
-              OS warnings (SmartScreen / Gatekeeper) for an unverified publisher. Same version
-              number on every OS = same build.
+              OS warnings (SmartScreen / Gatekeeper) for an unverified publisher. Windows is
+              the lead platform for the internal test; Linux/macOS stay at v0.2.2 until the
+              Windows client is verified, then resume releasing together.
             </div>
           </div>
         </section>

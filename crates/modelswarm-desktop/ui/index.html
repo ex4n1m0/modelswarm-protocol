@@ -65,6 +65,7 @@
 <body>
   <header>
     <h1>ModelSwarm</h1>
+    <span class="build-tag" id="version-tag" role="note" aria-label="Client version">v…</span>
     <span class="build-tag" role="note" aria-label="Build label">INTERNAL TEST BUILD — UNSIGNED</span>
     <span class="note" id="conn-note" role="status">connecting…</span>
   </header>
@@ -170,7 +171,7 @@
     </section>
   </main>
 
-  <footer>ModelSwarm internal test shell (Phase H) — every number in this UI is measured, never theoretical.</footer>
+  <footer>ModelSwarm <span id="foot-version">v…</span> internal test shell — every number in this UI is measured, never theoretical.</footer>
 
   <script>
     const { invoke } = window.__TAURI__.core;
@@ -182,7 +183,16 @@
 
     async function refreshModels() {
       let models = [];
-      try { models = await invoke("list_models"); error(""); } catch (e) { $("model-cards").innerHTML = '<div class="note">catalog unreachable</div>'; return; }
+      try { models = await invoke("list_models"); error(""); }
+      catch (e) {
+        // Show the real error (fetched URL, TLS/DNS/timeout/signature cause) —
+        // never a bare "unreachable" that hides the actual failure.
+        const note = document.createElement("div");
+        note.className = "note";
+        note.textContent = "catalog unreachable — " + e;
+        $("model-cards").replaceChildren(note);
+        return;
+      }
       $("model-cards").innerHTML = models.map(m => `
         <div class="card ${m.selected ? "selected" : ""}" role="option" aria-selected="${!!m.selected}"
              data-id="${m.profile_id}" tabindex="0">
@@ -213,7 +223,11 @@
       try { s = await invoke("get_status"); $("conn-note").textContent = "live"; error(""); }
       catch (e) { $("conn-note").textContent = "ipc error"; return; }
       $("tracker-url").value = s.tracker;
-      $("engine-line").textContent = s.engine_available ? "pinned llama.cpp — present" : "MISSING (install incomplete)";
+      $("version-tag").textContent = "v" + s.version;
+      $("foot-version").textContent = "v" + s.version + " ";
+      $("engine-line").textContent = s.engine_available
+        ? "pinned llama.cpp — present"
+        : "MISSING — expected at " + s.engine_path;
       $("privacy-gate").hidden = s.license_accepted;
       hostingOn = s.node.hosting;
       $("hosting-switch").dataset.on = hostingOn;

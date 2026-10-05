@@ -113,10 +113,17 @@ fn default_tracker() -> String {
 }
 
 fn read_config(data_dir: &std::path::Path) -> PersistedConfig {
-    std::fs::read_to_string(data_dir.join("config.json"))
+    let mut config: PersistedConfig = std::fs::read_to_string(data_dir.join("config.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // A persisted empty string would otherwise override the default tracker
+    // (serde defaults only apply to missing keys) and every fetch would die
+    // on a relative URL.
+    if config.tracker.trim().is_empty() {
+        config.tracker = default_tracker();
+    }
+    config
 }
 
 fn engine_binary_path() -> PathBuf {
@@ -127,15 +134,37 @@ fn engine_binary_path() -> PathBuf {
     };
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("modelswarm"));
     let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
-    // Installers place resources beside the exe; dev builds may use a staged
-    // `resources/` subdir. First hit wins.
-    for candidate in [name, &format!("resources/{name}")] {
+    // The NSIS bundle installs the pinned engine into `engine/` beside the
+    // exe (tauri.conf.json `resources: ["engine/*"]`); dev builds may stage
+    // it flat or under `resources/`. First hit wins.
+    let candidates = [
+        format!("engine/{name}"),
+        name.to_string(),
+        format!("resources/{name}"),
+    ];
+    for candidate in &candidates {
         let path = dir.join(candidate);
         if path.is_file() {
             return path;
         }
     }
-    dir.join(name)
+    dir.join(&candidates[0])
+}
+
+/// Appends one event to the node log (same sink/format as the node's own
+/// events) so client-side failures — catalog fetches above all — leave a
+/// trail even when the UI is the only thing reporting them.
+fn log_event(data_dir: &std::path::Path, level: &str, event: &str, fields: &[(&str, &str)]) {
+    let _ = std::fs::create_dir_all(data_dir.join("logs"));
+    let Ok(sink) = modelswarm_telemetry::FileSink::open(&data_dir.join("logs").join("node.jsonl"))
+    else {
+        return;
+    };
+    let telemetry = Telemetry::with_sink(Box::new(sink));
+    match level {
+        "warn" => telemetry.warn(event, fields),
+        _ => telemetry.info(event, fields),
+    };
 }
 
 async fn tracker_client(
@@ -238,7 +267,10 @@ pub fn render_chatml(messages: &[ChatTurn]) -> String {
 // ---- IPC commands ---------------------------------------------------------
 
 #[tauri::command]
-async fn get_status(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Value, String> {
+async fn get_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<serde_json::Value, String> {
     let inner = state.inner.lock().await;
     let engine = engine_binary_path();
     let node_running = inner.node.is_some();
@@ -251,9 +283,11 @@ async fn get_status(state: tauri::State<'_, DesktopState>) -> Result<serde_json:
         None => (None, None, None),
     };
     Ok(serde_json::json!({
+        "version": app.package_info().version.to_string(),
         "tracker": inner.tracker_url,
         "data_dir": inner.data_dir.display().to_string(),
         "engine_available": engine.is_file(),
+        "engine_path": engine.display().to_string(),
         "license_accepted": inner.license_accepted,
         "profile_id": inner.profile_id,
         "artifact": inner.artifact.as_ref().map(|a| serde_json::json!({
@@ -277,7 +311,11 @@ async fn set_tracker(state: tauri::State<'_, DesktopState>, url: String) -> Resu
     if inner.node.is_some() {
         return Err("stop hosting before changing the tracker".into());
     }
-    inner.tracker_url = url.trim_end_matches('/').to_string();
+    let url = url.trim().trim_end_matches('/');
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("tracker URL must start with http:// or https://".into());
+    }
+    inner.tracker_url = url.to_string();
     let config = PersistedConfig {
         tracker: inner.tracker_url.clone(),
         profile_id: inner.profile_id.clone(),
@@ -309,9 +347,30 @@ async fn list_models(
 ) -> Result<Vec<serde_json::Value>, String> {
     let mut inner = state.inner.lock().await;
     let tracker = tracker_client(&inner.tracker_url, &inner.data_dir).await?;
-    let profiles = catalog::active_profiles(&tracker)
-        .await
-        .map_err(|e| e.to_string())?;
+    // One retry after a short pause: a single reset packet between here and
+    // the hub should not read as "catalog down". Both attempts are logged;
+    // the second failure is what the UI shows.
+    let profiles = match catalog::active_profiles(&tracker).await {
+        Ok(profiles) => profiles,
+        Err(first) => {
+            log_event(
+                &inner.data_dir,
+                "warn",
+                "catalog.error",
+                &[
+                    ("error", &first.to_string()),
+                    ("tracker", &inner.tracker_url),
+                ],
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            catalog::active_profiles(&tracker).await.map_err(|second| {
+                format!(
+                    "{second} (tracker {url}, retried once)",
+                    url = inner.tracker_url
+                )
+            })?
+        }
+    };
     let store = modelswarm_store::Store::open(inner.data_dir.join("state.sqlite")).ok();
     let manager = ArtifactManager::new(&inner.data_dir);
     let head_client = reqwest::Client::new();
@@ -492,11 +551,13 @@ async fn set_hosting_inner(
     let version = listing.manifest.runtime().version().to_string();
     let build = listing.manifest.runtime().build_hash().to_string();
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
+    let hb_data_dir = inner.data_dir.clone();
     let heartbeat = tokio::spawn(async move {
         let runtime_desc = serde_json::json!({
             "name": "llama.cpp", "version": version, "build_hash": build,
         });
         let mut lease_id: Option<String> = None;
+        let mut roster_failures: u32 = 0;
         loop {
             if *heartbeat_shutdown.borrow() {
                 return;
@@ -528,6 +589,22 @@ async fn set_hosting_inner(
                     }),
             };
             if let Err(error) = result {
+                // A windowed app's stderr is invisible: roster failures (an
+                // unenrolled installation reads as 401 until the ops
+                // approval gate clears) must reach the log file, throttled
+                // to the first failure and then every 20th (10 min).
+                roster_failures += 1;
+                if roster_failures == 1 || roster_failures % 20 == 0 {
+                    log_event(
+                        &hb_data_dir,
+                        "warn",
+                        "roster.error",
+                        &[
+                            ("error", &error.to_string()),
+                            ("attempt", &roster_failures.to_string()),
+                        ],
+                    );
+                }
                 eprintln!("modelswarm-desktop: roster: {error}");
             }
             tokio::select! {

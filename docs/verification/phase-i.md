@@ -39,3 +39,47 @@ binary-name portability, tauri deb/appimage/dmg matrix CI. Tracked in
 
 Local serving; roster visible cross-machine; remote execution awaits the
 transport listener. Unsigned builds, labeled. All badge numbers measured.
+
+## I6 — v0.2.3 Windows-first release (this commit)
+
+Owner report (2026-10-05 23:56): "catalog unreachable", no version number in
+the client, engine reported missing. Root causes found on the live build:
+
+1. **v0.2.2 NSIS shipped without the engine** — built from a cleaned tree
+   (`engine/` is gitignored and empty; the `resources: ["engine/*"]` glob
+   fails silently) → 13.9 MB installer, every fresh install dead.
+2. **`engine_binary_path()` never looked in `engine/`** — the exact subdir
+   the NSIS bundle installs to; even engine-complete installs read as
+   "Engine MISSING".
+3. **No version anywhere** (title, UI, `get_status`) — builds were
+   indistinguishable, which is how v0.2.1/v0.2.2 confusion happened.
+4. **The UI swallowed every catalog error** as a bare "catalog unreachable"
+   and nothing was logged. (The catalog itself was healthy: the same fetch
+   path from current source verified live — 3 profiles, Ed25519 OK.)
+
+Fixes in `crates/modelswarm-desktop`: engine lookup order `engine/` → flat →
+`resources/`; `get_status` exposes `version` (tauri package_info) +
+`engine_path`; empty persisted tracker falls back to the default;
+`set_tracker` requires an absolute http(s) URL; `list_models` retries once
+and surfaces the real error + URL; catalog and roster failures are logged to
+`logs/node.jsonl` (`catalog.error`, `roster.error` — throttled); UI shows
+version chip + footer version and the actual error text; `build.rs` warns
+when a release build lacks the staged engine; new
+`installer/stage-engine-windows.mjs` stages the pinned b11407 engine
+(per-file SHA-256 vs `runtime-pins.json`, fail-closed).
+
+Evidence: sandbox `/S /D=` install of the exact published artifact →
+engine `pinned llama.cpp — present`, catalog renders 3 cards, `live` IPC,
+title/header/footer read `0.2.3-internal-test-unsigned`; SmolLM2-135M
+selected → 105,454,432 B downloaded (exact catalog size), gateway
+`127.0.0.1:11435` serving the profile, chat measured **244.5 tok/s · 256
+tok · 1047 ms**. Live site: counted route 302 → artifact, SHA-256 match
+(`d0e16f8c…`), counter incremented. Owner machine upgraded in place.
+
+**Windows-first (owner directive)**: Linux/macOS stay at v0.2.2 ("paused"
+on the site) until the Windows client is verified; releases then resume
+together.
+
+Known boundary (now visible, not silent): roster registration 401s until
+the installation is device-enrolled AND admin-approved (tracker ops gate);
+hosting is local-only until the Phase F listener, as before.

@@ -6,7 +6,7 @@ const TITLE = "ModelSwarm — Decentralized Cooperative Inference";
 const DESCRIPTION =
   "Network-aware micro-swarms of peers hosting the same immutable model profile. " +
   "Lossless cooperative inference with fastest-host fallback. " +
-  "Client for Windows, Linux, and macOS — all platforms released together.";
+  "Windows client leads the internal test; Linux and macOS follow.";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),

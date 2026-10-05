@@ -623,3 +623,43 @@ async fn unknown_peer_is_refused_by_resolver() {
         "got {server_err:?}"
     );
 }
+
+// Raw-JSON passthrough (extension namespaces, ADR-018 amended staging) -------
+
+#[tokio::test]
+async fn raw_json_passthrough_rides_the_authenticated_session() {
+    let client = ident(40);
+    let listener = make_listener().await;
+    let addr = listener.local_addr().unwrap();
+    let expected = client.verifying_key();
+    let responder = tokio::spawn(async move {
+        let mut session = listener.accept(&expected, D).await?;
+        // Extension server: one raw JSON exchange, then the typed surface
+        // keeps working on the same session.
+        let value = session.recv_json(D).await?;
+        let reply = serde_json::json!({
+            "echo": value,
+            "namespace": "/msp/extension-test/1.0.0",
+        });
+        session.send_json(&reply, D).await?;
+        let typed: WireMessage = session.recv(D).await?;
+        assert!(matches!(typed, WireMessage::Cancel(_)));
+        Ok::<(), TransportError>(())
+    });
+
+    let mut session: Session =
+        SignedFrameTransport::connect(&addr.to_string(), handshake_for(&client), D)
+            .await
+            .expect("connect");
+    // The extension frame is NOT a WireMessage: a typed-only peer would have
+    // failed to decode it (and closed); recv_json reads it verbatim.
+    let ext = json!({"op": "hello", "round": 7});
+    session.send_json(&ext, D).await.expect("send_json");
+    let echoed = session.recv_json(D).await.expect("recv_json");
+    assert_eq!(echoed["echo"], ext);
+    assert_eq!(echoed["namespace"], "/msp/extension-test/1.0.0");
+    // Typed traffic still flows both directions afterwards.
+    session.request_cancel("raw-json-1").await.expect("cancel");
+    session.close();
+    responder.await.unwrap().expect("responder flow");
+}

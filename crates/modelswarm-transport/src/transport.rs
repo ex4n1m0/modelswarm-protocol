@@ -13,6 +13,7 @@
 //! authentication, not confidentiality, and must never listen beyond
 //! loopback.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::VerifyingKey;
 use modelswarm_identity::{rfc3339_now, within_window, REPLAY_WINDOW_SECS};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
@@ -44,11 +46,20 @@ pub const CANCEL_DEADLINE: Duration = Duration::from_secs(5);
 // Session
 // ---------------------------------------------------------------------------
 
+/// Pre-serialized frame payload queued for the writer task.
 struct OutboundItem {
-    msg: WireMessage,
+    payload: Vec<u8>,
     /// Completed by the writer task once the frame hit the socket. Dropped
     /// without send when the writer dies first (surfaced as `Closed`).
     ack: oneshot::Sender<Result<(), TransportError>>,
+}
+
+/// One decoded inbound frame: a typed [`WireMessage`] or, when the payload is
+/// valid JSON but not a typed message, the raw passthrough value delivered to
+/// [`Session::recv_json`] (extension namespaces, ADR-018 amended staging).
+enum InboundFrame {
+    Typed(WireMessage),
+    Raw(Value),
 }
 
 #[derive(Debug, Default)]
@@ -84,7 +95,13 @@ impl SessionState {
 #[derive(Debug)]
 pub struct Session {
     outbound: mpsc::Sender<OutboundItem>,
-    inbound: mpsc::Receiver<WireMessage>,
+    inbound: mpsc::Receiver<InboundFrame>,
+    /// Typed frames intercepted by [`Session::recv_json`] while waiting for a
+    /// raw passthrough frame (delivered by the next [`Session::recv`]).
+    stashed_typed: VecDeque<WireMessage>,
+    /// Raw passthrough frames intercepted by [`Session::recv`] while waiting
+    /// for a typed message (delivered by the next [`Session::recv_json`]).
+    stashed_raw: VecDeque<Value>,
     shutdown: watch::Sender<bool>,
     state: Arc<SessionState>,
 }
@@ -94,7 +111,7 @@ fn spawn_session(stream: TcpStream) -> Session {
     let (read_half, write_half) = stream.into_split();
 
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundItem>(SEND_CHANNEL_CAPACITY);
-    let (inbound_tx, inbound_rx) = mpsc::channel::<WireMessage>(RECV_CHANNEL_CAPACITY);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<InboundFrame>(RECV_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let state = Arc::new(SessionState::default());
 
@@ -103,7 +120,9 @@ fn spawn_session(stream: TcpStream) -> Session {
     // shutdown arm; caller-side deadlines bound the observable wait. Write
     // failures are delivered to the awaiting sender via the ack; the reader
     // task's terminal error (the connection is broken for it too) covers
-    // callers that never see the ack.
+    // callers that never see the ack. Payloads arrive pre-serialized
+    // (typed WireMessage or raw JSON passthrough) — encode errors surface at
+    // the send call site instead.
     {
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -115,14 +134,7 @@ fn spawn_session(stream: TcpStream) -> Session {
                     _ = shutdown_rx.changed() => break,
                     item = queue.recv() => {
                         let Some(item) = item else { break };
-                        let payload = match serde_json::to_vec(&item.msg) {
-                            Ok(payload) => payload,
-                            Err(e) => {
-                                let _ = item.ack.send(Err(TransportError::Io(invalid_data("frame encode", e))));
-                                break;
-                            }
-                        };
-                        let result = frame::write_frame_raw(&mut writer, &payload)
+                        let result = frame::write_frame_raw(&mut writer, &item.payload)
                             .await
                             .map_err(TransportError::from);
                         let fatal = result.is_err();
@@ -137,7 +149,10 @@ fn spawn_session(stream: TcpStream) -> Session {
     }
 
     // Reader task: frames off the socket into the bounded inbound channel.
-    // Control pings are answered transparently in-band and never reach the
+    // Payloads decode as typed WireMessages when they are one, and as raw
+    // JSON values otherwise (the extension-namespace passthrough); only a
+    // payload that is not valid JSON at all corrupts the session. Control
+    // pings are answered transparently in-band and never reach the
     // application; pongs do (RTT measurement).
     {
         let mut shutdown_rx = shutdown_rx;
@@ -158,18 +173,24 @@ fn spawn_session(stream: TcpStream) -> Session {
                         }
                     },
                 };
-                let msg: WireMessage = match serde_json::from_slice(&bytes) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        state.record(TransportError::Io(invalid_data("frame decode", e)));
-                        break;
-                    }
+                let msg = match serde_json::from_slice::<WireMessage>(&bytes) {
+                    Ok(msg) => InboundFrame::Typed(msg),
+                    Err(_) => match serde_json::from_slice::<Value>(&bytes) {
+                        Ok(value) => InboundFrame::Raw(value),
+                        Err(e) => {
+                            state.record(TransportError::Io(invalid_data("frame decode", e)));
+                            break;
+                        }
+                    },
                 };
-                if let WireMessage::Control(control) = &msg {
+                if let InboundFrame::Typed(WireMessage::Control(control)) = &msg {
                     if control.kind == Control::PING {
                         let (ack_tx, _ack_rx) = oneshot::channel();
                         let pong = OutboundItem {
-                            msg: WireMessage::Control(Control::pong(&control.nonce)),
+                            payload: serde_json::to_vec(&WireMessage::Control(Control::pong(
+                                &control.nonce,
+                            )))
+                            .expect("control pong serializes"),
                             ack: ack_tx,
                         };
                         if pong_channel.send(pong).await.is_err() {
@@ -188,26 +209,60 @@ fn spawn_session(stream: TcpStream) -> Session {
     Session {
         outbound: outbound_tx,
         inbound: inbound_rx,
+        stashed_typed: VecDeque::new(),
+        stashed_raw: VecDeque::new(),
         shutdown: shutdown_tx,
         state,
     }
 }
 
 impl Session {
-    /// Sends one message. The deadline bounds both the bounded-channel wait
-    /// (backpressure when the peer is slow) and the socket write. Deadline
-    /// expiry closes the session.
+    /// Sends one typed message. The deadline bounds both the bounded-channel
+    /// wait (backpressure when the peer is slow) and the socket write.
+    /// Deadline expiry closes the session.
     pub async fn send(
         &mut self,
         msg: WireMessage,
         deadline: Duration,
     ) -> Result<(), TransportError> {
         self.check_open()?;
+        let payload = serde_json::to_vec(&msg)
+            .map_err(|e| TransportError::Io(invalid_data("frame encode", e)))?;
+        self.send_payload(payload, deadline).await
+    }
+
+    /// Sends one raw JSON value as a frame (extension-namespace passthrough).
+    ///
+    /// ADR-018 amended staging: cooperative extension protocols (e.g. the
+    /// Phase-D speculative namespace in `modelswarm-session`) ride the
+    /// handshake-authenticated session without being part of the frozen §6
+    /// typed surface; state-changing extension messages (commits, receipts)
+    /// are additionally signed at the session layer by the extension itself.
+    /// The value is framed exactly as serialized — it is NOT wrapped in a
+    /// typed [`WireMessage`], so only a peer using [`Session::recv_json`]
+    /// can read it.
+    pub async fn send_json(&self, value: &Value, deadline: Duration) -> Result<(), TransportError> {
+        self.check_open()?;
+        let payload = serde_json::to_vec(value)
+            .map_err(|e| TransportError::Io(invalid_data("frame encode", e)))?;
+        self.send_payload(payload, deadline).await
+    }
+
+    /// Shared send path: enqueue the pre-serialized payload, await the writer
+    /// ack, apply the deadline policy (expiry closes the session).
+    async fn send_payload(
+        &self,
+        payload: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<(), TransportError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         let outbound = self.outbound.clone();
         let send_and_write = async move {
             outbound
-                .send(OutboundItem { msg, ack: ack_tx })
+                .send(OutboundItem {
+                    payload,
+                    ack: ack_tx,
+                })
                 .await
                 .map_err(|_| TransportError::Closed)?;
             match ack_rx.await {
@@ -228,15 +283,65 @@ impl Session {
         }
     }
 
-    /// Receives the next application message. Control pongs are delivered
-    /// (used by [`Session::measure_rtt`]); control pings never are. Deadline
-    /// expiry closes the session; a dead peer surfaces as its terminal error
-    /// or [`TransportError::Closed`].
+    /// Receives the next typed application message. Control pongs are
+    /// delivered (used by [`Session::measure_rtt`]); control pings never are.
+    /// Raw JSON passthrough frames (see [`Session::send_json`]) are stashed
+    /// for [`Session::recv_json`] instead of surfacing here. Deadline expiry
+    /// closes the session; a dead peer surfaces as its terminal error or
+    /// [`TransportError::Closed`].
     pub async fn recv(&mut self, deadline: Duration) -> Result<WireMessage, TransportError> {
         self.check_open()?;
-        match timeout(deadline, self.inbound.recv()).await {
-            Ok(Some(msg)) => Ok(msg),
-            Ok(None) => Err(self.state.take_terminal().unwrap_or(TransportError::Closed)),
+        let wait = async {
+            loop {
+                if let Some(msg) = self.stashed_typed.pop_front() {
+                    return Ok(msg);
+                }
+                match self.inbound.recv().await {
+                    Some(InboundFrame::Typed(msg)) => return Ok(msg),
+                    Some(InboundFrame::Raw(value)) => {
+                        self.stashed_raw.push_back(value);
+                    }
+                    None => {
+                        return Err(self.state.take_terminal().unwrap_or(TransportError::Closed))
+                    }
+                }
+            }
+        };
+        match timeout(deadline, wait).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.close();
+                Err(TransportError::Timeout)
+            }
+        }
+    }
+
+    /// Receives the next raw JSON passthrough frame (see [`Session::send_json`]).
+    ///
+    /// Typed [`WireMessage`] frames that arrive meanwhile are stashed and
+    /// delivered by the next [`Session::recv`]. Same deadline policy as
+    /// [`Session::recv`]: expiry closes the session; a dead peer surfaces as
+    /// its terminal error or [`TransportError::Closed`].
+    pub async fn recv_json(&mut self, deadline: Duration) -> Result<Value, TransportError> {
+        self.check_open()?;
+        let wait = async {
+            loop {
+                if let Some(value) = self.stashed_raw.pop_front() {
+                    return Ok(value);
+                }
+                match self.inbound.recv().await {
+                    Some(InboundFrame::Raw(value)) => return Ok(value),
+                    Some(InboundFrame::Typed(msg)) => {
+                        self.stashed_typed.push_back(msg);
+                    }
+                    None => {
+                        return Err(self.state.take_terminal().unwrap_or(TransportError::Closed))
+                    }
+                }
+            }
+        };
+        match timeout(deadline, wait).await {
+            Ok(result) => result,
             Err(_) => {
                 self.close();
                 Err(TransportError::Timeout)

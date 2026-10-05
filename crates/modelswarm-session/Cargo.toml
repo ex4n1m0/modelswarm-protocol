@@ -10,9 +10,22 @@ rust-version.workspace = true
 [dependencies]
 sha2 = "0.10"
 hex = "0.4"
+async-trait = "0.1"
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "sync", "time"] }
+modelswarm-gateway = { path = "../modelswarm-gateway" }
+modelswarm-identity = { path = "../modelswarm-identity" }
+modelswarm-runtime = { path = "../modelswarm-runtime" }
+modelswarm-speculation = { path = "../modelswarm-speculation" }
+modelswarm-transport = { path = "../modelswarm-transport" }
 
 [dev-dependencies]
 proptest = "1"
+tokio = { version = "1", features = ["full"] }
+modelswarm-runtime = { path = "../modelswarm-runtime", features = ["mock-runtime"] }
 
 [lints]
 workspace = true

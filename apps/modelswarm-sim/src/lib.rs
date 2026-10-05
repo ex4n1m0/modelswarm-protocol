@@ -1,5 +1,5 @@
 //! `modelswarm-sim` — deterministic loopback scenario runner for the Phase C
-//! transport gate (ADR-018).
+//! transport gate (ADR-018) and the Phase D speculative gate.
 //!
 //! Every scenario runs against real TCP sockets on `127.0.0.1:0` and prints
 //! exactly one JSON object per line (machine-readable; timings vary, the
@@ -14,16 +14,27 @@
 //!   adjacency matrix + RTT matrix.
 //! - [`kill`]: a pair where the responder dies at a deadline; the client
 //!   reports a structured failure event — no silent hang, ever.
+//! - [`spec`]: in-process proposer + verifier servers (TEST-ONLY
+//!   [`MockRuntime`], ADR-019) plus a coordinator over real loopback
+//!   `SignedFrameTransport` sessions; 64 speculative tokens and, for the same
+//!   prompt, plain single decoding against the verifier runtime; reports the
+//!   greedy-equality verdict plus acceptance telemetry (Phase D).
 //!
 //! [`pair`]: run_pair
 //! [`mesh`]: run_mesh
 //! [`kill`]: run_kill
+//! [`spec`]: run_spec
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use modelswarm_identity::InstallationIdentity;
+use modelswarm_runtime::{InferenceRuntime, MockRuntime, SamplingParams};
+use modelswarm_session::spec::{
+    serve_proposer, serve_speculative, speculate, FallbackPolicy, SpecOutcome,
+};
 use modelswarm_transport::ed25519_dalek::VerifyingKey;
 use modelswarm_transport::{
     ChatMessage, Completed, Handshake, InferenceRequest, Listener, Sampling, Session,
@@ -426,6 +437,167 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
+// ---------------------------------------------------------------------------
+// spec (Phase D)
+// ---------------------------------------------------------------------------
+
+/// Output length of the `spec` scenario.
+pub const SPEC_TOKENS: u32 = 64;
+
+/// The measured facts of one `spec` run (kept as a struct so the test matrix
+/// asserts on data, not on the printed JSON line).
+#[derive(Debug, Clone)]
+pub struct SpecCase {
+    pub prompt_seed: u64,
+    pub window: u32,
+    pub draft_accuracy: f32,
+    pub tokens_equal_to_single: bool,
+    pub rounds: u64,
+    pub mean_acceptance_length: f32,
+    pub acceptance_rate: f32,
+    pub fallback: Option<&'static str>,
+    pub receipts_verified: bool,
+    pub verifier_reports: usize,
+    pub proposer_reports: usize,
+    pub verifier_addr: String,
+    pub proposer_addr: String,
+    pub elapsed_ms: f64,
+}
+
+/// Runs one `spec` case: in-process proposer + verifier servers (MockRuntime,
+/// `draft_accuracy` knob) + coordinator over real loopback TCP, 64 tokens;
+/// then plain single decoding of the same prompt against the verifier
+/// runtime for the greedy-equality verdict (D1 contract).
+async fn spec_case(prompt_seed: u64, window: u32, draft_accuracy: f32) -> Result<SpecCase> {
+    let coordinator = sim_identity(150);
+    let verifier_id = sim_identity(151);
+    let proposer_id = sim_identity(152);
+    let prompt: Vec<u32> = (0..8u64)
+        .map(|k| (prompt_seed.wrapping_mul(k + 3) % 256) as u32)
+        .collect();
+
+    let verifier_runtime = Arc::new(MockRuntime::new(prompt_seed, draft_accuracy));
+    let proposer_runtime = Arc::new(MockRuntime::new(prompt_seed, draft_accuracy));
+    let client_runtime: Arc<dyn InferenceRuntime> =
+        Arc::new(MockRuntime::new(prompt_seed, draft_accuracy));
+
+    let verifier_listener = SignedFrameTransport::listen("127.0.0.1:0")
+        .await
+        .context("spec verifier listener")?;
+    let verifier_addr = verifier_listener
+        .local_addr()
+        .context("spec verifier addr")?
+        .to_string();
+    let verifier_key = coordinator.verifying_key();
+    let verifier_task = tokio::spawn(serve_speculative(
+        verifier_listener,
+        verifier_runtime.clone(),
+        SIM_PROFILE,
+        verifier_id.clone(),
+        verifier_key,
+        1,
+    ));
+
+    let proposer_listener = SignedFrameTransport::listen("127.0.0.1:0")
+        .await
+        .context("spec proposer listener")?;
+    let proposer_addr = proposer_listener
+        .local_addr()
+        .context("spec proposer addr")?
+        .to_string();
+    let proposer_task = tokio::spawn(serve_proposer(
+        proposer_listener,
+        proposer_runtime,
+        SIM_PROFILE,
+        proposer_id.clone(),
+        verifier_key,
+        1,
+    ));
+
+    let started = Instant::now();
+    let outcome: SpecOutcome = speculate(
+        &verifier_addr,
+        &proposer_addr,
+        client_runtime,
+        SIM_PROFILE,
+        &prompt,
+        window.max(1),
+        SPEC_TOKENS,
+        &coordinator,
+        &verifier_id.verifying_key(),
+        FallbackPolicy::default(),
+    )
+    .await
+    .context("spec speculate")?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+    // Plain single decode of the same prompt on the verifier's own runtime.
+    let handle = verifier_runtime.load(SIM_PROFILE).await?;
+    let single = verifier_runtime
+        .decode_stream(
+            &handle,
+            &prompt,
+            &SamplingParams::default(),
+            SPEC_TOKENS,
+            DEADLINE,
+        )
+        .await
+        .context("spec single decode")?;
+
+    let verifier_reports = verifier_task
+        .await
+        .context("verifier task")?
+        .context("verifier served")?
+        .len();
+    let proposer_reports = proposer_task
+        .await
+        .context("proposer task")?
+        .context("proposer served")?
+        .len();
+
+    Ok(SpecCase {
+        prompt_seed,
+        window,
+        draft_accuracy,
+        tokens_equal_to_single: outcome.tokens == single,
+        rounds: outcome.rounds,
+        mean_acceptance_length: outcome.acceptance.mean_acceptance_length(),
+        acceptance_rate: outcome.acceptance.acceptance_rate(),
+        fallback: outcome.fallback.map(|reason| reason.as_str()),
+        receipts_verified: outcome.receipts_verified,
+        verifier_reports,
+        proposer_reports,
+        verifier_addr,
+        proposer_addr,
+        elapsed_ms,
+    })
+}
+
+/// `spec <prompt_seed> [window] [draft_accuracy]`: one speculative session vs
+/// plain single decoding; prints the equality verdict + acceptance telemetry.
+pub async fn run_spec(prompt_seed: u64, window: u32, draft_accuracy: f32) -> Result<Value> {
+    let case = spec_case(prompt_seed, window, draft_accuracy).await?;
+    Ok(json!({
+        "scenario": "spec",
+        "ok": true,
+        "prompt_seed": case.prompt_seed,
+        "window": case.window,
+        "draft_accuracy": case.draft_accuracy,
+        "tokens": SPEC_TOKENS,
+        "tokens_equal_to_single": case.tokens_equal_to_single,
+        "rounds": case.rounds,
+        "mean_acceptance_length": case.mean_acceptance_length,
+        "acceptance_rate": case.acceptance_rate,
+        "fallback": case.fallback,
+        "receipts_verified": case.receipts_verified,
+        "verifier_reports": case.verifier_reports,
+        "proposer_reports": case.proposer_reports,
+        "elapsed_ms": round2(case.elapsed_ms),
+        "verifier_addr": case.verifier_addr,
+        "proposer_addr": case.proposer_addr,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +612,60 @@ mod tests {
             sim_identity(1).peer_id_label(),
             sim_identity(2).peer_id_label()
         );
+    }
+
+    /// D1/D5/D6 sweep: 20 seeds × windows {2,4,8} × draft accuracy
+    /// {0.0, 0.5, 1.0}. The greedy contract is unconditional — speculative
+    /// output equals plain single decoding token for token, INCLUDING the
+    /// fallback path (which is the plain decoder). Accuracy 0.0 must trip
+    /// the acceptance-collapse fallback. Every case is bounded by a 30 s
+    /// timeout: no hangs.
+    #[tokio::test]
+    async fn spec_matrix_greedy_equality_always_and_fallback_at_zero_accuracy() {
+        const CASE_TIMEOUT: Duration = Duration::from_secs(30);
+        let mut cases = 0usize;
+        for seed in 0..20u64 {
+            for window in [2u32, 4, 8] {
+                for accuracy in [0.0f32, 0.5, 1.0] {
+                    let case =
+                        tokio::time::timeout(CASE_TIMEOUT, spec_case(seed, window, accuracy))
+                            .await
+                            .expect("no hangs: every case is bounded")
+                            .expect("case runs");
+                    assert!(
+                        case.tokens_equal_to_single,
+                        "seed={seed} window={window} accuracy={accuracy}: greedy contract"
+                    );
+                    assert!(case.receipts_verified, "receipt must verify");
+                    assert_eq!(case.verifier_reports, 1);
+                    assert_eq!(case.proposer_reports, 1);
+                    if accuracy == 0.0 {
+                        assert_eq!(
+                            case.fallback,
+                            Some("acceptance_collapse"),
+                            "seed={seed} window={window}: accuracy 0 must fall back"
+                        );
+                    } else {
+                        assert_eq!(
+                            case.fallback,
+                            None,
+                            "seed={seed} window={window} accuracy={accuracy}: healthy acceptance must not fall back"
+                        );
+                    }
+                    if accuracy == 1.0 {
+                        // Every draft accepted: mean acceptance length is
+                        // exactly 1 + window (vLLM convention), modulo the
+                        // final budget-capped round.
+                        assert!(
+                            case.mean_acceptance_length >= window as f32,
+                            "seed={seed} window={window}: perfect drafts must accept the whole window (got {})",
+                            case.mean_acceptance_length
+                        );
+                    }
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 180, "20 seeds × 3 windows × 3 accuracies");
     }
 }

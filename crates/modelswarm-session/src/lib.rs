@@ -17,6 +17,20 @@
 //! Session open/close, rollback beyond the last committed prefix, straggler
 //! drops and peer replacement are Phase D concerns layered on top of this
 //! machine; the commit gate itself is the Phase B deliverable (ADR-015).
+//!
+//! Phase D layers those concerns in [`spec`]: the exact speculative-decoding
+//! protocol (verifier/proposer servers, coordinator, signed commits over the
+//! ADR-018 staged transport, fallback, receipts).
+
+pub mod spec;
+
+pub use spec::{
+    default_sampling_params_hash, sign_commit, sign_receipt, sign_receipt_ack, speculate,
+    verify_commit_signature, verify_receipt_ack, verify_receipt_signature, FallbackPolicy,
+    FallbackReason, ProposerReport, SpecError, SpecMessage, SpecOutcome, SpecPeer,
+    SpeculativeExecutor, VerifierReport, ACCEPT_DEADLINE, GENESIS_PREFIX_HASH, ROUND_DEADLINE,
+    RTT_SPIKE_STREAK, SERVER_IDLE, WINDOW_GROW_STREAK, WINDOW_MAX, WINDOW_SHRINK_STREAK,
+};
 
 use std::collections::{HashMap, VecDeque};
 

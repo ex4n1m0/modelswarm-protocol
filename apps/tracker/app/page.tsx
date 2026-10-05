@@ -44,7 +44,8 @@ const ENDPOINTS: Array<{ method: string; path: string; note: string }> = [
 const css = `
   :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #050a1f; color: #e8f4ff; font-family: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace; line-height: 1.6; }
+  /* #00060f = modal backdrop of hero.png (edges #00040a–#000811) so the artwork bleeds into the page */
+  body { background: #00060f; color: #e8f4ff; font-family: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace; line-height: 1.6; }
   a { color: #2fd4ff; }
   .wrap { max-width: 1080px; margin: 0 auto; padding: 0 1.25rem; }
   nav { display: flex; align-items: center; gap: 1rem; padding: 0.9rem 0; font-size: 0.85rem; }

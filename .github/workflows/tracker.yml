@@ -25,3 +25,39 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm run validate:vectors
+
+  # R22: the Postgres-backed suite has never executed locally (no DB on
+  # dev machines). CI runs it against a disposable service container —
+  # migrations apply for real, then the env-gated PgStore tests run.
+  integration-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: msp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/msp_test
+    defaults:
+      run:
+        working-directory: apps/tracker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/tracker/package-lock.json
+      - run: npm ci
+      - run: npm run db:migrate
+      - run: npm test
+      - name: Migration is a no-op on second run (A1)
+        run: npm run db:migrate

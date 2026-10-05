@@ -214,6 +214,8 @@ export interface TrackerStore {
   }): Promise<void>;
   /** Directory view: non-expired, non-draining peers, optionally by profile. */
   listPeers(filter: { profileId?: string; limit: number }): Promise<PeerView[]>;
+  /** Distinct peers with a live, non-draining lease (public counter). */
+  countOnlinePeers(): Promise<number>;
   /** Authoritative audit epoch for a peer (0 default). Leases pin the epoch at
    *  registration; sweeps bump this counter only (ADR-012). */
   peerEpoch(peerId: string): Promise<number>;
@@ -455,6 +457,15 @@ export class MemoryStore implements TrackerStore {
     }
     out.sort((a, b) => (a.peerId < b.peerId ? -1 : 1));
     return out.slice(0, filter.limit);
+  }
+
+  async countOnlinePeers(): Promise<number> {
+    const now = this.clock();
+    const live = new Set<string>();
+    for (const rec of this.leases.values()) {
+      if (this.isLive(rec, now) && !live.has(rec.peerId)) live.add(rec.peerId);
+    }
+    return live.size;
   }
 
   async peerEpoch(peerId: string): Promise<number> {
@@ -962,6 +973,15 @@ export class PgStore implements TrackerStore {
       lastSeenAt: (row.last_heartbeat_at as Date).getTime(),
       capacityClass: row.capacity_class as CapacityClass,
     }));
+  }
+
+  async countOnlinePeers(): Promise<number> {
+    const rows = await this.query(
+      `SELECT COUNT(DISTINCT peer_id) AS n FROM peer_leases
+       WHERE expires_at > $1 AND draining = false`,
+      [PgStore.iso(this.clock())],
+    );
+    return Number((rows[0] as { n: string | number }).n);
   }
 
   async peerEpoch(peerId: string): Promise<number> {

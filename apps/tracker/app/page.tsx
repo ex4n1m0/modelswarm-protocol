@@ -75,6 +75,7 @@ export default function Home() {
         <nav aria-label="Site">
           <span className="brand">MSP//HUB</span>
           <span className="badge" title="Tracker status: check /api/v1/health">TRACKER LIVE</span>
+          <span className="badge" id="online-badge" title="Peers with a live lease right now (GET /api/v1/stats)" style={{ borderColor: "#43c78f55", color: "#7fe0b8" }}>… online</span>
           <span className="spacer" />
           <a href="/api/v1/health">status</a>
           <a href="/api/v1/catalog">catalog</a>
@@ -188,7 +189,24 @@ export default function Home() {
           </table>
         </section>
 
-        <footer>
+          <script
+          dangerouslySetInnerHTML={{
+            __html: `
+(async () => {
+  const badge = document.getElementById('online-badge');
+  const update = async () => {
+    try {
+      const r = await fetch('/api/v1/stats');
+      if (!r.ok) throw 0;
+      const { peersOnline } = await r.json();
+      badge.textContent = peersOnline + (peersOnline === 1 ? ' peer online' : ' peers online');
+    } catch { badge.textContent = '— online'; }
+  };
+  await update(); setInterval(update, 30000);
+})();`,
+          }}
+        />
+      <footer>
           ModelSwarm Protocol · control plane only — never carries prompts,
           completions, or model files (ADR-001) · protocol v1
         </footer>

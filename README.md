@@ -22,7 +22,7 @@ verification reports under `docs/verification/`):
 | C runtime/scheduler/gateway/transport/bench | done | `phase-c.md` (e6834e3, f792fa0) |
 | D exact two-peer speculation | done | `phase-d.md` (e9b48a8, ad675d2) |
 | E multi-proposer token trees | done | `phase-e.md` (248aa05, e5420c6) |
-| F hostile-swarm hardening | in execution | `phase-f.md` |
+| F hostile-swarm hardening | done (F11 fixed post-phase) | `phase-f.md` |
 | G node + Tauri shell (unsigned) | done | `phase-g.md` (d27cf78) |
 
 Workspace: **256+ tests, 0 failures, clippy `-D warnings` clean**; tracker:
@@ -32,8 +32,10 @@ adversarial drafts, proposers, and fallback; sampled distribution
 preservation proven at unit level). **Every performance number is
 TEST-ONLY mock/loopback** (ADR-019): no real-model claim exists; real
 claims await the research runtime + an approved GGUF profile (stop
-conditions intact). Known deployment gaps: live-Postgres CI run (R22),
-libp2p backend swap + ADR-020 completion (F), code signing (G stop).
+conditions intact). **Live: https://modelswarm.deepflux.space** (tracker, preview-grade env —
+see `docs/deployment.md`). Known deployment gaps: production env vars
+(Neon `DATABASE_URL`, stable `HUB_SIGNING_KEY`, `ADMIN_TOKEN`), code
+signing (G stop), D/E-suite reparameterization over the libp2p backend.
 
 **Plans:** `docs/build-plan.md` (original 0–7) → `docs/cooperative-plan.md`
 (P0–P8) → `docs/competitive-revision-plan.md` (**A–G governs**; map in

@@ -99,6 +99,7 @@
       <dl class="kv">
         <dt>Tracker</dt><dd><input type="text" id="tracker-url" aria-label="Tracker base URL"></dd>
         <dt>Engine</dt><dd id="engine-line">—</dd>
+        <dt>Device approval</dt><dd id="enroll-line">—</dd>
       </dl>
       <div class="row" style="margin-top:10px">
         <button class="ghost" id="save-tracker">save tracker</button>
@@ -228,6 +229,16 @@
       $("engine-line").textContent = s.engine_available
         ? "pinned llama.cpp — present"
         : "MISSING — expected at " + s.engine_path;
+      const en = s.node && s.node.enrollment;
+      if (s.node.running && en) {
+        $("enroll-line").textContent =
+          en.phase === "pending" ? "code " + en.user_code + " — ask the owner to approve it at " + en.verify_url
+          : en.phase === "enrolled" ? "approved — this device is in the roster"
+          : en.phase === "error" ? en.error
+          : "requesting approval code…";
+      } else {
+        $("enroll-line").textContent = "starts with hosting (automatic)";
+      }
       $("privacy-gate").hidden = s.license_accepted;
       hostingOn = s.node.hosting;
       $("hosting-switch").dataset.on = hostingOn;
@@ -254,6 +265,9 @@
         } catch (e) { $("chip-tracker").dataset.state = "active"; }
       } else {
         $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">pick a model above — the swarm starts on selection</td></tr>';
+      }
+      if (hostingOn && s.node.enrollment && s.node.enrollment.phase === "pending") {
+        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">device approval pending (code ' + s.node.enrollment.user_code + ') — the roster joins automatically once the owner approves it</td></tr>';
       }
     }
 

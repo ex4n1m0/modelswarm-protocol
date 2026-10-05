@@ -44,3 +44,6 @@ apps/tracker/public/downloads/*.exe
 apps/tracker/public/downloads/*.deb
 apps/tracker/public/downloads/*.AppImage
 apps/tracker/public/downloads/*.dmg
+
+# Staged pinned engine (installer/stage-engine-windows.mjs or CI); never committed
+crates/modelswarm-desktop/engine/

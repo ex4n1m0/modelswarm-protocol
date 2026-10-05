@@ -88,6 +88,36 @@ jobs:
           mkdir -p dist
           find target/release/bundle -maxdepth 3 \( -name "*-setup.exe" -o -name "*.deb" -o -name "*.AppImage" -o -name "*.dmg" \) -exec cp {} dist/ \;
           cd dist && ls -la && shopt -s nullglob && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Verify the engine is INSIDE each built artifact
+        shell: bash
+        run: |
+          # v0.2.2 shipped a silently engine-less installer: staging was
+          # verified but the bundle glob matched nothing. Open every real
+          # artifact and require the pinned engine binary inside it.
+          set -e
+          cd dist
+          shopt -s nullglob
+          for f in *-setup.exe; do
+            7z l "$f" | grep -q "llama-server.exe" || { echo "::error::engine missing in $f"; exit 1; }
+            echo "engine present in $f"
+          done
+          for f in *.deb; do
+            dpkg-deb -c "$f" | grep -q "engine/llama-server$" || { echo "::error::engine missing in $f"; exit 1; }
+            echo "engine present in $f"
+          done
+          for f in *.AppImage; do
+            chmod +x "$f"
+            "./$f" --appimage-extract >/dev/null 2>&1 || true
+            find squashfs-root -path "*engine/llama-server" | grep -q . || { echo "::error::engine missing in $f"; rm -rf squashfs-root; exit 1; }
+            rm -rf squashfs-root
+            echo "engine present in $f"
+          done
+          for f in *.dmg; do
+            m=$(hdiutil attach -nobrowse -readonly "$f" | tail -1 | awk '{for(i=NF;i>0;i--) if($i ~ /^\//) {print $i; exit}}')
+            find "$m" -path "*engine/llama-server" | grep -q . || { hdiutil detach "$m" >/dev/null; echo "::error::engine missing in $f"; exit 1; }
+            hdiutil detach "$m" >/dev/null
+            echo "engine present in $f"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: modelswarm-installer-${{ matrix.platform }}

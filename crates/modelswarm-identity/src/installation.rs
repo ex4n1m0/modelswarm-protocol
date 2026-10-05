@@ -60,6 +60,12 @@ impl InstallationIdentity {
         installation_id_for(&self.public_key_bytes())
     }
 
+    /// The public key itself, base58 — the enrollment wire form
+    /// (`/auth/device/start` `pubKey`, msp-v1 §3.2).
+    pub fn pub_key_b58(&self) -> String {
+        bs58::encode(self.public_key_bytes()).into_string()
+    }
+
     /// The wire identity (ADR-020): base58 of the identity multihash over
     /// the protobuf-encoded public key — exactly libp2p's PeerId for an
     /// Ed25519 identity key (the `12D3Koo…` form). Distinct from

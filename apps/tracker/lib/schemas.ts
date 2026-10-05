@@ -34,6 +34,13 @@ export const DeviceCompleteSchema = z
   })
   .strict();
 
+export const DeviceApproveSchema = z
+  .object({
+    // Format of randomUserCode(): 8 chars, no separators, ambiguous glyphs removed.
+    userCode: z.string().regex(/^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$/, "user pairing code (8 characters, e.g. AB2CDEFG)"),
+  })
+  .strict();
+
 export const PeerRegisterSchema = z
   .object({
     peerId: Base58Id,

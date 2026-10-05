@@ -68,6 +68,53 @@ describe("C1 device enrollment", () => {
     expect(Date.parse(session.expiresAt) - rig.ctx.now()).toBe(24 * 60 * 60 * 1000);
   });
 
+  it("approve-by-user-code (the /verify page hook) completes the same loop; unknown code -> 404", async () => {
+    // Routes resolve the global context; give this whole loop one rig that
+    // carries an admin token (the outer beforeEach rig has adminToken: null).
+    const adminRig = makeRig({ adminToken: "test-admin-token" });
+    const keys = makeKeypair();
+    const ids = keyPairIds(keys);
+
+    const startRes = await deviceStart.POST(
+      new Request("http://tracker.local/api/v1/auth/device/start", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": "198.51.100.10" },
+        body: JSON.stringify({ installationId: ids.installationId, pubKey: ids.pubKeyB58 }),
+      }),
+    );
+    expect(startRes.status).toBe(200);
+    const start = (await startRes.json()) as { deviceCode: string; userCode: string };
+
+    const approveRoute = await import("@/app/api/v1/admin/devices/approve/route");
+    const approve = (userCode: string, admin?: string) =>
+      approveRoute.POST(
+        new Request("http://tracker.local/api/v1/admin/devices/approve", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(admin === undefined ? {} : { "x-msp-admin": admin }),
+          },
+          body: JSON.stringify({ userCode }),
+        }),
+      );
+
+    // Gate stays owner-controlled: no token -> 403, wrong token -> 403.
+    expect((await approve(start.userCode)).status).toBe(403);
+    expect((await approve(start.userCode, "wrong")).status).toBe(403);
+
+    const goodCode = await approve(start.userCode, "test-admin-token");
+    expect(goodCode.status).toBe(200);
+
+    const completeRes = await deviceComplete.POST(
+      signedRequest(keys, ids.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: start.deviceCode }), adminRig.ctx.now, { ip: "198.51.100.10" }),
+    );
+    expect(completeRes.status).toBe(200);
+
+    // Unknown / malformed codes are not approved silently.
+    expect((await approve("ZZZZZZZZ", "test-admin-token")).status).toBe(404);
+    expect((await approve("not-a-code", "test-admin-token")).status).toBe(400);
+  });
+
   it("start rejects an installationId that does not derive from pubKey", async () => {
     const enrolledKeys = makeKeypair();
     const ids = keyPairIds(enrolledKeys);

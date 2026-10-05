@@ -89,6 +89,7 @@ routes).
 |---|---|---|
 | `POST /auth/device/start` | `{installationId, pubKey}` | `{deviceCode, userCode, verifyUrl, expiresAt}`; `pubKey` is base58; 10 req/min per IP |
 | `POST /auth/device/complete` | signed envelope `{deviceCode}` | `{session}` or `403 pending` |
+| `POST /admin/devices/approve` | admin token (`X-MSP-Admin`) `{userCode}` | `{approved:true}` or `404`; the `verifyUrl` approval page — knowing the user code alone is never enough |
 
 ### 3.3 Peer lifecycle (all require signed envelope + session)
 

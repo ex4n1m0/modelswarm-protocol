@@ -56,6 +56,20 @@ struct RunningNode {
     handle: NodeHandle,
     shutdown: tokio::sync::watch::Sender<bool>,
     heartbeat: tokio::task::JoinHandle<()>,
+    enrollment: Arc<tokio::sync::RwLock<EnrollmentView>>,
+}
+
+/// The enrollment/roster half of "swarm readiness", shared between the
+/// heartbeat task (writer) and `get_status` (reader) so the UI can show the
+/// honest phase instead of a silent 401 loop.
+#[derive(Debug, Clone, Default, Serialize)]
+struct EnrollmentView {
+    /// `enrolling` | `pending` | `enrolled` | `error`
+    phase: String,
+    user_code: String,
+    verify_url: String,
+    expires_at: String,
+    error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,29 +140,30 @@ fn read_config(data_dir: &std::path::Path) -> PersistedConfig {
     config
 }
 
-fn engine_binary_path() -> PathBuf {
+/// Where each OS bundle actually installs the pinned engine (tauri.conf
+/// `resources: ["engine/*"]` preserves the `engine/` prefix under the
+/// platform resource dir): beside the exe on Windows NSIS, `/usr/lib/…` on
+/// Linux deb/AppImage, `Contents/Resources` on macOS — i.e. exactly what
+/// `resource_dir()` resolves. Dev fallbacks cover staged/flat layouts.
+fn engine_binary_path(app: &tauri::AppHandle) -> PathBuf {
     let name = if cfg!(windows) {
         "llama-server.exe"
     } else {
         "llama-server"
     };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("engine").join(name));
+    }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("modelswarm"));
     let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
-    // The NSIS bundle installs the pinned engine into `engine/` beside the
-    // exe (tauri.conf.json `resources: ["engine/*"]`); dev builds may stage
-    // it flat or under `resources/`. First hit wins.
-    let candidates = [
-        format!("engine/{name}"),
-        name.to_string(),
-        format!("resources/{name}"),
-    ];
-    for candidate in &candidates {
-        let path = dir.join(candidate);
-        if path.is_file() {
-            return path;
-        }
-    }
-    dir.join(&candidates[0])
+    candidates.push(dir.join("engine").join(name));
+    candidates.push(dir.join(name));
+    candidates.push(dir.join("resources").join(name));
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| dir.join("engine").join(name))
 }
 
 /// Appends one event to the node log (same sink/format as the node's own
@@ -272,8 +287,12 @@ async fn get_status(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<serde_json::Value, String> {
     let inner = state.inner.lock().await;
-    let engine = engine_binary_path();
+    let engine = engine_binary_path(&app);
     let node_running = inner.node.is_some();
+    let enrollment = match &inner.node {
+        Some(running) => Some(running.enrollment.read().await.clone()),
+        None => None,
+    };
     let (gateway_addr, installation_id, engine_port) = match &inner.node {
         Some(running) => (
             Some(running.handle.local_addr.to_string()),
@@ -300,6 +319,7 @@ async fn get_status(
             "gateway_addr": gateway_addr,
             "installation_id": installation_id,
             "engine_port": engine_port,
+            "enrollment": enrollment,
         },
         "chat_turns": inner.chat_log.len(),
     }))
@@ -471,14 +491,16 @@ async fn download_model(
 
 #[tauri::command]
 async fn set_hosting(
+    app: tauri::AppHandle,
     state: tauri::State<'_, DesktopState>,
     window: tauri::Window,
     on: bool,
 ) -> Result<serde_json::Value, String> {
-    set_hosting_inner(&state, &window, on).await
+    set_hosting_inner(&app, &state, &window, on).await
 }
 
 async fn set_hosting_inner(
+    app: &tauri::AppHandle,
     state: &tauri::State<'_, DesktopState>,
     _window: &tauri::Window,
     on: bool,
@@ -496,7 +518,7 @@ async fn set_hosting_inner(
     if !inner.license_accepted {
         return Err("accept the privacy disclosure first".into());
     }
-    let engine = engine_binary_path();
+    let engine = engine_binary_path(app);
     if !engine.is_file() {
         return Err(format!(
             "pinned engine not found next to the app (expected {})",
@@ -543,8 +565,9 @@ async fn set_hosting_inner(
         }
     };
 
-    // Roster heartbeat: register + heartbeat so exact-profile peers see this
-    // machine (with the honest no-listener address until transport lands).
+    // Roster heartbeat: device-enroll (approval gated) → session →
+    // register + heartbeat so exact-profile peers see this machine (with
+    // the honest no-listener address until transport lands).
     let heartbeat_tracker = tracker_client(&inner.tracker_url, &inner.data_dir).await?;
     let peer_id = handle.installation_id.clone();
     let profile_id = listing.profile_id.clone();
@@ -552,47 +575,164 @@ async fn set_hosting_inner(
     let build = listing.manifest.runtime().build_hash().to_string();
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
     let hb_data_dir = inner.data_dir.clone();
+    let enrollment_view = Arc::new(tokio::sync::RwLock::new(EnrollmentView {
+        phase: "enrolling".into(),
+        ..EnrollmentView::default()
+    }));
+    let enroll_view = Arc::clone(&enrollment_view);
     let heartbeat = tokio::spawn(async move {
         let runtime_desc = serde_json::json!({
             "name": "llama.cpp", "version": version, "build_hash": build,
         });
         let mut lease_id: Option<String> = None;
         let mut roster_failures: u32 = 0;
+        let mut pending_device: Option<String> = None;
         loop {
             if *heartbeat_shutdown.borrow() {
                 return;
             }
-            let result = match &lease_id {
-                Some(id) => heartbeat_tracker
-                    .heartbeat(id, std::slice::from_ref(&profile_id), 1, 0, false)
-                    .await
-                    .map(|_| ())
-                    .or_else(|_| {
-                        // Lease lost (expiry/revocation): re-register next tick.
-                        lease_id = None;
-                        Ok(())
-                    }),
-                None => heartbeat_tracker
-                    .register(
-                        &peer_id,
-                        &[ADDR_NO_LISTENER.to_string()],
-                        std::slice::from_ref(&profile_id),
-                        1,
-                        runtime_desc.clone(),
-                    )
-                    .await
-                    .map(|response| {
-                        lease_id = response
-                            .get("leaseId")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                    }),
+
+            // ---- device enrollment (automatic, approval-gated) ----
+            if !heartbeat_tracker.has_session() {
+                if let Some(code) = pending_device.clone() {
+                    match heartbeat_tracker.device_complete(&code).await {
+                        Ok(done) => {
+                            if let Some(token) = done.get("token").and_then(|v| v.as_str()) {
+                                heartbeat_tracker.set_session(token.to_string());
+                                pending_device = None;
+                                *enroll_view.write().await = EnrollmentView {
+                                    phase: "enrolled".into(),
+                                    ..EnrollmentView::default()
+                                };
+                                log_event(&hb_data_dir, "info", "enroll.approved", &[]);
+                                lease_id = None; // register below with the new session
+                            }
+                            // Malformed-but-2xx: keep polling the same code.
+                        }
+                        Err(modelswarm_tracker_api::TrackerError::Api { code, .. })
+                            if code == "pending" =>
+                        {
+                            // Still awaiting owner approval — keep polling.
+                        }
+                        Err(modelswarm_tracker_api::TrackerError::Api { status: 401, .. }) => {
+                            // Device code expired/unknown: restart enrollment.
+                            pending_device = None;
+                            *enroll_view.write().await = EnrollmentView {
+                                phase: "enrolling".into(),
+                                ..EnrollmentView::default()
+                            };
+                        }
+                        Err(error) => {
+                            roster_failures += 1;
+                            if roster_failures == 1 || roster_failures % 20 == 0 {
+                                log_event(
+                                    &hb_data_dir,
+                                    "warn",
+                                    "enroll.error",
+                                    &[("error", &error.to_string())],
+                                );
+                            }
+                            *enroll_view.write().await = EnrollmentView {
+                                phase: "error".into(),
+                                error: format!(
+                                    "approval check failed: {error} (retrying every 30 s)"
+                                ),
+                                ..EnrollmentView::default()
+                            };
+                        }
+                    }
+                } else {
+                    match heartbeat_tracker.device_start().await {
+                        Ok(start) => {
+                            let view = EnrollmentView {
+                                phase: "pending".into(),
+                                user_code: start
+                                    .get("userCode")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                verify_url: start
+                                    .get("verifyUrl")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                expires_at: start
+                                    .get("expiresAt")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                error: String::new(),
+                            };
+                            log_event(
+                                &hb_data_dir,
+                                "info",
+                                "enroll.pending",
+                                &[("user_code", &view.user_code)],
+                            );
+                            pending_device = start
+                                .get("deviceCode")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string);
+                            *enroll_view.write().await = view;
+                        }
+                        Err(error) => {
+                            roster_failures += 1;
+                            if roster_failures == 1 || roster_failures % 20 == 0 {
+                                log_event(
+                                    &hb_data_dir,
+                                    "warn",
+                                    "enroll.error",
+                                    &[("error", &error.to_string())],
+                                );
+                            }
+                            *enroll_view.write().await = EnrollmentView {
+                                phase: "error".into(),
+                                error: format!(
+                                    "device enrollment failed: {error} (retrying every 30 s)"
+                                ),
+                                ..EnrollmentView::default()
+                            };
+                        }
+                    }
+                }
+            }
+
+            // ---- roster register/heartbeat (session required) ----
+            let result = if heartbeat_tracker.has_session() {
+                match &lease_id {
+                    Some(id) => heartbeat_tracker
+                        .heartbeat(id, std::slice::from_ref(&profile_id), 1, 0, false)
+                        .await
+                        .map(|_| ())
+                        .or_else(|_| {
+                            // Lease lost (expiry/revocation): re-register next tick.
+                            lease_id = None;
+                            Ok(())
+                        }),
+                    None => heartbeat_tracker
+                        .register(
+                            &peer_id,
+                            &[ADDR_NO_LISTENER.to_string()],
+                            std::slice::from_ref(&profile_id),
+                            1,
+                            runtime_desc.clone(),
+                        )
+                        .await
+                        .map(|response| {
+                            lease_id = response
+                                .get("leaseId")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string);
+                        }),
+                }
+            } else {
+                Ok(())
             };
             if let Err(error) = result {
-                // A windowed app's stderr is invisible: roster failures (an
-                // unenrolled installation reads as 401 until the ops
-                // approval gate clears) must reach the log file, throttled
-                // to the first failure and then every 20th (10 min).
+                // A windowed app's stderr is invisible: roster failures must
+                // reach the log file, throttled to the first failure and
+                // then every 20th (10 min). A 401/403 here means the session
+                // died (24 h expiry / revocation): drop it and re-enroll.
                 roster_failures += 1;
                 if roster_failures == 1 || roster_failures % 20 == 0 {
                     log_event(
@@ -604,6 +744,15 @@ async fn set_hosting_inner(
                             ("attempt", &roster_failures.to_string()),
                         ],
                     );
+                }
+                if let modelswarm_tracker_api::TrackerError::Api { status, .. } = &error {
+                    if *status == 401 || *status == 403 {
+                        heartbeat_tracker.clear_session();
+                        *enroll_view.write().await = EnrollmentView {
+                            phase: "enrolling".into(),
+                            ..EnrollmentView::default()
+                        };
+                    }
                 }
                 eprintln!("modelswarm-desktop: roster: {error}");
             }
@@ -626,6 +775,7 @@ async fn set_hosting_inner(
         handle,
         shutdown: shutdown_tx,
         heartbeat,
+        enrollment: enrollment_view,
     });
     Ok(status)
 }
@@ -634,6 +784,7 @@ async fn set_hosting_inner(
 /// load it → the swarm starts working (node up, registered, local API live).
 #[tauri::command]
 async fn select_model(
+    app: tauri::AppHandle,
     state: tauri::State<'_, DesktopState>,
     window: tauri::Window,
     profile_id: String,
@@ -649,7 +800,7 @@ async fn select_model(
         inner.profile_id = Some(profile_id.clone());
         persist_config(&inner)?;
     }
-    let result = set_hosting_inner(&state, &window, true).await?;
+    let result = set_hosting_inner(&app, &state, &window, true).await?;
     Ok(result)
 }
 

@@ -1,16 +1,16 @@
-// Windows is the lead platform while the client is an internal test; the
-// other OS builds stay frozen at the last all-OS release until the Windows
-// client is verified working end-to-end (owner directive, 2026-10-05).
+// Every installer bundles the full pinned inference engine; the model
+// weights download from HuggingFace on first use. v0.2.4 restores the
+// all-OS release rule: same version number on every OS = same build.
 const DOWNLOADS = [
-  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.3-windows-x64.exe", version: "0.2.3", lead: true },
-  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.2-linux-amd64.deb", version: "0.2.2", lead: false },
-  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.2-linux-amd64.AppImage", version: "0.2.2", lead: false },
-  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.2-macos-arm64.dmg", version: "0.2.2", lead: false },
+  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.4-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
+  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.4-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
+  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.4-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
+  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.4-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
 ];
 const DOWNLOAD = {
-  version: "0.2.3",
+  version: "0.2.4",
   sums: "/downloads/SHA256SUMS.txt",
-  sha256: "d0e16f8c27a408572847ba1c2cc841d144f9aa3658b3f989fa85ba39808ba58d",
+  sha256: "PENDING-CI",
 };
 
 // Dedicated community room — the room word is fixed here and nowhere else on
@@ -26,6 +26,7 @@ const ENDPOINTS: Array<{ method: string; path: string; note: string }> = [
   { method: "GET", path: "/api/v1/catalog/{profile_id}", note: "single-profile envelope" },
   { method: "POST", path: "/api/v1/auth/device/start", note: "device enrollment start" },
   { method: "POST", path: "/api/v1/auth/device/complete", note: "session issuance (403 pending until approved)" },
+  { method: "POST", path: "/api/v1/admin/devices/approve", note: "device approval by pairing code (admin, /verify page)" },
   { method: "POST", path: "/api/v1/peers/register", note: "lease issuance (60–90 s TTL)" },
   { method: "POST", path: "/api/v1/peers/heartbeat", note: "lease extension + revocation notices" },
   { method: "POST", path: "/api/v1/peers/drain", note: "exclude peer from lookups" },
@@ -122,21 +123,24 @@ export default function Home() {
 
       <div className="wrap">
         <section aria-labelledby="download-heading">
-          <h2 id="download-heading">Download the client — Windows leads, other OSes frozen at 0.2.2</h2>
+          <h2 id="download-heading">Download the client — v{DOWNLOAD.version}, all platforms, everything bundled</h2>
           <div className="card">
             <div className="dl">
               <div>
-                <h3>ModelSwarm Desktop — {DOWNLOAD.version} (internal test, Windows-first)</h3>
+                <h3>ModelSwarm Desktop — {DOWNLOAD.version} (internal test)</h3>
                 <p className="meta">
                   windowed app hosting one of three model profiles: model-picker first page,
                   download-or-load on selection, swarm starts, local OpenAI-compatible API +
-                  test box. The model downloads from HuggingFace on first use — never bundled.
+                  test box. The pinned inference engine ships inside every installer; the
+                  model weights download from HuggingFace on first use — never bundled.
+                  First hosting start asks for a one-time device approval
+                  at <a href="/verify">/verify</a> (owner-controlled).
                 </p>
               </div>
               <div>
                 {DOWNLOADS.map((d) => (
-                  <a className="btn ghost" data-file={d.file} style={{ marginRight: 8, marginBottom: 6, display: "inline-block" }} href={"/api/download/" + d.file} download={d.file} aria-label={"Download ModelSwarm " + d.version + " for " + d.os}>
-                    {d.os} · v{d.version}{d.lead ? "" : " (paused)"} <span className="dl-count" data-count-for={d.file} style={{ opacity: 0.75 }}>· ↓0</span>
+                  <a key={d.file} className="btn ghost" data-file={d.file} style={{ marginRight: 8, marginBottom: 6, display: "inline-block" }} href={"/api/download/" + d.file} download={d.file} aria-label={"Download ModelSwarm " + DOWNLOAD.version + " for " + d.os}>
+                    {d.os} · v{DOWNLOAD.version} <span className="dl-count" data-count-for={d.file} style={{ opacity: 0.75 }}>· ↓0</span>
                   </a>
                 ))}
                 <a className="btn ghost" href={DOWNLOAD.sums} download="SHA256SUMS.txt">checksums</a>
@@ -145,9 +149,13 @@ export default function Home() {
             <p className="sum">windows sha256&nbsp; {DOWNLOAD.sha256}</p>
             <div className="warn" role="note">
               INTERNAL TEST BUILD — UNSIGNED. Verify the SHA-256 above before running; expect
-              OS warnings (SmartScreen / Gatekeeper) for an unverified publisher. Windows is
-              the lead platform for the internal test; Linux/macOS stay at v0.2.2 until the
-              Windows client is verified, then resume releasing together.
+              OS warnings (SmartScreen / Gatekeeper) for an unverified publisher. Same version
+              number on every OS = same build. Per-OS first-run notes:
+              <ul style={{ margin: "8px 0 0", paddingLeft: 18, fontSize: "0.78rem" }}>
+                {DOWNLOADS.map((d) => (
+                  <li key={d.file} style={{ marginBottom: 4 }}><b>{d.os}:</b> {d.note}</li>
+                ))}
+              </ul>
             </div>
           </div>
         </section>

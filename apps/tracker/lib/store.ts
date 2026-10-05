@@ -172,6 +172,8 @@ export interface TrackerStore {
   getDeviceAuth(deviceCode: string): Promise<DeviceAuthRecord | null>;
   /** Ops-runbook stand-in (approval hook); test-only in Phase B. */
   approveDevice(deviceCode: string): Promise<boolean>;
+  /** The /verify page hook: approve by the user-visible pairing code. */
+  approveDeviceByUserCode(userCode: string): Promise<boolean>;
 
   createSession(rec: SessionRecord): Promise<void>;
   getSession(token: string): Promise<SessionRecord | null>;
@@ -351,6 +353,16 @@ export class MemoryStore implements TrackerStore {
     if (!rec) return false;
     rec.approved = true;
     return true;
+  }
+
+  async approveDeviceByUserCode(userCode: string): Promise<boolean> {
+    for (const rec of this.deviceAuths.values()) {
+      if (rec.userCode === userCode) {
+        rec.approved = true;
+        return true;
+      }
+    }
+    return false;
   }
 
   async createSession(rec: SessionRecord): Promise<void> {
@@ -819,6 +831,14 @@ export class PgStore implements TrackerStore {
     const rows = await this.query(
       `UPDATE device_codes SET approved = true WHERE device_code = $1 RETURNING device_code`,
       [deviceCode],
+    );
+    return rows.length > 0;
+  }
+
+  async approveDeviceByUserCode(userCode: string): Promise<boolean> {
+    const rows = await this.query(
+      `UPDATE device_codes SET approved = true WHERE user_code = $1 RETURNING device_code`,
+      [userCode],
     );
     return rows.length > 0;
   }

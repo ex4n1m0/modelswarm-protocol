@@ -127,9 +127,53 @@ impl TrackerClient {
         *self.session_token.try_write().expect("session lock") = Some(token);
     }
 
+    /// True once a session token is set (device enrollment completed).
+    pub fn has_session(&self) -> bool {
+        self.session_token
+            .try_read()
+            .expect("session lock")
+            .is_some()
+    }
+
+    /// Drops the session (24 h expiry / server-side revocation): the next
+    /// signed request requiring a session fails and callers re-enroll.
+    pub fn clear_session(&self) {
+        *self.session_token.try_write().expect("session lock") = None;
+    }
+
     /// GET /health — public.
     pub async fn health(&self) -> Result<serde_json::Value, TrackerError> {
         self.get_json(&format!("{API_PREFIX}/health"), None).await
+    }
+
+    /// POST /auth/device/start (msp-v1 §3.2) — public, unsigned. Registers
+    /// (upserts) this installation's public key and returns a device code +
+    /// user code pair for owner approval. Callers poll
+    /// [`Self::device_complete`] until the code is approved or expires.
+    pub async fn device_start(&self) -> Result<serde_json::Value, TrackerError> {
+        let path = format!("{API_PREFIX}/auth/device/start");
+        let body = serde_json::json!({
+            "installationId": self.identity.installation_id(),
+            "pubKey": self.identity.pub_key_b58(),
+        });
+        let req = self.http.post(format!("{}{path}", self.base)).json(&body);
+        Self::finish(req.send().await, &path).await
+    }
+
+    /// POST /auth/device/complete — signed envelope, no session yet.
+    /// `TrackerError::Api { code: "pending" }` until the device code is
+    /// approved; on success returns `{token, expiresAt}` (24 h session the
+    /// caller passes to [`Self::set_session`]).
+    pub async fn device_complete(
+        &self,
+        device_code: &str,
+    ) -> Result<serde_json::Value, TrackerError> {
+        self.signed_json(
+            "POST",
+            &format!("{API_PREFIX}/auth/device/complete"),
+            serde_json::json!({ "deviceCode": device_code }),
+        )
+        .await
     }
 
     /// GET /catalog — public; signature verification is the caller's job

@@ -117,17 +117,22 @@ fn read_config(data_dir: &std::path::Path) -> PersistedConfig {
 }
 
 fn engine_binary_path() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("modelswarm.exe"));
+    let name = if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("modelswarm"));
     let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
-    // NSIS installs resources beside the exe; dev builds may use a staged
+    // Installers place resources beside the exe; dev builds may use a staged
     // `resources/` subdir. First hit wins.
-    for candidate in ["llama-server.exe", "resources/llama-server.exe"] {
+    for candidate in [name, &format!("resources/{name}")] {
         let path = dir.join(candidate);
         if path.is_file() {
             return path;
         }
     }
-    dir.join("llama-server.exe")
+    dir.join(name)
 }
 
 async fn tracker_client(

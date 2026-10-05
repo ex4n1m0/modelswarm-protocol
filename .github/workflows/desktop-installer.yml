@@ -1,63 +1,98 @@
-# Phase H5: build the NSIS desktop installer (ADR-008).
-# The pinned llama.cpp engine (runtime-pins.json) is hash-verified before it
-# is bundled; model weights are NEVER bundled (first-run download per ADR-008).
-# Artifacts: ModelSwarm_<version>_x64-setup.exe + SHA256SUMS. Publishing to
-# modelswarm.deepflux.space/downloads is a manual owner step from the artifact.
+# Phase I3: one release, all OSes together (owner directive 2026-10-05).
+# Every change bumps tauri.conf.json version AND builds Windows + Linux +
+# macOS in the same run. The pinned llama.cpp engine (runtime-pins.json,
+# platforms{}) is hash-verified per OS before bundling; model weights are
+# NEVER bundled (first-run download per ADR-008).
 name: desktop-installer
 on:
   workflow_dispatch: {}
   push:
     branches: [main]
-    paths: ["crates/modelswarm-desktop/**", "runtime-pins.json", ".github/workflows/desktop-installer.yml"]
+    paths: ["crates/modelswarm-desktop/**", "crates/modelswarm-node/**", "runtime-pins.json", ".github/workflows/desktop-installer.yml"]
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x64
+            bundles: nsis
+            archive: https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-win-cpu-x64.zip
+            archive_sha: 353c4aab423bff5cb6dc0e1d32e41a447990ab3d69a411b7f58ff48187c91a03
+          - os: ubuntu-latest
+            platform: linux-x64
+            bundles: deb,appimage
+            archive: https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-ubuntu-x64.tar.gz
+            archive_sha: 086d6289901545b664b70fe032b49d5c0e3e242e5d07540d18b573603c563529
+          - os: macos-latest
+            platform: macos-arm64
+            bundles: dmg,appimage
+            archive: https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-macos-arm64.tar.gz
+            archive_sha: 23dc51ce360ffaf0753cb3257b4020b9d7d9da2215198a81ce187d29aa7801f7
+          - os: macos-13
+            platform: macos-x64
+            bundles: dmg
+            archive: https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-macos-x64.tar.gz
+            archive_sha: b39cc89a605373dcf7a429b12edf4361c3b385d2f908587891e8ba7c84b12d49
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Fetch pinned engine (b11407 CPU x64)
+      - name: Linux build deps (webkit2gtk)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Fetch pinned engine (${{ matrix.platform }})
         shell: bash
         run: |
           mkdir -p crates/modelswarm-desktop/engine
-          curl -sSL -o engine.zip \
-            "https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-win-cpu-x64.zip"
-          echo "353c4aab423bff5cb6dc0e1d32e41a447990ab3d69a411b7f58ff48187c91a03  engine.zip" | sha256sum -c -
-          unzip -j -o engine.zip -d crates/modelswarm-desktop/engine \
-            llama-server.exe llama-server-impl.dll llama-common.dll llama.dll \
-            ggml.dll ggml-base.dll ggml-cpu-x64.dll ggml-cpu-alderlake.dll ggml-cpu-cannonlake.dll \
-            ggml-cpu-cascadelake.dll ggml-cpu-cooperlake.dll ggml-cpu-haswell.dll ggml-cpu-icelake.dll \
-            ggml-cpu-ivybridge.dll ggml-cpu-piledriver.dll ggml-cpu-sandybridge.dll \
-            ggml-cpu-sapphirerapids.dll ggml-cpu-skylakex.dll ggml-cpu-sse42.dll ggml-cpu-zen4.dll \
-            libomp.dll mtmd.dll
-      - name: Verify every engine file against runtime-pins.json
+          curl -sSL -o engine.archive "$ARCHIVE"
+          echo "$ARCHIVE_SHA  engine.archive" | sha256sum -c -
+          case "$ARCHIVE" in
+            *.zip) unzip -j -o engine.archive -d crates/modelswarm-desktop/engine ;;
+            *.tar.gz) tar -xzf engine.archive --strip-components=1 -C crates/modelswarm-desktop/engine ;;
+          esac
+          ls crates/modelswarm-desktop/engine | head -8
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          ARCHIVE_SHA: ${{ matrix.archive_sha }}
+      - name: Verify every pinned engine file (runtime-pins.json)
         shell: pwsh
         run: |
           $pins = Get-Content runtime-pins.json -Raw | ConvertFrom-Json
+          $entry = $pins.platforms.${{ matrix.platform }}
           $dir = "crates/modelswarm-desktop/engine"
-          foreach ($f in $pins.bundle) {
+          $verified = 0
+          foreach ($prop in $entry.files.PSObject.Properties) {
+            $f = $prop.Name
             $actual = (Get-FileHash "$dir/$f" -Algorithm SHA256).Hash.ToLower()
-            if ($actual -ne $pins.files.$f) { throw "engine file $f hash mismatch" }
+            if ($actual -ne $prop.Value) { throw "engine file $f hash mismatch" }
+            $verified++
           }
-          Write-Host "engine verified: $($pins.bundle.Count) files, $($pins.tag)"
+          foreach ($f in $entry.bundle) {
+            if (-not (Test-Path "$dir/$f")) { throw "bundled engine entry missing: $f" }
+          }
+          Write-Host "engine verified ($verified files hashed, $($entry.bundle.Count) entries present)"
       - name: Install tauri-cli
         run: cargo install tauri-cli --version '^2' --locked
-      - name: Build NSIS installer
+      - name: Build ${{ matrix.bundles }} installer
         shell: bash
         run: |
           cd crates/modelswarm-desktop
-          cargo tauri build --bundles nsis -- --features tauri-shell
-      - name: Smoke + hash
+          cargo tauri build --bundles ${{ matrix.bundles }} -- --features tauri-shell
+      - name: Collect + hash artifacts
         shell: bash
         run: |
-          ls target/release/bundle/nsis/
-          cd target/release/bundle/nsis && sha256sum *-setup.exe | tee SHA256SUMS.txt
+          mkdir -p dist
+          find target/release/bundle -maxdepth 3 \( -name "*-setup.exe" -o -name "*.deb" -o -name "*.AppImage" -o -name "*.dmg" \) -exec cp {} dist/ \;
+          cd dist && ls -la && shopt -s nullglob && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: modelswarm-installer-win-x64
-          path: |
-            target/release/bundle/nsis/*-setup.exe
-            target/release/bundle/nsis/SHA256SUMS.txt
+          name: modelswarm-installer-${{ matrix.platform }}
+          path: dist/
           if-no-files-found: error

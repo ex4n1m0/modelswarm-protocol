@@ -34,10 +34,48 @@ pub const RUNTIME_PINS_JSON: &str = include_str!("../../../runtime-pins.json");
 #[derive(Debug, Deserialize)]
 struct RuntimePins {
     tag: String,
-    zip_sha256: String,
+    /// The release anchor reported as `runtime.build_hash` on EVERY
+    /// platform (ADR-022 §6): the windows-x64 archive sha of this release.
+    canonical_build_hash: String,
+    platforms: std::collections::BTreeMap<String, PlatformPins>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlatformPins {
+    /// Used by CI/install scripts to fetch the engine; kept here so the
+    /// pins file is the single source of truth for every platform.
+    #[serde(default)]
+    #[allow(dead_code)]
+    binary: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    archive_url: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    archive_sha256: String,
     #[serde(default)]
     bundle: Vec<String>,
     files: std::collections::BTreeMap<String, String>,
+}
+
+/// The pins entry for the OS/arch this binary was built for.
+fn current_platform() -> &'static str {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        "windows-x64"
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "linux-x64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "macos-arm64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "macos-x64"
+    }
 }
 
 fn parse_pins() -> Result<RuntimePins, EngineError> {
@@ -107,6 +145,12 @@ pub struct EngineHandle {
 /// may unpack the full zip).
 pub fn verify_engine_dir(exe: &Path) -> Result<EngineIdentity, EngineError> {
     let pins = parse_pins()?;
+    let platform = pins.platforms.get(current_platform()).ok_or_else(|| {
+        EngineError::Pins(format!(
+            "runtime-pins has no entry for {}",
+            current_platform()
+        ))
+    })?;
     let dir = exe
         .parent()
         .ok_or_else(|| EngineError::Pins("engine exe has no parent directory".into()))?;
@@ -116,14 +160,16 @@ pub fn verify_engine_dir(exe: &Path) -> Result<EngineIdentity, EngineError> {
             dir.display()
         )));
     }
-    for file in &pins.bundle {
+    for file in &platform.bundle {
         let path = dir.join(file);
         let bytes = std::fs::read(&path)
             .map_err(|e| EngineError::Pins(format!("bundled file {file}: {e}")))?;
+        // Not in the hash map: a symlink entry (unversioned .so/.dylib) —
+        // its content is the linked file, already verified under its name.
+        let Some(expected) = platform.files.get(file) else {
+            continue;
+        };
         let actual = hex::encode(Sha256::digest(&bytes));
-        let expected = pins.files.get(file).ok_or_else(|| {
-            EngineError::Pins(format!("pins have no hash for bundled file {file}"))
-        })?;
         if actual != *expected {
             return Err(EngineError::Pins(format!(
                 "bundled file {file}: sha256 {actual} != pinned {expected}"
@@ -132,7 +178,7 @@ pub fn verify_engine_dir(exe: &Path) -> Result<EngineIdentity, EngineError> {
     }
     Ok(EngineIdentity {
         version: pins.tag.clone(),
-        build_hash: pins.zip_sha256.clone(),
+        build_hash: pins.canonical_build_hash.clone(),
     })
 }
 
@@ -301,23 +347,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_pins_parse_and_cover_the_bundle() {
+    fn embedded_pins_parse_and_cover_every_platform() {
         let pins = parse_pins().expect("pins parse");
-        assert!(pins.tag.starts_with('b'), "tag: {}", pins.tag);
-        assert_eq!(pins.zip_sha256.len(), 64);
-        assert!(!pins.bundle.is_empty());
-        for file in &pins.bundle {
-            assert!(
-                pins.files.contains_key(file),
-                "bundle file {file} not hashed"
-            );
-        }
-        // The exact pinned engine (Phase H1).
         assert_eq!(pins.tag, "b11407");
         assert_eq!(
-            pins.zip_sha256,
+            pins.canonical_build_hash,
             "353c4aab423bff5cb6dc0e1d32e41a447990ab3d69a411b7f58ff48187c91a03"
         );
+        for platform in ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"] {
+            let entry = pins
+                .platforms
+                .get(platform)
+                .unwrap_or_else(|| panic!("missing platform {platform}"));
+            assert!(!entry.bundle.is_empty(), "{platform} bundle empty");
+            assert!(!entry.files.is_empty(), "{platform} files empty");
+            assert_eq!(entry.archive_sha256.len(), 64, "{platform} archive sha");
+        }
+        // Every platform ships its server binary.
+        assert!(pins.platforms["windows-x64"]
+            .bundle
+            .iter()
+            .any(|f| f == "llama-server.exe"));
+        for platform in ["linux-x64", "macos-arm64", "macos-x64"] {
+            assert!(pins.platforms[platform]
+                .bundle
+                .iter()
+                .any(|f| f == "llama-server"));
+        }
     }
 
     #[test]
@@ -329,7 +385,12 @@ mod tests {
 
         // A file with the right name but wrong bytes -> error.
         let pins = parse_pins().unwrap();
-        let first = pins.bundle.first().unwrap().clone();
+        let first = pins.platforms[current_platform()]
+            .bundle
+            .iter()
+            .find(|f| pins.platforms[current_platform()].files.contains_key(*f))
+            .unwrap()
+            .clone();
         std::fs::write(dir.path().join(&first), b"tampered").unwrap();
         let err = verify_engine_dir(&dir.path().join("llama-server.exe"));
         assert!(matches!(err, Err(EngineError::Pins(_))), "{err:?}");

@@ -3107,6 +3107,7 @@ dependencies = [
 name = "modelswarm-desktop"
 version = "0.1.0"
 dependencies = [
+ "modelswarm-gateway",
  "modelswarm-node",
  "modelswarm-store",
  "modelswarm-telemetry",

@@ -14,10 +14,10 @@ Contract: `protocol/msp-v1.md` §2–§5 + revision endpoint set.
 | `GET /peers?profile_id=` | ✅ frozen | response adds `capacity_class` (ADR-012) |
 | `rendezvous/{offer,answer,pending}` | ✅ frozen | unchanged |
 | `events/job-result` | ✅ frozen | unchanged |
-| `POST /api/v1/session-authorize` | — | **New**: cooperative session authorization (micro-swarm roster + role hints; metadata only) |
-| `POST /api/v1/lease` | — | **New**: consolidated eligibility-lease issuance/refresh (ADR-012); replaces ad-hoc challenge/complete issuance shape while keeping its semantics |
-| `POST /api/v1/receipt` | — | **New**: canonical receipt intake (co-receipt style settlement evidence; study item from p2ptokens) |
-| `POST /api/v1/audit` | — | **New**: audit-epoch sweep + random re-verification assignments |
+| `POST /api/v1/session-authorize` | — | **New (Phase B, shipped)**: cooperative session authorization (micro-swarm roster; metadata only) |
+| `POST /api/v1/peers/lease` | — | **New (Phase B, shipped)**: eligibility-lease issuance/refresh (ADR-012); challenge/complete records the passed challenge, this endpoint issues |
+| `POST /api/v1/receipt` | — | **New (Phase B, shipped)**: canonical receipt intake (co-receipt style settlement evidence) |
+| `POST /api/v1/audit` | — | **New (Phase B, shipped)**: audit-epoch sweep (per-peer counter; stale-epoch lease refresh rejected) |
 | `model-catalog` admin | ✅ §3.5 | gains manifest-v2 candidate promotion |
 
 Every addition is metadata-only. **Structural invariant (test A2/F4 carry

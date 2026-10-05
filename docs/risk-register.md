@@ -26,6 +26,8 @@ evidence. Severity = impact × likelihood (H/M/L).
 | R19 | Three overlapping plans (0–7, P0–P8, A–G) cause cross-implementation and gate confusion | H | ADR-015 supersession map; newest-plan-governs rule in AGENTS.md/README until then | Integrator | Revision A |
 | R20 | `speculative_exact` depends on runtime hooks llama.cpp does not expose (vLLM adapter or fork) | H | Phase D entry requires ADR on research runtime; stop condition on "large unsafe fork"; production llama.cpp path untouched | Runtime Engineer | Revision D |
 | R21 | Performance-dishonesty creep (average baselines, simulated results, hidden regressions) | H | Fastest-eligible-single comparator rule in AGENTS.md; release gates forbid simulated claims; Scheduler Scientist must publish negative results | Test/Release | Every revision phase |
+| R22 | PgStore SQL never executed against live Postgres; serverless rate-limit dilution (per-instance buckets) | M | CI must add postgres service container running the env-gated suite before deploy; Vercel-level rate limiting or shared-store limiter at deployment time | Tracker Engineer | Pre-deploy |
+| R23 | peerId placeholder equality (installation_id) shipped in Phase B | M | ADR-020 dual-derivation contract + Phase F migration task (multihash binding); goldens updated then | Network Engineer | Phase F |
 
 ## Standing review triggers
 

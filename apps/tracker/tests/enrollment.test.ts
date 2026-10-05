@@ -1,0 +1,244 @@
+// C enrollment + signed-request hardening (C1–C5).
+
+import { beforeEach, describe, expect, it } from "vitest";
+import * as deviceStart from "@/app/api/v1/auth/device/start/route";
+import * as deviceComplete from "@/app/api/v1/auth/device/complete/route";
+import * as registerRoute from "@/app/api/v1/peers/register/route";
+import * as heartbeatRoute from "@/app/api/v1/peers/heartbeat/route";
+import {
+  enroll,
+  keyPairIds,
+  makeKeypair,
+  makeRig,
+  register,
+  seedActiveProfile,
+  signedRequest,
+  testManifest,
+} from "./helpers";
+
+let rig: ReturnType<typeof makeRig>;
+let profileId: string;
+
+beforeEach(async () => {
+  rig = makeRig();
+  profileId = await seedActiveProfile(rig, testManifest());
+});
+
+describe("C1 device enrollment", () => {
+  it("start -> complete-without-approval -> 403 pending; approve -> session", async () => {
+    const enrolledKeys = makeKeypair();
+    const ids = keyPairIds(enrolledKeys);
+
+    const startRes = await deviceStart.POST(
+      new Request("http://tracker.local/api/v1/auth/device/start", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": "198.51.100.1" },
+        body: JSON.stringify({ installationId: ids.installationId, pubKey: ids.pubKeyB58 }),
+      }),
+    );
+    expect(startRes.status).toBe(200);
+    const start = (await startRes.json()) as {
+      deviceCode: string;
+      userCode: string;
+      verifyUrl: string;
+      expiresAt: string;
+    };
+    expect(start.deviceCode.length).toBeGreaterThanOrEqual(16);
+    expect(start.userCode).toMatch(/^[A-Z2-9]{8}$/);
+    expect(start.verifyUrl).toContain("https://");
+    expect(start.expiresAt).toBeTruthy();
+
+    const completeBody = JSON.stringify({ deviceCode: start.deviceCode });
+    const pendingRes = await deviceComplete.POST(
+      signedRequest(enrolledKeys, ids.installationId, "", "/api/v1/auth/device/complete", completeBody, rig.ctx.now, { ip: "198.51.100.1" }),
+    );
+    expect(pendingRes.status).toBe(403);
+    expect(((await pendingRes.json()) as { error: { code: string } }).error.code).toBe("pending");
+
+    // ops-runbook stand-in approval hook
+    expect(await rig.store.approveDevice(start.deviceCode)).toBe(true);
+
+    const okRes = await deviceComplete.POST(
+      signedRequest(enrolledKeys, ids.installationId, "", "/api/v1/auth/device/complete", completeBody, rig.ctx.now, { ip: "198.51.100.1" }),
+    );
+    expect(okRes.status).toBe(200);
+    const session = (await okRes.json()) as { token: string; expiresAt: string };
+    expect(session.token.length).toBeGreaterThanOrEqual(32);
+    // 24 h session
+    expect(Date.parse(session.expiresAt) - rig.ctx.now()).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it("start rejects an installationId that does not derive from pubKey", async () => {
+    const enrolledKeys = makeKeypair();
+    const ids = keyPairIds(enrolledKeys);
+    const res = await deviceStart.POST(
+      new Request("http://tracker.local/api/v1/auth/device/start", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": "198.51.100.2" },
+        body: JSON.stringify({ installationId: ids.installationId + "x".repeat(3), pubKey: ids.pubKeyB58 }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("invalid_body");
+  });
+});
+
+describe("C2 unsigned/unauthenticated peer calls", () => {
+  it("missing envelope -> 400 unsigned_request; garbage header -> 401; bad session -> 401", async () => {
+    const body = JSON.stringify({
+      peerId: "x",
+      addresses: ["/ip4/10.0.0.1/tcp/1"],
+      profiles: [profileId],
+      maxSlots: 2,
+      runtime: { name: "r", build: "b" },
+    });
+    const noAuth = await registerRoute.POST(
+      new Request("http://tracker.local/api/v1/peers/register", { method: "POST", body }),
+    );
+    expect([400, 401]).toContain(noAuth.status);
+    expect(((await noAuth.json()) as { error: { code: string } }).error.code).toBe("unsigned_request");
+
+    const garbageAuth = await registerRoute.POST(
+      new Request("http://tracker.local/api/v1/peers/register", {
+        method: "POST",
+        headers: { authorization: "MSP1 !!!not-base64!!!" },
+        body,
+      }),
+    );
+    expect([400, 401]).toContain(garbageAuth.status);
+
+    const who = await enroll(rig, "198.51.100.3");
+    const noSession = await registerRoute.POST(
+      signedRequest(who.keys, who.installationId, "", "/api/v1/peers/register", body, rig.ctx.now, { ip: "198.51.100.3" }),
+    );
+    expect(noSession.status).toBe(401);
+
+    const wrongSession = await heartbeatRoute.POST(
+      signedRequest(who.keys, who.installationId, "deadbeef", "/api/v1/peers/heartbeat", JSON.stringify({ leaseId: "0".repeat(32), activeProfiles: [], freeSlots: 1, queueMs: 0, draining: false }), rig.ctx.now),
+    );
+    expect(wrongSession.status).toBe(401);
+  });
+});
+
+describe("C3 timestamp skew", () => {
+  it("ts older than 120 s -> 400 stale_timestamp", async () => {
+    const who = await enroll(rig, "198.51.100.4");
+    const body = JSON.stringify({
+      peerId: who.peerId,
+      addresses: ["/ip4/10.0.0.1/tcp/4001"],
+      profiles: [profileId],
+      maxSlots: 2,
+      runtime: { name: "r", build: "b" },
+    });
+    const res = await registerRoute.POST(
+      signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/register", body, rig.ctx.now, {
+        ts: rig.ctx.now() - 121_000,
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("stale_timestamp");
+  });
+});
+
+describe("C4 replay protection", () => {
+  it("replaying a captured request -> 400 replayed_nonce", async () => {
+    const who = await enroll(rig, "198.51.100.5");
+    const body = JSON.stringify({
+      peerId: who.peerId,
+      addresses: ["/ip4/10.0.0.1/tcp/4001"],
+      profiles: [profileId],
+      maxSlots: 2,
+      runtime: { name: "r", build: "b" },
+    });
+    const nonce = "a".repeat(32);
+    const first = await registerRoute.POST(
+      signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/register", body, rig.ctx.now, { nonce }),
+    );
+    expect(first.status).toBe(200);
+    const replay = await registerRoute.POST(
+      signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/register", body, rig.ctx.now, { nonce }),
+    );
+    expect(replay.status).toBe(400);
+    expect(((await replay.json()) as { error: { code: string } }).error.code).toBe("replayed_nonce");
+  });
+});
+
+describe("C5 tampered body", () => {
+  it("body changed after signing (digest mismatch) -> 401", async () => {
+    const who = await enroll(rig, "198.51.100.6");
+    const goodBody = JSON.stringify({
+      peerId: who.peerId,
+      addresses: ["/ip4/10.0.0.1/tcp/4001"],
+      profiles: [profileId],
+      maxSlots: 2,
+      runtime: { name: "r", build: "b" },
+    });
+    // sanity: untampered works
+    const ok = await registerRoute.POST(
+      signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/register", goodBody, rig.ctx.now),
+    );
+    expect(ok.status).toBe(200);
+
+    const tampered = JSON.stringify({
+      peerId: who.peerId,
+      addresses: ["/ip4/10.0.0.1/tcp/4001"],
+      profiles: [profileId],
+      maxSlots: 8, // escalated after signing
+      runtime: { name: "r", build: "b" },
+    });
+    const res = await registerRoute.POST(
+      signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/register", tampered, rig.ctx.now, {
+        tamperBodyDigest: true,
+      }),
+    );
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("register validation", () => {
+  it("peerId not deriving from the pubKey -> 400 invalid_body", async () => {
+    const who = await enroll(rig, "198.51.100.7");
+    const body = JSON.stringify({
+      peerId: "WrongPeerId123",
+      addresses: ["/ip4/10.0.0.1/tcp/4001"],
+      profiles: [profileId],
+      maxSlots: 2,
+      runtime: { name: "r", build: "b" },
+    });
+    const res = await registerRoute.POST(
+      signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/register", body, rig.ctx.now),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("invalid_body");
+  });
+
+  it("unknown profile -> 400 unknown_profile; bad multiaddr -> 400; maxSlots out of range -> 400", async () => {
+    const who = await enroll(rig, "198.51.100.8");
+    const base = (overrides: Record<string, unknown>) =>
+      signedRequest(
+        who.keys,
+        who.installationId,
+        who.session,
+        "/api/v1/peers/register",
+        JSON.stringify({
+          peerId: who.peerId,
+          addresses: ["/ip4/10.0.0.1/tcp/4001"],
+          profiles: [profileId],
+          maxSlots: 2,
+          runtime: { name: "r", build: "b" },
+          ...overrides,
+        }),
+        rig.ctx.now,
+      );
+
+    const unknownProfile = await registerRoute.POST(base({ profiles: ["msp1:" + "9".repeat(64)] }));
+    expect(unknownProfile.status).toBe(400);
+    expect(((await unknownProfile.json()) as { error: { code: string } }).error.code).toBe("unknown_profile");
+
+    const badAddr = await registerRoute.POST(base({ addresses: ["ftp://not-a-multiaddr"] }));
+    expect(badAddr.status).toBe(400);
+
+    const badSlots = await registerRoute.POST(base({ maxSlots: 9 }));
+    expect(badSlots.status).toBe(400);
+  });
+});

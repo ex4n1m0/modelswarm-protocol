@@ -18,7 +18,7 @@
 //! serves **locally**; remote execution over a transport listener is the
 //! Phase F wiring and is surfaced as the `direct-connect` degraded state.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

@@ -28,7 +28,7 @@ jobs:
             archive_sha: 086d6289901545b664b70fe032b49d5c0e3e242e5d07540d18b573603c563529
           - os: macos-latest
             platform: macos-arm64
-            bundles: dmg,appimage
+            bundles: dmg
             archive: https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-macos-arm64.tar.gz
             archive_sha: 23dc51ce360ffaf0753cb3257b4020b9d7d9da2215198a81ce187d29aa7801f7
           - os: macos-13

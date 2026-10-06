@@ -1,1 +1,1 @@
-5613f98276801f0cdcef2c0c9e368adfadab0730fc1be243aa32dca9f92d2905 *ModelSwarm-Setup-0.2.10-windows-x64.exe
+287ad908cc833e777d25c31aa81b1519f24e24f5e8d4b7efd5acce2e1024d881 *ModelSwarm-Setup-0.2.11-windows-x64.exe

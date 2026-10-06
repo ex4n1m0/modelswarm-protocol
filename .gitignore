@@ -47,3 +47,5 @@ apps/tracker/public/downloads/*.dmg
 
 # Staged pinned engine (installer/stage-engine-windows.mjs or CI); never committed
 crates/modelswarm-desktop/engine/
+# Staged GPU engine variant (ADR-024); never committed
+crates/modelswarm-desktop/engine-vulkan/

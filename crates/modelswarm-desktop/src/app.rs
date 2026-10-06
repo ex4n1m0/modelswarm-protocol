@@ -169,6 +169,25 @@ fn engine_binary_path(app: &tauri::AppHandle) -> PathBuf {
         .unwrap_or_else(|| dir.join("engine").join(name))
 }
 
+/// GPU-accelerated engine variant (ADR-024): `engine-vulkan/llama-server.exe`
+/// from the same layouts as the CPU engine. Windows-only bundle today; other
+/// OSes simply never resolve a file and stay on the canonical engine.
+fn engine_gpu_binary_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("engine-vulkan").join(name));
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("modelswarm"));
+    let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+    candidates.push(dir.join("engine-vulkan").join(name));
+    candidates.into_iter().find(|path| path.is_file())
+}
+
 /// Appends one event to the node log (same sink/format as the node's own
 /// events) so client-side failures — catalog fetches above all — leave a
 /// trail even when the UI is the only thing reporting them.
@@ -252,7 +271,7 @@ pub fn hardware_requirements(download_bytes: Option<u64>) -> Option<serde_json::
     Some(serde_json::json!({
         "download_mb": download_mb,
         "ram_mb_est": ram_mb,
-        "gpu": "not required (CPU engine)",
+        "gpu": "optional — a Vulkan-capable GPU (any modern NVIDIA/AMD/Intel driver) accelerates decode; otherwise CPU",
         "note": "estimates; RAM = weights + KV cache + runtime overhead",
     }))
 }
@@ -296,13 +315,14 @@ async fn get_status(
         Some(running) => Some(running.enrollment.read().await.clone()),
         None => None,
     };
-    let (gateway_addr, installation_id, engine_port) = match &inner.node {
+    let (gateway_addr, installation_id, engine_port, engine_backend) = match &inner.node {
         Some(running) => (
             Some(running.handle.local_addr.to_string()),
             Some(running.handle.installation_id.clone()),
             running.handle.engine_port,
+            running.handle.engine_backend.clone(),
         ),
-        None => (None, None, None),
+        None => (None, None, None, None),
     };
     Ok(serde_json::json!({
         "version": app.package_info().version.to_string(),
@@ -310,6 +330,7 @@ async fn get_status(
         "data_dir": inner.data_dir.display().to_string(),
         "engine_available": engine.is_file(),
         "engine_path": engine.display().to_string(),
+        "gpu_engine_available": engine_gpu_binary_path(&app).is_some(),
         "license_accepted": inner.license_accepted,
         "profile_id": inner.profile_id,
         "artifact": inner.artifact.as_ref().map(|a| serde_json::json!({
@@ -322,6 +343,7 @@ async fn get_status(
             "gateway_addr": gateway_addr,
             "installation_id": installation_id,
             "engine_port": engine_port,
+            "engine_backend": engine_backend,
             "enrollment": enrollment,
         },
         "chat_turns": inner.chat_log.len(),
@@ -546,6 +568,9 @@ async fn set_hosting_inner(
         .map_err(|e| format!("artifact: {e}"))?;
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    // ADR-024: prefer the GPU (Vulkan) engine variant when the bundle is
+    // present; the node falls back to the CPU engine visibly on any failure.
+    let gpu_engine = engine_gpu_binary_path(app);
     let mut config = NodeConfig {
         tracker_base: Some(inner.tracker_url.clone()),
         // Stable local API first (DEFAULT_PORT 11435); fall back to an
@@ -555,6 +580,7 @@ async fn set_hosting_inner(
         profile_id: Some(listing.profile_id.clone()),
         mock: false,
         engine_binary: Some(engine),
+        engine_gpu_binary: gpu_engine,
         engine_model: Some(ensured.path.clone()),
         engine_threads: None,
     };

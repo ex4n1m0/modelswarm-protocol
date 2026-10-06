@@ -129,6 +129,7 @@
         </div>
         <dl class="kv" style="margin-top:8px">
           <dt>Model</dt><dd id="model-name-line">—</dd>
+          <dt>Compute</dt><dd id="compute-line">—</dd>
           <dt>Profile id</dt><dd id="profile-line">—</dd>
           <dt>Gateway</dt><dd id="gateway-line">—</dd>
           <dt>Installation</dt><dd id="install-line">—</dd>
@@ -339,6 +340,10 @@
       $("engine-line").textContent = s.engine_available
         ? "pinned llama.cpp — present"
         : "MISSING — expected at " + s.engine_path;
+      const backend = s.node.engine_backend || (s.gpu_engine_available ? "vulkan" : "cpu");
+      $("compute-line").textContent = s.node.running
+        ? (backend === "cpu" ? "CPU" : "GPU · " + backend)
+        : (s.gpu_engine_available ? "GPU available (Vulkan) + CPU fallback" : "CPU (no Vulkan engine bundle)");
       const en = s.node && s.node.enrollment;
       if (s.node.running && en) {
         pendingEnroll = en.phase === "pending" ? en : null;

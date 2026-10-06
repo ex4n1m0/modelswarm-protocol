@@ -107,6 +107,12 @@ pub struct NodeConfig {
     /// engine and serves through it; takes precedence over the sidecar env
     /// vars.
     pub engine_binary: Option<PathBuf>,
+    /// Path to a GPU-accelerated pinned engine variant (ADR-024), e.g.
+    /// `engine-vulkan/llama-server.exe`. Tried FIRST when present; any
+    /// verification/spawn/health failure falls back to the CPU engine with
+    /// a visible `engine.gpu_fallback` telemetry event (honest CPU mode —
+    /// never a silent downgrade).
+    pub engine_gpu_binary: Option<PathBuf>,
     /// Path to the verified GGUF artifact the engine loads.
     pub engine_model: Option<PathBuf>,
     /// Compute threads for the engine; `None` = engine default.
@@ -122,6 +128,7 @@ impl Default for NodeConfig {
             profile_id: None,
             mock: false,
             engine_binary: None,
+            engine_gpu_binary: None,
             engine_model: None,
             engine_threads: None,
         }
@@ -208,21 +215,49 @@ impl Node {
         );
 
         // Pinned engine (Phase H3): spawn + supervise when configured.
+        // ADR-024: a GPU variant is preferred when configured and present;
+        // any failure falls back to the canonical CPU engine, visibly.
         let engine = match (&config.engine_binary, &config.engine_model) {
             (Some(exe), Some(model)) => {
-                let spec = engine::EngineSpec {
-                    exe: exe.clone(),
-                    model: model.clone(),
-                    threads: config.engine_threads,
-                    ..engine::EngineSpec::default()
+                let mut started = None;
+                if let Some(gpu_exe) = &config.engine_gpu_binary {
+                    if gpu_exe.is_file() {
+                        let spec = engine::EngineSpec {
+                            exe: gpu_exe.clone(),
+                            model: model.clone(),
+                            threads: config.engine_threads,
+                            gpu_layers: Some(999),
+                            backend: "vulkan".into(),
+                            ..engine::EngineSpec::default()
+                        };
+                        match engine::start_engine(spec, shutdown.clone()).await {
+                            Ok(handle) => started = Some(handle),
+                            Err(e) => telemetry.warn(
+                                "engine.gpu_fallback",
+                                &[("variant", "vulkan"), ("reason", &e.to_string())],
+                            ),
+                        }
+                    }
+                }
+                let handle = match started {
+                    Some(handle) => handle,
+                    None => {
+                        let spec = engine::EngineSpec {
+                            exe: exe.clone(),
+                            model: model.clone(),
+                            threads: config.engine_threads,
+                            ..engine::EngineSpec::default()
+                        };
+                        engine::start_engine(spec, shutdown.clone()).await?
+                    }
                 };
-                let handle = engine::start_engine(spec, shutdown.clone()).await?;
                 telemetry.info(
                     "engine.started",
                     &[
                         ("port", &handle.port.to_string()),
                         ("version", handle.identity.version.as_str()),
                         ("build_hash", handle.identity.build_hash.as_str()),
+                        ("backend", handle.backend.as_str()),
                     ],
                 );
                 Some(handle)
@@ -334,6 +369,7 @@ impl Node {
             data_dir: config.data_dir,
             tracker,
             engine_port: engine.as_ref().map(|e| e.port),
+            engine_backend: engine.as_ref().map(|e| e.backend.clone()),
             server,
         })
     }
@@ -357,6 +393,9 @@ pub struct NodeHandle {
     pub tracker: Option<Arc<TrackerClient>>,
     /// The supervised engine's loopback port, when one was started.
     pub engine_port: Option<u16>,
+    /// The backend the engine actually serves on ("cpu" or a GPU variant
+    /// name, ADR-024); `None` when no engine was started.
+    pub engine_backend: Option<String>,
     server: tokio::task::JoinHandle<()>,
 }
 

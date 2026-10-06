@@ -23,6 +23,8 @@ jobs:
             bundles: nsis
             archive: https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-win-cpu-x64.zip
             archive_sha: 353c4aab423bff5cb6dc0e1d32e41a447990ab3d69a411b7f58ff48187c91a03
+            gpu_archive: https://github.com/ggml-org/llama.cpp/releases/download/b11407/llama-b11407-bin-win-vulkan-x64.zip
+            gpu_archive_sha: a56279698e17484bfb55eaf98c16e4b7414481675ac94b309b5372aa73ae6f2a
           - os: ubuntu-latest
             platform: linux-x64
             bundles: deb,appimage
@@ -58,6 +60,23 @@ jobs:
         env:
           ARCHIVE: ${{ matrix.archive }}
           ARCHIVE_SHA: ${{ matrix.archive_sha }}
+      - name: Fetch GPU engine variant (ADR-024; windows only)
+        shell: bash
+        run: |
+          mkdir -p crates/modelswarm-desktop/engine-vulkan
+          if [ -n "$GPU_ARCHIVE" ]; then
+            curl -sSL -o engine-vulkan.archive "$GPU_ARCHIVE"
+            echo "$GPU_ARCHIVE_SHA  engine-vulkan.archive" | sha256sum -c -
+            unzip -j -o engine-vulkan.archive -d crates/modelswarm-desktop/engine-vulkan
+            ls crates/modelswarm-desktop/engine-vulkan | wc -l
+          else
+            # Non-Windows: keep the resource glob non-empty; the node never
+            # resolves (or starts) a GPU variant on these platforms.
+            printf 'Windows-only GPU engine variant (ADR-024). This platform ships the canonical CPU engine only.\n' > crates/modelswarm-desktop/engine-vulkan/README.txt
+          fi
+        env:
+          GPU_ARCHIVE: ${{ matrix.gpu_archive }}
+          GPU_ARCHIVE_SHA: ${{ matrix.gpu_archive_sha }}
       - name: Verify every pinned engine file (runtime-pins.json)
         shell: pwsh
         run: |
@@ -75,6 +94,21 @@ jobs:
             if (-not (Test-Path "$dir/$f")) { throw "bundled engine entry missing: $f" }
           }
           Write-Host "engine verified ($verified files hashed, $($entry.bundle.Count) entries present)"
+          if ('${{ matrix.platform }}' -eq 'windows-x64') {
+            $variant = $pins.platforms.'windows-x64'.variants.vulkan
+            $vdir = "crates/modelswarm-desktop/engine-vulkan"
+            $vverified = 0
+            foreach ($prop in $variant.files.PSObject.Properties) {
+              $f = $prop.Name
+              $actual = (Get-FileHash "$vdir/$f" -Algorithm SHA256).Hash.ToLower()
+              if ($actual -ne $prop.Value) { throw "vulkan engine file $f hash mismatch" }
+              $vverified++
+            }
+            foreach ($f in $variant.bundle) {
+              if (-not (Test-Path "$vdir/$f")) { throw "vulkan bundled engine entry missing: $f" }
+            }
+            Write-Host "vulkan variant verified ($vverified files hashed, $($variant.bundle.Count) entries present)"
+          }
       - name: Install tauri-cli
         run: cargo install tauri-cli --version '^2' --locked
       - name: Build ${{ matrix.bundles }} installer
@@ -99,7 +133,8 @@ jobs:
           shopt -s nullglob
           for f in *-setup.exe; do
             7z l "$f" | grep -q "llama-server.exe" || { echo "::error::engine missing in $f"; exit 1; }
-            echo "engine present in $f"
+            7z l "$f" | grep -q "engine-vulkan/llama-server.exe" || { echo "::error::vulkan engine variant missing in $f"; exit 1; }
+            echo "engine + vulkan variant present in $f"
           done
           for f in *.deb; do
             # Not piped into grep -q: early pipe-close kills tar (SIGPIPE).

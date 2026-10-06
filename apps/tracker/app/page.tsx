@@ -1,20 +1,19 @@
 // Every installer bundles the full pinned inference engine; the model
-// weights download from HuggingFace on first use. v0.2.16: one-click model
-// switch + stop (Start/Stop on every card, swap keeps the old swarm serving
-// during download); v0.2.15: community model requests (ADR-023) — search
-// Hugging Face in the app; v0.2.14: zero-click enrollment (tracker
-// auto-approval) + registration fixes — the client now sends the strict
-// runtime shape {name, build} and the ADR-020 peerId derivation, so hosting
-// really joins the live swarm census.
+// weights download from HuggingFace on first use. v0.2.17: GPU compute
+// (Vulkan) — Windows bundles a second pinned engine that offloads to any
+// NVIDIA/AMD/Intel GPU with honest CPU fallback; v0.2.16: one-click model
+// switch + stop (swap keeps the old swarm serving during download);
+// v0.2.15: community model requests (ADR-023) — search Hugging Face in
+// the app; v0.2.14: zero-click enrollment + registration fixes.
 // Same version on every OS = same build.
 const DOWNLOADS = [
-  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.16-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
-  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.16-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
-  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.16-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
-  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.16-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
+  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.17-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
+  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.17-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
+  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.17-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
+  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.17-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
 ];
 const DOWNLOAD = {
-  version: "0.2.16",
+  version: "0.2.17",
   sums: "/downloads/SHA256SUMS.txt",
   sha256: "b7d9172dc7c0cc78572c9333f52723fa50e1af0a169ba43b0789977a95c5a8ba",
 };

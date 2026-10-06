@@ -56,6 +56,26 @@ struct PlatformPins {
     #[serde(default)]
     bundle: Vec<String>,
     files: std::collections::BTreeMap<String, String>,
+    /// GPU-accelerated engine builds of the SAME release tag (ADR-024).
+    /// A variant bundle is verified exactly like the canonical set, but it
+    /// never changes the reported identity: `canonical_build_hash` stays
+    /// the anchor on every backend (the backend is a local execution
+    /// detail, not a swarm-visible runtime change).
+    #[serde(default)]
+    variants: std::collections::BTreeMap<String, VariantPins>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VariantPins {
+    #[serde(default)]
+    #[allow(dead_code)]
+    archive_url: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    archive_sha256: String,
+    #[serde(default)]
+    bundle: Vec<String>,
+    files: std::collections::BTreeMap<String, String>,
 }
 
 /// The pins entry for the OS/arch this binary was built for.
@@ -110,6 +130,13 @@ pub struct EngineSpec {
     pub ctx: u32,
     /// How long to wait for `/health` after spawn.
     pub startup_timeout: Duration,
+    /// GPU offload layers (ADR-024): `Some(n)` passes `-ngl n` — used with
+    /// a GPU-accelerated engine variant. `None` keeps the engine default
+    /// (CPU: no offload).
+    pub gpu_layers: Option<u32>,
+    /// Backend label for telemetry/UI disclosure (e.g. "cpu", "vulkan").
+    /// Reported locally only — never part of the wire runtime descriptor.
+    pub backend: String,
 }
 
 impl Default for EngineSpec {
@@ -120,6 +147,8 @@ impl Default for EngineSpec {
             threads: None,
             ctx: 4096,
             startup_timeout: Duration::from_secs(120),
+            gpu_layers: None,
+            backend: "cpu".into(),
         }
     }
 }
@@ -135,6 +164,8 @@ pub struct EngineHandle {
     pub port: u16,
     /// The pinned-engine identity (verified at launch).
     pub identity: EngineIdentity,
+    /// Backend actually serving ("cpu" or a GPU variant name, ADR-024).
+    pub backend: String,
     /// Exact token vocabulary from the verified GGUF.
     pub vocab: Arc<TokenVocab>,
 }
@@ -144,6 +175,16 @@ pub struct EngineHandle {
 /// file with the exact pinned sha256 (extras are tolerated — dev machines
 /// may unpack the full zip).
 pub fn verify_engine_dir(exe: &Path) -> Result<EngineIdentity, EngineError> {
+    verify_engine_variant(exe, None)
+}
+
+/// Variant-aware verification (ADR-024): `None` checks the canonical CPU
+/// bundle; `Some(name)` checks `platforms[<platform>].variants[name]`.
+/// Identity is identical for every variant of the same release tag.
+pub fn verify_engine_variant(
+    exe: &Path,
+    variant: Option<&str>,
+) -> Result<EngineIdentity, EngineError> {
     let pins = parse_pins()?;
     let platform = pins.platforms.get(current_platform()).ok_or_else(|| {
         EngineError::Pins(format!(
@@ -151,6 +192,18 @@ pub fn verify_engine_dir(exe: &Path) -> Result<EngineIdentity, EngineError> {
             current_platform()
         ))
     })?;
+    let (label, bundle, files) = match variant {
+        None => ("canonical".to_string(), &platform.bundle, &platform.files),
+        Some(name) => {
+            let v = platform.variants.get(name).ok_or_else(|| {
+                EngineError::Pins(format!(
+                    "runtime-pins has no '{name}' variant for {platform_name}",
+                    platform_name = current_platform()
+                ))
+            })?;
+            (name.to_string(), &v.bundle, &v.files)
+        }
+    };
     let dir = exe
         .parent()
         .ok_or_else(|| EngineError::Pins("engine exe has no parent directory".into()))?;
@@ -160,13 +213,13 @@ pub fn verify_engine_dir(exe: &Path) -> Result<EngineIdentity, EngineError> {
             dir.display()
         )));
     }
-    for file in &platform.bundle {
+    for file in bundle {
         let path = dir.join(file);
         let bytes = std::fs::read(&path)
             .map_err(|e| EngineError::Pins(format!("bundled file {file}: {e}")))?;
         // Not in the hash map: a symlink entry (unversioned .so/.dylib) —
         // its content is the linked file, already verified under its name.
-        let Some(expected) = platform.files.get(file) else {
+        let Some(expected) = files.get(file) else {
             continue;
         };
         let actual = hex::encode(Sha256::digest(&bytes));
@@ -176,6 +229,7 @@ pub fn verify_engine_dir(exe: &Path) -> Result<EngineIdentity, EngineError> {
             )));
         }
     }
+    let _ = label;
     Ok(EngineIdentity {
         version: pins.tag.clone(),
         build_hash: pins.canonical_build_hash.clone(),
@@ -199,7 +253,12 @@ pub async fn start_engine(
     spec: EngineSpec,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<EngineHandle, EngineError> {
-    let identity = verify_engine_dir(&spec.exe)?;
+    let variant = if spec.backend == "cpu" {
+        None
+    } else {
+        Some(spec.backend.as_str())
+    };
+    let identity = verify_engine_variant(&spec.exe, variant)?;
     let port = ephemeral_port()?;
     let bearer = modelswarm_identity::new_nonce();
     let base_url = format!("http://127.0.0.1:{port}");
@@ -246,6 +305,7 @@ pub async fn start_engine(
         base_url,
         bearer,
         port,
+        backend: spec.backend.clone(),
         vocab: load_vocab(&spec.model)?,
         identity,
     })
@@ -292,27 +352,41 @@ fn spawn_supervised(
     });
 }
 
+/// The exact llama-server argv (loopback-only, bearer-gated, no webui).
+/// Pure so the arg contract (`-ngl` only for GPU variants) is testable.
+fn engine_args(spec: &EngineSpec, port: u16, bearer: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string(),
+        "-m".into(),
+        spec.model.display().to_string(),
+        "-c".into(),
+        spec.ctx.to_string(),
+        "--no-webui".into(),
+        "--api-key".into(),
+        bearer.into(),
+    ];
+    if let Some(threads) = spec.threads {
+        args.push("-t".into());
+        args.push(threads.to_string());
+    }
+    if let Some(layers) = spec.gpu_layers {
+        args.push("-ngl".into());
+        args.push(layers.to_string());
+    }
+    args
+}
+
 fn launch(spec: &EngineSpec, port: u16, bearer: &str) -> Result<Child, EngineError> {
     let mut command = Command::new(&spec.exe);
     command
-        .arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("-m")
-        .arg(&spec.model)
-        .arg("-c")
-        .arg(spec.ctx.to_string())
-        .arg("--no-webui")
-        .arg("--api-key")
-        .arg(bearer)
+        .args(engine_args(spec, port, bearer))
         // Engine stdout/stderr are discarded by policy: they may echo prompt
         // text, and prompts are structurally never persisted (ADR-001).
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(threads) = spec.threads {
-        command.arg("-t").arg(threads.to_string());
-    }
     #[cfg(windows)]
     {
         // CREATE_NO_WINDOW: no console flash for the GUI-supervised node.
@@ -377,6 +451,47 @@ mod tests {
     }
 
     #[test]
+    fn vulkan_variant_pins_parse_and_carry_server() {
+        let pins = parse_pins().expect("pins parse");
+        let variant = pins.platforms["windows-x64"]
+            .variants
+            .get("vulkan")
+            .expect("windows-x64 vulkan variant pinned");
+        assert!(!variant.bundle.is_empty());
+        assert!(variant.bundle.iter().any(|f| f == "llama-server.exe"));
+        assert!(variant.bundle.iter().any(|f| f == "ggml-vulkan.dll"));
+        for file in &variant.bundle {
+            assert!(
+                variant.files.contains_key(file),
+                "vulkan bundle file {file} has no pinned sha256"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_variant_name_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = verify_engine_variant(&dir.path().join("llama-server.exe"), Some("cuda"));
+        assert!(matches!(err, Err(EngineError::Pins(_))), "{err:?}");
+    }
+
+    #[test]
+    fn launch_args_include_ngl_only_for_gpu_layers() {
+        let spec = |gpu: Option<u32>| EngineSpec {
+            gpu_layers: gpu,
+            ..EngineSpec::default()
+        };
+        let cpu = engine_args(&spec(None), 8137, "k");
+        assert!(!cpu.contains(&"-ngl".to_string()));
+        let gpu = engine_args(&spec(Some(999)), 8137, "k");
+        let i = gpu.iter().position(|a| a == "-ngl").expect("-ngl present");
+        assert_eq!(gpu[i + 1], "999");
+        let host = gpu.iter().position(|a| a == "--host").unwrap();
+        assert_eq!(gpu[host + 1], "127.0.0.1");
+        assert!(gpu.contains(&"--no-webui".to_string()));
+    }
+
+    #[test]
     fn verify_engine_dir_fails_closed_on_tampering() {
         let dir = tempfile::tempdir().unwrap();
         // Empty dir: every bundle file missing -> error.
@@ -397,21 +512,28 @@ mod tests {
     }
 
     /// Real-engine smoke (Phase H3 gate): set MSP_LLAMA_SERVER + MSP_REAL_GGUF
-    /// to the pinned llama-server.exe and the verified Qwen GGUF.
+    /// to the pinned llama-server.exe and the verified Qwen GGUF. Optional
+    /// MSP_ENGINE_BACKEND (e.g. "vulkan") runs the ADR-024 GPU variant with
+    /// full offload instead of the canonical CPU engine.
     #[test]
     #[ignore = "set MSP_LLAMA_SERVER and MSP_REAL_GGUF"]
     fn real_engine_starts_serves_and_dies() {
         let exe = std::env::var("MSP_LLAMA_SERVER").expect("MSP_LLAMA_SERVER");
         let model = std::env::var("MSP_REAL_GGUF").expect("MSP_REAL_GGUF");
+        let backend = std::env::var("MSP_ENGINE_BACKEND").unwrap_or_else(|_| "cpu".into());
+        let gpu_layers = if backend == "cpu" { None } else { Some(999u32) };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let (_tx, rx) = tokio::sync::watch::channel(false);
             let spec = EngineSpec {
                 exe: exe.into(),
                 model: model.into(),
+                gpu_layers,
+                backend: backend.clone(),
                 ..EngineSpec::default()
             };
             let engine = start_engine(spec, rx).await.expect("engine starts");
+            assert_eq!(engine.backend, backend);
             let config = engine.runtime_config();
             assert_eq!(engine.identity.version, "b11407");
             let adapter = modelswarm_runtime::llamacpp::LlamaCppAdapter::new(config).unwrap();

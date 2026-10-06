@@ -11,7 +11,7 @@ const DOWNLOADS = [
 const DOWNLOAD = {
   version: "0.2.7",
   sums: "/downloads/SHA256SUMS.txt",
-  sha256: "PENDING-CI",
+  sha256: "101b9de3741411559110d30cdb4efbd58f87d2f9b442338707e6a4d4c52aa9b8",
 };
 
 // Dedicated community room — the room word is fixed here and nowhere else on

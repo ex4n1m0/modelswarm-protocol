@@ -1,4 +1,4 @@
-2bd4e3c8291dce240fd2cef2389ebc8e4348eed1cc1f585ce71ba44b77bd9447 *ModelSwarm-Setup-0.2.6-windows-x64.exe
-49587f26b36d264fb03bd9dc5cc991cff71e174bd9b4b663b4d01229c08d11ac *ModelSwarm-0.2.6-linux-amd64.deb
-2c796901dce72ea0cccac249eb0cc727ff5fd59dc800247f8a9e5c6c1da9dd55 *ModelSwarm-0.2.6-linux-amd64.AppImage
-88a7c5190153a8bf4045e8970739979ade554bf4fef1f474fb647c23f9ab9c0a *ModelSwarm-0.2.6-macos-arm64.dmg
+101b9de3741411559110d30cdb4efbd58f87d2f9b442338707e6a4d4c52aa9b8 *ModelSwarm-Setup-0.2.7-windows-x64.exe
+fdfe20401a99f3ffa9d0cd360acfbf77ab5b66e79840ba68984667bf30e3c35d *ModelSwarm-0.2.7-linux-amd64.deb
+ea6f8038554209e8f0b1b5b209331603846b4b640cc53ce24fbf4e67896b911d *ModelSwarm-0.2.7-linux-amd64.AppImage
+a10e7ac327e489eb37cbbd3bcf6d5aff0df7542ce7d59a7cd70fb221c93c84d0 *ModelSwarm-0.2.7-macos-arm64.dmg

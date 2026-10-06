@@ -303,6 +303,29 @@ fn read_value<R: Read>(r: &mut R, value_type: u32) -> Result<GgufValue, GgufErro
     }
 }
 
+// ADR-022 amendment (2026-10-06): tokenizer keys a GGUF may legitimately
+// omit hash as null — absence itself is identity, never an error and never
+// a guessed default. Applies to add_bos_token and padding_token_id (both
+// observed absent in Qwen3.5-family conversions); every other member of
+// the ADR-022 tokenizer object stays fail-closed.
+fn nullable_bool(metadata: &BTreeMap<String, GgufValue>, key: &str) -> Result<Value, GgufError> {
+    match get(metadata, key) {
+        Ok(GgufValue::Bool(b)) => Ok(Value::Bool(*b)),
+        Ok(_) => Err(GgufError::BadValue(key.to_string())),
+        Err(GgufError::MissingKey(_)) => Ok(Value::Null),
+        Err(e) => Err(e),
+    }
+}
+
+fn nullable_u32(metadata: &BTreeMap<String, GgufValue>, key: &str) -> Result<Value, GgufError> {
+    match get(metadata, key) {
+        Ok(GgufValue::U32(v)) => Ok(Value::Number((*v).into())),
+        Ok(_) => Err(GgufError::BadValue(key.to_string())),
+        Err(GgufError::MissingKey(_)) => Ok(Value::Null),
+        Err(e) => Err(e),
+    }
+}
+
 /// Derives the three ADR-022 identity hashes from GGUF metadata.
 pub fn identity_hashes(
     metadata: &BTreeMap<String, GgufValue>,
@@ -313,7 +336,7 @@ pub fn identity_hashes(
     let mut tokenizer = Map::new();
     tokenizer.insert(
         "add_bos_token".into(),
-        Value::Bool(get_bool(metadata, "tokenizer.ggml.add_bos_token")?),
+        nullable_bool(metadata, "tokenizer.ggml.add_bos_token")?,
     );
     tokenizer.insert(
         "bos_token_id".into(),
@@ -338,7 +361,7 @@ pub fn identity_hashes(
     );
     tokenizer.insert(
         "padding_token_id".into(),
-        u32_value(metadata, "tokenizer.ggml.padding_token_id")?,
+        nullable_u32(metadata, "tokenizer.ggml.padding_token_id")?,
     );
     tokenizer.insert(
         "pre".into(),
@@ -448,13 +471,6 @@ fn get<'a>(
 fn get_str<'a>(metadata: &'a BTreeMap<String, GgufValue>, key: &str) -> Result<&'a str, GgufError> {
     match get(metadata, key)? {
         GgufValue::Str(s) => Ok(s),
-        _ => Err(GgufError::BadValue(key.to_string())),
-    }
-}
-
-fn get_bool(metadata: &BTreeMap<String, GgufValue>, key: &str) -> Result<bool, GgufError> {
-    match get(metadata, key)? {
-        GgufValue::Bool(b) => Ok(*b),
         _ => Err(GgufError::BadValue(key.to_string())),
     }
 }
@@ -627,6 +643,45 @@ mod tests {
             assert_eq!(h.len(), 64);
             assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
         }
+    }
+
+    #[test]
+    fn absent_tokenizer_keys_hash_as_null_amendment() {
+        // ADR-022 amendment (2026-10-06): GGUFs may omit add_bos_token and
+        // padding_token_id (Qwen3.5-family conversions do). Absence hashes
+        // as null — never an error, never a guessed default. The pinned
+        // digest is the node resolver's canonical-JSON sha256 of the same
+        // object (cross-runtime parity lock).
+        let bytes = {
+            let mut w = GgufWriter::new();
+            w.str("general.architecture", "qwen2");
+            w.u32("qwen2.attention.head_count", 14);
+            w.u32("qwen2.attention.head_count_kv", 2);
+            w.f32("qwen2.attention.layer_norm_rms_epsilon", 897_988_541);
+            w.u32("qwen2.block_count", 24);
+            w.u32("qwen2.context_length", 32_768);
+            w.u32("qwen2.embedding_length", 896);
+            w.u32("qwen2.feed_forward_length", 4_864);
+            w.u32("general.file_type", 15);
+            w.f32("qwen2.rope.freq_base", 1_232_348_160);
+            // NOTE: no tokenizer.ggml.add_bos_token, no padding_token_id.
+            w.u32("tokenizer.ggml.bos_token_id", 0);
+            w.u32("tokenizer.ggml.eos_token_id", 1);
+            w.str_array("tokenizer.ggml.merges", &["a"]);
+            w.str("tokenizer.ggml.model", "gpt2");
+            w.str("tokenizer.ggml.pre", "qwen2");
+            w.i32_array("tokenizer.ggml.token_type", &[0]);
+            w.str_array("tokenizer.ggml.tokens", &["a"]);
+            w.str("tokenizer.chat_template", "{%- im_start %}");
+            w.finish(18)
+        };
+        let metadata = read_metadata_from(bytes.as_slice()).expect("parse");
+        let hashes = identity_hashes(&metadata).expect("absent keys must hash as null");
+        assert_eq!(
+            hashes.tokenizer_hash,
+            "02400c13858ae8f711fa52f3a7d1469018f303b910b61ea8b3b2a94694a86e20",
+            "cross-runtime parity with the node resolver's canonical derivation"
+        );
     }
 
     #[test]

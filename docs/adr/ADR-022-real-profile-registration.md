@@ -134,3 +134,27 @@ aborts.
   with different metadata key coverage would need the subset extended (new
   ADR or a v2 subset hash — a manifest change means a new profile id anyway).
 − Rust-side GGUF metadata parsing becomes node code (~150 lines, no deps).
+
+## Amendment (2026-10-06): absent tokenizer keys hash as null
+
+Qwen3.5-family GGUF conversions (unsloth, lmstudio-community — every ungated
+source checked) omit `tokenizer.ggml.add_bos_token`; the original spec's
+fail-closed `need()` therefore rejected the whole line. Absence is not an
+anomaly to refuse — it is tokenizer identity like any value.
+
+**Rule:** within the `tokenizer_hash` object, `add_bos_token` and
+`padding_token_id` are **nullable** — when the GGUF omits the key, the
+canonical object carries `null` (JSON null, canonical-stable). No default
+is ever guessed. Every other member remains fail-closed on absence, and a
+present-but-wrong-type key still errors.
+
+- Backward compatible: artifacts that carry the keys hash byte-identically
+  to before (all 14 promoted profiles re-verified unchanged by the
+  golden-vector gate).
+- Parity lock: `gguf.rs::absent_tokenizer_keys_hash_as_null_amendment`
+  pins the exact digest of a null-carrying tokenizer object against the
+  node resolver's canonical derivation
+  (`02400c13…86e20`).
+- Scope note: this amendment does not extend to `architecture_hash` or
+  `chat_template_hash` inputs — those keys have no observed-absent case;
+  new absent-key cases get their own amendment with evidence.

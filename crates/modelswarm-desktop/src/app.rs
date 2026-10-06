@@ -801,7 +801,12 @@ async fn set_hosting_inner(
 }
 
 /// The picker's single action (owner UX spec): select a model → download or
-/// load it → the swarm starts working (node up, registered, local API live).
+/// load it → the swarm starts working. UX-study P0 (2026-10-06): selecting a
+/// DIFFERENT profile while hosting is a one-action SWAP — the new artifact
+/// downloads while the old node keeps serving, then the old node stops and
+/// the new one starts. One advertised profile at a time (project rule);
+/// downtime is the engine restart only. Re-selecting the hosted profile is
+/// an idempotent no-op.
 #[tauri::command]
 async fn select_model(
     app: tauri::AppHandle,
@@ -810,12 +815,47 @@ async fn select_model(
     profile_id: String,
 ) -> Result<serde_json::Value, String> {
     {
-        let mut inner = state.inner.lock().await;
+        let inner = state.inner.lock().await;
         if !inner.license_accepted {
             return Err("accept the privacy disclosure first".into());
         }
-        if inner.node.is_some() {
-            return Err("stop hosting before switching models".into());
+        if inner.node.is_some() && inner.profile_id.as_deref() == Some(profile_id.as_str()) {
+            return Ok(serde_json::json!({ "hosting": true, "profile_id": profile_id }));
+        }
+    }
+
+    // Resolve + fetch the new artifact FIRST (download events flow to the
+    // UI) so the running swarm serves throughout the download.
+    let (tracker_url, data_dir) = {
+        let inner = state.inner.lock().await;
+        (inner.tracker_url.clone(), inner.data_dir.clone())
+    };
+    let listing = resolve_profile(&tracker_url, &data_dir, Some(&profile_id))
+        .await
+        .map_err(|e| format!("catalog: {e}"))?;
+    let manager = ArtifactManager::new(&data_dir);
+    let store = std::sync::Mutex::new(
+        modelswarm_store::Store::open(data_dir.join("state.sqlite")).map_err(|e| e.to_string())?,
+    );
+    manager
+        .ensure_artifact(&listing.manifest, &store, |done, total| {
+            let _ = window.emit(
+                "download",
+                serde_json::json!({ "done": done, "total": total }),
+            );
+        })
+        .await
+        .map_err(|e| format!("artifact: {e}"))?;
+
+    // Artifact ready: stop the old node (if any), then start the new one
+    // via the normal hosting path — ensure_artifact hits the cache, so
+    // there is no second download.
+    {
+        let mut inner = state.inner.lock().await;
+        if let Some(running) = inner.node.take() {
+            let _ = running.shutdown.send(true);
+            running.heartbeat.abort();
+            let _ = running.handle.stopped().await;
         }
         inner.profile_id = Some(profile_id.clone());
         persist_config(&inner)?;

@@ -282,13 +282,28 @@ const archSubset = {
 
 // Everything that affects tokenize/detokenize behavior, from the GGUF itself.
 // (No scores key: modern BPE conversions don't emit tokenizer.ggml.scores.)
+// ADR-022 amendment (2026-10-06): keys a GGUF may legitimately omit
+// (add_bos_token, padding_token_id — both absent in Qwen3.5-family
+// conversions) hash as null. Absence is identity; never a guessed default.
+const optionalBool = (key) => {
+  if (!kv.has(key)) return null;
+  const v = kv.get(key);
+  if (typeof v !== "boolean") throw new Error(`fail-closed: key "${key}" has unexpected value ${JSON.stringify(v)}`);
+  return v;
+};
+const optionalU32 = (key) => {
+  if (!kv.has(key)) return null;
+  const v = kv.get(key);
+  if (!isU32(v)) throw new Error(`fail-closed: key "${key}" has unexpected value ${JSON.stringify(v)}`);
+  return v;
+};
 const tokenizerObject = {
-  add_bos_token: need(kv, "tokenizer.ggml.add_bos_token", isBool),
+  add_bos_token: optionalBool("tokenizer.ggml.add_bos_token"),
   bos_token_id: need(kv, "tokenizer.ggml.bos_token_id", isU32),
   eos_token_id: need(kv, "tokenizer.ggml.eos_token_id", isU32),
   merges: need(kv, "tokenizer.ggml.merges", isStrArray),
   model: tokenizerModel,
-  padding_token_id: need(kv, "tokenizer.ggml.padding_token_id", isU32),
+  padding_token_id: optionalU32("tokenizer.ggml.padding_token_id"),
   pre: need(kv, "tokenizer.ggml.pre", isStr),
   token_type: tokenType,
   tokens,

@@ -271,3 +271,47 @@ Evidence (owner machine, shipped installers, 2026-10-06):
   11435 LISTENING.
 - One-click approval re-proven on 0.2.10 and 0.2.11 (Edge at
   `…/verify?code=3J4RR97Y`, code prefilled, owner-token focused).
+
+## I13 — v0.2.12–0.2.14: zero-click enrollment (auto-approval) + the registration fixes it exposed
+
+Owner directive (2026-10-06): approvals automatic, one-click at most.
+
+- v0.2.12 (f8c7e17): `DEVICE_AUTO_APPROVE=1` makes /auth/device/start
+  create the device code already approved — enrollment completes on the
+  client's first /complete poll, which the desktop now sends immediately
+  (one short tick instead of 30 s; a poll_now flag prevents any
+  start→401 spin). Guardrails: existing 10 req/min/IP enroll limit;
+  `DEVICE_APPROVAL_CAP` (default 250 distinct installations, counted
+  from sessions) — beyond it the manual /verify + admin-token gate
+  resumes unchanged. msp-v1 §3.2 + threat-model updated. Tests:
+  memory-store auto-approve, cap fallback to manual approval, real-Pg
+  auto-approve round-trip. Production env set via `vercel env add
+  DEVICE_AUTO_APPROVE production`.
+- v0.2.13 (4af42d4): the first live E2E showed enroll.approved 1 s after
+  start (auto-approval works) but /peers/register 400 invalid_body — the
+  desktop's runtime object carried `version`/`build_hash` while the
+  schema is strict `{name, build}` (the desktop had NEVER successfully
+  registered; it never got past the approval gate before today — the
+  same TS↔Rust integration gap as the v0.2.5 envelope bug). Fixed via
+  `runtime_wire_desc()` with a shape-pinning test.
+- v0.2.14 (712c222): the next live E2E surfaced the last defect: the
+  desktop sent installationId as peerId; the tracker requires the
+  ADR-020 identity-multihash derivation. Now derived from the heartbeat
+  tracker client's identity. (Also fixed the window title a sed had
+  silently left at 0.2.12.)
+
+Evidence (owner machine, shipped installers, 2026-10-06): gates green
+at each step; CI runs 37411598689 / 37413720979 / 37415693244 green;
+live downloads byte-verified (0.2.14 Windows sha256 `b7d9172d…`).
+
+**The end-to-end that was never before possible — zero clicks from
+install to the public census:** launch 0.2.14 → select the model →
+hosting up (gateway 11435) → `enroll.approved` ~1 s after
+`enroll.pending` → register (ADR-020 peerId) → heartbeat → live
+`GET /api/v1/stats` = `{"peersOnline":1,"models":[{profileId:
+"msp1:948d898a…","peers":1}]}` → website renders "1 peer online" and
+"SmolLM2 135M … · 1 online" (DOM-verified in a fresh browser tab).
+
+Follow-up worth an ADR-level harness: a Rust-client-against-TS-tracker
+integration suite — three wire bugs (envelope casing, runtime shape,
+peerId) all lived exactly in that gap.

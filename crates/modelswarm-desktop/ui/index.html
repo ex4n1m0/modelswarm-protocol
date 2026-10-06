@@ -102,9 +102,11 @@
     <div class="col grow">
       <section aria-labelledby="models-h">
         <h2 id="models-h">Models</h2>
-        <div id="model-cards" class="cards" role="listbox" aria-label="Available model profiles">
+        <p class="note" id="hw-line" style="margin:0 0 8px"></p>
+        <div id="model-cards" class="cards" role="listbox" aria-label="Recommended model profiles for this machine">
           <div class="note">loading catalog…</div>
         </div>
+        <div id="more-models" hidden><button type="button" class="ghost" id="show-all-models"></button></div>
         <div class="row" style="margin-top:8px">
           <div class="bar" aria-hidden="true"><div id="dl-progress"></div></div>
           <span class="note" id="dl-label"></span>
@@ -209,10 +211,16 @@
 
     function error(msg) { const b = $("error-banner"); b.textContent = msg; b.style.display = msg ? "block" : "none"; }
 
+    const FIT_BADGE = { gpu_full: "● GPU", gpu_partial: "◐ GPU+CPU", ram_only: "◍ CPU" };
+    let showAll = false;
+
     async function refreshModels() {
       let models = [];
-      try { models = await invoke("list_models"); error(""); }
-      catch (e) {
+      let hw = null;
+      try {
+        [models, hw] = await Promise.all([invoke("list_models"), invoke("analyze_hardware").catch(() => null)]);
+        error("");
+      } catch (e) {
         // Show the real error (fetched URL, TLS/DNS/timeout/signature cause) —
         // never a bare "unreachable" that hides the actual failure.
         const note = document.createElement("div");
@@ -221,7 +229,25 @@
         $("model-cards").replaceChildren(note);
         return;
       }
-      $("model-cards").innerHTML = models.map(m => {
+      // Hardware line: what the analyser found on THIS machine.
+      if (hw && hw.ram_mb > 0) {
+        const ram = (hw.ram_mb / 1024).toFixed(0);
+        $("hw-line").textContent = hw.gpu
+          ? `recommended for your PC — ${hw.gpu.name} · ${(hw.gpu.vram_mb/1024).toFixed(0)} GB VRAM · ${ram} GB RAM`
+          : `recommended for your PC — no GPU detected · ${ram} GB RAM · CPU execution`;
+      } else {
+        $("hw-line").textContent = "recommendations unavailable — showing all models";
+      }
+      const anyRecommended = models.some(m => m.recommended);
+      // Shortlist by default (owner directive: 6 picks per machine);
+      // downloaded/selected models always stay visible; "show all" restores.
+      const visible = showAll || !anyRecommended ? models
+        : models.filter(m => m.recommended || m.downloaded || m.selected);
+      const hidden = models.length - visible.length;
+      $("more-models").hidden = !(hidden > 0);
+      if (hidden > 0) $("show-all-models").textContent = `show all ${models.length} models (${hidden} more)`;
+      $("show-all-models").onclick = () => { showAll = true; $("more-models").hidden = true; refreshModels(); };
+      $("model-cards").innerHTML = visible.map(m => {
         const running = hostingOn && m.selected;
         const badge = running
           ? `<span class="running-badge">● hosting</span>`
@@ -229,12 +255,13 @@
         const action = running
           ? `<button type="button" class="stop-card" data-stop="${m.profile_id}">Stop</button>`
           : `<button type="button" data-start="${m.profile_id}">${m.downloaded ? "Start" : "Download & start"}</button>`;
+        const fit = m.fit ? `<span style="color:var(--accent)">${FIT_BADGE[m.fit] ?? ""}</span> · ` : "";
         return `
         <div class="card ${m.selected ? "selected" : ""}" role="button" aria-selected="${!!m.selected}" aria-disabled="${busy}"
              data-id="${m.profile_id}" tabindex="0">
           <div><div class="name">${m.display_name}</div>
                <div class="meta">profile ${m.profile_id.slice(0, 18)}… · ${m.quantization}</div>
-               <div class="meta" style="margin-top:2px">${m.hw ? m.hw.download_mb + ' MB download · needs ≈ ' + (m.hw.ram_mb_est/1024).toFixed(1) + ' GB RAM' : 'size unknown'}</div></div>
+               <div class="meta" style="margin-top:2px">${fit}${m.hw ? m.hw.download_mb + ' MB download · needs ≈ ' + (m.hw.ram_mb_est/1024).toFixed(1) + ' GB RAM' : 'size unknown'}</div></div>
           <div class="action-row"><div class="meta">${badge}</div>${action}</div>
         </div>`;
       }).join("");

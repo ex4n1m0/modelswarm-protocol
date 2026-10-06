@@ -28,6 +28,9 @@ tauri-shell = [
     "dep:serde_json",
 ]
 
+[target.'cfg(windows)'.dependencies]
+modelswarm-winjob = { path = "../modelswarm-winjob" }
+
 [dependencies]
 tauri = { version = "2", optional = true, default-features = false, features = ["wry"] }
 tauri-plugin-opener = { version = "2", optional = true }

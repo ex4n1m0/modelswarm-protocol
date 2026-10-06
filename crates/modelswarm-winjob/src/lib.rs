@@ -1,4 +1,6 @@
-//! Windows kill-on-close job objects for supervised engine children.
+//! Windows FFI helpers for the desktop node: kill-on-close job objects
+//! for supervised engine children, plus total-RAM detection. Kept as the
+//! workspace's single unsafe-sanctioned crate.
 //!
 //! Force-killing the desktop app (taskkill /F, crash) must never orphan a
 //! llama-server (observed live 2026-10-06). A job object created with
@@ -24,6 +26,36 @@ mod imp {
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
     };
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    #[repr(C)]
+    struct MemoryStatusEx {
+        dw_length: u32,
+        dw_memory_load: u32,
+        ull_total_phys: u64,
+        ull_avail_phys: u64,
+        ull_total_page_file: u64,
+        ull_avail_page_file: u64,
+        ull_total_virtual: u64,
+        ull_avail_virtual: u64,
+        ull_avail_extended_virtual: u64,
+    }
+
+    /// Total physical RAM in bytes (0 = unknown).
+    pub fn total_ram_bytes() -> u64 {
+        unsafe {
+            let mut status: MemoryStatusEx = std::mem::zeroed();
+            status.dw_length = std::mem::size_of::<MemoryStatusEx>() as u32;
+            if GlobalMemoryStatusEx(&mut status) == 0 {
+                return 0;
+            }
+            status.ull_total_phys
+        }
+    }
 
     /// Opaque kernel job handle; Send+Sync because it is only ever used by
     /// the FFI calls in this module.
@@ -119,7 +151,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{assign_child, close_one_retained_job_for_test};
+pub use imp::{assign_child, close_one_retained_job_for_test, total_ram_bytes};
 
 #[cfg(test)]
 mod tests {

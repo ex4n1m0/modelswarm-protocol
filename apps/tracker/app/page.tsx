@@ -1,6 +1,6 @@
 // Every installer bundles the full pinned inference engine; the model
-// weights download from HuggingFace on first use. v0.2.18: GPU auto-fit
-// + chat-template fix (ADR-025) + force-kill-safe engine; v0.2.18: GPU
+// weights download from HuggingFace on first use. v0.2.19: GPU auto-fit
+// + chat-template fix (ADR-025) + force-kill-safe engine; v0.2.19: GPU
 // compute (Vulkan) — Windows bundles a second pinned engine that offloads
 // to any NVIDIA/AMD/Intel GPU with honest CPU fallback; v0.2.16: one-click model
 // switch + stop (swap keeps the old swarm serving during download);
@@ -8,13 +8,13 @@
 // the app; v0.2.14: zero-click enrollment + registration fixes.
 // Same version on every OS = same build.
 const DOWNLOADS = [
-  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.18-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
-  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.18-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
-  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.18-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
-  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.18-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
+  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.19-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
+  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.19-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
+  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.19-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
+  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.19-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
 ];
 const DOWNLOAD = {
-  version: "0.2.18",
+  version: "0.2.19",
   sums: "/downloads/SHA256SUMS.txt",
   sha256: "6224d5f92cf399c88ab01b4c2e07a846a320fb33cbdfa25e7c674ace1dba3927",
 };
@@ -294,12 +294,17 @@ export default function Home() {
         const n = (downloads || {})[el.dataset.countFor] ?? 0;
         el.textContent = '· ↓' + n;
       }
-      rows.innerHTML = Object.entries(cat).map(([id, p]) => {
+      // Only models with at least one live peer are listed (owner directive
+      // 2026-10-07): an idle catalog row reads as a broken product promise.
+      const live = Object.entries(cat).filter(([id]) => (byProfile[id] ?? 0) >= 1);
+      rows.innerHTML = live.length === 0
+        ? '<p class="sum">No models are being hosted right now — install the app and start hosting to be the first peer.</p>'
+        : live.map(([id, p]) => {
         const n = byProfile[id] ?? 0;
         const quant = p.manifest?.quantization;
         return '<div class="model-row"><div><div class="mname">' + p.display_name + '</div>' +
           '<div class="mmeta">' + id + ' · ' + (quant ? quant.method + ' · ' + quant.bits + '-bit' : '') + ' · engine ' + (p.manifest?.runtime?.version || '') + '</div></div>' +
-          '<span class="mcount">' + n + (n === 1 ? ' online' : ' online') + '</span></div>';
+          '<span class="mcount">' + n + ' online</span></div>';
       }).join('');
     } catch { badge.textContent = '— online'; rows.innerHTML = '<p class="sum">census unavailable</p>'; }
   };

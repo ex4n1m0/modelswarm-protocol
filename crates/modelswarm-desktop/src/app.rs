@@ -41,6 +41,8 @@ const ADDR_NO_LISTENER: &str = "/ip4/0.0.0.0/tcp/0";
 
 pub struct DesktopState {
     inner: Mutex<Inner>,
+    /// Hardware analysis, computed once per process (engine query + RAM FFI).
+    hardware: tokio::sync::OnceCell<HardwareInfo>,
 }
 
 struct Inner {
@@ -88,6 +90,7 @@ impl DesktopState {
         let config = read_config(&data_dir);
         let license_accepted = license_accepted(&config.tracker, &data_dir).await;
         Self {
+            hardware: tokio::sync::OnceCell::new(),
             inner: Mutex::new(Inner {
                 data_dir,
                 tracker_url: config.tracker,
@@ -287,6 +290,180 @@ async fn artifact_size(http: &reqwest::Client, url: &str) -> Option<u64> {
     response.content_length()
 }
 
+// ---- Hardware analysis + per-machine recommendations ----------------------
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GpuInfo {
+    pub name: String,
+    pub vram_mb: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct HardwareInfo {
+    pub ram_mb: u64,
+    pub cpu_cores: u32,
+    pub gpu: Option<GpuInfo>,
+}
+
+/// How a profile fits this machine (drives card badges + ranking).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// Weights fit free VRAM with headroom — full GPU offload.
+    GpuFull,
+    /// Partial offload: some layers on GPU, the rest in RAM.
+    GpuPartial,
+    /// No usable GPU (or none detected) — CPU execution.
+    RamOnly,
+}
+
+impl Fit {
+    fn label(self) -> &'static str {
+        match self {
+            Fit::GpuFull => "gpu_full",
+            Fit::GpuPartial => "gpu_partial",
+            Fit::RamOnly => "ram_only",
+        }
+    }
+}
+
+/// Feasibility + score for one profile on this machine. `None` = does not
+/// fit RAM honestly (excluded from recommendations AND warned on start).
+///
+/// Scoring (bigger = better, deliberately explainable):
+/// - full GPU fit:  10 + size_gb — the best experience wins outright,
+///   larger among fits ranks higher (quality at equal speed).
+/// - partial GPU:  6 + 6·min(1, vram/weights) + 0.2·size_gb — favors
+///   offloading most layers; huge models on small GPUs sink.
+/// - RAM only:  10 − |size_gb − 8| — peaks at ~8 GB of weights (the
+///   responsive zone for CPU decode); giant dense models score far below
+///   everything: usable, but not recommendation material.
+pub fn fit_and_score(hw: &HardwareInfo, ram_est_mb: u64, weights_mb: u64) -> Option<(Fit, f64)> {
+    if hw.ram_mb == 0 || ram_est_mb > hw.ram_mb * 9 / 10 {
+        return None;
+    }
+    let size_gb = weights_mb as f64 / 1024.0;
+    let fit = match &hw.gpu {
+        Some(gpu) if gpu.vram_mb > 0 && weights_mb <= gpu.vram_mb * 9 / 10 => Fit::GpuFull,
+        Some(gpu) if gpu.vram_mb > 0 => Fit::GpuPartial,
+        _ => Fit::RamOnly,
+    };
+    let score = match fit {
+        Fit::GpuFull => 10.0 + size_gb,
+        Fit::GpuPartial => {
+            let gpu = hw.gpu.as_ref().expect("partial implies gpu");
+            6.0 + 6.0 * (gpu.vram_mb as f64 / weights_mb as f64).min(1.0) + 0.2 * size_gb
+        }
+        Fit::RamOnly => 10.0 - (size_gb - 8.0).abs(),
+    };
+    Some((fit, score))
+}
+
+/// Parses `llama-server --list-devices` output lines like
+/// `  Vulkan0: NVIDIA GeForce RTX 5080 Laptop GPU (16003 MiB, 15235 MiB free)`
+/// and keeps the largest device.
+fn parse_largest_device(stdout: &str) -> Option<GpuInfo> {
+    let mut best: Option<GpuInfo> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        let Some((_, rest)) = line.split_once(": ") else {
+            continue;
+        };
+        let open = rest.rfind(" (")?;
+        let close = rest.rfind(')')?;
+        if close <= open {
+            continue;
+        }
+        let name = rest[..open].trim();
+        let mut parts = rest[open + 2..close].split(',');
+        let total = parts.next()?.trim();
+        let Some(total_mb) = total
+            .strip_suffix(" MiB")
+            .and_then(|n| n.trim().parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|b| total_mb > b.vram_mb) {
+            best = Some(GpuInfo {
+                name: name.to_string(),
+                vram_mb: total_mb,
+            });
+        }
+    }
+    best
+}
+
+fn total_ram_mb() -> u64 {
+    #[cfg(windows)]
+    {
+        modelswarm_winjob::total_ram_bytes() / 1_000_000
+    }
+    #[cfg(not(windows))]
+    {
+        // /proc/meminfo "MemTotal:  32612345 kB" (Linux); macOS falls back
+        // to sysctl via command (best effort, 0 = unknown).
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|s| {
+                    s.lines().next().and_then(|l| {
+                        l.split_whitespace()
+                            .nth(1)
+                            .and_then(|kb| kb.parse::<u64>().ok())
+                    })
+                })
+                .map(|kb| kb / 1000)
+                .unwrap_or(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::process::Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|b| b / 1_000_000)
+                .unwrap_or(0)
+        }
+    }
+}
+
+/// Detects the machine's serving-relevant hardware once per process:
+/// RAM (FFI), CPU cores, and the largest Vulkan device by asking the
+/// bundled GPU engine itself (`--list-devices`) — the same backend that
+/// will run the model, so the number is the one that matters.
+async fn detect_hardware(app: &tauri::AppHandle) -> HardwareInfo {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
+    let gpu = engine_gpu_binary_path(app).and_then(|exe| {
+        std::process::Command::new(&exe)
+            .arg("--list-devices")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| parse_largest_device(&s))
+    });
+    HardwareInfo {
+        ram_mb: total_ram_mb(),
+        cpu_cores: cores,
+        gpu,
+    }
+}
+
+async fn hardware_of(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, DesktopState>,
+) -> HardwareInfo {
+    state
+        .hardware
+        .get_or_init(|| detect_hardware(app))
+        .await
+        .clone()
+}
+
 // Chat templating lives in the SERVING executor (ADR-025): the desktop
 // sends plain {role, content} turns and the node renders ChatML exactly
 // once. The pre-v0.2.18 client-side render_chatml caused either role-less
@@ -379,6 +556,7 @@ async fn accept_privacy(state: tauri::State<'_, DesktopState>) -> Result<(), Str
 
 #[tauri::command]
 async fn list_models(
+    app: tauri::AppHandle,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let mut inner = state.inner.lock().await;
@@ -415,6 +593,7 @@ async fn list_models(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     const SIZE_TTL_MS: u64 = 10 * 60 * 1000;
+    let hardware = hardware_of(&app, &state).await;
     let mut out = Vec::new();
     for p in profiles {
         let downloaded = store
@@ -458,17 +637,73 @@ async fn list_models(
                 }
             }
         };
+        let hw_json = hardware_requirements(size_bytes);
+        let (ram_est_mb, weights_mb) = match size_bytes {
+            Some(bytes) => {
+                let hw = hardware_requirements(Some(bytes)).expect("size known implies hw");
+                (hw["ram_mb_est"].as_u64().unwrap_or(0), bytes / 1_000_000)
+            }
+            None => (0, 0),
+        };
+        let ranked = if ram_est_mb > 0 {
+            fit_and_score(&hardware, ram_est_mb, weights_mb)
+        } else {
+            None
+        };
         out.push(serde_json::json!({
             "profile_id": p.profile_id,
             "display_name": p.display_name,
             "quantization": format!("{} ({} bit)", p.manifest.quantization().method(), p.manifest.quantization().bits()),
             "runtime": p.manifest.runtime().version(),
             "downloaded": downloaded,
-            "hw": hardware_requirements(size_bytes),
+            "hw": hw_json,
+            "fit": ranked.map(|(fit, _)| fit.label()),
+            "feasible": ranked.is_some() || ram_est_mb == 0,
             "selected": inner.profile_id.as_deref() == Some(p.profile_id.as_str()),
         }));
     }
+
+    // The shortlist: rank every feasible, size-known profile and flag the
+    // top 6 as recommended for THIS machine (owner directive 2026-10-07 —
+    // too many options is not good; every user gets a different six).
+    let mut ranked_indices: Vec<(usize, f64, u64)> = out
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let fit = m["fit"].as_str()?;
+            let score = match fit {
+                "gpu_full" => 10.0,
+                "gpu_partial" => 6.0,
+                _ => 0.0,
+            };
+            // Exact score recomputed from the same inputs (kept in the
+            // closure to avoid cloning HardwareInfo into the filter).
+            let _ = score;
+            let hw = m["hw"].as_object()?;
+            let ram_est = hw["ram_mb_est"].as_u64()?;
+            let weights = hw["download_mb"].as_u64()?;
+            let (_, s) = fit_and_score(&hardware, ram_est, weights)?;
+            Some((i, s, weights))
+        })
+        .collect();
+    ranked_indices.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)));
+    let recommended: std::collections::HashSet<usize> = ranked_indices
+        .into_iter()
+        .take(6)
+        .map(|(i, _, _)| i)
+        .collect();
+    for (i, entry) in out.iter_mut().enumerate() {
+        entry["recommended"] = serde_json::json!(recommended.contains(&i));
+    }
     Ok(out)
+}
+
+#[tauri::command]
+async fn analyze_hardware(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<serde_json::Value, String> {
+    serde_json::to_value(hardware_of(&app, &state).await).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1328,7 +1563,8 @@ pub fn run() {
             open_approval_page,
             hf_search_models,
             hf_list_ggufs,
-            request_model
+            request_model,
+            analyze_hardware
         ])
         .run(tauri::generate_context!())
         .expect("modelswarm desktop shell failed to start");
@@ -1380,6 +1616,73 @@ mod tests {
         assert_eq!(obj.len(), 2, "no extra keys allowed: {desc}");
         assert_eq!(obj["name"], "llama.cpp");
         assert_eq!(obj["build"], "353c4aab0f0d");
+    }
+
+    #[test]
+    fn fit_and_score_matches_the_rtx_3080_vector() {
+        // Owner reference machine: 10 GB VRAM (9216 MiB), 32 GB RAM.
+        let hw = HardwareInfo {
+            ram_mb: 32_000,
+            cpu_cores: 12,
+            gpu: Some(GpuInfo {
+                name: "RTX 3080".into(),
+                vram_mb: 9216,
+            }),
+        };
+        let (fit, _) = fit_and_score(&hw, 6_144, 5_680).unwrap(); // 9B: fits GPU
+        assert_eq!(fit, Fit::GpuFull);
+        // 14B (9.0 GB weights) misses the 0.90 headroom gate -> partial.
+        let (fit, _) = fit_and_score(&hw, 9_344, 9_000).unwrap();
+        assert_eq!(fit, Fit::GpuPartial);
+        let (fit, _) = fit_and_score(&hw, 19_968, 18_973).unwrap(); // 27B: partial
+        assert_eq!(fit, Fit::GpuPartial);
+        // 32B still fits 32 GB RAM (0.9 RAM gate) as a partial; a 16 GB
+        // machine excludes it honestly.
+        assert!(fit_and_score(&hw, 20_480, 19_851).is_some());
+        let small = HardwareInfo {
+            ram_mb: 16_000,
+            cpu_cores: 8,
+            ..hw.clone()
+        };
+        assert!(fit_and_score(&small, 20_480, 19_851).is_none());
+        // Full fits beat partials; the clamp keeps a near-fit 14B below 9B.
+        let score = |ram: u64, w: u64| fit_and_score(&hw, ram, w).unwrap().1;
+        assert!(score(6_144, 5_680) > score(9_344, 9_000));
+        assert!(score(9_344, 9_000) > score(19_968, 18_973));
+    }
+
+    #[test]
+    fn no_gpu_ranks_responsive_picks_over_cpu_heavyweights() {
+        let hw = HardwareInfo {
+            ram_mb: 32_000,
+            cpu_cores: 8,
+            gpu: None,
+        };
+        let score = |ram: u64, w: u64| fit_and_score(&hw, ram, w).unwrap().1;
+        // Everything is RamOnly; the ~8 GB sweet spot beats both giants
+        // (slow decode) and tiny proof-of-pipeline models (quality).
+        assert!(score(6_144, 5_680) > score(19_968, 18_973));
+        assert!(score(6_144, 5_680) > score(384, 386));
+    }
+
+    #[test]
+    fn parses_largest_vulkan_device_from_list_devices() {
+        let stdout = "Available devices:
+  Vulkan0: Intel(R) Graphics (18275 MiB, 17507 MiB free)
+  Vulkan1: NVIDIA GeForce RTX 5080 Laptop GPU (16003 MiB, 15235 MiB free)
+";
+        let gpu = parse_largest_device(stdout).expect("parses");
+        // Largest by total MiB wins, regardless of device order.
+        assert_eq!(gpu.vram_mb, 18_275);
+        assert_eq!(gpu.name, "Intel(R) Graphics");
+        let two = "  Vulkan0: NVIDIA GeForce RTX 5080 Laptop GPU (16003 MiB, 15235 MiB free)
+  Vulkan1: AMD Radeon (8192 MiB, 8000 MiB free)
+";
+        assert_eq!(
+            parse_largest_device(two).unwrap().name,
+            "NVIDIA GeForce RTX 5080 Laptop GPU"
+        );
+        assert!(parse_largest_device("no devices").is_none());
     }
 
     #[test]

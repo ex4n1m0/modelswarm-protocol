@@ -340,7 +340,7 @@ pub fn identity_hashes(
     );
     tokenizer.insert(
         "bos_token_id".into(),
-        u32_value(metadata, "tokenizer.ggml.bos_token_id")?,
+        nullable_u32(metadata, "tokenizer.ggml.bos_token_id")?,
     );
     tokenizer.insert(
         "eos_token_id".into(),
@@ -680,6 +680,43 @@ mod tests {
         assert_eq!(
             hashes.tokenizer_hash,
             "02400c13858ae8f711fa52f3a7d1469018f303b910b61ea8b3b2a94694a86e20",
+            "cross-runtime parity with the node resolver's canonical derivation"
+        );
+    }
+
+    #[test]
+    fn absent_bos_token_id_hashes_as_null_amendment_2() {
+        // Second ADR-022 amendment (2026-10-06): unsloth's Qwen3.5-9B GGUF
+        // also omits tokenizer.ggml.bos_token_id. Same rule — absence is
+        // identity-relevant and hashes as null; eos_token_id stays REQUIRED
+        // (decode termination depends on it). Digest = resolver parity lock.
+        let bytes = {
+            let mut w = GgufWriter::new();
+            w.str("general.architecture", "qwen2");
+            w.u32("qwen2.attention.head_count", 14);
+            w.u32("qwen2.attention.head_count_kv", 2);
+            w.f32("qwen2.attention.layer_norm_rms_epsilon", 897_988_541);
+            w.u32("qwen2.block_count", 24);
+            w.u32("qwen2.context_length", 32_768);
+            w.u32("qwen2.embedding_length", 896);
+            w.u32("qwen2.feed_forward_length", 4_864);
+            w.u32("general.file_type", 15);
+            w.f32("qwen2.rope.freq_base", 1_232_348_160);
+            // NOTE: no add_bos_token, no padding_token_id, NO bos_token_id.
+            w.u32("tokenizer.ggml.eos_token_id", 1);
+            w.str_array("tokenizer.ggml.merges", &["a"]);
+            w.str("tokenizer.ggml.model", "gpt2");
+            w.str("tokenizer.ggml.pre", "qwen2");
+            w.i32_array("tokenizer.ggml.token_type", &[0]);
+            w.str_array("tokenizer.ggml.tokens", &["a"]);
+            w.str("tokenizer.chat_template", "{%- im_start %}");
+            w.finish(17)
+        };
+        let metadata = read_metadata_from(bytes.as_slice()).expect("parse");
+        let hashes = identity_hashes(&metadata).expect("absent bos must hash as null");
+        assert_eq!(
+            hashes.tokenizer_hash,
+            "d525b0cfd4a0590d0b91a2c6efa5c93649c3d26a2edf34d94138aaef6179e900",
             "cross-runtime parity with the node resolver's canonical derivation"
         );
     }

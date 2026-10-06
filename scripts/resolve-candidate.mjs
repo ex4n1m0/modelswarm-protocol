@@ -299,7 +299,7 @@ const optionalU32 = (key) => {
 };
 const tokenizerObject = {
   add_bos_token: optionalBool("tokenizer.ggml.add_bos_token"),
-  bos_token_id: need(kv, "tokenizer.ggml.bos_token_id", isU32),
+  bos_token_id: optionalU32("tokenizer.ggml.bos_token_id"),
   eos_token_id: need(kv, "tokenizer.ggml.eos_token_id", isU32),
   merges: need(kv, "tokenizer.ggml.merges", isStrArray),
   model: tokenizerModel,

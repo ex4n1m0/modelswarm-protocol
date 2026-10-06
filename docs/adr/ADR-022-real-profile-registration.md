@@ -158,3 +158,21 @@ present-but-wrong-type key still errors.
 - Scope note: this amendment does not extend to `architecture_hash` or
   `chat_template_hash` inputs — those keys have no observed-absent case;
   new absent-key cases get their own amendment with evidence.
+
+## Amendment 2 (2026-10-06, later the same day): absent `bos_token_id` hashes as null
+
+Evidence: `unsloth/Qwen3.5-9B-GGUF@3885219b` (Qwen3.5-9B Q4_K_M, the
+RTX-3080-tier artifact) omits `tokenizer.ggml.bos_token_id` as well.
+Same rule, same reasoning as Amendment 1: absence is identity-relevant
+and hashes as `null`; never an error, never a guessed default.
+
+- `tokenizer.ggml.bos_token_id` is now nullable in both derivations
+  (`gguf.rs`, `scripts/resolve-candidate.mjs`).
+- `tokenizer.ggml.eos_token_id` stays REQUIRED: decode termination
+  (`TokenVocab::eos_id`) depends on it, so tolerance there would let an
+  unservable artifact into the catalog.
+- Parity lock: `absent_bos_token_id_hashes_as_null_amendment_2` pins
+  digest `d525b0cf…79e900` (absent add_bos + padding + bos together).
+- Shipped with the promotion of
+  `msp1:d45c55cce8469410708595a01672f4cacf1c842328a64b93266661954c5fbc80`
+  (artifact sha256 `9b86850a…77db`, catalogVersion 34).

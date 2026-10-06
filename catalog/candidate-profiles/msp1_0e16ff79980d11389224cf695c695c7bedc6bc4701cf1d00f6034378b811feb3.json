@@ -1,0 +1,38 @@
+{
+  "manifest": {
+    "schema_version": 2,
+    "hf_repo": "Qwen/Qwen3-8B-GGUF",
+    "hf_revision": "7c41481f57cb95916b40956ab2f0b139b296d974",
+    "artifact_hashes": [
+      {
+        "path": "Qwen3-8B-Q4_K_M.gguf",
+        "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+      }
+    ],
+    "tokenizer_hash": "9e9870091f25f1450f43588f45114be1391bf0519d79be8c3f74ac10b7670af3",
+    "chat_template_hash": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361",
+    "architecture_hash": "9bf39bf3a94707ead4e83fc433c36202b2deb1acc7d5353495d9e5afe625820d",
+    "quantization": {
+      "method": "q4_k_m",
+      "bits": 4
+    },
+    "runtime": {
+      "name": "llama.cpp",
+      "version": "b11407",
+      "build_hash": "353c4aab423bff5cb6dc0e1d32e41a447990ab3d69a411b7f58ff48187c91a03"
+    },
+    "decoding_abi_version": 1,
+    "speculative_capabilities": [
+      "proposal_tokens"
+    ]
+  },
+  "profile_id": "msp1:0e16ff79980d11389224cf695c695c7bedc6bc4701cf1d00f6034378b811feb3",
+  "display_name": "Qwen3 8B (Q4_K_M)",
+  "status": "candidate",
+  "provenance": {
+    "resolvedBy": "scripts/resolve-candidate.mjs (Phase H, ADR-022)",
+    "resolvedAt": "2026-10-06T08:46:12.012Z",
+    "reviewedBy": "owner",
+    "licenseEvidenceUrl": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/blob/7c41481f57cb95916b40956ab2f0b139b296d974/LICENSE"
+  }
+}

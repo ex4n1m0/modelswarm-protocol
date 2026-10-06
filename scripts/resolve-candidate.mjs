@@ -93,6 +93,9 @@ function parseGgufMetadata(buf) {
   const readString = () => {
     const n = Number(buf.readBigUInt64LE(o));
     o += 8;
+    // Prefix parses must fail loudly, never clamp: a truncated string would
+    // silently corrupt every identity hash derived from it.
+    if (o + n > buf.length) throw new Error("metadata prefix too small — truncated string");
     // Lossy UTF-8 (U+FFFD per invalid sequence) — ADR-022 canonical string rule.
     const s = buf.toString("utf8", o, o + n);
     o += n;
@@ -209,12 +212,48 @@ if (!statSync(artifactPath, { throwIfNoEntry: false })) {
     sink.on("error", reject);
   });
 }
-const artifact = readFileSync(artifactPath);
-const artifactSha = sha256Hex(artifact);
-console.error(`artifact: ${args.file} ${artifact.length} bytes sha256=${artifactSha}`);
+// Stream-hash + prefix-parse: artifacts at or above ~4 GB (everything from
+// the 7B tier up) exceed Node's single-Buffer cap, so whole-file reads can
+// never work for the full ladder. sha256 is chunk-streamed; the GGUF
+// metadata section sits at the file start and is parsed from a prefix that
+// grows on demand (readString guards against truncation — a short prefix is
+// always a retry, never a wrong hash).
+const artifactBytes = statSync(artifactPath).size;
+const artifactSha = await (async () => {
+  const { createReadStream } = await import("node:fs");
+  const hash = createHash("sha256");
+  await new Promise((resolve, reject) => {
+    const src = createReadStream(artifactPath, { highWaterMark: 1 << 23 });
+    src.on("data", (chunk) => hash.update(chunk));
+    src.on("end", resolve);
+    src.on("error", reject);
+  });
+  return hash.digest("hex");
+})();
+console.error(`artifact: ${args.file} ${artifactBytes} bytes sha256=${artifactSha}`);
 
-// 3. GGUF metadata → identity hashes (ADR-022).
-const kv = parseGgufMetadata(artifact);
+// 3. GGUF metadata → identity hashes (ADR-022), fail-closed on the prefix.
+const { open } = await import("node:fs/promises");
+let kv = null;
+for (let prefixLen = 64 << 20; prefixLen <= 1 << 30 && !kv; prefixLen *= 2) {
+  const fh = await open(artifactPath, "r");
+  try {
+    const prefix = Buffer.alloc(prefixLen);
+    const { bytesRead } = await fh.read(prefix, 0, Math.min(prefixLen, artifactBytes), 0);
+    const view = prefix.subarray(0, bytesRead);
+    try {
+      kv = parseGgufMetadata(view);
+    } catch (e) {
+      // Whole file already in view → a real parse error, not a short prefix.
+      if (artifactBytes <= bytesRead) throw e;
+      if (!/prefix too small|out of range|out_of_bounds/i.test(String(e?.message ?? e))) throw e;
+      console.error(`metadata prefix of ${bytesRead} bytes was short — retrying with a larger one`);
+    }
+  } finally {
+    await fh.close();
+  }
+}
+if (!kv) throw new Error("GGUF metadata section exceeds the 1 GB prefix cap");
 const arch = need(kv, "general.architecture", isStr);
 
 const tokens = need(kv, "tokenizer.ggml.tokens", isStrArray);
@@ -272,10 +311,16 @@ if (ftypeQuant[0] !== quantMethod || ftypeQuant[1] !== quantBits) {
 
 // 5. Engine pin → runtime block.
 const pins = JSON.parse(readFileSync(join(repoRoot, "runtime-pins.json"), "utf8"));
+// runtime-pins.json went multi-platform: the cross-OS anchor is
+// canonical_build_hash (the old single-zip `zip_sha256` key is gone).
+const buildHash = pins.canonical_build_hash ?? pins.zip_sha256;
+if (!/^[0-9a-f]{64}$/.test(buildHash ?? "")) {
+  throw new Error("runtime-pins.json carries no 64-hex canonical build hash — refusing to resolve");
+}
 const runtime = {
   name: "llama.cpp",
   version: pins.tag,
-  build_hash: pins.zip_sha256,
+  build_hash: buildHash,
 };
 
 // 6. Manifest + derived id + schema validation (Ajv from the tracker's deps).
@@ -310,7 +355,7 @@ const record = {
     resolvedBy: "scripts/resolve-candidate.mjs (Phase H, ADR-022)",
     resolvedAt: new Date().toISOString(),
     reviewedBy: "owner",
-    licenseEvidenceUrl: `https://huggingface.co/${args.repo}/blob/${revision}/LICENSE`,
+    licenseEvidenceUrl: args["license-url"] ?? `https://huggingface.co/${args.repo}/blob/${revision}/LICENSE`,
   },
 };
 

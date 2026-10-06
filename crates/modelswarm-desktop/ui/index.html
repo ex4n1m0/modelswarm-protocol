@@ -106,6 +106,16 @@
           <div class="bar" aria-hidden="true"><div id="dl-progress"></div></div>
           <span class="note" id="dl-label"></span>
         </div>
+        <details id="hf-picker" style="margin-top:8px">
+          <summary style="cursor:pointer;color:var(--muted);font-size:11.5px">＋ more models — search Hugging Face &amp; request one for the swarm</summary>
+          <p class="note" style="margin:6px 0">Requests are reviewed before they join the catalog — an approved model
+          becomes available to every installation. Nothing is hosted until then.</p>
+          <div class="row">
+            <input type="text" id="hf-query" placeholder="e.g. qwen3, llama-3.2, gemma-2 (GGUF repos)" aria-label="Hugging Face search" maxlength="100" style="max-width:340px">
+            <button class="ghost" id="hf-search-btn" type="button">search</button>
+          </div>
+          <div id="hf-results" class="note" style="margin-top:6px">results appear here — pick a repo, then a file</div>
+        </details>
       </section>
 
       <section aria-labelledby="hosting-h">
@@ -234,6 +244,63 @@
         $("dl-label").textContent = r.hosting ? "swarm running · " + r.gateway_addr : "";
       } catch (e) { error(String(e)); $("dl-label").textContent = ""; }
       busy = false; refresh(); refreshModels();
+    }
+
+    // ---- Hugging Face picker (ADR-023): search → repo → file → request ----
+    const hfResults = () => $("hf-results");
+    $("hf-search-btn").onclick = async () => {
+      const q = $("hf-query").value.trim();
+      if (!q) return;
+      hfResults().textContent = "searching huggingface.co…";
+      try {
+        const repos = await invoke("hf_search_models", { query: q });
+        if (!repos.length) { hfResults().textContent = "no GGUF repos matched — try a shorter query"; return; }
+        hfResults().replaceChildren(...repos.map(r => {
+          const row = document.createElement("div");
+          row.className = "row"; row.style.cssText = "margin:3px 0;cursor:pointer";
+          row.innerHTML = `<span style="font-family:var(--mono);font-size:12px">${r.repo}</span>
+            <span class="note">▾ ${(r.downloads/1000).toFixed(0)}k downloads</span>`;
+          row.onclick = () => hfPickRepo(r.repo);
+          return row;
+        }));
+      } catch (e) { hfResults().textContent = "search failed: " + e; }
+    };
+    async function hfPickRepo(repo) {
+      hfResults().textContent = "listing files at the pinned revision…";
+      try {
+        const listing = await invoke("hf_list_ggufs", { repo });
+        if (!listing.files.length) { hfResults().textContent = `${repo}: no requestable quantized files (≤8-bit)`; return; }
+        const wrap = document.createElement("div");
+        wrap.append(Object.assign(document.createElement("div"), {
+          className: "note",
+          textContent: `${repo} @ ${listing.revision.slice(0, 12)}… — pick a file to request:`
+        }));
+        for (const f of listing.files) {
+          const row = document.createElement("div");
+          row.className = "row"; row.style.cssText = "margin:3px 0;align-items:center";
+          const gb = (f.bytes / 1e9).toFixed(2);
+          const ram = f.hw ? (f.hw.ram_mb_est / 1024).toFixed(1) : "?";
+          const btn = document.createElement("button");
+          btn.type = "button"; btn.className = "ghost"; btn.textContent = `request ${f.quant_method}`;
+          btn.onclick = async () => {
+            btn.disabled = true; btn.textContent = "sending…";
+            try {
+              const r = await invoke("request_model", { payload: {
+                hf_repo: repo, hf_revision: listing.revision, artifact_path: f.path,
+                artifact_sha256: f.sha256, artifact_bytes: f.bytes,
+                quant_method: f.quant_method, quant_bits: f.quant_bits,
+                display_name: `${repo.split("/")[1]} (${f.quant_method})`
+              }});
+              btn.textContent = r.status === "queued" ? "requested ✓ pending review" : "already requested ✓";
+            } catch (e) { btn.disabled = false; btn.textContent = "retry — " + String(e).slice(0, 60); }
+          };
+          row.innerHTML = `<span class="mono" style="font-family:var(--mono);font-size:11.5px;overflow-wrap:anywhere">${f.path}</span>
+            <span class="note">${gb} GB · needs ≈ ${ram} GB RAM</span>`;
+          row.append(btn);
+          wrap.append(row);
+        }
+        hfResults().replaceChildren(wrap);
+      } catch (e) { hfResults().textContent = "file listing failed: " + e; }
     }
 
     async function refresh() {

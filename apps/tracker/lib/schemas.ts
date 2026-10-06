@@ -201,3 +201,29 @@ export const PromoteSchema = z
     profileId: ProfileId,
   })
   .strict();
+
+// -- community model requests (ADR-023) --------------------------------------
+// Exactly what a resolver run needs and the tracker can verify — every field
+// is an artifact pointer filled by the desktop from the public HF Hub API.
+// Content-blind by construction: no field can carry prompt/completion data.
+export const ModelRequestSchema = z
+  .object({
+    hf_repo: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/).max(120),
+    hf_revision: z.string().regex(/^[0-9a-f]{40}$/),
+    artifact_path: z.string().regex(/^[A-Za-z0-9._/-]+$/).max(200),
+    artifact_sha256: Hex32,
+    artifact_bytes: z.number().int().min(1).max(200_000_000_000),
+    // Resolver re-derives both from the artifact itself; these are display hints.
+    quant_method: z.string().regex(/^[A-Za-z0-9_]+$/).max(24),
+    quant_bits: z.number().int().min(1).max(8),
+    display_name: z.string().min(1).max(80),
+    note: z.string().max(280).optional(),
+  })
+  .strict();
+
+export const ModelRequestResolveSchema = z
+  .object({
+    id: z.number().int().min(1),
+    resolution: z.enum(["promoted", "rejected"]),
+  })
+  .strict();

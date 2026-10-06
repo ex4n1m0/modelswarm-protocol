@@ -160,6 +160,29 @@ export interface ReceiptRecord {
 
 export type InsertProfileResult = "inserted" | "exists_same" | "conflict";
 
+/** Community model request (ADR-023) — artifact pointers only, never catalog
+ * content; the owner resolves each into a candidate profile via the
+ * resolver script and the existing promote flow. */
+export interface ModelRequestRecord {
+  id: number;
+  artifactSha256: string;
+  hfRepo: string;
+  hfRevision: string;
+  artifactPath: string;
+  artifactBytes: number;
+  quantMethod: string;
+  quantBits: number;
+  displayName: string;
+  note: string;
+  requestedFrom: string;
+  createdAt: number;
+  resolvedAt: number | null;
+  /** "" while open; "promoted" | "rejected" after the owner acts. */
+  resolution: "" | "promoted" | "rejected";
+}
+
+export type InsertModelRequestResult = "inserted" | "duplicate";
+
 export interface TrackerStore {
   /** Clock, shared with the request context (injectable; never Date.now directly). */
   now(): number;
@@ -260,6 +283,17 @@ export interface TrackerStore {
   promoteProfile(profileId: string): Promise<boolean>;
   catalogVersion(): Promise<number>;
 
+  // -- community model requests (ADR-023) --------------------------------------
+  /** Insert a request; dedupes on artifactSha256 ("duplicate" when the exact
+   *  artifact was already requested). Idempotent from the client's view. */
+  insertModelRequest(
+    rec: Omit<ModelRequestRecord, "id" | "createdAt" | "resolvedAt" | "resolution">,
+  ): Promise<InsertModelRequestResult>;
+  /** Open requests first (oldest first), then resolved — the owner's queue. */
+  listModelRequests(): Promise<ModelRequestRecord[]>;
+  /** Mark a request resolved; false when unknown or already resolved. */
+  resolveModelRequest(id: number, resolution: "promoted" | "rejected"): Promise<boolean>;
+
   // -- notices (revocation propagation, delete-on-read per lease) -------------
   pushNotice(target: { all: true } | { leaseId: string }, notice: Notice): Promise<void>;
   drainNotices(leaseId: string): Promise<Notice[]>;
@@ -306,6 +340,8 @@ export class MemoryStore implements TrackerStore {
   private challenges = new Map<string, ChallengeRecord>();
   private tokens = new Map<string, TokenRecord>();
   private profiles = new Map<string, ProfileRecord>();
+  private modelRequests = new Map<number, ModelRequestRecord>();
+  private nextModelRequestId = 1;
   private notices = new Map<string, Notice[]>();
   private rendezvous = new Map<string, Array<RendezvousItem>>();
   private receipts = new Map<string, ReceiptRecord>();
@@ -645,6 +681,41 @@ export class MemoryStore implements TrackerStore {
 
   async catalogVersion(): Promise<number> {
     return this.version;
+  }
+
+  async insertModelRequest(
+    rec: Omit<ModelRequestRecord, "id" | "createdAt" | "resolvedAt" | "resolution">,
+  ): Promise<InsertModelRequestResult> {
+    for (const existing of this.modelRequests.values()) {
+      if (existing.artifactSha256 === rec.artifactSha256) return "duplicate";
+    }
+    this.modelRequests.set(this.nextModelRequestId, {
+      ...rec,
+      id: this.nextModelRequestId,
+      createdAt: this.now(),
+      resolvedAt: null,
+      resolution: "",
+    });
+    this.nextModelRequestId += 1;
+    return "inserted";
+  }
+
+  async listModelRequests(): Promise<ModelRequestRecord[]> {
+    return [...this.modelRequests.values()]
+      .sort((a, b) => {
+        const aOpen = a.resolvedAt === null ? 0 : 1;
+        const bOpen = b.resolvedAt === null ? 0 : 1;
+        return aOpen - bOpen || a.createdAt - b.createdAt || a.id - b.id;
+      })
+      .map((r) => ({ ...r }));
+  }
+
+  async resolveModelRequest(id: number, resolution: "promoted" | "rejected"): Promise<boolean> {
+    const rec = this.modelRequests.get(id);
+    if (!rec || rec.resolvedAt !== null) return false;
+    rec.resolvedAt = this.now();
+    rec.resolution = resolution;
+    return true;
   }
 
   async pushNotice(target: { all: true } | { leaseId: string }, notice: Notice): Promise<void> {
@@ -1347,6 +1418,69 @@ export class PgStore implements TrackerStore {
   async catalogVersion(): Promise<number> {
     const rows = await this.query(`SELECT version FROM catalog_state WHERE singleton = true`);
     return Number((rows[0] as { version: string | number }).version);
+  }
+
+  async insertModelRequest(
+    rec: Omit<ModelRequestRecord, "id" | "createdAt" | "resolvedAt" | "resolution">,
+  ): Promise<InsertModelRequestResult> {
+    const rows = await this.query(
+      `INSERT INTO model_requests
+         (artifact_sha256, hf_repo, hf_revision, artifact_path, artifact_bytes,
+          quant_method, quant_bits, display_name, note, requested_from)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (artifact_sha256) DO NOTHING
+       RETURNING id`,
+      [
+        rec.artifactSha256,
+        rec.hfRepo,
+        rec.hfRevision,
+        rec.artifactPath,
+        rec.artifactBytes,
+        rec.quantMethod,
+        rec.quantBits,
+        rec.displayName,
+        rec.note ?? "",
+        rec.requestedFrom,
+      ],
+    );
+    return rows.length === 0 ? "duplicate" : "inserted";
+  }
+
+  async listModelRequests(): Promise<ModelRequestRecord[]> {
+    const rows = await this.query(
+      `SELECT id, artifact_sha256, hf_repo, hf_revision, artifact_path, artifact_bytes,
+              quant_method, quant_bits, display_name, note, requested_from,
+              created_at, resolved_at, resolution
+       FROM model_requests
+       ORDER BY resolved_at NULLS FIRST, created_at ASC, id ASC`,
+    );
+    return (rows as Record<string, unknown>[]).map((row) => ({
+      id: Number(row.id),
+      artifactSha256: row.artifact_sha256 as string,
+      hfRepo: row.hf_repo as string,
+      hfRevision: row.hf_revision as string,
+      artifactPath: row.artifact_path as string,
+      artifactBytes: Number(row.artifact_bytes),
+      quantMethod: row.quant_method as string,
+      quantBits: Number(row.quant_bits),
+      displayName: row.display_name as string,
+      note: row.note as string,
+      requestedFrom: row.requested_from as string,
+      createdAt: (row.created_at as Date).getTime(),
+      resolvedAt: row.resolved_at ? (row.resolved_at as Date).getTime() : null,
+      resolution: (row.resolution as "" | "promoted" | "rejected") ?? "",
+    }));
+  }
+
+  async resolveModelRequest(id: number, resolution: "promoted" | "rejected"): Promise<boolean> {
+    const rows = await this.query(
+      `UPDATE model_requests
+         SET resolved_at = now(), resolution = $2
+       WHERE id = $1 AND resolved_at IS NULL
+       RETURNING id`,
+      [id, resolution],
+    );
+    return rows.length > 0;
   }
 
   async pushNotice(target: { all: true } | { leaseId: string }, notice: Notice): Promise<void> {

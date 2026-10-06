@@ -82,6 +82,7 @@ routes).
 | `GET /health` | Liveness + protocol version | `{status:"ok", service:"modelswarm-tracker", protocol:"1"}` |
 | `GET /catalog` | Signed catalog envelope (§4) | |
 | `GET /catalog/{profileId}` | Signed single-profile envelope | `200` body is a CatalogEnvelope containing exactly that profile; `404 unknown_profile` |
+| `POST /catalog/requests` | Community model request (ADR-023): `{hf_repo, hf_revision, artifact_path, artifact_sha256, artifact_bytes, quant_method, quant_bits, display_name, note?}` — GGUF pointers only, content-blind by schema | `201 {status:"queued"\|"already-requested"}`; 10 req/min per IP (enrollment grade); dedupe on `artifact_sha256` |
 
 ### 3.2 Device enrollment
 
@@ -174,6 +175,8 @@ Phase 1). These are the only endpoints that mutate `model_profiles`:
 |---|---|---|
 | `POST /admin/catalog/candidates` | resolver output validated against `catalog/schema.json` | `201 {profileId}` (status `candidate`) |
 | `POST /admin/catalog/promote` | `{profileId}` | `200 {profileId, status:"active"}` |
+| `GET /admin/catalog/requests` | — (ADR-023) | `200 {requests:[…]}` open first (oldest first), then resolved |
+| `POST /admin/catalog/requests/resolve` | `{id, resolution:"promoted"\|"rejected"}` (ADR-023) | `200 {id, resolution}` or `404 unknown_request` |
 
 Publishing an artifact that differs from an existing `profileId` is
 `400 invalid_body` (immutability, ADR-005). Non-admins get `403 forbidden`.

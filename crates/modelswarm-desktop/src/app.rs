@@ -13,6 +13,9 @@
 //! | `download_model` | streams `download` events, returns artifact state |
 //! | `set_hosting` | starts/stops the in-process node (+ roster heartbeat) |
 //! | `send_chat` | one function: chat through the node's loopback gateway |
+//! | `hf_search_models` | public HF Hub repo search (ADR-023 picker) |
+//! | `hf_list_ggufs` | pinned revision + artifact rows for one repo |
+//! | `request_model` | files a community model request with the tracker |
 //!
 //! Honest beta boundary (shown in the UI, not hidden): the node hosts and
 //! serves **locally**; remote execution over a transport listener is the
@@ -963,6 +966,280 @@ fn runtime_wire_desc(build: &str) -> serde_json::Value {
     serde_json::json!({ "name": "llama.cpp", "build": build })
 }
 
+// ---- Hugging Face picker (ADR-023): search → file list → model request ----
+// The webview CSP never gains a network origin: all Hub calls run in the
+// node process; the UI receives plain JSON rows.
+
+/// Quantization token parsed from an artifact filename — requestable quants
+/// only (≤8 bit), longest tokens first so `q4_k_m` wins over `q4_0`.
+fn quant_of_filename(path: &str) -> Option<(&'static str, u8)> {
+    const TABLE: &[(&str, u8)] = &[
+        ("q3_k_s", 3),
+        ("q3_k_m", 3),
+        ("q3_k_l", 3),
+        ("q4_k_s", 4),
+        ("q4_k_m", 4),
+        ("q5_k_s", 5),
+        ("q5_k_m", 5),
+        ("q2_k", 2),
+        ("q4_0", 4),
+        ("q5_0", 5),
+        ("q5_1", 5),
+        ("q6_k", 6),
+        ("q8_0", 8),
+    ];
+    let lower = path.to_ascii_lowercase();
+    let delimited = |token: &str| {
+        let mut start = 0;
+        while let Some(at) = lower[start..].find(token) {
+            let s = start + at;
+            let e = s + token.len();
+            let before_ok = s == 0 || !lower.as_bytes()[s - 1].is_ascii_alphanumeric();
+            let after_ok = e == lower.len() || !lower.as_bytes()[e].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            start = s + 1;
+        }
+        false
+    };
+    TABLE
+        .iter()
+        .find(|(token, _)| delimited(token))
+        .map(|(token, bits)| (*token, *bits))
+}
+
+fn valid_hf_repo(repo: &str) -> bool {
+    let mut parts = repo.splitn(2, '/');
+    let user = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 100
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    };
+    ok(user)
+        && name.len() <= 100
+        && repo.len() <= 120
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && repo.chars().filter(|c| *c == '/').count() == 1
+}
+
+fn hf_http() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn hf_search_models(query: String) -> Result<Vec<serde_json::Value>, String> {
+    let q = query.trim().to_string();
+    if q.is_empty() || q.len() > 100 {
+        return Err("search query must be 1–100 characters".into());
+    }
+    let http = hf_http()?;
+    let hits: serde_json::Value = http
+        .get("https://huggingface.co/api/models")
+        .query(&[
+            ("library", "gguf"),
+            ("search", q.as_str()),
+            ("sort", "downloads"),
+            ("direction", "-1"),
+            ("limit", "20"),
+        ])
+        .header("user-agent", "modelswarm-desktop")
+        .send()
+        .await
+        .map_err(|e| format!("huggingface.co unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(list) = hits.as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(list
+        .iter()
+        .filter_map(|m| {
+            let repo = m.get("id")?.as_str()?.to_string();
+            if !valid_hf_repo(&repo) {
+                return None;
+            }
+            Some(serde_json::json!({
+                "repo": repo,
+                "downloads": m.get("downloads").and_then(|v| v.as_u64()).unwrap_or(0),
+                "likes": m.get("likes").and_then(|v| v.as_u64()).unwrap_or(0),
+            }))
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn hf_list_ggufs(repo: String) -> Result<serde_json::Value, String> {
+    if !valid_hf_repo(&repo) {
+        return Err("not a valid huggingface repo id".into());
+    }
+    let http = hf_http()?;
+    let meta: serde_json::Value = http
+        .get(format!("https://huggingface.co/api/models/{repo}"))
+        .header("user-agent", "modelswarm-desktop")
+        .send()
+        .await
+        .map_err(|e| format!("huggingface.co unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("repo not found: {e}"))?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let revision = meta
+        .get("sha")
+        .and_then(|v| v.as_str())
+        .ok_or("hub returned no pinned revision")?
+        .to_string();
+    if revision.len() != 40 || !revision.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("hub returned a malformed revision sha".into());
+    }
+    // List at the pinned sha (not `main`) so file rows and revision agree.
+    let tree: serde_json::Value = http
+        .get(format!(
+            "https://huggingface.co/api/models/{repo}/tree/{revision}"
+        ))
+        .query(&[("limit", "1000")])
+        .header("user-agent", "modelswarm-desktop")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(files) = tree.as_array() else {
+        return Err("hub returned no file tree".into());
+    };
+    let mut out = Vec::new();
+    for f in files {
+        let path = match f.get("path").and_then(|v| v.as_str()) {
+            Some(p) if p.ends_with(".gguf") => p,
+            _ => continue,
+        };
+        let lfs = f.get("lfs");
+        let (bytes, sha) = match (f.get("size").and_then(|v| v.as_u64()), lfs) {
+            (Some(bytes), Some(lfs)) => {
+                let sha = lfs.get("oid").and_then(|v| v.as_str()).unwrap_or("");
+                if sha.len() != 64 {
+                    continue; // not an LFS artifact we can pin
+                }
+                (bytes, sha.to_string())
+            }
+            _ => continue,
+        };
+        // Only requestable quants (≤8 bit): the resolver's quant cross-check
+        // would reject anything else anyway.
+        let Some((method, bits)) = quant_of_filename(path) else {
+            continue;
+        };
+        out.push(serde_json::json!({
+            "path": path,
+            "bytes": bytes,
+            "sha256": sha,
+            "quant_method": method,
+            "quant_bits": bits,
+            "hw": hardware_requirements(Some(bytes)),
+        }));
+    }
+    out.sort_by_key(|f| f["bytes"].as_u64().unwrap_or(0));
+    Ok(serde_json::json!({ "repo": repo, "revision": revision, "files": out }))
+}
+
+#[tauri::command]
+async fn request_model(
+    state: tauri::State<'_, DesktopState>,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    // Shape-validate everything again server-of-the-client: the tracker's
+    // strict zod would reject it anyway, but the error should be legible here.
+    let repo = payload["hf_repo"].as_str().unwrap_or_default().to_string();
+    let revision = payload["hf_revision"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let path = payload["artifact_path"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let sha = payload["artifact_sha256"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let bytes = payload["artifact_bytes"].as_u64().unwrap_or(0);
+    let quant_method = payload["quant_method"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let quant_bits = payload["quant_bits"].as_u64().unwrap_or(0);
+    let display_name = payload["display_name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if !valid_hf_repo(&repo)
+        || revision.len() != 40
+        || !revision.chars().all(|c| c.is_ascii_hexdigit())
+        || path.is_empty()
+        || path.len() > 200
+        || !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
+        || sha.len() != 64
+        || !sha.chars().all(|c| c.is_ascii_hexdigit())
+        || bytes == 0
+        || quant_method.is_empty()
+        || quant_method.len() > 24
+        || !(1..=8).contains(&quant_bits)
+        || display_name.is_empty()
+        || display_name.len() > 80
+    {
+        return Err("request payload failed validation".into());
+    }
+    let (tracker_url, data_dir) = {
+        let inner = state.inner.lock().await;
+        (inner.tracker_url.clone(), inner.data_dir.clone())
+    };
+    log_event(
+        &data_dir,
+        "info",
+        "model.request",
+        &[("repo", &repo), ("artifact", &path)],
+    );
+    let http = hf_http()?;
+    let response: serde_json::Value = http
+        .post(format!("{tracker_url}/api/v1/catalog/requests"))
+        .json(&serde_json::json!({
+            "hf_repo": repo,
+            "hf_revision": revision,
+            "artifact_path": path,
+            "artifact_sha256": sha,
+            "artifact_bytes": bytes,
+            "quant_method": quant_method,
+            "quant_bits": quant_bits,
+            "display_name": display_name,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("tracker unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("tracker rejected the request: {e}"))?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(response)
+}
+
 pub fn run() {
     tauri::Builder::default()
         // Opens the device-approval page in the system browser (capability
@@ -986,7 +1263,10 @@ pub fn run() {
             select_model,
             lookup_peers,
             send_chat,
-            open_approval_page
+            open_approval_page,
+            hf_search_models,
+            hf_list_ggufs,
+            request_model
         ])
         .run(tauri::generate_context!())
         .expect("modelswarm desktop shell failed to start");
@@ -995,6 +1275,38 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quant_tokens_parse_from_filenames_with_delimiters() {
+        assert_eq!(
+            quant_of_filename("qwen2.5-1.5b-instruct-q4_k_m.gguf"),
+            Some(("q4_k_m", 4))
+        );
+        assert_eq!(
+            quant_of_filename("Qwen3-30B-A3B-Q4_K_M.gguf"),
+            Some(("q4_k_m", 4))
+        );
+        assert_eq!(
+            quant_of_filename("model-Q4_K_M-imod.gguf"),
+            Some(("q4_k_m", 4))
+        );
+        assert_eq!(quant_of_filename("llama-8b-q8_0.gguf"), Some(("q8_0", 8)));
+        // Unrequestable / absent quants must not guess.
+        assert_eq!(quant_of_filename("model-bf16.gguf"), None);
+        assert_eq!(quant_of_filename("tokenizer.json"), None);
+        // q4_0 must not match inside q4_k_m (delimiters prevent it).
+        assert_ne!(quant_of_filename("m-q4_k_m.gguf"), Some(("q4_0", 4)));
+    }
+
+    #[test]
+    fn hf_repo_ids_are_validated() {
+        assert!(valid_hf_repo("Qwen/Qwen2.5-1.5B-Instruct-GGUF"));
+        assert!(valid_hf_repo("ggml-org/Qwen3-1.7B-GGUF"));
+        assert!(!valid_hf_repo("Qwen/Qwen2.5/x"));
+        assert!(!valid_hf_repo("../etc/passwd"));
+        assert!(!valid_hf_repo("no-slash"));
+        assert!(!valid_hf_repo(""));
+    }
 
     #[test]
     fn runtime_descriptor_is_exactly_name_and_build() {

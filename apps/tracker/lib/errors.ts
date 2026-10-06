@@ -10,6 +10,7 @@ export type ErrorCode =
   | "payload_too_large"
   | "invalid_body"
   | "unknown_profile"
+  | "unknown_request"
   | "unknown_installation"
   | "pending"
   | "forbidden"
@@ -29,6 +30,7 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   payload_too_large: 413,
   invalid_body: 400,
   unknown_profile: 400,
+  unknown_request: 404,
   unknown_installation: 401,
   pending: 403,
   forbidden: 403,

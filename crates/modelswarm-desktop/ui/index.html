@@ -329,8 +329,9 @@
       addMsg("user", text);
       try {
         const r = await invoke("send_chat", { message: text });
-        addMsg("assistant", r.content || "(empty)",
-          `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms`);
+        const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms`;
+        if (r.content) addMsg("assistant", r.content, meta);
+        else addMsg("assistant", "(no reply — the model ended its turn before the first token; rephrase the message and send again)", meta);
       } catch (err) { addMsg("assistant", "error: " + err); }
       $("send-btn").disabled = false; busy = false; $("chat-input").focus();
     };

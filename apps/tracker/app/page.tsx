@@ -65,6 +65,7 @@ const css = `
   .hero { width: 75%; height: auto; display: block; margin: 0 auto; }
   .tagline { text-align: center; color: #9fb8d8; padding: 1.4rem 1rem 0.2rem; font-size: 0.95rem; }
   .tagline b { color: #e8f4ff; font-weight: 600; }
+  .lede { text-align: center; color: #b6cbe8; padding: 1.6rem 1rem 0; font-size: 0.92rem; line-height: 1.7; max-width: 62rem; margin: 0 auto; }
   section { padding: 2.2rem 0 0.6rem; }
   h2 { font-size: 0.85rem; letter-spacing: 0.22em; text-transform: uppercase; color: #2fd4ff; margin-bottom: 1.1rem; }
   .card { border: 1px solid #1c2b52; background: #0a1030; border-radius: 14px; padding: 1.5rem; }
@@ -121,6 +122,14 @@ export default function Home() {
         width={1672}
         height={941}
       />
+
+      <p className="lede">
+        ModelSwarm is a decentralized inference protocol that groups peers hosting identical,
+        cryptographically verified model profiles into latency-aware micro-swarms. It uses direct
+        P2P communication, exact speculative decoding, parallel candidate search, and adversarial
+        verification to improve inference performance, while automatically falling back to the
+        fastest individual peer when distributed execution offers no advantage.
+      </p>
 
       <p className="tagline">
         Network-aware <b>micro-swarms</b> of peers hosting the same immutable model profile —<br />

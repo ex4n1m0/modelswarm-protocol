@@ -62,9 +62,10 @@ export default function VerifyPage() {
           Approve a device
         </h1>
         <p style={{ color: "#9fb8d8", fontSize: "0.85rem", lineHeight: 1.6, margin: "0 0 1.1rem" }}>
-          A new ModelSwarm installation joins the swarm only after approval. The
-          client shows its pairing code while waiting — enter it below with the
-          owner token to approve it.
+          New installations normally enroll automatically (zero-click). This page
+          is the owner fallback: if a client shows a pairing code — beyond the
+          auto-approval cap or with the flag off — enter it below with the owner
+          token to approve it.
         </p>
 
         <label style={{ display: "block", fontSize: "0.72rem", letterSpacing: "0.1em", color: "#9fb8d8", marginBottom: 4 }}>

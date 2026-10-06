@@ -15,6 +15,9 @@ rust-version.workspace = true
 # without extra flags.
 node-selftest = ["modelswarm-runtime/mock-runtime"]
 
+[target.'cfg(windows)'.dependencies]
+modelswarm-winjob = { path = "../modelswarm-winjob" }
+
 [dependencies]
 async-trait = "0.1"
 axum = "0.8"

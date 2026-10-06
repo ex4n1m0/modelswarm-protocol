@@ -226,8 +226,19 @@ impl Node {
                             exe: gpu_exe.clone(),
                             model: model.clone(),
                             threads: config.engine_threads,
-                            gpu_layers: Some(999),
+                            // NO explicit -ngl: b11407's auto-fit aborts when
+                            // a user-pinned layer count cannot fit FREE VRAM
+                            // (observed with Qwen3.8-27B on a 16 GB 5080:
+                            // "failed to fit params to free device memory:
+                            // n_gpu_layers already set by user to 999").
+                            // Left unset, the engine auto-fits: full offload
+                            // when it fits, partial offload when it doesn't.
+                            gpu_layers: None,
                             backend: "vulkan".into(),
+                            // First GPU load of a large model can include
+                            // shader compilation — minutes on a cold driver
+                            // cache. Later loads are much faster.
+                            startup_timeout: std::time::Duration::from_secs(600),
                             ..engine::EngineSpec::default()
                         };
                         match engine::start_engine(spec, shutdown.clone()).await {
@@ -572,6 +583,63 @@ mod tests {
         assert!(cfg.tracker_base.is_none());
         assert!(cfg.profile_id.is_none());
         assert!(cfg.data_dir.ends_with("ModelSwarm") || cfg.data_dir.ends_with(".modelswarm"));
+    }
+
+    /// Real-engine GPU-preference test (ADR-024): set MSP_LLAMA_SERVER_CPU,
+    /// MSP_LLAMA_SERVER_GPU (the engine-vulkan bundle) and MSP_REAL_GGUF.
+    /// Proves the production path the desktop's Start button drives: GPU
+    /// variant verified + spawned with -ngl inside the (extended) startup
+    /// window, node telemetry carries backend=vulkan, the gateway serves,
+    /// and shutdown leaves no process behind (kill-on-close job object).
+    #[test]
+    #[ignore = "set MSP_LLAMA_SERVER_CPU, MSP_LLAMA_SERVER_GPU and MSP_REAL_GGUF"]
+    fn real_node_prefers_gpu_variant() {
+        let cpu = std::env::var("MSP_LLAMA_SERVER_CPU").expect("MSP_LLAMA_SERVER_CPU");
+        let gpu = std::env::var("MSP_LLAMA_SERVER_GPU").expect("MSP_LLAMA_SERVER_GPU");
+        let model = std::env::var("MSP_REAL_GGUF").expect("MSP_REAL_GGUF");
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let cfg = NodeConfig {
+                gateway_port: 0,
+                data_dir: dir.path().to_path_buf(),
+                profile_id: Some("msp1:real".to_string()),
+                engine_binary: Some(cpu.into()),
+                engine_gpu_binary: Some(gpu.into()),
+                engine_model: Some(model.into()),
+                ..NodeConfig::default()
+            };
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let node = Node::start(cfg, rx)
+                .await
+                .expect("node starts on GPU engine");
+            assert_eq!(
+                node.engine_backend.as_deref(),
+                Some("vulkan"),
+                "GPU variant must win when healthy"
+            );
+            // The gateway must actually serve through the engine.
+            let addr = node.local_addr;
+            let body = serde_json::json!({
+                "model": "msp1:real",
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "max_tokens": 8,
+            });
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .json(&body)
+                .send()
+                .await
+                .expect("gateway responds");
+            assert!(
+                resp.status().is_success(),
+                "chat must succeed: {}",
+                resp.status()
+            );
+            drop(node);
+            tx.send(true).ok();
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        });
     }
 
     #[test]

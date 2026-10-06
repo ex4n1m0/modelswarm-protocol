@@ -1,19 +1,20 @@
 // Every installer bundles the full pinned inference engine; the model
-// weights download from HuggingFace on first use. v0.2.17: GPU compute
-// (Vulkan) — Windows bundles a second pinned engine that offloads to any
-// NVIDIA/AMD/Intel GPU with honest CPU fallback; v0.2.16: one-click model
+// weights download from HuggingFace on first use. v0.2.18: GPU auto-fit
+// + chat-template fix (ADR-025) + force-kill-safe engine; v0.2.18: GPU
+// compute (Vulkan) — Windows bundles a second pinned engine that offloads
+// to any NVIDIA/AMD/Intel GPU with honest CPU fallback; v0.2.16: one-click model
 // switch + stop (swap keeps the old swarm serving during download);
 // v0.2.15: community model requests (ADR-023) — search Hugging Face in
 // the app; v0.2.14: zero-click enrollment + registration fixes.
 // Same version on every OS = same build.
 const DOWNLOADS = [
-  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.17-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
-  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.17-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
-  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.17-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
-  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.17-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
+  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.18-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
+  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.18-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
+  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.18-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
+  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.18-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
 ];
 const DOWNLOAD = {
-  version: "0.2.17",
+  version: "0.2.18",
   sums: "/downloads/SHA256SUMS.txt",
   sha256: "74f04152988dc6764003ecee83932f86d7299eb4475de3383049e855a55c0fd8",
 };
@@ -134,12 +135,14 @@ export default function Home() {
               <div>
                 <h3>ModelSwarm Desktop — {DOWNLOAD.version} (internal test)</h3>
                 <p className="meta">
-                  windowed app hosting one of three model profiles: model-picker first page,
+                  windowed app hosting any of the 15 catalog profiles: model-picker first page,
                   download-or-load on selection, swarm starts, local OpenAI-compatible API +
-                  test box. The pinned inference engine ships inside every installer; the
-                  model weights download from HuggingFace on first use — never bundled.
-                  First hosting start asks for a one-time device approval
-                  at <a href="/verify">/verify</a> (owner-controlled).
+                  test box, one-click model switch. Windows bundles a Vulkan GPU engine
+                  (any NVIDIA/AMD/Intel card) with honest CPU fallback; the pinned inference
+                  engine ships inside every installer; the model weights download from
+                  HuggingFace on first use — never bundled. Enrollment is zero-click:
+                  hosting start joins the swarm automatically (a manual approval page at{" "}
+                  <a href="/verify">/verify</a> remains as the owner fallback).
                 </p>
               </div>
               <div>

@@ -287,19 +287,10 @@ async fn artifact_size(http: &reqwest::Client, url: &str) -> Option<u64> {
     response.content_length()
 }
 
-// ---- ChatML rendering (Qwen/ChatML family; the profile pins the template) ----
-
-pub fn render_chatml(messages: &[ChatTurn]) -> String {
-    let mut out = String::new();
-    for turn in messages {
-        out.push_str(&format!(
-            "<|im_start|>{}\n{}<|im_end|>\n",
-            turn.role, turn.content
-        ));
-    }
-    out.push_str("<|im_start|>assistant\n");
-    out
-}
+// Chat templating lives in the SERVING executor (ADR-025): the desktop
+// sends plain {role, content} turns and the node renders ChatML exactly
+// once. The pre-v0.2.18 client-side render_chatml caused either role-less
+// flattening (0-token replies on tiny models) or double templating.
 
 // ---- IPC commands ---------------------------------------------------------
 
@@ -950,7 +941,12 @@ async fn send_chat(
         let drop = log.len() - 20;
         log.drain(0..drop);
     }
-    let prompt = render_chatml(&log);
+    // Plain {role, content} turns — the serving executor applies ChatML
+    // exactly once (ADR-025).
+    let turns: Vec<serde_json::Value> = log
+        .iter()
+        .map(|t| serde_json::json!({ "role": t.role, "content": t.content }))
+        .collect();
 
     let started = Instant::now();
     let http = reqwest::Client::builder()
@@ -961,7 +957,7 @@ async fn send_chat(
         .post(format!("http://{gateway}/v1/chat/completions"))
         .json(&serde_json::json!({
             "model": profile,
-            "messages": [{ "role": "user", "content": prompt }],
+            "messages": turns,
             "max_tokens": max_tokens.unwrap_or(256),
             "temperature": 0.0,
             "stream": false,
@@ -1399,35 +1395,5 @@ mod tests {
 
         // Unknown size -> no invented numbers (fail-closed display).
         assert!(hardware_requirements(None).is_none());
-    }
-
-    #[test]
-    fn chatml_renders_full_conversation_with_generation_prompt() {
-        let turns = vec![
-            ChatTurn {
-                role: "system".into(),
-                content: "You are terse.".into(),
-            },
-            ChatTurn {
-                role: "user".into(),
-                content: "Hi".into(),
-            },
-            ChatTurn {
-                role: "assistant".into(),
-                content: "Hello.".into(),
-            },
-            ChatTurn {
-                role: "user".into(),
-                content: "Bye".into(),
-            },
-        ];
-        assert_eq!(
-            render_chatml(&turns),
-            "<|im_start|>system\nYou are terse.<|im_end|>\n\
-             <|im_start|>user\nHi<|im_end|>\n\
-             <|im_start|>assistant\nHello.<|im_end|>\n\
-             <|im_start|>user\nBye<|im_end|>\n\
-             <|im_start|>assistant\n"
-        );
     }
 }

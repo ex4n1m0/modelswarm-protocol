@@ -15,6 +15,7 @@ members = [
     "crates/modelswarm-telemetry",
     "crates/modelswarm-bench",
     "crates/modelswarm-node",
+    "crates/modelswarm-winjob",
     "crates/modelswarm-desktop",
     "apps/modelswarm-sim",
 ]

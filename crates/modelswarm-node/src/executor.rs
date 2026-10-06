@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use futures_util::stream;
 use modelswarm_gateway::{
     ExecutorError, ExecutorEvent, ExecutorStream, FinishReason, InferenceExecutor,
-    NormalizedRequest,
+    NormalizedMessage, NormalizedRequest,
 };
 use modelswarm_runtime::{InferenceRuntime, SamplingParams};
 
@@ -52,6 +52,26 @@ fn fatal(code: &str) -> ExecutorError {
     }
 }
 
+/// Renders the conversation in ChatML — the template family of every
+/// catalog profile (Qwen, SmolLM2; evidenced by their chat_template_hash
+/// inputs). The serving side owns template application (msp-v1 §6.2):
+/// the raw `/v1/completions` endpoint applies nothing, and the previous
+/// newline flattening made role-less text that tiny models answer with
+/// immediate EOS (0-token replies). Non-ChatML profiles need template
+/// metadata before they may join the catalog (ADR-025).
+pub fn render_chatml(messages: &[NormalizedMessage]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        out.push_str("<|im_start|>");
+        out.push_str(&message.role);
+        out.push('\n');
+        out.push_str(&message.content);
+        out.push_str("<|im_end|>\n");
+    }
+    out.push_str("<|im_start|>assistant\n");
+    out
+}
+
 #[async_trait]
 impl InferenceExecutor for SingleLocalExecutor {
     async fn execute(&self, request: NormalizedRequest) -> Result<ExecutorStream, ExecutorError> {
@@ -61,14 +81,10 @@ impl InferenceExecutor for SingleLocalExecutor {
             return Err(fatal("profile_mismatch"));
         }
 
-        // Same conversation flattening as the session executor: contents
-        // joined with newlines — the serving runtime applies the chat
-        // template (msp-v1 §6.2).
-        let mut conversation = String::new();
-        for message in &request.messages {
-            conversation.push_str(&message.content);
-            conversation.push('\n');
-        }
+        // The serving executor applies the chat template (ADR-025): clients
+        // send plain {role, content} messages; ChatML is rendered exactly
+        // once, here.
+        let conversation = render_chatml(&request.messages);
         let prompt = runtime
             .tokenize(&conversation)
             .await
@@ -137,6 +153,36 @@ mod tests {
     use super::*;
     use modelswarm_gateway::{NormalizedMessage, Sampling};
     use modelswarm_runtime::MockRuntime;
+
+    #[test]
+    fn chatml_rendering_marks_roles_and_opens_assistant_turn() {
+        let messages = vec![
+            NormalizedMessage {
+                role: "system".to_string(),
+                content: "You are terse.".to_string(),
+            },
+            NormalizedMessage {
+                role: "user".to_string(),
+                content: "Hi".to_string(),
+            },
+            NormalizedMessage {
+                role: "assistant".to_string(),
+                content: "Hello.".to_string(),
+            },
+            NormalizedMessage {
+                role: "user".to_string(),
+                content: "Bye".to_string(),
+            },
+        ];
+        assert_eq!(
+            render_chatml(&messages),
+            "<|im_start|>system\nYou are terse.<|im_end|>\n\
+             <|im_start|>user\nHi<|im_end|>\n\
+             <|im_start|>assistant\nHello.<|im_end|>\n\
+             <|im_start|>user\nBye<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
 
     fn request(profile: &str, max_tokens: u32) -> NormalizedRequest {
         NormalizedRequest {

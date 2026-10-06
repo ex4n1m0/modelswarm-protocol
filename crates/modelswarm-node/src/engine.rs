@@ -263,12 +263,18 @@ pub async fn start_engine(
     let bearer = modelswarm_identity::new_nonce();
     let base_url = format!("http://127.0.0.1:{port}");
 
+    // Flips when the supervisor gives up (spawn failure or restart budget
+    // exhausted) so the health loop fails in milliseconds instead of
+    // waiting out the full startup timeout on a dead port (observed:
+    // a load-time engine abort burning the whole 600 s GPU window).
+    let dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_supervised(
         &spec,
         port,
         &bearer,
         shutdown.clone(),
         3, // bounded restart attempts per session
+        std::sync::Arc::clone(&dead),
     );
 
     // Block until healthy (model load) or timeout.
@@ -281,6 +287,12 @@ pub async fn start_engine(
         if *shutdown.borrow() {
             return Err(EngineError::Spawn(
                 "node shut down while engine loaded".into(),
+            ));
+        }
+        if dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(EngineError::Spawn(
+                "engine exited before becoming healthy (load failed or restart budget exhausted)"
+                    .into(),
             ));
         }
         if started.elapsed() >= spec.startup_timeout {
@@ -317,6 +329,7 @@ fn spawn_supervised(
     bearer: &str,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     max_restarts: u32,
+    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let spec = spec.clone();
     let bearer = bearer.to_string();
@@ -327,6 +340,7 @@ fn spawn_supervised(
                 Ok(child) => child,
                 Err(e) => {
                     eprintln!("modelswarm-node: engine spawn failed: {e}");
+                    dead.store(true, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
             };
@@ -341,6 +355,7 @@ fn spawn_supervised(
                     }
                     if restarts_left == 0 {
                         eprintln!("modelswarm-node: engine exited ({status:?}); restart budget exhausted");
+                        dead.store(true, std::sync::atomic::Ordering::Relaxed);
                         return;
                     }
                     restarts_left -= 1;
@@ -393,9 +408,23 @@ fn launch(spec: &EngineSpec, port: u16, bearer: &str) -> Result<Child, EngineErr
         // (tokio::process::Command has an inherent creation_flags on Windows.)
         command.creation_flags(0x0800_0000);
     }
-    command
+    let child = command
         .spawn()
-        .map_err(|e| EngineError::Spawn(format!("{}: {e}", spec.exe.display())))
+        .map_err(|e| EngineError::Spawn(format!("{}: {e}", spec.exe.display())))?;
+    #[cfg(windows)]
+    {
+        // Force-killing the app (taskkill /F, crash) must never orphan the
+        // engine (observed live 2026-10-06). A kill-on-close job object ties
+        // the child's life to this process: when our handles close — however
+        // the process dies — the OS terminates the engine. Best effort: the
+        // graceful shutdown path (watch channel) already kills the child.
+        if let Some(pid) = child.id() {
+            if let Err(e) = modelswarm_winjob::assign_child(pid) {
+                eprintln!("modelswarm-node: job-object assignment failed: {e}");
+            }
+        }
+    }
+    Ok(child)
 }
 
 impl EngineHandle {

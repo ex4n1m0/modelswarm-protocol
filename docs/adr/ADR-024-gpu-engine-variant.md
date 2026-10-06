@@ -44,10 +44,17 @@ and Vulkan (single driver-only build covering NVIDIA, AMD, and Intel).
    lossless verification cannot mix backends. This ADR explicitly does
    not grant permission for cross-backend token-level cooperation.
 3. **GPU preferred, fallback honest.** When the desktop finds an
-   `engine-vulkan/` bundle beside the CPU engine it starts it first with
-   `-ngl 999` (all layers). Any pin-verification, spawn, or health
-   failure logs `engine.gpu_fallback {variant, reason}` (warn) and
-   starts the canonical CPU engine instead. There is no silent
+   `engine-vulkan/` bundle beside the CPU engine it starts it first.
+   **No `-ngl` is passed** (amended 2026-10-06 night): b11407's
+   auto-fit ABORTS when a user-pinned layer count cannot fit FREE VRAM
+   (`failed to fit params to free device memory: n_gpu_layers already
+   set by user to 999` — observed with Qwen3.8-27B on a 16 GB 5080);
+   left unset the engine auto-fits: full offload when it fits, partial
+   when it doesn't (measured: the 27B loads in ~20 s with warm shader
+   cache). Any pin-verification, spawn, or health failure — now
+   fail-fast, the supervisor flags a dead child instead of burning the
+   startup window — logs `engine.gpu_fallback {variant, reason}` (warn)
+   and starts the canonical CPU engine instead. There is no silent
    downgrade: the fallback is a telemetry event and the UI shows the
    backend actually serving. On machines without a Vulkan driver the
    variant fails fast at startup and the CPU engine serves, visibly.

@@ -1,8 +1,12 @@
 # Phase H5: env-gated real-model E2E (manual only — downloads 470MB from HF).
 # Re-runs the cross-language GGUF parity test and the real-engine smoke gate
 # against the pinned llama.cpp b11407 + Qwen2.5-0.5B Q4_K_M on a clean runner.
+# NOTE: `on:` must stay a proper block mapping — the earlier one-line
+# `on: workflow_dispatch: {}` form parsed as invalid YAML and GitHub fell
+# back to default push triggers, insta-failing every push (2026-10-06).
 name: real-model-e2e
-on: workflow_dispatch: {}
+on:
+  workflow_dispatch: {}
 jobs:
   e2e:
     runs-on: windows-latest

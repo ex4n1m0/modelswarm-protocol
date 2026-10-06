@@ -237,3 +237,37 @@ Evidence (owner machine, shipped installer, 2026-10-06):
 - One-click approval re-proven on 0.2.9: click → Edge at
   `…/verify?code=GDE4FB4D`, pairing code prefilled, owner-token field
   focused (AX tree of the Edge window).
+
+## I12 — v0.2.10/v0.2.11: two-column 16:9 UI + honest empty-reply copy
+
+Owner report: the UI "still looks vertical" — the window was 16:9 but the
+page inside was one 760px centered column, so everything stacked and
+scrolled. v0.2.10 restructures `ui/index.html` into a two-column board
+(markup + CSS only; every element id and all script logic unchanged):
+left = workflow (models as a horizontal card row, hosting, chat filling
+the remaining height), right = status (setup/approval, peers, local API,
+degraded chips, privacy); single-column fallback under 980px.
+
+While verifying, three consecutive chat replies returned 0 tokens — root
+cause (pre-existing, not a v0.2.10 regression; the shipped Rust is
+unchanged and the templated `/v1/chat/completions` path serves fine via
+curl): the exact-token executor flattens the conversation and calls the
+engine's RAW `/v1/completions` endpoint, which applies no chat template
+(mep-v1 §6.2's assumption only holds for the /chat endpoint; the engine
+is launched without --jinja), so the 135M demo model often emits EOS
+before the first token. v0.2.11 makes the chat box explain this
+("(no reply — the model ended its turn before the first token;
+rephrase…)") instead of a bare "(empty)". Proper template-aware prompt
+construction in the executor is a protocol-level change for a later ADR.
+
+Evidence (owner machine, shipped installers, 2026-10-06):
+
+- Gates green both versions; CI runs 37407131969 / 37409399708 green on
+  all three OSes; live downloads byte-verified (0.2.11 Windows sha256
+  `287ad908…`).
+- Rendered-layout check (screenshot at the 1152×648 default, analyzed):
+  two columns, model cards in one horizontal row, NO page scrollbar,
+  nothing cut off, all nine sections visible; hosting ON, gateway
+  11435 LISTENING.
+- One-click approval re-proven on 0.2.10 and 0.2.11 (Edge at
+  `…/verify?code=3J4RR97Y`, code prefilled, owner-token focused).

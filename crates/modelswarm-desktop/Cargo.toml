@@ -15,6 +15,7 @@ build = "build.rs"
 # docs/verification/phase-g-notes.md for the Phase G attempt outcome.
 tauri-shell = [
     "dep:tauri",
+    "dep:tauri-plugin-opener",
     "dep:tauri-build",
     "dep:modelswarm-node",
     "dep:modelswarm-tracker-api",
@@ -29,6 +30,7 @@ tauri-shell = [
 
 [dependencies]
 tauri = { version = "2", optional = true, default-features = false, features = ["wry"] }
+tauri-plugin-opener = { version = "2", optional = true }
 modelswarm-node = { path = "../modelswarm-node", optional = true }
 modelswarm-tracker-api = { path = "../modelswarm-tracker-api", optional = true }
 modelswarm-store = { path = "../modelswarm-store", optional = true }

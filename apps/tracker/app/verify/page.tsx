@@ -5,15 +5,26 @@
 // /auth/device/complete); the owner enters that code here with the ops
 // admin token to let the device into the roster. Knowledge of the code
 // alone is NOT enough — the admin token keeps the gate owner-controlled.
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-const CODE_HINT = "8 characters, shown in the app under Setup → Device approval";
+const CODE_HINT = "8 characters, shown in the app under Setup → Device approval (or click \"approve this device…\" in the app — the code fills in here automatically)";
 
 export default function VerifyPage() {
   const [userCode, setUserCode] = useState("");
   const [adminToken, setAdminToken] = useState("");
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const tokenRef = useRef<HTMLInputElement>(null);
+
+  // The app's "approve this device…" button opens /verify?code=XXXX —
+  // prefill it so only the owner token is left to enter.
+  useEffect(() => {
+    const code = new URLSearchParams(window.location.search).get("code");
+    if (code) {
+      setUserCode(code.trim().toUpperCase().slice(0, 8));
+      tokenRef.current?.focus();
+    }
+  }, []);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -73,6 +84,7 @@ export default function VerifyPage() {
         <label style={{ display: "block", fontSize: "0.72rem", letterSpacing: "0.1em", color: "#9fb8d8", marginBottom: 14 }}>
           OWNER TOKEN
           <input
+            ref={tokenRef}
             type="password"
             value={adminToken}
             onChange={(e) => setAdminToken(e.target.value)}

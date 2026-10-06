@@ -99,7 +99,7 @@
       <dl class="kv">
         <dt>Tracker</dt><dd><input type="text" id="tracker-url" aria-label="Tracker base URL"></dd>
         <dt>Engine</dt><dd id="engine-line">—</dd>
-        <dt>Device approval</dt><dd id="enroll-line">—</dd>
+        <dt>Device approval</dt><dd><span id="enroll-line">—</span> <button class="ghost" id="enroll-open" hidden>approve this device…</button></dd>
       </dl>
       <div class="row" style="margin-top:10px">
         <button class="ghost" id="save-tracker">save tracker</button>
@@ -178,7 +178,7 @@
     const { invoke } = window.__TAURI__.core;
     const listen = window.__TAURI__.event.listen;
     const $ = (id) => document.getElementById(id);
-    let hostingOn = false, busy = false;
+    let hostingOn = false, busy = false, pendingEnroll = null;
 
     function error(msg) { const b = $("error-banner"); b.textContent = msg; b.style.display = msg ? "block" : "none"; }
 
@@ -231,12 +231,16 @@
         : "MISSING — expected at " + s.engine_path;
       const en = s.node && s.node.enrollment;
       if (s.node.running && en) {
+        pendingEnroll = en.phase === "pending" ? en : null;
+        $("enroll-open").hidden = !pendingEnroll;
         $("enroll-line").textContent =
-          en.phase === "pending" ? "code " + en.user_code + " — ask the owner to approve it at " + en.verify_url
+          en.phase === "pending" ? "code " + en.user_code + " — one click below, then the owner token"
           : en.phase === "enrolled" ? "approved — this device is in the roster"
           : en.phase === "error" ? en.error
           : "requesting approval code…";
       } else {
+        pendingEnroll = null;
+        $("enroll-open").hidden = true;
         $("enroll-line").textContent = "starts with hosting (automatic)";
       }
       $("privacy-gate").hidden = s.license_accepted;
@@ -267,13 +271,19 @@
         $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">pick a model above — the swarm starts on selection</td></tr>';
       }
       if (hostingOn && s.node.enrollment && s.node.enrollment.phase === "pending") {
-        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">device approval pending (code ' + s.node.enrollment.user_code + ') — the roster joins automatically once the owner approves it</td></tr>';
+        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">device approval pending (code ' + s.node.enrollment.user_code + ') — use "approve this device…" in Setup; the roster joins automatically once approved</td></tr>';
       }
     }
 
     $("save-tracker").onclick = async () => { try { await invoke("set_tracker", { url: $("tracker-url").value }); error(""); } catch (e) { error(String(e)); } };
     $("stop-btn").onclick = async () => { try { await invoke("set_hosting", { on: false }); } catch (e) { error(String(e)); } refresh(); };
     $("accept-btn").onclick = async () => { try { await invoke("accept_privacy"); } catch (e) { error(String(e)); } refresh(); };
+    $("enroll-open").onclick = async () => {
+      if (!pendingEnroll) return;
+      const url = pendingEnroll.verify_url + "?code=" + encodeURIComponent(pendingEnroll.user_code);
+      try { await window.__TAURI__.opener.openUrl(url); }
+      catch (e) { window.open(url, "_blank"); }
+    };
     listen("download", (e) => {
       const { done, total } = e.payload;
       const pct = total ? Math.round((done / total) * 100) : 0;

@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Main window: core defaults plus opening the device-approval page in the system browser (scoped to the tracker origin only).","local":true,"windows":["main"],"permissions":["core:default",{"identifier":"opener:allow-open-url","allow":[{"url":"https://modelswarm.deepflux.space/*"}]}]}}

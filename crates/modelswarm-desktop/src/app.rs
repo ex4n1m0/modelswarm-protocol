@@ -922,6 +922,9 @@ async fn send_chat(
 
 pub fn run() {
     tauri::Builder::default()
+        // Opens the device-approval page in the system browser (capability
+        // scopes it to the tracker origin only).
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {

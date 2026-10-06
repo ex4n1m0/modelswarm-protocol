@@ -59,4 +59,17 @@ describe("I1 GET /api/v1/stats", () => {
     expect(models[one]).toBe(3);
     expect(models[two]).toBe(1);
   });
+
+  it("reports a single registered host as its model's sole online peer", async () => {
+    // The one-machine swarm: a single host registers its one profile and the
+    // census must show that model online — the landing page renders
+    // "1 online" from exactly this shape.
+    const a = await enroll(rig);
+    const one = await seedActiveProfile(rig, testManifest());
+    await register(rig, a, [one]);
+
+    const body = await stats();
+    expect(body.peersOnline).toBe(1);
+    expect(body.models).toEqual([{ profileId: one, peers: 1 }]);
+  });
 });

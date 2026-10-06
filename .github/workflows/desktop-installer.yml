@@ -132,8 +132,10 @@ jobs:
           cd dist
           shopt -s nullglob
           for f in *-setup.exe; do
-            7z l "$f" | grep -q "llama-server.exe" || { echo "::error::engine missing in $f"; exit 1; }
-            7z l "$f" | grep -q "engine-vulkan/llama-server.exe" || { echo "::error::vulkan engine variant missing in $f"; exit 1; }
+            # NSIS listings use backslash paths; deb/AppImage/dmg use forward
+            # slashes — accept both (v0.2.17's first run failed on exactly this).
+            7z l "$f" | grep -E "engine[/\\]llama-server\.exe" || { echo "::error::engine missing in $f"; 7z l "$f" | grep -iE "llama|engine" | head -20; exit 1; }
+            7z l "$f" | grep -E "engine-vulkan[/\\]llama-server\.exe" || { echo "::error::vulkan engine variant missing in $f"; 7z l "$f" | grep -iE "llama|engine" | head -20; exit 1; }
             echo "engine + vulkan variant present in $f"
           done
           for f in *.deb; do

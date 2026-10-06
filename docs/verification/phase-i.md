@@ -162,3 +162,52 @@ node/engine instances during testing produced a transient no_eligible_peer
 window that fully recovered after cleanup + restart (verified across four
 paths: app gateway, node CLI, H3 real-engine selftest at 143 tok/s, and
 direct engine HTTP).
+
+## I10 — v0.2.7/v0.2.8: 16:9 window, one-click device approval, single-host census
+
+Owner report (2026-10-06): window should be 16:9; the website census shows
+no model even though one is hosted. Diagnosis: the census was honest —
+`GET /api/v1/stats` returned `peersOnline: 0, models: []` because the
+installation never got past device approval (code KR2RX8U5 sat pending; no
+`/admin/devices/approve` or `/peers/register` in the Vercel logs). A
+one-machine swarm is supported by design: it serves locally and, once
+registered, must appear as `peersOnline: 1` with its model as the sole
+online entry — now pinned by a regression test
+(`stats.test.ts` → "reports a single registered host as its model's sole
+online peer").
+
+v0.2.7 (5ef4dc0): window 800×600 → 1152×648 (16:9); `?code=` prefill on
+/verify (focus moves to the owner-token field); tauri-plugin-opener with a
+capability scoped to `https://modelswarm.deepflux.space/*`.
+
+v0.2.8 (0f0ec63): the 0.2.7 webview-side `__TAURI__.opener.openUrl` click
+produced NO visible effect on the shipped binary (no browser window or
+tab anywhere; the OS path itself was proven fine — `start <url>` opened
+Edge immediately, so the failure was in the webview JS/IPC layer). The
+button now invokes a Rust command, `open_approval_page`, that
+prefix-validates the URL (`https://modelswarm.deepflux.space/verify`) and
+calls the opener API directly; errors surface in the UI banner.
+
+Evidence (owner machine, shipped installers, 2026-10-06):
+
+- Gates: `cargo fmt --check`, clippy workspace + `-p modelswarm-desktop
+  --features tauri-shell` (`-D warnings`), `cargo test --workspace` (46
+  suites ok), tracker `tsc --noEmit` + `vitest run` (93 passed) +
+  `npm run build` — all green for both versions.
+- CI 37399820790 (0.2.7) and 37402698707 (0.2.8): all three OS builds
+  green incl. the engine-inside-artifact checks.
+- Live: counted download route 302, downloaded Windows exe sha256
+  `1df82797…` matches SHA256SUMS.txt and the site (0.2.8).
+- E2E 0.2.8 on the owner machine: install → launch → window client area
+  exactly 1152×648 (outer rect 1167×685 incl. chrome) → select SmolLM2
+  135M → gateway `127.0.0.1:11435` LISTENING, enrollment pending
+  (code T3PW8EG8) → click "approve this device…" → **Edge opens
+  `https://modelswarm.deepflux.space/verify?code=T3PW8EG8` with the
+  pairing code prefilled and the owner-token field focused** (AX tree of
+  the Edge window, pid 25120). Gateway serving verified
+  (`/v1/chat/completions`, 16 completion tokens).
+
+Still pending (owner action, by design): the admin-token paste on /verify.
+The app polls `device/complete` every 30 s; within one poll of approval it
+registers, heartbeats, and the census shows `1 peer online` +
+`SmolLM2 135M · 1 online`.

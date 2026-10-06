@@ -211,3 +211,29 @@ Still pending (owner action, by design): the admin-token paste on /verify.
 The app polls `device/complete` every 30 s; within one poll of approval it
 registers, heartbeats, and the census shows `1 peer online` +
 `SmolLM2 135M · 1 online`.
+
+## I11 — v0.2.9: no console window on Windows launch
+
+Owner report: a command window opens alongside the app on every launch.
+Root cause: `modelswarm-desktop.exe` was a console-subsystem binary — the
+standard Tauri `#![cfg_attr(not(debug_assertions), windows_subsystem =
+"windows")]` attribute was missing from `main.rs`, so each launch got a
+Windows Terminal window titled with the exe path (observed live: a
+WindowsTerminal process spawned the same second as the app). The
+llama-server child was already spawned with CREATE_NO_WINDOW
+(`engine.rs` launch), so no second console appears when hosting starts.
+
+Evidence (owner machine, shipped installer, 2026-10-06):
+
+- Gates: fmt, clippy workspace + tauri-shell (`-D warnings`), workspace
+  tests, tracker tsc/vitest/build — all green; CI 37405016190 green on
+  all three OSes; live download route 302, Windows exe sha256
+  `76274767…` matches SHA256SUMS.txt + site.
+- Launch via Start-Process (shortcut-equivalent): the ONLY new visible
+  window is the app itself — no Windows Terminal, no window titled with
+  the exe path (EnumWindows before/after).
+- Hosting start (model select → engine spawn): gateway 11435 LISTENING,
+  still no console window.
+- One-click approval re-proven on 0.2.9: click → Edge at
+  `…/verify?code=GDE4FB4D`, pairing code prefilled, owner-token field
+  focused (AX tree of the Edge window).

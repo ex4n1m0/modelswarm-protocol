@@ -1,3 +1,9 @@
+// GUI subsystem on Windows in release builds: without this every launch of
+// modelswarm-desktop.exe opens a console window alongside the app (the
+// engine child is separately spawned with CREATE_NO_WINDOW). Debug builds
+// keep the console for development output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! ModelSwarm desktop shell entry point (Phase G, ADR-008).
 //!
 //! Two build modes:

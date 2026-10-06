@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ModelSwarm",
-  "version": "0.2.7-internal-test-unsigned",
+  "version": "0.2.8-internal-test-unsigned",
   "identifier": "space.deepflux.modelswarm",
   "build": {
     "frontendDist": "ui"
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "ModelSwarm 0.2.7 \u2014 INTERNAL TEST (UNSIGNED)",
+        "title": "ModelSwarm 0.2.8 \u2014 INTERNAL TEST (UNSIGNED)",
         "label": "main",
         "width": 1152,
         "height": 648,

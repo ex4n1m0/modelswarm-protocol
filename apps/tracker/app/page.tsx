@@ -1,17 +1,18 @@
 // Every installer bundles the full pinned inference engine; the model
-// weights download from HuggingFace on first use. v0.2.7: 16:9 window and
-// one-click device approval (the app opens this site's /verify with the
-// pairing code prefilled). Same version number on every OS = same build.
+// weights download from HuggingFace on first use. v0.2.8: the one-click
+// device approval opens /verify through a validated Rust command (the 0.2.7
+// webview-side call could be silently dropped). Same version number on
+// every OS = same build.
 const DOWNLOADS = [
-  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.7-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
-  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.7-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
-  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.7-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
-  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.7-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
+  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.8-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
+  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.8-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
+  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.8-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
+  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.8-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
 ];
 const DOWNLOAD = {
-  version: "0.2.7",
+  version: "0.2.8",
   sums: "/downloads/SHA256SUMS.txt",
-  sha256: "101b9de3741411559110d30cdb4efbd58f87d2f9b442338707e6a4d4c52aa9b8",
+  sha256: "PENDING-CI",
 };
 
 // Dedicated community room — the room word is fixed here and nowhere else on

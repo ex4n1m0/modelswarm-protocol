@@ -281,8 +281,8 @@
     $("enroll-open").onclick = async () => {
       if (!pendingEnroll) return;
       const url = pendingEnroll.verify_url + "?code=" + encodeURIComponent(pendingEnroll.user_code);
-      try { await window.__TAURI__.opener.openUrl(url); }
-      catch (e) { window.open(url, "_blank"); }
+      try { await invoke("open_approval_page", { url }); error(""); }
+      catch (e) { error("approval page failed to open: " + e); }
     };
     listen("download", (e) => {
       const { done, total } = e.payload;

@@ -920,6 +920,24 @@ async fn send_chat(
     }))
 }
 
+/// One-click device approval: open the tracker's /verify page (pairing code
+/// prefilled by the site) in the system browser. Rust-side validation — only
+/// the tracker's approval page may be opened, and the opener call bypasses
+/// the webview entirely (the shipped 0.2.7 JS-side `__TAURI__.opener` call
+/// produced no visible effect; the OS path itself was verified working).
+#[tauri::command]
+async fn open_approval_page(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    const VERIFY_PREFIX: &str = "https://modelswarm.deepflux.space/verify";
+    let url = url.trim().to_string();
+    if !url.starts_with(VERIFY_PREFIX) {
+        return Err(format!("refusing to open non-tracker URL: {url}"));
+    }
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         // Opens the device-approval page in the system browser (capability
@@ -942,7 +960,8 @@ pub fn run() {
             set_hosting,
             select_model,
             lookup_peers,
-            send_chat
+            send_chat,
+            open_approval_page
         ])
         .run(tauri::generate_context!())
         .expect("modelswarm desktop shell failed to start");

@@ -18,6 +18,14 @@ export interface TrackerContext {
   adminToken: string | null;
   /** Device verification URL returned by /auth/device/start. */
   verifyUrl: string;
+  /** Auto-approve device enrollments at /auth/device/start (env
+   *  DEVICE_AUTO_APPROVE=1; owner decision 2026-10-06). Bounded by the
+   *  enroll rate limit (10/min/IP) and deviceApprovalCap; beyond the cap
+   *  devices wait for manual /verify approval exactly as before. */
+  autoApproveDevices: boolean;
+  /** Max distinct enrolled installations under auto-approval (env
+   *  DEVICE_APPROVAL_CAP, default 250). */
+  deviceApprovalCap: number;
 }
 
 /** Development-only deterministic seed so local/CI builds can sign catalogs
@@ -58,6 +66,8 @@ function buildDefaultContext(): TrackerContext {
     },
     adminToken: process.env.ADMIN_TOKEN ?? null,
     verifyUrl: process.env.DEVICE_VERIFY_URL ?? "https://modelswarm.deepflux.space/verify",
+    autoApproveDevices: process.env.DEVICE_AUTO_APPROVE === "1",
+    deviceApprovalCap: envInt("DEVICE_APPROVAL_CAP", 250),
   };
 }
 

@@ -323,3 +323,88 @@ describe("register validation", () => {
     expect(badSlots.status).toBe(400);
   });
 });
+
+// Auto-approval (DEVICE_AUTO_APPROVE=1; owner decision 2026-10-06): the
+// device code is born approved under the enrollment cap, so enrollment
+// completes on the first /complete poll with zero owner action. Beyond the
+// cap the gate is exactly the manual /verify flow again.
+describe("auto-approval", () => {
+  it("completes enrollment with no approval step when enabled", async () => {
+    const rig = makeRig({ autoApproveDevices: true });
+    await seedActiveProfile(rig, testManifest());
+    const keys = makeKeypair();
+    const ids = keyPairIds(keys);
+
+    const startRes = await deviceStart.POST(
+      new Request("http://tracker.local/api/v1/auth/device/start", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": "198.51.100.20" },
+        body: JSON.stringify({ installationId: ids.installationId, pubKey: ids.pubKeyB58 }),
+      }),
+    );
+    expect(startRes.status).toBe(200);
+    const start = (await startRes.json()) as { deviceCode: string };
+
+    // No approveDevice / admin /verify call of any kind:
+    const res = await deviceComplete.POST(
+      signedRequest(keys, ids.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: start.deviceCode }), rig.ctx.now, { ip: "198.51.100.20" }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { token: string; expiresInS: number };
+    expect(body.token.length).toBeGreaterThanOrEqual(16);
+
+    // The session registers like any enrolled device.
+    const who = { keys, installationId: ids.installationId, session: body.token, peerId: ids.peerId ?? "" } as Parameters<typeof register>[1];
+    const lease = await register(rig, who, [(await seedActiveProfile(rig, { ...testManifest(), decoding_abi_version: 2 }))]);
+    expect(lease.leaseId).toBeTruthy();
+  });
+
+  it("stops at the cap: the next device stays pending until /verify approves it", async () => {
+    const rig = makeRig({ autoApproveDevices: true, deviceApprovalCap: 1, adminToken: "test-admin-token" });
+    await seedActiveProfile(rig, testManifest());
+
+    const startOne = async (ip: string) => {
+      const keys = makeKeypair();
+      const ids = keyPairIds(keys);
+      const startRes = await deviceStart.POST(
+        new Request("http://tracker.local/api/v1/auth/device/start", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-forwarded-for": ip },
+          body: JSON.stringify({ installationId: ids.installationId, pubKey: ids.pubKeyB58 }),
+        }),
+      );
+      const start = (await startRes.json()) as { deviceCode: string; userCode: string };
+      return { keys, ids, start };
+    };
+
+    // Device 1 fills the cap (enrolled = 1 distinct installation).
+    const one = await startOne("198.51.100.21");
+    const oneRes = await deviceComplete.POST(
+      signedRequest(one.keys, one.ids.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: one.start.deviceCode }), rig.ctx.now, { ip: "198.51.100.21" }),
+    );
+    expect(oneRes.status).toBe(200);
+
+    // Device 2 is over the cap: pending until the owner approves the code.
+    const two = await startOne("198.51.100.22");
+    const pendingRes = await deviceComplete.POST(
+      signedRequest(two.keys, two.ids.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: two.start.deviceCode }), rig.ctx.now, { ip: "198.51.100.22" }),
+    );
+    expect(pendingRes.status).toBe(403);
+    expect(((await pendingRes.json()) as { error: { code: string } }).error.code).toBe("pending");
+
+    const approveRoute = await import("@/app/api/v1/admin/devices/approve/route");
+    const approveRes = await approveRoute.POST(
+      new Request("http://tracker.local/api/v1/admin/devices/approve", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-msp-admin": "test-admin-token" },
+        body: JSON.stringify({ userCode: two.start.userCode }),
+      }),
+    );
+    expect(approveRes.status).toBe(200);
+
+    const twoRes = await deviceComplete.POST(
+      signedRequest(two.keys, two.ids.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: two.start.deviceCode }), rig.ctx.now, { ip: "198.51.100.22" }),
+    );
+    expect(twoRes.status).toBe(200);
+  });
+});

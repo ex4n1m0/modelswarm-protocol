@@ -35,13 +35,22 @@ export async function POST(req: Request) {
 
   const deviceCode = randomToken();
   const userCode = randomUserCode();
+  // Auto-approval (owner decision 2026-10-06, msp-v1 §3.2): when enabled and
+  // under the enrollment cap the device code is born approved — enrollment
+  // completes on the client's first /complete poll with no owner action.
+  // The enroll rate limit above bounds throughput; the cap bounds the total.
+  // Beyond the cap (or when disabled) the code stays pending and /verify +
+  // the admin token approve it exactly as before.
+  const autoApprove =
+    ctx.autoApproveDevices &&
+    (await ctx.store.countEnrolledInstallations()) < ctx.deviceApprovalCap;
   await ctx.store.createDeviceAuth({
     deviceCode,
     installationId: body.installationId,
     userCode,
     verifyUrl: ctx.verifyUrl,
     expiresAt: now + DEVICE_CODE_TTL_MS,
-    approved: false,
+    approved: autoApprove,
   });
 
   return jsonOk({

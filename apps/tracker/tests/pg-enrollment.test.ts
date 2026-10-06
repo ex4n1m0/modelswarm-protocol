@@ -102,4 +102,41 @@ describe.skipIf(!dbUrl)("Pg enrollment round-trip", () => {
     const reg = (await registerRes.json()) as { leaseId: string };
     expect(reg.leaseId).toBeTruthy();
   });
+
+  it("auto-approval (DEVICE_AUTO_APPROVE) enrolls with no owner action on Postgres", async () => {
+    initTrackerContext({
+      store,
+      now: () => nowMs,
+      adminToken: "test-admin-token",
+      autoApproveDevices: true,
+    });
+
+    const keys = makeKeypair();
+    const ids = keyPairIds(keys);
+    const startRes = await deviceStart.POST(
+      new Request("http://tracker.local/api/v1/auth/device/start", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": "198.51.100.30" },
+        body: JSON.stringify({ installationId: ids.installationId, pubKey: ids.pubKeyB58 }),
+      }),
+    );
+    expect(startRes.status).toBe(200);
+    const start = (await startRes.json()) as { deviceCode: string };
+
+    // No approval step of any kind — the code was born approved.
+    const completeRes = await deviceComplete.POST(
+      signedRequest(
+        keys,
+        ids.installationId,
+        "",
+        "/api/v1/auth/device/complete",
+        JSON.stringify({ deviceCode: start.deviceCode }),
+        () => nowMs,
+        { ip: "198.51.100.30" },
+      ),
+    );
+    expect(completeRes.status).toBe(200);
+    const session = (await completeRes.json()) as { token: string };
+    expect(session.token.length).toBeGreaterThanOrEqual(32);
+  });
 });

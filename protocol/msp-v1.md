@@ -91,6 +91,18 @@ routes).
 | `POST /auth/device/complete` | signed envelope `{deviceCode}` | `{session}` or `403 pending` |
 | `POST /admin/devices/approve` | admin token (`X-MSP-Admin`) `{userCode}` | `{approved:true}` or `404`; the `verifyUrl` approval page — knowing the user code alone is never enough |
 
+**Automatic approval (deployment option, 2026-10-06).** A tracker MAY
+auto-approve device codes at `/auth/device/start` (`DEVICE_AUTO_APPROVE=1`):
+the code is created already approved, so enrollment completes on the
+client's first `/complete` poll with no owner action. The wire format is
+unchanged — `/complete` still reports `403 pending` when a code is not
+approved. Exposure is bounded by the `/auth/device/start` rate limit
+(10 req/min/IP) and an enrollment cap (`DEVICE_APPROVAL_CAP`, default 250
+distinct installations); beyond the cap, codes stay pending and only the
+admin-token flow above admits them. The census therefore counts
+self-enrolled installations on such deployments — an owner-visible
+trade-off, recorded in `docs/threat-model.md`.
+
 ### 3.3 Peer lifecycle (all require signed envelope + session)
 
 `leaseId` values are unguessable random ids **bound to the signing

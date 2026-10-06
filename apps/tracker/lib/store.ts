@@ -177,6 +177,9 @@ export interface TrackerStore {
 
   createSession(rec: SessionRecord): Promise<void>;
   getSession(token: string): Promise<SessionRecord | null>;
+  /** Distinct installations holding an enrollment session ever — the
+   *  auto-approval cap basis (bounded Sybil exposure). */
+  countEnrolledInstallations(): Promise<number>;
 
   // -- replay protection ----------------------------------------------------
   /** Single-use per installation within the window; true = fresh nonce. */
@@ -371,6 +374,10 @@ export class MemoryStore implements TrackerStore {
 
   async getSession(token: string): Promise<SessionRecord | null> {
     return this.sessions.get(token) ?? null;
+  }
+
+  async countEnrolledInstallations(): Promise<number> {
+    return new Set([...this.sessions.values()].map((s) => s.installationId)).size;
   }
 
   async consumeNonce(installationId: string, nonce: string, windowMs: number): Promise<boolean> {
@@ -855,7 +862,7 @@ export class PgStore implements TrackerStore {
 
   async getSession(token: string): Promise<SessionRecord | null> {
     const rows = await this.query(
-      `SELECT token, installation_id, expires_at FROM sessions WHERE token = $1`,
+      `SELECT token, installation_id, created_at, expires_at FROM sessions WHERE token = $1`,
       [token],
     );
     const row = rows[0] as { token: string; installation_id: string; expires_at: Date } | undefined;
@@ -866,6 +873,13 @@ export class PgStore implements TrackerStore {
       createdAt: 0,
       expiresAt: row.expires_at.getTime(),
     };
+  }
+
+  async countEnrolledInstallations(): Promise<number> {
+    const rows = await this.query(
+      `SELECT COUNT(DISTINCT installation_id) AS n FROM sessions`,
+    );
+    return Number((rows[0] as { n: string | number } | undefined)?.n ?? 0);
   }
 
   async consumeNonce(installationId: string, nonce: string, windowMs: number): Promise<boolean> {

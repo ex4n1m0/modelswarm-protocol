@@ -56,6 +56,7 @@ G. **Hub operator / database compromise** — out of scope for v0.1 defenses but
 | Oversized bodies | Strict Zod schemas, payload limits, reject before parse |
 | Resource exhaustion | Per-account and per-endpoint rate limiting, function timeouts |
 | Fake peer registration | Signed registration bound to enrolled installation key; heartbeat expiry; hosting challenge before capability issuance |
+| Sybil enrollment under auto-approval (`DEVICE_AUTO_APPROVE=1`, owner decision 2026-10-06) | Enrollment rate limit (10 req/min/IP) bounds throughput; `DEVICE_APPROVAL_CAP` (default 250 distinct installations) bounds total exposure — beyond it the admin-token `/verify` gate resumes. Damage without a transport listener is census/roster pollution only (no remote serving in v0.1); census counters on such deployments count self-enrolled installations |
 | Token theft/replay | Capability tokens are peer-bound, profile-bound, short-lived, nonce-carrying; revocation list checked by serving peers via hub lookups |
 | Injected catalog entries | Admin-only promotion flow; catalog is signed and versioned; nodes verify signature |
 

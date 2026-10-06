@@ -587,6 +587,11 @@ async fn set_hosting_inner(
         let mut lease_id: Option<String> = None;
         let mut roster_failures: u32 = 0;
         let mut pending_device: Option<String> = None;
+        // One-shot: poll /complete immediately after a fresh device code
+        // (auto-approval enrolls within one round-trip) instead of waiting
+        // a full tick. Cleared after a single short sleep so a pathological
+        // start→complete-401 cycle can never spin the loop hot.
+        let mut poll_now = false;
         loop {
             if *heartbeat_shutdown.borrow() {
                 return;
@@ -674,6 +679,7 @@ async fn set_hosting_inner(
                                 .and_then(|v| v.as_str())
                                 .map(str::to_string);
                             *enroll_view.write().await = view;
+                            poll_now = true;
                         }
                         Err(error) => {
                             roster_failures += 1;
@@ -756,9 +762,17 @@ async fn set_hosting_inner(
                 }
                 eprintln!("modelswarm-desktop: roster: {error}");
             }
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
-                _ = heartbeat_shutdown.changed() => return,
+            if poll_now {
+                poll_now = false;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = heartbeat_shutdown.changed() => return,
+                }
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = heartbeat_shutdown.changed() => return,
+                }
             }
         }
     });

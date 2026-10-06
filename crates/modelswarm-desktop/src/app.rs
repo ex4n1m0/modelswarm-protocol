@@ -571,7 +571,6 @@ async fn set_hosting_inner(
     let heartbeat_tracker = tracker_client(&inner.tracker_url, &inner.data_dir).await?;
     let peer_id = handle.installation_id.clone();
     let profile_id = listing.profile_id.clone();
-    let version = listing.manifest.runtime().version().to_string();
     let build = listing.manifest.runtime().build_hash().to_string();
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
     let hb_data_dir = inner.data_dir.clone();
@@ -581,9 +580,7 @@ async fn set_hosting_inner(
     }));
     let enroll_view = Arc::clone(&enrollment_view);
     let heartbeat = tokio::spawn(async move {
-        let runtime_desc = serde_json::json!({
-            "name": "llama.cpp", "version": version, "build_hash": build,
-        });
+        let runtime_desc = runtime_wire_desc(&build);
         let mut lease_id: Option<String> = None;
         let mut roster_failures: u32 = 0;
         let mut pending_device: Option<String> = None;
@@ -952,6 +949,14 @@ async fn open_approval_page(app: tauri::AppHandle, url: String) -> Result<(), St
         .map_err(|e| e.to_string())
 }
 
+/// Runtime descriptor for /peers/register (msp-v1 §3.3): the schema is
+/// STRICT — exactly `{name, build}`, both ≤64 chars. Extra keys (the old
+/// `version`/`build_hash` pair) 400 the registration; keep this shape
+/// pinned by test.
+fn runtime_wire_desc(build: &str) -> serde_json::Value {
+    serde_json::json!({ "name": "llama.cpp", "build": build })
+}
+
 pub fn run() {
     tauri::Builder::default()
         // Opens the device-approval page in the system browser (capability
@@ -984,6 +989,18 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_descriptor_is_exactly_name_and_build() {
+        // /peers/register's runtime object is strict zod {name, build} —
+        // anything else 400s the registration (found live 2026-10-06: the
+        // desktop sent version/build_hash and never registered).
+        let desc = runtime_wire_desc("353c4aab0f0d");
+        let obj = desc.as_object().unwrap();
+        assert_eq!(obj.len(), 2, "no extra keys allowed: {desc}");
+        assert_eq!(obj["name"], "llama.cpp");
+        assert_eq!(obj["build"], "353c4aab0f0d");
+    }
 
     #[test]
     fn hardware_requirements_are_conservative_and_labeled() {

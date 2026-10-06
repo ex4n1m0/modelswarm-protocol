@@ -27,6 +27,21 @@ Hub LFS digest (**13/13 ✓** — ten ladder profiles plus the three existing).
 | Qwen3-14B Q4_K_M | Qwen/Qwen3-14B-GGUF | 9.00 | ~9.5 GB | 16–32 GB | Apache-2.0 (in-repo) |
 | Qwen3-30B-A3B Q4_K_M (MoE) | Qwen/Qwen3-30B-A3B-GGUF | 18.56 | ~19 GB | 32 GB | Apache-2.0 (in-repo) |
 | Qwen2.5-32B-Instruct Q4_K_M | bartowski/Qwen2.5-32B-Instruct-GGUF † | 19.85 | ~20.3 GB | 32 GB | Qwen Research (upstream repo) |
+| **Qwen3.8-27B Q4_K_M** (RTX-3080 tier, added later 2026-10-06) | ggml-org/Qwen3.8-27B-GGUF | 18.97 | ~19.5 GB | 32 GB (+10 GB VRAM split when a GPU engine pin lands) | Apache-2.0 (upstream Qwen/Qwen3.8-27B) |
+
+**Qwen3.5/3.8 arch gate (2026-10-06):** the pinned b11407 engine loads the
+Qwen3.5-family architecture and generates (verified with the 0.8B Q4_K_M
+before resolving the 27B). Qwen3.8-27B is the owner-requested
+"fits a RTX 3080 10 GB / 32 GB RAM machine" profile. Honest boundary: the
+pinned engine is **CPU-only** — a CUDA/Vulkan engine pin is a separate
+ADR + all-OS re-pin before the 3080 actually accelerates anything.
+
+**Qwen3.5-9B blocked (fail-closed, by design):** every ungated GGUF source
+for it (unsloth, lmstudio-community) omits `tokenizer.ggml.add_bos_token`,
+which ADR-022's tokenizer-hash spec requires — the resolver refuses rather
+than guess. Handling absent keys in the identity hash needs an ADR-022
+amendment (resolver + Rust parity + golden vectors; backward-compatible for
+the 14 existing profiles whose GGUFs carry the key). Tracked as follow-up.
 
 † bartowski single-file builds used where the official repo ships **sharded**
 Q4_K_M (our artifact pipeline pins exactly one file); provenance points at

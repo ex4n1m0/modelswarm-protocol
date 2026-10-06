@@ -569,7 +569,8 @@ async fn set_hosting_inner(
     // register + heartbeat so exact-profile peers see this machine (with
     // the honest no-listener address until transport lands).
     let heartbeat_tracker = tracker_client(&inner.tracker_url, &inner.data_dir).await?;
-    let peer_id = handle.installation_id.clone();
+    // peerId is derived inside the heartbeat task (ADR-020); the
+    // installation_id stays a UI label.
     let profile_id = listing.profile_id.clone();
     let build = listing.manifest.runtime().build_hash().to_string();
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
@@ -580,6 +581,11 @@ async fn set_hosting_inner(
     }));
     let enroll_view = Arc::clone(&enrollment_view);
     let heartbeat = tokio::spawn(async move {
+        // peerId is the ADR-020 identity-multihash derivation of the pubKey
+        // — NOT the installationId label (the tracker rejects the latter;
+        // found live 2026-10-06 when registration first got past the
+        // schema gate).
+        let peer_id = heartbeat_tracker.identity().peer_id();
         let runtime_desc = runtime_wire_desc(&build);
         let mut lease_id: Option<String> = None;
         let mut roster_failures: u32 = 0;

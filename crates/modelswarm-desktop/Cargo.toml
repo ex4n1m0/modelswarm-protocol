@@ -32,6 +32,8 @@ tauri-shell = [
 modelswarm-winjob = { path = "../modelswarm-winjob" }
 
 [dependencies]
+modelswarm-transport = { path = "../modelswarm-transport", features = ["libp2p-backend"] }
+
 tauri = { version = "2", optional = true, default-features = false, features = ["wry"] }
 tauri-plugin-opener = { version = "2", optional = true }
 modelswarm-node = { path = "../modelswarm-node", optional = true }

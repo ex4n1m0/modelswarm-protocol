@@ -207,6 +207,65 @@ fn log_event(data_dir: &std::path::Path, level: &str, event: &str, fields: &[(&s
     };
 }
 
+/// F0(2): when the operator opted in (MSP_LISTENER=1), bind the libp2p
+/// serving listener on 0.0.0.0 and return the honestly-advertised LAN
+/// multiaddr. The listener is parked in a holding task — dropping it stops
+/// the driver, so it lives until process end (or hosting stop kills the
+/// node; the listener itself is connectionless until the serving bridge
+/// lands in F0(3)). None = not opted in or bind failed (log both).
+async fn bind_serving_listener(data_dir: &std::path::Path) -> Option<String> {
+    if std::env::var("MSP_LISTENER").as_deref() != Ok("1") {
+        return None;
+    }
+    let logs_dir = data_dir.join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let sink = modelswarm_telemetry::FileSink::open(&logs_dir.join("node.jsonl")).ok()?;
+    let telemetry = Telemetry::with_sink(Box::new(sink));
+    let identity = load_or_create_identity(data_dir, &telemetry).ok()?;
+    let backend = match modelswarm_transport::libp2p_backend::Libp2pTransport::new(&identity) {
+        Ok(b) => b,
+        Err(e) => {
+            log_event(
+                data_dir,
+                "warn",
+                "listener.error",
+                &[("phase", "backend"), ("error", &e.to_string())],
+            );
+            return None;
+        }
+    };
+    let listener = match backend.listen("0.0.0.0:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            log_event(
+                data_dir,
+                "warn",
+                "listener.error",
+                &[("phase", "bind"), ("error", &e.to_string())],
+            );
+            return None;
+        }
+    };
+    // Bind says 0.0.0.0; advertise the real LAN IP (UDP-connect trick —
+    // no packets leave the machine).
+    let lan_ip = (|| {
+        let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        s.connect("8.8.8.8:80").ok()?;
+        Some(s.local_addr().ok()?.ip().to_string())
+    })()
+    .unwrap_or_else(|| "0.0.0.0".into());
+    let addr = listener
+        .bound_addr()
+        .to_string()
+        .replace("/0.0.0.0/", &format!("/{lan_ip}/"));
+    log_event(data_dir, "info", "listener.bound", &[("addr", &addr)]);
+    tokio::spawn(async move {
+        let _held = listener;
+        std::future::pending::<()>().await;
+    });
+    Some(addr)
+}
+
 async fn tracker_client(
     tracker_url: &str,
     data_dir: &std::path::Path,
@@ -827,6 +886,7 @@ async fn set_hosting_inner(
     // peerId is derived inside the heartbeat task (ADR-020); the
     // installation_id stays a UI label.
     let profile_id = listing.profile_id.clone();
+    let advertised_addr = bind_serving_listener(&inner.data_dir).await;
     let build = listing.manifest.runtime().build_hash().to_string();
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
     let hb_data_dir = inner.data_dir.clone();
@@ -976,7 +1036,9 @@ async fn set_hosting_inner(
                     None => heartbeat_tracker
                         .register(
                             &peer_id,
-                            &[ADDR_NO_LISTENER.to_string()],
+                            &[advertised_addr
+                                .clone()
+                                .unwrap_or_else(|| ADDR_NO_LISTENER.to_string())],
                             std::slice::from_ref(&profile_id),
                             1,
                             runtime_desc.clone(),

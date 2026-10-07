@@ -55,10 +55,13 @@ contribute-to-consume, thin clients deferred.
 
 ## Remaining actions (ordered, sized)
 
-- **E0 — determinism experiment (S, can run TODAY, no transport needed):**
-  greedy temperature-0 completions, same profile, CPU vs CPU cross-machine
-  and CPU vs Vulkan — logprob/text equality matrix. Decides F3's
-  verification tier. Uses existing artifacts + the real-model-e2e harness.
+- **E0 — determinism experiment — DONE 2026-10-07, result:
+  `docs/verification/e0-determinism-2026-10-07.md`.** CPU deterministic
+  across thread counts; Vulkan deterministic ACROSS GPU VENDORS (5080 =
+  Intel iGPU byte-identical); CPU ≠ Vulkan (135M and 27B). F3 verifier
+  pairs same-backend prover/verifier (backend rides the lease/handshake);
+  cross-backend checks need the TopLoc tier later. Open sub-question:
+  cross-machine CPU microarch (zen4 vs alderlake).
 - **F0 — dialable listener + serving bridge (M):** flag the loopback guard
   open (`MSP_LISTENER=1`); advertise the real multiaddr in heartbeats;
   build the frame↔executor bridge; bind ADR-020 peerId at handshake; lease

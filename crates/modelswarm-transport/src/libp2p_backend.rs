@@ -50,6 +50,8 @@ fn io_err(what: &'static str, e: impl std::error::Error + Send + Sync + 'static)
 /// message surface as the staged backend's [`crate::Session`] (typed
 /// send/recv, deadline-bounded), minus the Ed25519 handshake exchange — the
 /// channel itself is cryptographically bound to the peer's key by QUIC.
+pub use libp2p::PeerId;
+
 pub struct Libp2pSession {
     role: Role,
     #[allow(dead_code)]

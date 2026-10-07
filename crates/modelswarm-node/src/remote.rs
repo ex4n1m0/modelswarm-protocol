@@ -450,3 +450,137 @@ mod failover_tests {
         assert_eq!(local.calls.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod lan_proof {
+    use super::*;
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{ExecutorEvent, InferenceExecutor, NormalizedMessage, NormalizedRequest};
+    use crate::load_or_create_identity;
+use modelswarm_tracker_api::TrackerClient;    use modelswarm_telemetry::Telemetry;
+    use std::time::Duration;
+
+    /// F0(5)/F1 LAN CROSS-MACHINE PROOF (ignored; env-gated):
+    /// MSP_LAN_PROFILE=<profile id> MSP_DATA_DIR=<ModelSwarm data dir>
+    /// MSP_EXCLUDE_ADDR=<own advertised multiaddr> — looks the profile up
+    /// on the PRODUCTION tracker with the real installation identity,
+    /// dials the first OTHER peer advertising a real QUIC multiaddr, and
+    /// streams one real completion from that machine.
+    #[tokio::test]
+    #[ignore = "set MSP_LAN_PROFILE, MSP_DATA_DIR and MSP_EXCLUDE_ADDR"]
+    async fn lan_cross_machine_completion() {
+        let profile = std::env::var("MSP_LAN_PROFILE").expect("MSP_LAN_PROFILE");
+        let data_dir = std::env::var("MSP_DATA_DIR").expect("MSP_DATA_DIR");
+        let exclude = std::env::var("MSP_EXCLUDE_ADDR").unwrap_or_default();
+        let tracker_url =
+            std::env::var("MSP_TRACKER").unwrap_or_else(|_| "https://modelswarm.deepflux.space".into());
+
+        let dir = std::path::PathBuf::from(&data_dir);
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let sink = modelswarm_telemetry::FileSink::open(&logs.join("node.jsonl")).unwrap();
+        let telemetry = Telemetry::with_sink(Box::new(sink));
+        let identity = load_or_create_identity(&dir, &telemetry).unwrap();
+
+        let tracker = TrackerClient::new(&tracker_url, std::sync::Arc::new(load_or_create_identity(&dir, &telemetry).unwrap()));
+        // The roster endpoint needs an enrolled session (X-MSP-Session);
+        // prefer the app's persisted session, else enroll on the fly
+        // (production auto-approves devices).
+        if let Ok(token) = std::fs::read_to_string(dir.join("session.token")) {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                tracker.set_session(token);
+            }
+        }
+        if !tracker.has_session() {
+            let start = tracker.device_start().await.unwrap();
+            let device_code = start["deviceCode"].as_str().expect("deviceCode");
+            let mut session = None;
+            for _ in 0..10 {
+                match tracker.device_complete(device_code).await {
+                    Ok(v) => {
+                        session = v["token"].as_str().map(str::to_string);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+                }
+            }
+            tracker.set_session(session.expect("device enrollment completes (auto-approve)"));
+        }
+        let peers = tracker.lookup(&profile, 10).await.unwrap();
+        println!("roster: {} peers for this profile", peers.len());
+        for p in &peers {
+            println!("  peer {} addr {:?} slots {}", p.peer_id, p.addresses, p.free_slots);
+        }
+        // Structural self-exclusion: MSP_EXCLUDE_ADDR is treated as a
+        // substring (any peer advertising it — e.g. our own multiaddr — is
+        // skipped), so the proof always dials the OTHER machine.
+        let candidate = peers
+            .iter()
+            .find(|p| {
+                p.free_slots > 0
+                    && p.addresses.iter().any(|a| {
+                        a.ends_with("quic-v1")
+                            && !a.contains("0.0.0.0")
+                            && (exclude.is_empty() || !a.contains(&exclude))
+                    })
+            })
+            .expect("no other serving peer with a real address on the roster");
+        let addr = candidate
+            .addresses
+            .iter()
+            .find(|a| {
+                a.ends_with("quic-v1")
+                    && !a.contains("0.0.0.0")
+                    && (exclude.is_empty() || !a.contains(&exclude))
+            })
+            .unwrap()
+            .clone();
+        println!("dialing {addr} (peer {}…)", &candidate.peer_id[..16.min(candidate.peer_id.len())]);
+
+        let executor = RemoteExecutor::new(
+            RemotePeer { addr, peer_id: candidate.peer_id.clone() },
+            identity,
+        );
+        let started = std::time::Instant::now();
+        let mut stream = executor
+            .execute(NormalizedRequest {
+                request_id: format!("lan-proof-{}", modelswarm_identity::new_nonce()),
+                profile_id: profile.clone(),
+                capability_token: None,
+                messages: vec![NormalizedMessage {
+                    role: "user".into(),
+                    content: "Say exactly: cross-machine swarm serving works.".into(),
+                }],
+                sampling: modelswarm_gateway::Sampling {
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: 40,
+                    seed: None,
+                },
+                max_tokens: 24,
+                deadline_ms: 60_000,
+                stream: true,
+            })
+            .await
+            .expect("remote execute starts");
+
+        let mut text = String::new();
+        let mut completion_tokens = 0u32;
+        while let Some(event) = stream.next().await {
+            match event {
+                ExecutorEvent::TokenDelta { delta, .. } => text.push_str(&delta),
+                ExecutorEvent::Usage { completion_tokens: t, .. } => completion_tokens = t,
+                ExecutorEvent::Completed { finish_reason } => {
+                    println!("finish: {finish_reason:?}");
+                    break;
+                }
+                ExecutorEvent::Error { code, .. } => panic!("stream error: {code}"),
+                ExecutorEvent::Accepted { .. } => {}
+            }
+        }
+        let secs = started.elapsed().as_secs_f64();
+        println!("REMOTE REPLY ({completion_tokens} tokens, {secs:.1}s): {text}");
+        assert!(!text.trim().is_empty(), "remote peer must produce tokens");
+    }
+}

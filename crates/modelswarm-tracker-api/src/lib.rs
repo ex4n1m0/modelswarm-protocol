@@ -337,7 +337,13 @@ impl TrackerClient {
     ) -> Result<serde_json::Value, TrackerError> {
         let mut req = self.http.get(format!("{}{path}", self.base));
         if let Some((method, _p)) = signed {
-            let header = self.build_envelope(method, path, &serde_json::Value::Null)?;
+            // msp-v1 §5 signs `path` = the pathname WITHOUT query string
+            // (the hub verifies against url.pathname); query params ride
+            // unsigned. Found live 2026-10-07: lookup signed the full
+            // path+query and every Rust lookup 401'd with
+            // "envelope signature verification failed".
+            let pathname = path.split('?').next().unwrap_or(path);
+            let header = self.build_envelope(method, pathname, &serde_json::Value::Null)?;
             req = req
                 .header("Authorization", format!("MSP1 {header}"))
                 .header(
@@ -384,10 +390,20 @@ impl TrackerClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<String, TrackerError> {
+        // GET envelopes digest the EMPTY body (the hub's EMPTY_BODY_DIGEST);
+        // serializing Value::Null gave the digest of the literal "null"
+        // string and every signed GET failed with bodyDigest mismatch
+        // (found live 2026-10-07 alongside the query-string path bug).
+        let get_empty = method.eq_ignore_ascii_case("GET");
+        let body_bytes = if get_empty {
+            Vec::new()
+        } else {
+            serde_json::to_vec(body).unwrap_or_default()
+        };
         let body_digest = format!(
             "sha256:{}",
             hex::encode(sha2::Sha256::digest(
-                serde_json::to_vec(body).unwrap_or_default()
+                body_bytes
             ))
         );
         let envelope = SignedEnvelope::sign(

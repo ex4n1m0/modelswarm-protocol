@@ -277,10 +277,15 @@ async fn tracker_client(
         .map_err(|e| format!("telemetry sink: {e}"))?;
     let telemetry = Telemetry::with_sink(Box::new(sink));
     let identity = load_or_create_identity(data_dir, &telemetry).map_err(|e| e.to_string())?;
-    Ok(Arc::new(TrackerClient::new(
-        tracker_url,
-        Arc::new(identity),
-    )))
+    let client = TrackerClient::new(tracker_url, Arc::new(identity));
+    // Reuse the enrolled session (the roster/lookup endpoints require it).
+    if let Ok(token) = std::fs::read_to_string(data_dir.join("session.token")) {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            client.set_session(token);
+        }
+    }
+    Ok(Arc::new(client))
 }
 
 /// Resolves a profile from the verified catalog: by id when given, else the
@@ -938,6 +943,9 @@ async fn set_hosting_inner(
                         Ok(done) => {
                             if let Some(token) = done.get("token").and_then(|v| v.as_str()) {
                                 heartbeat_tracker.set_session(token.to_string());
+                                // Persist so later tracker clients (swarm
+                                // chat roster lookup) reuse the session.
+                                let _ = std::fs::write(&hb_data_dir.join("session.token"), token);
                                 pending_device = None;
                                 *enroll_view.write().await = EnrollmentView {
                                     phase: "enrolled".into(),

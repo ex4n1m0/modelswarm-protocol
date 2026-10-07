@@ -284,3 +284,169 @@ mod tests {
         assert_eq!(finish, "Stop");
     }
 }
+
+/// F1.5 chooser: remote-first with honest local fallback. If a serving
+/// peer is known for the profile, requests go there; ANY pre-first-token
+/// failure (dial, send, retryable error) falls back to the LOCAL
+/// executor — the requester never notices unless the remote was slower.
+/// After the first streamed token, remote failures are surfaced as
+/// honest interrupted errors (ADR-007: no cross-peer retry mid-stream).
+///
+/// v1 policy is deliberately this simple: one remote peer, no EWMA, no
+/// hedging. Live latency measurement (fastest-peer selection) stacks
+/// above this once real WAN numbers exist (phase-f-research, F1.5).
+pub struct FailoverExecutor {
+    remote: RemoteExecutor,
+    local: std::sync::Arc<dyn InferenceExecutor>,
+}
+
+impl FailoverExecutor {
+    pub fn new(remote: RemoteExecutor, local: std::sync::Arc<dyn InferenceExecutor>) -> Self {
+        Self { remote, local }
+    }
+}
+
+#[async_trait::async_trait]
+impl InferenceExecutor for FailoverExecutor {
+    async fn execute(&self, request: NormalizedRequest) -> Result<ExecutorStream, ExecutorError> {
+        match self.remote.execute(request.clone()).await {
+            Ok(stream) => Ok(stream),
+            Err(ExecutorError::Retryable { .. }) => {
+                eprintln!("modelswarm-node: remote peer failed pre-token; falling back to local");
+                self.local.execute(request).await
+            }
+            // Fatal remote errors (bad peer id, transport build) also
+            // degrade to local — the request itself is still servable.
+            Err(ExecutorError::Fatal { code }) => {
+                eprintln!("modelswarm-node: remote executor fatal ({code}); falling back to local");
+                self.local.execute(request).await
+            }
+            Err(ExecutorError::NoPeer) => self.local.execute(request).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+    use crate::serving::serve_sessions;
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedRequest};
+    use modelswarm_identity::InstallationIdentity;
+    use modelswarm_transport::libp2p_backend::Libp2pTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn request(profile: &str) -> NormalizedRequest {
+        NormalizedRequest {
+            request_id: "req-fo".into(),
+            profile_id: profile.into(),
+            capability_token: None,
+            messages: vec![modelswarm_gateway::NormalizedMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            sampling: modelswarm_gateway::Sampling {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 40,
+                seed: None,
+            },
+            max_tokens: 8,
+            deadline_ms: 10_000,
+            stream: true,
+        }
+    }
+
+    struct CountingExecutor {
+        label: &'static str,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl modelswarm_gateway::InferenceExecutor for CountingExecutor {
+        async fn execute(
+            &self,
+            _request: NormalizedRequest,
+        ) -> Result<ExecutorStream, ExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                ExecutorEvent::TokenDelta {
+                    delta: self.label.into(),
+                    index: 0,
+                },
+                ExecutorEvent::Completed {
+                    finish_reason: modelswarm_gateway::FinishReason::Stop,
+                },
+            ])))
+        }
+    }
+
+    async fn collect(stream: ExecutorStream) -> String {
+        let mut text = String::new();
+        futures_util::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            if let ExecutorEvent::TokenDelta { delta, .. } = event {
+                text.push_str(&delta);
+            }
+        }
+        text
+    }
+
+    #[tokio::test]
+    async fn remote_up_answers_come_from_the_peer() {
+        let server_identity = InstallationIdentity::from_bytes(&[37u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[38u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let listener = server.listen("127.0.0.1:0").await.unwrap();
+        let peer = RemotePeer {
+            addr: listener.bound_addr().to_string(),
+            peer_id: server.peer_id().to_string(),
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let remote_executor = Arc::new(CountingExecutor {
+            label: "REMOTE",
+            calls: AtomicUsize::new(0),
+        });
+        tokio::spawn(serve_sessions(
+            listener,
+            remote_executor.clone(),
+            "msp1:fo".into(),
+            rx,
+        ));
+
+        let local = Arc::new(CountingExecutor {
+            label: "LOCAL",
+            calls: AtomicUsize::new(0),
+        });
+        let fo = FailoverExecutor::new(RemoteExecutor::new(peer, client_identity), local.clone());
+
+        let text = collect(fo.execute(request("msp1:fo")).await.unwrap()).await;
+        assert_eq!(text, "REMOTE");
+        assert_eq!(
+            local.calls.load(Ordering::SeqCst),
+            0,
+            "local untouched when remote is up"
+        );
+        assert_eq!(remote_executor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_down_falls_back_to_local_honestly() {
+        // No listener at that address: the dial must fail and the local
+        // executor answers instead.
+        let client_identity = InstallationIdentity::from_bytes(&[39u8; 32]);
+        let peer = RemotePeer {
+            addr: "/ip4/127.0.0.1/udp/9/udt".into(), // nothing listens here
+            peer_id: "12D3KooWExamplePeerIdThatIsValidBase58ForTheParseCheck1111111111111".into(),
+        };
+        let local = Arc::new(CountingExecutor {
+            label: "LOCAL",
+            calls: AtomicUsize::new(0),
+        });
+        let fo = FailoverExecutor::new(RemoteExecutor::new(peer, client_identity), local.clone());
+        let text = collect(fo.execute(request("msp1:fo")).await.unwrap()).await;
+        assert_eq!(text, "LOCAL");
+        assert_eq!(local.calls.load(Ordering::SeqCst), 1);
+    }
+}

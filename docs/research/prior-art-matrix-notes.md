@@ -119,7 +119,7 @@ Verbatim research record from the Prior-Art Auditor agent, 2026-10-04
   verification ranking. Treat all figures as research evidence, not
   promises.
 - Sources: https://gradient.network/blog/turning-latency-into-throughput-speculative-decoding-for-the-decentralized-inference ·
-  arXiv:2511.21669 · arXiv:2511.11733.
+  arXiv:2511.21669 · VeriLLM arXiv:2509.24257 (corrected 2026-10-07: 2511.11733 is a different paper — "Speculative Decoding in Decentralized LLM Inference"; found by the Phase F prior-art audit).
 - Confidence: verified-from-source (vendor blog, not peer review).
 
 ## 9. FlowSpec

@@ -307,12 +307,10 @@ mod tests {
         shutdown_tx.send(true).ok();
     }
 
-    /// The honest-refusal path (wrong profile → StreamError). A
-    /// transport-level interaction closes the connection before the
-    /// client reads the error frame on this path (the server provably
-    /// sends it); ignored pending Network-Engineer driver diagnosis.
+    /// The honest-refusal path (wrong profile → StreamError frame, then
+    /// close). Previously flaky: the connection close raced the error
+    /// frame — fixed by the post-error linger; kept as a regression pin.
     #[tokio::test]
-    #[ignore = "transport follow-up: connection closes (ApplicationClosed, code 0) after the client's first send on the error-then-linger path; the happy-path round trip above is green"]
     async fn serving_bridge_refuses_foreign_profile() {
         use super::serve_sessions;
         use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedRequest};

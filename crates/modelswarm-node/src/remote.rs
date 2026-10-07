@@ -454,10 +454,13 @@ mod failover_tests {
 #[cfg(test)]
 mod lan_proof {
     use super::*;
-    use futures_util::StreamExt;
-    use modelswarm_gateway::{ExecutorEvent, InferenceExecutor, NormalizedMessage, NormalizedRequest};
     use crate::load_or_create_identity;
-use modelswarm_tracker_api::TrackerClient;    use modelswarm_telemetry::Telemetry;
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{
+        ExecutorEvent, InferenceExecutor, NormalizedMessage, NormalizedRequest,
+    };
+    use modelswarm_telemetry::Telemetry;
+    use modelswarm_tracker_api::TrackerClient;
     use std::time::Duration;
 
     /// F0(5)/F1 LAN CROSS-MACHINE PROOF (ignored; env-gated):
@@ -472,8 +475,8 @@ use modelswarm_tracker_api::TrackerClient;    use modelswarm_telemetry::Telemetr
         let profile = std::env::var("MSP_LAN_PROFILE").expect("MSP_LAN_PROFILE");
         let data_dir = std::env::var("MSP_DATA_DIR").expect("MSP_DATA_DIR");
         let exclude = std::env::var("MSP_EXCLUDE_ADDR").unwrap_or_default();
-        let tracker_url =
-            std::env::var("MSP_TRACKER").unwrap_or_else(|_| "https://modelswarm.deepflux.space".into());
+        let tracker_url = std::env::var("MSP_TRACKER")
+            .unwrap_or_else(|_| "https://modelswarm.deepflux.space".into());
 
         let dir = std::path::PathBuf::from(&data_dir);
         let logs = dir.join("logs");
@@ -482,7 +485,10 @@ use modelswarm_tracker_api::TrackerClient;    use modelswarm_telemetry::Telemetr
         let telemetry = Telemetry::with_sink(Box::new(sink));
         let identity = load_or_create_identity(&dir, &telemetry).unwrap();
 
-        let tracker = TrackerClient::new(&tracker_url, std::sync::Arc::new(load_or_create_identity(&dir, &telemetry).unwrap()));
+        let tracker = TrackerClient::new(
+            &tracker_url,
+            std::sync::Arc::new(load_or_create_identity(&dir, &telemetry).unwrap()),
+        );
         // The roster endpoint needs an enrolled session (X-MSP-Session);
         // prefer the app's persisted session, else enroll on the fly
         // (production auto-approves devices).
@@ -510,7 +516,10 @@ use modelswarm_tracker_api::TrackerClient;    use modelswarm_telemetry::Telemetr
         let peers = tracker.lookup(&profile, 10).await.unwrap();
         println!("roster: {} peers for this profile", peers.len());
         for p in &peers {
-            println!("  peer {} addr {:?} slots {}", p.peer_id, p.addresses, p.free_slots);
+            println!(
+                "  peer {} addr {:?} slots {}",
+                p.peer_id, p.addresses, p.free_slots
+            );
         }
         // Structural self-exclusion: MSP_EXCLUDE_ADDR is treated as a
         // substring (any peer advertising it — e.g. our own multiaddr — is
@@ -536,10 +545,16 @@ use modelswarm_tracker_api::TrackerClient;    use modelswarm_telemetry::Telemetr
             })
             .unwrap()
             .clone();
-        println!("dialing {addr} (peer {}…)", &candidate.peer_id[..16.min(candidate.peer_id.len())]);
+        println!(
+            "dialing {addr} (peer {}…)",
+            &candidate.peer_id[..16.min(candidate.peer_id.len())]
+        );
 
         let executor = RemoteExecutor::new(
-            RemotePeer { addr, peer_id: candidate.peer_id.clone() },
+            RemotePeer {
+                addr,
+                peer_id: candidate.peer_id.clone(),
+            },
             identity,
         );
         let started = std::time::Instant::now();
@@ -570,7 +585,10 @@ use modelswarm_tracker_api::TrackerClient;    use modelswarm_telemetry::Telemetr
         while let Some(event) = stream.next().await {
             match event {
                 ExecutorEvent::TokenDelta { delta, .. } => text.push_str(&delta),
-                ExecutorEvent::Usage { completion_tokens: t, .. } => completion_tokens = t,
+                ExecutorEvent::Usage {
+                    completion_tokens: t,
+                    ..
+                } => completion_tokens = t,
                 ExecutorEvent::Completed { finish_reason } => {
                     println!("finish: {finish_reason:?}");
                     break;

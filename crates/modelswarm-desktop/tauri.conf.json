@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "ModelSwarm 0.2.17 \u2014 INTERNAL TEST (UNSIGNED)",
+        "title": "ModelSwarm 0.2.19 \u2014 INTERNAL TEST (UNSIGNED)",
         "label": "main",
         "width": 1152,
         "height": 648,

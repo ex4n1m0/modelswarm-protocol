@@ -21,7 +21,9 @@ tauri-shell = [
     "dep:modelswarm-tracker-api",
     "dep:modelswarm-store",
     "dep:modelswarm-gateway",
+    "dep:modelswarm-identity",
     "dep:modelswarm-telemetry",
+    "dep:futures-util",
     "dep:tokio",
     "dep:reqwest",
     "dep:serde",
@@ -40,11 +42,13 @@ modelswarm-node = { path = "../modelswarm-node", optional = true, features = ["l
 modelswarm-tracker-api = { path = "../modelswarm-tracker-api", optional = true }
 modelswarm-store = { path = "../modelswarm-store", optional = true }
 modelswarm-gateway = { path = "../modelswarm-gateway", optional = true }
+modelswarm-identity = { path = "../modelswarm-identity", optional = true }
 modelswarm-telemetry = { path = "../modelswarm-telemetry", optional = true }
 tokio = { version = "1", optional = true, features = ["macros", "rt", "sync", "time"] }
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 
 [build-dependencies]
 tauri-build = { version = "2", optional = true, default-features = false , features = [] }

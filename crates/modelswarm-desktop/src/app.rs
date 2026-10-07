@@ -1227,19 +1227,151 @@ async fn lookup_peers(
         .collect())
 }
 
+/// F1(3): swarm-first chat. Finds a peer verifiably hosting this exact
+/// profile with a REAL advertised address (not the no-listener
+/// placeholder, not ourselves), and if one exists, drives the
+/// FailoverExecutor (remote peer first, this node's local executor as
+/// honest fallback). Returns None when no remote peer is known or the
+/// whole path errored pre-token — the caller's local gateway path then
+/// serves identically.
+#[allow(clippy::too_many_arguments)]
+async fn try_swarm_chat(
+    tracker_url: &str,
+    data_dir: &std::path::Path,
+    profile: &str,
+    local_executor: std::sync::Arc<dyn modelswarm_gateway::InferenceExecutor>,
+    log: &[ChatTurn],
+    max_tokens: Option<u32>,
+) -> Option<serde_json::Value> {
+    let tracker = tracker_client(tracker_url, data_dir).await.ok()?;
+    let peers = tracker.lookup(profile, 10).await.ok()?;
+    let logs_dir = data_dir.join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let sink = modelswarm_telemetry::FileSink::open(&logs_dir.join("node.jsonl")).ok()?;
+    let telemetry = Telemetry::with_sink(Box::new(sink));
+    let identity = load_or_create_identity(data_dir, &telemetry).ok()?;
+    let own_peer_id = identity.peer_id();
+
+    // First peer with a real QUIC multiaddr that is not us.
+    let candidate = peers.into_iter().find(|p| {
+        p.peer_id != own_peer_id
+            && p.free_slots > 0
+            && p.addresses
+                .iter()
+                .any(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))
+    })?;
+    let addr = candidate
+        .addresses
+        .iter()
+        .find(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))?
+        .clone();
+    let peer = modelswarm_node::remote::RemotePeer {
+        addr,
+        peer_id: candidate.peer_id,
+    };
+    telemetry.info(
+        "chat.swarm",
+        &[
+            ("peer", peer.peer_id.as_str()),
+            ("addr", peer.addr.as_str()),
+        ],
+    );
+
+    let request = modelswarm_gateway::NormalizedRequest {
+        request_id: format!("chat-{}", modelswarm_identity::new_nonce()),
+        profile_id: profile.to_string(),
+        capability_token: None,
+        messages: log
+            .iter()
+            .map(|t| modelswarm_gateway::NormalizedMessage {
+                role: t.role.clone(),
+                content: t.content.clone(),
+            })
+            .collect(),
+        sampling: modelswarm_gateway::Sampling {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 40,
+            seed: None,
+        },
+        max_tokens: max_tokens.unwrap_or(256),
+        deadline_ms: 120_000,
+        stream: true,
+    };
+
+    let failover = modelswarm_node::remote::FailoverExecutor::new(
+        modelswarm_node::remote::RemoteExecutor::new(peer, identity),
+        local_executor,
+    );
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{ExecutorEvent, InferenceExecutor};
+    let mut events = match failover.execute(request).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            telemetry.warn("chat.swarm.error", &[("error", &e.to_string())]);
+            return None;
+        }
+    };
+    let started = Instant::now();
+    let mut content = String::new();
+    let mut completion_tokens = 0u64;
+    let mut completed = false;
+    while let Some(event) = events.next().await {
+        match event {
+            ExecutorEvent::TokenDelta { delta, .. } => content.push_str(&delta),
+            ExecutorEvent::Usage {
+                completion_tokens: t,
+                ..
+            } => completion_tokens = u64::from(t),
+            ExecutorEvent::Completed { .. } => {
+                completed = true;
+                break;
+            }
+            ExecutorEvent::Error { code, .. } => {
+                telemetry.warn("chat.swarm.error", &[("code", code.as_str())]);
+                return None;
+            }
+            ExecutorEvent::Accepted { .. } => {}
+        }
+    }
+    if !completed || content.trim().is_empty() {
+        return None;
+    }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let tok_s = if elapsed_ms > 0 && completion_tokens > 0 {
+        (completion_tokens as f64) * 1000.0 / elapsed_ms as f64
+    } else {
+        0.0
+    };
+    Some(serde_json::json!({
+        "content": content.trim(),
+        "completion_tokens": completion_tokens,
+        "elapsed_ms": elapsed_ms,
+        "tokens_per_second": tok_s,
+        "mode": "swarm — served by a remote peer (local fallback)",
+    }))
+}
+
 #[tauri::command]
 async fn send_chat(
     state: tauri::State<'_, DesktopState>,
     message: String,
     max_tokens: Option<u32>,
 ) -> Result<serde_json::Value, String> {
-    let (gateway, profile, mut log) = {
+    let (gateway, profile, mut log, node_ctx) = {
         let inner = state.inner.lock().await;
         let running = inner.node.as_ref().ok_or("hosting is off")?;
+        // F1(3): swarm context for the remote-first chat path.
+        let ctx = running
+            .handle
+            .executor
+            .clone()
+            .map(|executor| (executor, running.handle.profile_id.clone()));
         (
             running.handle.local_addr.to_string(),
             inner.profile_id.clone().ok_or("no profile selected")?,
             inner.chat_log.clone(),
+            ctx,
         )
     };
 
@@ -1254,6 +1386,35 @@ async fn send_chat(
         let drop = log.len() - 20;
         log.drain(0..drop);
     }
+
+    // F1(3): SWARM FIRST — if another peer is verifiably hosting this
+    // exact profile with a real address, ask it before this machine's
+    // local engine; FailoverExecutor degrades to the local executor on
+    // any pre-token failure (honest fallback, logged). Returns None when
+    // no remote peer is known — the local gateway path continues.
+    if let Some((executor, Some(hosted_profile))) = &node_ctx {
+        if hosted_profile == &profile {
+            let (tracker_url, data_dir) = {
+                let inner = state.inner.lock().await;
+                (inner.tracker_url.clone(), inner.data_dir.clone())
+            };
+            if let Some(reply) = try_swarm_chat(
+                &tracker_url,
+                &data_dir,
+                &profile,
+                executor.clone(),
+                &log,
+                max_tokens,
+            )
+            .await
+            {
+                let mut inner = state.inner.lock().await;
+                inner.chat_log = log;
+                return Ok(reply);
+            }
+        }
+    }
+
     // Plain {role, content} turns — the serving executor applies ChatML
     // exactly once (ADR-025).
     let turns: Vec<serde_json::Value> = log

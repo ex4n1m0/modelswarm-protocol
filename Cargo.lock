@@ -3292,7 +3292,9 @@ dependencies = [
 name = "modelswarm-desktop"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "modelswarm-gateway",
+ "modelswarm-identity",
  "modelswarm-node",
  "modelswarm-store",
  "modelswarm-telemetry",

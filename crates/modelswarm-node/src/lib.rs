@@ -51,6 +51,8 @@ pub mod artifact;
 pub mod catalog;
 pub mod engine;
 mod executor;
+#[cfg(feature = "libp2p-backend")]
+pub mod serving;
 
 #[cfg(any(test, feature = "node-selftest"))]
 pub mod selftest;
@@ -330,7 +332,7 @@ impl Node {
             }])),
             None => Arc::new(StaticProfiles::new(Vec::new())),
         };
-        let state = GatewayState::new(executor, profiles);
+        let state = GatewayState::new(executor.clone(), profiles);
 
         // Loopback bind — structural, re-asserted (tested).
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.gateway_port);
@@ -338,7 +340,8 @@ impl Node {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
 
-        let mut shutdown_rx = shutdown;
+        let mut shutdown_rx = shutdown.clone();
+        let handle_shutdown_rx = shutdown_rx.clone();
         let server_telemetry = Arc::clone(&telemetry);
         let server = tokio::spawn(async move {
             let app = build_router(state);
@@ -381,6 +384,8 @@ impl Node {
             tracker,
             engine_port: engine.as_ref().map(|e| e.port),
             engine_backend: engine.as_ref().map(|e| e.backend.clone()),
+            executor: Some(executor),
+            shutdown_rx: handle_shutdown_rx,
             server,
         })
     }
@@ -404,6 +409,11 @@ pub struct NodeHandle {
     pub tracker: Option<Arc<TrackerClient>>,
     /// The supervised engine's loopback port, when one was started.
     pub engine_port: Option<u16>,
+    /// The serving executor (F0(3)): lets the desktop attach the P2P
+    /// serving bridge to the SAME executor the local gateway uses.
+    pub executor: Option<Arc<dyn modelswarm_gateway::InferenceExecutor>>,
+    /// Cloned shutdown receiver: attachées (P2P serving) die with the node.
+    pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
     /// The backend the engine actually serves on ("cpu" or a GPU variant
     /// name, ADR-024); `None` when no engine was started.
     pub engine_backend: Option<String>,

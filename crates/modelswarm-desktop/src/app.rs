@@ -213,7 +213,9 @@ fn log_event(data_dir: &std::path::Path, level: &str, event: &str, fields: &[(&s
 /// the driver, so it lives until process end (or hosting stop kills the
 /// node; the listener itself is connectionless until the serving bridge
 /// lands in F0(3)). None = not opted in or bind failed (log both).
-async fn bind_serving_listener(data_dir: &std::path::Path) -> Option<String> {
+async fn bind_serving_listener(
+    data_dir: &std::path::Path,
+) -> Option<(modelswarm_transport::libp2p_backend::Libp2pListener, String)> {
     if std::env::var("MSP_LISTENER").as_deref() != Ok("1") {
         return None;
     }
@@ -259,11 +261,7 @@ async fn bind_serving_listener(data_dir: &std::path::Path) -> Option<String> {
         .to_string()
         .replace("/0.0.0.0/", &format!("/{lan_ip}/"));
     log_event(data_dir, "info", "listener.bound", &[("addr", &addr)]);
-    tokio::spawn(async move {
-        let _held = listener;
-        std::future::pending::<()>().await;
-    });
-    Some(addr)
+    Some((listener, addr))
 }
 
 async fn tracker_client(
@@ -879,6 +877,25 @@ async fn set_hosting_inner(
         }
     };
 
+    // F0(3): attach the P2P serving bridge to the node's executor. The
+    // bridge dies with the node via the shared shutdown watch; the
+    // advertised multiaddr is the listener's real bound address.
+    let mut advertised_addr: Option<String> = None;
+    if let Some((listener, addr)) = bind_serving_listener(&inner.data_dir).await {
+        if let (Some(executor), Some(profile)) =
+            (handle.executor.clone(), handle.profile_id.clone())
+        {
+            advertised_addr = Some(addr);
+            let serving_shutdown = handle.shutdown_rx.clone();
+            tokio::spawn(modelswarm_node::serving::serve_sessions(
+                listener,
+                executor,
+                profile,
+                serving_shutdown,
+            ));
+        }
+    }
+
     // Roster heartbeat: device-enroll (approval gated) → session →
     // register + heartbeat so exact-profile peers see this machine (with
     // the honest no-listener address until transport lands).
@@ -886,7 +903,6 @@ async fn set_hosting_inner(
     // peerId is derived inside the heartbeat task (ADR-020); the
     // installation_id stays a UI label.
     let profile_id = listing.profile_id.clone();
-    let advertised_addr = bind_serving_listener(&inner.data_dir).await;
     let build = listing.manifest.runtime().build_hash().to_string();
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
     let hb_data_dir = inner.data_dir.clone();

@@ -3367,6 +3367,7 @@ dependencies = [
  "modelswarm-store",
  "modelswarm-telemetry",
  "modelswarm-tracker-api",
+ "modelswarm-transport",
  "modelswarm-types",
  "modelswarm-winjob",
  "reqwest 0.12.28",

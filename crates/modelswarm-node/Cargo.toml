@@ -8,6 +8,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
+# F0(3): P2P serving bridge (libp2p listener -> executor).
+libp2p-backend = ["dep:modelswarm-transport"]
 # Self-test path (ADR-019): turns on the TEST-ONLY mock runtime and the
 # `self-test` CLI subcommand. OFF by default — production node builds never
 # enable the mock runtime. `cargo test -p modelswarm-node` gets the same
@@ -19,6 +21,7 @@ node-selftest = ["modelswarm-runtime/mock-runtime"]
 modelswarm-winjob = { path = "../modelswarm-winjob" }
 
 [dependencies]
+modelswarm-transport = { path = "../modelswarm-transport", features = ["libp2p-backend"], optional = true }
 async-trait = "0.1"
 axum = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

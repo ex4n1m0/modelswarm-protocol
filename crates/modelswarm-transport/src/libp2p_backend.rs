@@ -203,7 +203,12 @@ impl Libp2pTransport {
         let addr: std::net::SocketAddr = bind
             .parse()
             .map_err(|e| TransportError::Io(invalid_data("invalid bind address", e)))?;
-        if !addr.ip().is_loopback() {
+        // ADR-018 honesty guard: the listener stays loopback-only unless the
+        // operator explicitly opts in for Phase F0 friendly-network testing.
+        // `MSP_LISTENER=1` is a per-machine decision, logged by the caller;
+        // the flag never changes what addresses are ADVERTISED (that is the
+        // heartbeat's honest multiaddr, updated separately).
+        if !addr.ip().is_loopback() && std::env::var("MSP_LISTENER").as_deref() != Ok("1") {
             return Err(TransportError::NonLoopbackDenied);
         }
         let ip = addr.ip();

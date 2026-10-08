@@ -201,6 +201,10 @@ out of scope. Details: `docs/privacy.md`.
 
 ## 14. Phase map
 
+> Historical (original 0-7 plan). The executed phases are A-G per
+> ADR-015's supersession map, plus H (real-model Windows client), I
+> (follow-ups), and F0-F3 (P2P serving) — see `docs/verification/`.
+
 | Phase | Scope |
 |---|---|
 | 0 | This document, ADRs, protocol draft, schemas, skeletons, CI, risk register |

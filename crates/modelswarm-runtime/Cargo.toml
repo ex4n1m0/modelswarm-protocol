@@ -18,7 +18,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "time"] }
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# 0.12 to match the workspace (two HTTP stacks compiled into the node
+# binary otherwise; unified 2026-10-08).
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 sha2 = "0.10"
 modelswarm-types = { path = "../modelswarm-types" }
 

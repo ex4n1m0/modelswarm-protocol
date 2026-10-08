@@ -3,10 +3,14 @@ name: rust
 on:
   push:
     branches: [main]
-    paths: ["crates/**", "apps/**", "Cargo.toml", "rust-toolchain.toml", ".github/workflows/rust.yml"]
+    paths: ["crates/**", "apps/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "protocol/**", "catalog/**", "runtime-pins.json", ".github/workflows/rust.yml"]
   pull_request:
-    paths: ["crates/**", "apps/**", "Cargo.toml", "rust-toolchain.toml", ".github/workflows/rust.yml"]
+    paths: ["crates/**", "apps/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "protocol/**", "catalog/**", "runtime-pins.json", ".github/workflows/rust.yml"]
   workflow_dispatch:
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,9 +18,12 @@ env:
 jobs:
   check:
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Matches rust-toolchain.toml's exact pin (a floating stable let a
+      # clippy lint promotion break main between local runs and CI).
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -26,3 +33,49 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
+      # The serving bridge, lease gate (ADR-026), and RemoteExecutor live
+      # behind this feature — without this step the enforcement point and
+      # the whole P2P path ship uncompiled and untested (that is exactly
+      # how the 2026-10-08 lease interop break went unnoticed).
+      - name: Clippy (libp2p-backend feature)
+        run: cargo clippy --workspace --all-targets --features modelswarm-node/libp2p-backend -- -D warnings
+      - name: Tests (libp2p-backend feature)
+        run: cargo test --workspace --features modelswarm-node/libp2p-backend
+      # Desktop chat orchestration (send_chat/try_swarm_chat/earn_lease)
+      # compiles only with tauri-shell; the stub build runs zero of it.
+      - name: Desktop tests (tauri-shell feature)
+        run: cargo test -p modelswarm-desktop --features tauri-shell
+
+  # Release hygiene guards: the product version is single-sourced in the
+  # workspace Cargo.toml (tauri.conf.json must NOT carry its own), and no
+  # binary artifact may ever be committed (installers ship via the
+  # gitignored downloads dir only).
+  guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: No binaries are committed
+        run: |
+          if git ls-files | grep -E '\.(exe|dll|gguf|deb|AppImage|dmg|msi|zip|7z|bin)$'; then
+            echo "::error::binary artifacts must never be committed (installers ship via gitignored downloads)"
+            exit 1
+          fi
+      - name: Version is single-sourced
+        run: |
+          if jq -e 'has("version")' crates/modelswarm-desktop/tauri.conf.json; then
+            echo "::error::tauri.conf.json must not set version — it single-sources from workspace Cargo.toml (Tauri falls back to the package version)"
+            exit 1
+          fi
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::workspace version not a plain semver: $VERSION"
+            exit 1
+          fi
+          echo "workspace version: $VERSION"
+          # The site's download filenames must match the product version
+          # (a drift here 404s every download button).
+          if ! grep -q "ModelSwarm-Setup-$VERSION-windows-x64.exe" apps/tracker/app/page.tsx; then
+            echo "::error::apps/tracker/app/page.tsx download filenames do not match version $VERSION"
+            exit 1
+          fi

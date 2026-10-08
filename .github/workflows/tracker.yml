@@ -3,9 +3,9 @@ name: tracker
 on:
   push:
     branches: [main]
-    paths: ["apps/tracker/**", "protocol/vectors/**", "catalog/schema-v2.json", ".github/workflows/tracker.yml"]
+    paths: ["apps/tracker/**", "protocol/vectors/**", "catalog/**", "crates/modelswarm-tracker-api/**", "crates/modelswarm-identity/**", "crates/modelswarm-eligibility/**", "crates/modelswarm-node/tests/**", "rust-toolchain.toml", ".github/workflows/tracker.yml"]
   pull_request:
-    paths: ["apps/tracker/**", "protocol/vectors/**", "catalog/schema-v2.json", ".github/workflows/tracker.yml"]
+    paths: ["apps/tracker/**", "protocol/vectors/**", "catalog/**", "crates/modelswarm-tracker-api/**", "crates/modelswarm-identity/**", "crates/modelswarm-eligibility/**", "crates/modelswarm-node/tests/**", "rust-toolchain.toml", ".github/workflows/tracker.yml"]
 
 defaults:
   run:
@@ -61,3 +61,86 @@ jobs:
       - run: npm test
       - name: Migration is a no-op on second run (A1)
         run: npm run db:migrate
+
+  # Rust client ↔ TS tracker wire compatibility (the structural fix for
+  # the shipped wire-bug class: envelope casing, query-string signing,
+  # null-body GET digest, and the 2026-10-08 lease-issuance break all
+  # passed both sides' green suites because neither side ever talked to
+  # the other). Runs the ignored live_tracker harness against a REAL
+  # locally-started tracker over a real Postgres — every signed route the
+  # desktop uses, including the full challenge→lease→gate chain.
+  wire-compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: msp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/msp_test
+      # Deterministic local signing key (never the production secret): its
+      # public half is pinned in the golden vector lease-hubkey-1.json and
+      # passed to the harness below.
+      MSP_HUB_SEED: "0707070707070707070707070707070707070707070707070707070707070707"
+      ADMIN_TOKEN: ci-admin-token
+      DEVICE_AUTO_APPROVE: "1"
+      PORT: "3010"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/tracker/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: npm run db:migrate
+      - run: npm run build
+      - name: Start the tracker
+        run: |
+          nohup npx next start -p 3010 > /tmp/tracker.log 2>&1 &
+          curl --retry 30 --retry-delay 2 --retry-connrefused -sf http://127.0.0.1:3010/api/v1/health
+      - name: Seed one active profile (candidate → promote)
+        run: |
+          PROFILE_ID=$(node -e '
+            const fs = require("node:fs");
+            const doc = JSON.parse(fs.readFileSync("../../catalog/candidate-profiles/msp1_948d898a6ace88592f19b8e02ccd776f3e09be1049e0809454ebe4ee2f1acc2f.json", "utf8"));
+            (async () => {
+              const res = await fetch("http://127.0.0.1:3010/api/v1/admin/catalog/candidates", {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-msp-admin": "ci-admin-token" },
+                body: JSON.stringify({
+                  manifest: doc.manifest,
+                  display_name: doc.display_name,
+                  provenance: doc.provenance,
+                }),
+              });
+              const body = await res.json();
+              if (!res.ok) throw new Error("candidates: " + JSON.stringify(body));
+              console.log(body.profileId);
+            })().catch((e) => { console.error(e); process.exit(1); });
+          ')
+          echo "seeded profile: $PROFILE_ID"
+          curl -sf -X POST -H "x-msp-admin: ci-admin-token" -H "content-type: application/json" \
+            -d "{\"profileId\":\"$PROFILE_ID\"}" \
+            http://127.0.0.1:3010/api/v1/admin/catalog/promote
+          echo "PROFILE_ID=$PROFILE_ID" >> "$GITHUB_ENV"
+      - name: Run the Rust wire harness against the live tracker
+        working-directory: .
+        run: |
+          cargo test -p modelswarm-node --features libp2p-backend --test live_tracker -- --ignored --nocapture
+        env:
+          MSP_LIVE: "1"
+          MSP_TRACKER: http://127.0.0.1:3010
+          MSP_LIVE_PROFILE: ${{ env.PROFILE_ID }}
+          MSP_HUB_PUBLIC_KEY_HEX: ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c

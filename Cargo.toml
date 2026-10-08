@@ -21,8 +21,11 @@ members = [
     "apps/modelswarm-sim",
 ]
 
+# Single source of the product version: tauri.conf.json omits its
+# `version` (Tauri falls back to this package version), so desktop,
+# node --version, and the UI all report the same number. Bump HERE only.
 [workspace.package]
-version = "0.1.0"
+version = "0.2.20"
 edition = "2021"
 license = "Proprietary"
 repository = "modelswarm"

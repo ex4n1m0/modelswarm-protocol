@@ -1,6 +1,6 @@
 // Every installer bundles the full pinned inference engine; the model
-// weights download from HuggingFace on first use. v0.2.19: GPU auto-fit
-// + chat-template fix (ADR-025) + force-kill-safe engine; v0.2.19: GPU
+// weights download from HuggingFace on first use. v0.2.20: GPU auto-fit
+// + chat-template fix (ADR-025) + force-kill-safe engine; v0.2.20: GPU
 // compute (Vulkan) — Windows bundles a second pinned engine that offloads
 // to any NVIDIA/AMD/Intel GPU with honest CPU fallback; v0.2.16: one-click model
 // switch + stop (swap keeps the old swarm serving during download);
@@ -8,13 +8,13 @@
 // the app; v0.2.14: zero-click enrollment + registration fixes.
 // Same version on every OS = same build.
 const DOWNLOADS = [
-  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.19-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
-  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.19-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
-  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.19-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
-  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.19-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
+  { os: "Windows x64", file: "ModelSwarm-Setup-0.2.20-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
+  { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.20-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
+  { os: "Linux amd64 (AppImage)", file: "ModelSwarm-0.2.20-linux-amd64.AppImage", note: "chmod +x then run; self-contained except webkit2gtk (in every mainstream distro)." },
+  { os: "macOS Apple Silicon (.dmg)", file: "ModelSwarm-0.2.20-macos-arm64.dmg", note: "Unsigned: right-click → Open the first time, or xattr -cr /Applications/ModelSwarm.app." },
 ];
 const DOWNLOAD = {
-  version: "0.2.19",
+  version: "0.2.20",
   sums: "/downloads/SHA256SUMS.txt",
   sha256: "adfd29dd043f2c686b9125c2734244d634d4a11afed5628e2a1505603a3995f2",
 };

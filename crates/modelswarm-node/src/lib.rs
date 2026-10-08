@@ -52,7 +52,9 @@ pub mod catalog;
 pub mod engine;
 mod executor;
 #[cfg(feature = "libp2p-backend")]
+#[cfg(feature = "libp2p-backend")]
 pub mod remote;
+#[cfg(feature = "libp2p-backend")]
 #[cfg(feature = "libp2p-backend")]
 pub mod serving;
 

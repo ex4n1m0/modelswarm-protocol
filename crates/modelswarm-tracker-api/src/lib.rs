@@ -400,12 +400,7 @@ impl TrackerClient {
         } else {
             serde_json::to_vec(body).unwrap_or_default()
         };
-        let body_digest = format!(
-            "sha256:{}",
-            hex::encode(sha2::Sha256::digest(
-                body_bytes
-            ))
-        );
+        let body_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(body_bytes)));
         let envelope = SignedEnvelope::sign(
             &self.identity,
             method,

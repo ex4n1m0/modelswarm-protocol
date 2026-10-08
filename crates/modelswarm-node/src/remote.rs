@@ -246,7 +246,6 @@ mod tests {
     use modelswarm_identity::InstallationIdentity;
     use modelswarm_transport::libp2p_backend::Libp2pTransport;
     use std::sync::Arc;
-    use std::time::Duration;
 
     /// F1 same-host proof: RemoteExecutor dials a serving peer over real
     /// QUIC and re-emits its frames as gateway executor events — the
@@ -299,6 +298,7 @@ mod tests {
             Arc::new(FixedExecutor),
             crate::serving::lease_helpers::TEST_PROFILE.into(),
             policy,
+            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
             shutdown_rx,
         ));
 
@@ -396,7 +396,6 @@ mod failover_tests {
     use modelswarm_transport::libp2p_backend::Libp2pTransport;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
 
     fn request(profile: &str) -> NormalizedRequest {
         NormalizedRequest {
@@ -480,6 +479,7 @@ mod failover_tests {
             remote_executor.clone(),
             profile.into(),
             policy,
+            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
             rx,
         ));
 
@@ -725,7 +725,7 @@ mod lan_proof {
 #[cfg(test)]
 mod reuse_tests {
     use super::*;
-    use crate::serving::{serve_sessions, LeasePolicy};
+    use crate::serving::serve_sessions;
     use futures_util::StreamExt;
     use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedMessage, NormalizedRequest};
     use modelswarm_identity::InstallationIdentity;
@@ -782,6 +782,7 @@ mod reuse_tests {
             served.clone(),
             profile.into(),
             policy,
+            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
             rx,
         ));
 

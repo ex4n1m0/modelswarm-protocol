@@ -3,21 +3,29 @@
 //!
 //! The listener hands us authenticated sessions (the QUIC handshake
 //! verifies the remote's libp2p PeerId = the ADR-020 derivation). For
-//! each session we read one `InferenceRequest`, drive the node's
+//! each session we read one `InferenceRequest`, check the hub-signed
+//! lease gate (ADR-026, at session open and per request), clamp
+//! requester-supplied limits (msp-v1 §6.4), drive the node's
 //! [`InferenceExecutor`] (the same executor the local gateway uses —
 //! ADR-025 ChatML templating applies), and stream
 //! `TokenDelta`/`Usage`/`Completed` frames back.
 //!
-//! Honest F0 scope: the capability/lease token is NOT yet verified here
-//! (TODO F3 — the tracker-signed lease check lands with hostile
-//! hardening); a session is admitted if it speaks the protocol and asks
-//! for the profile this node serves.
+//! Privacy: peer-supplied frame payloads are never logged or echoed —
+//! diagnostics carry variant names and stable codes only (AGENTS.md
+//! rule 5). Admission control (session cap, per-peer cap, request-id
+//! dedup) is prototype-grade hostile-peer resistance per
+//! docs/threat-model.md §4.2.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use modelswarm_gateway::{ExecutorEvent, InferenceExecutor, NormalizedMessage, NormalizedRequest};
+use modelswarm_gateway::{
+    ExecutorEvent, InferenceExecutor, NormalizedMessage, NormalizedRequest, DEADLINE_MS_MAX,
+    DEADLINE_MS_MIN, DEFAULT_MAX_OUTPUT_TOKENS, MAX_PROMPT_BYTES,
+};
+use modelswarm_telemetry::Telemetry;
 use modelswarm_transport::libp2p_backend::{Libp2pListener, Libp2pSession};
 use modelswarm_transport::message::{
     ChatMessage, Completed, StreamError, TokenDelta, Usage, WireMessage,
@@ -27,14 +35,16 @@ const IO_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Serves accepted sessions until `shutdown` flips to true. Never panics
 /// on a bad session: malformed input becomes a `StreamError` frame, then
-/// the session closes (one request per session in F0).
+/// the session closes.
 pub async fn serve_sessions(
     mut listener: Libp2pListener,
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: LeasePolicy,
+    telemetry: Arc<Telemetry>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let admission = Admission::defaults();
     loop {
         let session = tokio::select! {
             // watch::changed() fires immediately for the unseen INITIAL
@@ -50,14 +60,181 @@ pub async fn serve_sessions(
                 Err(_) => continue, // timeout/accept miss: keep serving
             },
         };
+        let peer_id = session.remote_peer_id().to_string();
         let executor = Arc::clone(&executor);
         let profile = profile_id.clone();
         let policy = lease_policy.clone();
+        let session_admission = admission.clone();
+        let session_telemetry = Arc::clone(&telemetry);
         tokio::spawn(async move {
-            if let Err(e) = serve_one(session, executor, profile, &policy).await {
-                eprintln!("modelswarm-node: serving session ended: {e}");
+            let _session_slot = match session_admission.admit_session(&peer_id) {
+                Ok(guard) => guard,
+                Err(reason) => {
+                    session_telemetry
+                        .warn("serving.refused", &[("peer", &peer_id), ("reason", reason)]);
+                    let mut session = session;
+                    send_error(&mut session, "over_limit", reason).await;
+                    return;
+                }
+            };
+            if let Err(code) = serve_one(
+                session,
+                executor,
+                profile,
+                &policy,
+                &session_admission,
+                &session_telemetry,
+            )
+            .await
+            {
+                // `code` is a stable reason code by construction — never
+                // peer-supplied payload text.
+                session_telemetry.warn("serving.session_ended", &[("code", code.as_str())]);
             }
         });
+    }
+}
+
+/// Wire-request limits (msp-v1 §6.4): the serving peer clamps
+/// requester-supplied values exactly like the local gateway does, so a
+/// lease-holder cannot pin the engine with a 49-day deadline or an
+/// unbounded token budget. Returns `(deadline_ms, max_tokens)` and a
+/// rejection code when the prompt itself exceeds the byte cap.
+pub(crate) fn clamp_wire_request(
+    deadline_ms: u32,
+    max_tokens: u32,
+    prompt_bytes: usize,
+) -> Result<(u32, u32), &'static str> {
+    if prompt_bytes > MAX_PROMPT_BYTES {
+        return Err("payload_too_large");
+    }
+    let deadline_ms = deadline_ms.clamp(DEADLINE_MS_MIN, DEADLINE_MS_MAX);
+    let max_tokens = max_tokens.clamp(1, DEFAULT_MAX_OUTPUT_TOKENS);
+    Ok((deadline_ms, max_tokens))
+}
+
+/// Variant name only — peer-supplied payloads must never reach logs or
+/// error echoes (privacy rule 5; a hostile peer writes arbitrary text
+/// into Debug output otherwise).
+fn wire_kind(m: &WireMessage) -> &'static str {
+    match m {
+        WireMessage::Handshake(_) => "Handshake",
+        WireMessage::HandshakeAck(_) => "HandshakeAck",
+        WireMessage::InferenceRequest(_) => "InferenceRequest",
+        WireMessage::TokenDelta(_) => "TokenDelta",
+        WireMessage::Usage(_) => "Usage",
+        WireMessage::StreamError(_) => "StreamError",
+        WireMessage::Cancelled(_) => "Cancelled",
+        WireMessage::Completed(_) => "Completed",
+        WireMessage::Cancel(_) => "Cancel",
+        WireMessage::Control(_) => "Control",
+    }
+}
+
+/// Executor error → stable code for the wire and logs (no payload text).
+fn executor_error_code(e: &modelswarm_gateway::ExecutorError) -> String {
+    use modelswarm_gateway::ExecutorError;
+    match e {
+        ExecutorError::NoPeer => "no_peer".into(),
+        ExecutorError::Retryable { .. } => "executor_retryable".into(),
+        ExecutorError::Fatal { code } => code.clone(),
+    }
+}
+
+/// Serving admission control: bounded concurrent sessions, a per-peer
+/// session cap, and a bounded request-id dedup window (threat model
+/// §4.2: a captured request frame must not replay into fresh inference
+/// for the lease's lifetime).
+#[derive(Clone)]
+pub struct Admission {
+    inner: Arc<std::sync::Mutex<AdmissionState>>,
+    max_sessions: usize,
+    max_sessions_per_peer: usize,
+}
+
+struct AdmissionState {
+    sessions: usize,
+    per_peer: HashMap<String, usize>,
+    seen_requests: HashMap<(String, String), Instant>,
+}
+
+/// RAII session slot — releasing on drop keeps the count correct on every
+/// exit path (panic, error return, client vanish).
+pub struct SessionGuard {
+    admission: Admission,
+    peer_id: String,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.admission.release_session(&self.peer_id);
+    }
+}
+
+impl Admission {
+    /// Defaults sized for the prototype swarm: 8 concurrent sessions
+    /// total, 2 per peer.
+    pub fn defaults() -> Self {
+        Self::new(8, 2)
+    }
+
+    pub fn new(max_sessions: usize, max_sessions_per_peer: usize) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(AdmissionState {
+                sessions: 0,
+                per_peer: HashMap::new(),
+                seen_requests: HashMap::new(),
+            })),
+            max_sessions,
+            max_sessions_per_peer,
+        }
+    }
+
+    pub fn admit_session(&self, peer_id: &str) -> Result<SessionGuard, &'static str> {
+        let mut state = self.inner.lock().expect("admission lock");
+        if state.sessions >= self.max_sessions {
+            return Err("session_limit");
+        }
+        if state.per_peer.get(peer_id).copied().unwrap_or(0) >= self.max_sessions_per_peer {
+            return Err("per_peer_session_limit");
+        }
+        state.sessions += 1;
+        *state.per_peer.entry(peer_id.to_string()).or_insert(0) += 1;
+        Ok(SessionGuard {
+            admission: self.clone(),
+            peer_id: peer_id.to_string(),
+        })
+    }
+
+    fn release_session(&self, peer_id: &str) {
+        let mut state = self.inner.lock().expect("admission lock");
+        state.sessions = state.sessions.saturating_sub(1);
+        if let Some(count) = state.per_peer.get_mut(peer_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.per_peer.remove(peer_id);
+            }
+        }
+    }
+
+    /// `true` when `(peer, request_id)` is fresh; `false` = duplicate
+    /// within the replay window (reject as a replay).
+    pub fn check_request_fresh(&self, peer_id: &str, request_id: &str) -> bool {
+        const WINDOW: Duration = Duration::from_secs(600);
+        const HARD_CAP: usize = 8192;
+        let mut state = self.inner.lock().expect("admission lock");
+        if state.seen_requests.len() > HARD_CAP {
+            state.seen_requests.retain(|_, at| at.elapsed() < WINDOW);
+        }
+        let key = (peer_id.to_string(), request_id.to_string());
+        let now = Instant::now();
+        match state.seen_requests.get(&key) {
+            Some(at) if at.elapsed() < WINDOW => false,
+            Some(_) | None => {
+                state.seen_requests.insert(key, now);
+                true
+            }
+        }
     }
 }
 
@@ -66,7 +243,10 @@ async fn serve_one(
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: &LeasePolicy,
+    admission: &Admission,
+    telemetry: &Telemetry,
 ) -> Result<(), String> {
+    let peer_id = session.remote_peer_id().to_string();
     // One QUIC session, many sequential requests (connection reuse): the
     // loop waits for the next request until the client closes. The
     // between-requests wait is generous (chat gaps); a recv error ends
@@ -76,15 +256,23 @@ async fn serve_one(
         let request = match session.recv(BETWEEN_REQUESTS).await {
             Ok(WireMessage::InferenceRequest(r)) => r,
             Ok(other) => {
-                let code = format!("expected InferenceRequest, got {other:?}");
-                send_error(&mut session, "bad_frame", &code).await;
+                // Variant name only — the payload is peer-controlled text.
+                let code = format!("expected InferenceRequest, got {}", wire_kind(&other));
+                send_error(
+                    &mut session,
+                    "bad_frame",
+                    "expected an InferenceRequest frame",
+                )
+                .await;
                 linger(&mut session).await;
                 return Err(code);
             }
             Err(e) => {
-                send_error(&mut session, "bad_frame", &e.to_string()).await;
+                // Transport errors are our own diagnostics text; the peer
+                // sees the code, the log keeps the detail short.
+                send_error(&mut session, "bad_frame", "frame receive failed").await;
                 linger(&mut session).await;
-                return Err(e.to_string());
+                return Err(format!("recv: {e}"));
             }
         };
         if request.profile_id != profile_id {
@@ -98,6 +286,19 @@ async fn serve_one(
             return Err("profile_mismatch".into());
         }
 
+        // Replay protection: a repeated (peer, request_id) is rejected —
+        // each replay would otherwise re-execute inference on the lease.
+        if !admission.check_request_fresh(&peer_id, &request.request_id) {
+            send_error(
+                &mut session,
+                "duplicate_request",
+                "request id already served",
+            )
+            .await;
+            linger(&mut session).await;
+            return Err("duplicate_request".into());
+        }
+
         // F3: the hub-signed lease gate. The remote's PeerId comes from the
         // QUIC handshake, so a lease issued to anyone else is worthless here.
         if let Err(why) = lease_policy.check(
@@ -105,9 +306,38 @@ async fn serve_one(
             &profile_id,
             &session.remote_peer_id().to_string(),
         ) {
-            send_error(&mut session, "invalid_lease", &why).await;
+            send_error(&mut session, "invalid_lease", "lease check failed").await;
             linger(&mut session).await;
             return Err(format!("invalid_lease: {why}"));
+        }
+
+        // §6.4 clamps — wire values are attacker-controlled even with a
+        // valid lease; the local gateway applies the same table.
+        let prompt_bytes: usize = request.messages.iter().map(|m| m.content.len()).sum();
+        let (deadline_ms, max_tokens) =
+            match clamp_wire_request(request.deadline_ms, request.max_tokens, prompt_bytes) {
+                Ok(v) => v,
+                Err(code) => {
+                    send_error(&mut session, code, "prompt exceeds the byte cap").await;
+                    linger(&mut session).await;
+                    return Err(code.into());
+                }
+            };
+        if deadline_ms != request.deadline_ms || max_tokens != request.max_tokens {
+            telemetry.info(
+                "serving.clamped",
+                &[
+                    ("peer", peer_id.as_str()),
+                    (
+                        "deadline_ms",
+                        &format!("{}->{}", request.deadline_ms, deadline_ms),
+                    ),
+                    (
+                        "max_tokens",
+                        &format!("{}->{}", request.max_tokens, max_tokens),
+                    ),
+                ],
+            );
         }
 
         let normalized = NormalizedRequest {
@@ -128,18 +358,18 @@ async fn serve_one(
                 top_k: request.sampling.top_k,
                 seed: request.sampling.seed,
             },
-            max_tokens: request.max_tokens,
-            deadline_ms: request.deadline_ms,
+            max_tokens,
+            deadline_ms,
             stream: true,
         };
 
         let mut events = match executor.execute(normalized).await {
             Ok(stream) => stream,
             Err(e) => {
-                let code = format!("{e:?}");
+                let code = executor_error_code(&e);
                 send_error(&mut session, "executor_error", &code).await;
                 linger(&mut session).await;
-                return Err(code);
+                return Err(format!("executor_error: {code}"));
             }
         };
         while let Some(event) = events.next().await {
@@ -332,6 +562,7 @@ mod tests {
             Arc::new(FixedExecutor),
             super::lease_helpers::TEST_PROFILE.into(),
             policy,
+            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
             shutdown_rx,
         ));
 
@@ -424,6 +655,7 @@ mod tests {
             Arc::new(NeverExecutor),
             super::lease_helpers::TEST_PROFILE.into(),
             super::LeasePolicy::production(),
+            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
             shutdown_rx,
         ));
 
@@ -466,7 +698,6 @@ mod tests {
     #[tokio::test]
     async fn serving_bridge_refuses_leaseless_requests() {
         use super::serve_sessions;
-        use futures_util::stream;
         use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedRequest};
         use modelswarm_identity::InstallationIdentity;
         use modelswarm_transport::libp2p_backend::Libp2pTransport;
@@ -504,6 +735,7 @@ mod tests {
             Arc::new(NeverExecutor),
             super::lease_helpers::TEST_PROFILE.into(),
             policy,
+            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
             rx,
         ));
 
@@ -546,7 +778,6 @@ mod tests {
     #[tokio::test]
     async fn serving_bridge_refuses_foreign_peer_lease() {
         use super::serve_sessions;
-        use futures_util::stream;
         use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedRequest};
         use modelswarm_identity::InstallationIdentity;
         use modelswarm_transport::libp2p_backend::Libp2pTransport;
@@ -588,6 +819,7 @@ mod tests {
             Arc::new(NeverExecutor),
             super::lease_helpers::TEST_PROFILE.into(),
             policy,
+            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
             rx,
         ));
 
@@ -622,7 +854,9 @@ mod tests {
         match session.recv(Duration::from_secs(10)).await.unwrap() {
             WireMessage::StreamError(e) => {
                 assert_eq!(e.code, "invalid_lease");
-                assert!(e.message.contains("not bound"), "got: {}", e.message);
+                // The wire message is static by policy (no lease internals
+                // cross the wire); the specific reason stays in node logs.
+                assert_eq!(e.message, "lease check failed");
             }
             other => panic!("expected StreamError, got {other:?}"),
         }
@@ -639,6 +873,47 @@ mod tests {
             .finish_reason,
             "stop"
         );
+    }
+
+    /// §6.4 clamps on the wire path: a lease-holder sending a 49-day
+    /// deadline or an unbounded token budget gets the same table the
+    /// local gateway applies; an oversized prompt is rejected outright.
+    #[test]
+    fn wire_limits_clamp_like_the_gateway() {
+        use modelswarm_gateway::{
+            DEADLINE_MS_MAX, DEADLINE_MS_MIN, DEFAULT_MAX_OUTPUT_TOKENS, MAX_PROMPT_BYTES,
+        };
+        let (d, t) = super::clamp_wire_request(u32::MAX, u32::MAX, 100).unwrap();
+        assert_eq!(d, DEADLINE_MS_MAX);
+        assert_eq!(t, DEFAULT_MAX_OUTPUT_TOKENS);
+        let (d, t) = super::clamp_wire_request(0, 0, 100).unwrap();
+        assert_eq!(d, DEADLINE_MS_MIN);
+        assert_eq!(t, 1);
+        let (d, t) = super::clamp_wire_request(30_000, 64, 100).unwrap();
+        assert_eq!((d, t), (30_000, 64));
+        assert_eq!(
+            super::clamp_wire_request(30_000, 64, MAX_PROMPT_BYTES + 1),
+            Err("payload_too_large")
+        );
+    }
+
+    #[test]
+    fn admission_caps_sessions_and_replays() {
+        let adm = super::Admission::new(2, 1);
+        let a = adm.admit_session("peer-a").expect("first session admitted");
+        assert!(adm.admit_session("peer-a").is_err(), "per-peer cap");
+        let b = adm.admit_session("peer-b").expect("second peer admitted");
+        assert!(adm.admit_session("peer-c").is_err(), "total cap");
+        drop(a);
+        drop(b);
+        assert!(
+            adm.admit_session("peer-c").is_ok(),
+            "slots released on drop"
+        );
+        // request-id dedup: fresh once, replay rejected, other peer fresh.
+        assert!(adm.check_request_fresh("peer-a", "req-1"));
+        assert!(!adm.check_request_fresh("peer-a", "req-1"));
+        assert!(adm.check_request_fresh("peer-b", "req-1"));
     }
 }
 

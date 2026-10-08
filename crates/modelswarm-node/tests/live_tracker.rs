@@ -108,6 +108,10 @@ async fn signed_flow_enroll_register_heartbeat_lookup() {
     assert!(found, "harness peer visible via lookup");
 
     // 5) Drain the lease so the census is not polluted.
+    // (request_lease requires a passed hosting-challenge first — the
+    // challenge flow times a REAL generation on the requesting peer; see
+    // the lease tests in serving.rs for the wire verification, and
+    // ADR-026 for the full chain.)
     let _ = tracker.drain(&lease_id).await;
     println!("wire harness: enroll/register/heartbeat/lookup/drain ALL verified");
 }

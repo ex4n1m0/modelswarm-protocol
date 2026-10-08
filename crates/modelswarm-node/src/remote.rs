@@ -237,11 +237,20 @@ mod tests {
             addr: listener.bound_addr().to_string(),
             peer_id: server.peer_id().to_string(),
         };
+        let client_peer_id = Libp2pTransport::new(&client_identity)
+            .unwrap()
+            .peer_id()
+            .to_string();
+        let (policy, token) = crate::serving::lease_helpers::policy_and_lease(
+            crate::serving::lease_helpers::TEST_PROFILE,
+            &client_peer_id,
+        );
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(serve_sessions(
             listener,
             Arc::new(FixedExecutor),
-            "msp1:f1-profile".into(),
+            crate::serving::lease_helpers::TEST_PROFILE.into(),
+            policy,
             shutdown_rx,
         ));
 
@@ -249,8 +258,8 @@ mod tests {
         let stream = executor
             .execute(NormalizedRequest {
                 request_id: "req-f1".into(),
-                profile_id: "msp1:f1-profile".into(),
-                capability_token: None,
+                profile_id: crate::serving::lease_helpers::TEST_PROFILE.into(),
+                capability_token: Some(token),
                 messages: vec![modelswarm_gateway::NormalizedMessage {
                     role: "user".into(),
                     content: "hi".into(),
@@ -403,6 +412,13 @@ mod failover_tests {
             addr: listener.bound_addr().to_string(),
             peer_id: server.peer_id().to_string(),
         };
+        let client_peer_id = Libp2pTransport::new(&client_identity)
+            .unwrap()
+            .peer_id()
+            .to_string();
+        let profile = crate::serving::lease_helpers::TEST_PROFILE;
+        let (policy, token) =
+            crate::serving::lease_helpers::policy_and_lease(profile, &client_peer_id);
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let remote_executor = Arc::new(CountingExecutor {
             label: "REMOTE",
@@ -411,7 +427,8 @@ mod failover_tests {
         tokio::spawn(serve_sessions(
             listener,
             remote_executor.clone(),
-            "msp1:fo".into(),
+            profile.into(),
+            policy,
             rx,
         ));
 
@@ -419,9 +436,11 @@ mod failover_tests {
             label: "LOCAL",
             calls: AtomicUsize::new(0),
         });
+        let mut with_lease = request(profile);
+        with_lease.capability_token = Some(token);
         let fo = FailoverExecutor::new(RemoteExecutor::new(peer, client_identity), local.clone());
 
-        let text = collect(fo.execute(request("msp1:fo")).await.unwrap()).await;
+        let text = collect(fo.execute(with_lease).await.unwrap()).await;
         assert_eq!(text, "REMOTE");
         assert_eq!(
             local.calls.load(Ordering::SeqCst),

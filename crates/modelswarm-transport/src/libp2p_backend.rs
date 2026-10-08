@@ -54,7 +54,6 @@ pub use libp2p::PeerId;
 
 pub struct Libp2pSession {
     role: Role,
-    #[allow(dead_code)]
     peer_id: libp2p::PeerId,
 }
 
@@ -75,6 +74,11 @@ enum Role {
 }
 
 impl Libp2pSession {
+    /// The remote's QUIC-authenticated PeerId (lease binding, F3).
+    pub fn remote_peer_id(&self) -> &PeerId {
+        &self.peer_id
+    }
+
     fn new_client(stream: quic::Stream, peer_id: libp2p::PeerId) -> Self {
         Self {
             role: Role::Client { stream },

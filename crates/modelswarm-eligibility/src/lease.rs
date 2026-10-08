@@ -38,6 +38,8 @@ pub enum CapacityClass {
 /// Errors from [`EligibilityLease::verify`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseError {
+    /// The wire form could not be decoded (bad base64url / json / shape).
+    BadWireLease(String),
     /// The detached signature did not verify against the hub key — this
     /// includes any tampering with a signed field (the payload recomputed
     /// from the struct no longer matches the signature).
@@ -62,6 +64,7 @@ pub enum LeaseError {
 impl fmt::Display for LeaseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            LeaseError::BadWireLease(why) => write!(f, "malformed wire lease: {why}"),
             LeaseError::InvalidSignature => write!(f, "lease signature invalid"),
             LeaseError::InvalidProfileId(v) => write!(f, "invalid model profile id: {v:?}"),
             LeaseError::Expired { overdue_secs } => {
@@ -227,6 +230,46 @@ impl EligibilityLease {
         }
 
         Ok(())
+    }
+}
+
+impl EligibilityLease {
+    /// Decodes the transport wire form `base64url(json).base64url(sig)`
+    /// (the tracker's issuance format) and re-attaches the detached
+    /// signature so [`Self::verify`] can check it.
+    pub fn from_wire(wire: &str) -> Result<Self, LeaseError> {
+        let (payload, sig) = wire
+            .split_once('.')
+            .ok_or(LeaseError::BadWireLease("missing '.' separator".into()))?;
+        let decode = |part: &str| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(part)
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(part))
+        };
+        let json =
+            decode(payload).map_err(|e| LeaseError::BadWireLease(format!("payload: {e}")))?;
+        let sig = decode(sig).map_err(|e| LeaseError::BadWireLease(format!("signature: {e}")))?;
+        let mut lease: EligibilityLease = serde_json::from_slice(&json)
+            .map_err(|e| LeaseError::BadWireLease(format!("json: {e}")))?;
+        lease.issuer_signature = BASE64_STANDARD.encode(sig);
+        Ok(lease)
+    }
+
+    /// Encodes the wire form `base64url(json).base64url(sig-bytes)`.
+    /// The signature travels as raw bytes in URL-safe base64 (the issuer
+    /// field's STANDARD alphabet never crosses the wire).
+    pub fn to_wire(&self) -> String {
+        use base64::Engine as _;
+        let json = serde_json::to_vec(self).expect("lease serializes");
+        let sig_bytes = BASE64_STANDARD
+            .decode(&self.issuer_signature)
+            .expect("issuer_signature is standard base64");
+        format!(
+            "{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes)
+        )
     }
 }
 

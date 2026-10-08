@@ -896,6 +896,7 @@ async fn set_hosting_inner(
                 listener,
                 executor,
                 profile,
+                modelswarm_node::serving::LeasePolicy::production(),
                 serving_shutdown,
             ));
         }
@@ -945,7 +946,7 @@ async fn set_hosting_inner(
                                 heartbeat_tracker.set_session(token.to_string());
                                 // Persist so later tracker clients (swarm
                                 // chat roster lookup) reuse the session.
-                                let _ = std::fs::write(&hb_data_dir.join("session.token"), token);
+                                let _ = std::fs::write(hb_data_dir.join("session.token"), token);
                                 pending_device = None;
                                 *enroll_view.write().await = EnrollmentView {
                                     phase: "enrolled".into(),

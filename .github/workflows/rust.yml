@@ -43,7 +43,13 @@ jobs:
         run: cargo test --workspace --features modelswarm-node/libp2p-backend
       # Desktop chat orchestration (send_chat/try_swarm_chat/earn_lease)
       # compiles only with tauri-shell; the stub build runs zero of it.
+      # Clean runners have no staged engine (engines are gitignored; only
+      # the installer workflows stage + hash-verify the real ones), so the
+      # bundle resources glob matches nothing and the build fails — strip
+      # the resources for this test-only build via the TAURI_CONFIG overlay.
       - name: Desktop tests (tauri-shell feature)
+        env:
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
         run: cargo test -p modelswarm-desktop --features tauri-shell
 
   # Release hygiene guards: the product version is single-sourced in the

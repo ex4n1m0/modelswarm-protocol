@@ -29,17 +29,29 @@ export interface TrackerContext {
 }
 
 /** Development-only deterministic seed so local/CI builds can sign catalogs
- *  without secrets. Production sets MSP_HUB_SEED (64 hex chars). */
+ *  without secrets. NEVER valid in production: MSP_HUB_SEED (64 hex chars)
+ *  must be set there — see keysFromEnv. */
 const DEV_SEED_HEX = "9d61b862b05cbaeba8a3b3a5d8f1b1b7a4c1e2f3a5b6c7d8e9f0a1b2c3d4e5f6";
 
 function keysFromEnv(): KeyPair {
   const seedHex = process.env.MSP_HUB_SEED;
-  let seed: Uint8Array;
   if (seedHex && /^[0-9a-f]{64}$/i.test(seedHex)) {
-    seed = new Uint8Array(Buffer.from(seedHex, "hex"));
-  } else {
-    seed = new Uint8Array(Buffer.from(DEV_SEED_HEX, "hex"));
+    const seed = new Uint8Array(Buffer.from(seedHex, "hex"));
+    return { secretKey: seed, publicKey: publicKeyOf(seed) };
   }
+  // Fail closed in production: signing catalogs/leases with the
+  // repo-published dev key would be total protocol compromise (any repo
+  // reader could forge leases). A malformed value is treated the same as
+  // a missing one — never silently downgraded.
+  if (process.env.VERCEL_ENV === "production" || process.env.NODE_ENV === "production") {
+    throw new Error(
+      "MSP_HUB_SEED (64 hex chars) is required in production — refusing to sign with the development key",
+    );
+  }
+  if (seedHex) {
+    console.warn("MSP_HUB_SEED malformed (want 64 hex chars); using the development key");
+  }
+  const seed = new Uint8Array(Buffer.from(DEV_SEED_HEX, "hex"));
   return { secretKey: seed, publicKey: publicKeyOf(seed) };
 }
 

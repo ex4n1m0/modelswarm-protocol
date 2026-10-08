@@ -19,6 +19,12 @@
 import type { Pool } from "pg";
 import { CHALLENGE_PROMPT } from "@/lib/constants";
 
+// Bounded rendezvous mailboxes (store-invariant extension 2026-10-08):
+// rows for peers that never drain are pruned at WRITE time — TTL first,
+// then a per-mailbox cap keeping the most recent items.
+export const RENDEZVOUS_TTL_MS = 24 * 60 * 60 * 1000;
+export const RENDEZVOUS_MAX_PER_MAILBOX = 64;
+
 export type ProfileStatus = "candidate" | "active" | "deprecated";
 export type CapacityClass = "cpu" | "gpu_entry" | "gpu_mid" | "gpu_high";
 export type ChallengeOutcome = "open" | "passed" | "failed";
@@ -735,8 +741,17 @@ export class MemoryStore implements TrackerStore {
   }
 
   async pushRendezvous(item: RendezvousItem & { toPeerId: string }): Promise<void> {
-    const mailbox = this.rendezvous.get(item.toPeerId) ?? [];
+    // Bounded mailboxes: drop items older than the TTL and keep the most
+    // recent RENDEZVOUS_MAX_PER_MAILBOX — an enrolled peer pushing 4 KiB
+    // blobs at a mailbox that never drains must not grow memory unboundedly.
+    const cutoff = item.receivedAt - RENDEZVOUS_TTL_MS;
+    const mailbox = (this.rendezvous.get(item.toPeerId) ?? []).filter(
+      (m) => m.receivedAt >= cutoff,
+    );
     mailbox.push({ fromPeerId: item.fromPeerId, kind: item.kind, payload: item.payload, receivedAt: item.receivedAt });
+    if (mailbox.length > RENDEZVOUS_MAX_PER_MAILBOX) {
+      mailbox.splice(0, mailbox.length - RENDEZVOUS_MAX_PER_MAILBOX);
+    }
     this.rendezvous.set(item.toPeerId, mailbox);
   }
 
@@ -1507,6 +1522,24 @@ export class PgStore implements TrackerStore {
   }
 
   async pushRendezvous(item: RendezvousItem & { toPeerId: string }): Promise<void> {
+    // Bounded mailboxes (parity with MemoryStore): a TTL sweep plus a
+    // per-mailbox cap — rows aimed at peers that never drain must not
+    // grow the table unboundedly (write-time pruning; reads drain-once).
+    await this.query(
+      `DELETE FROM rendezvous WHERE received_at < now() - make_interval(secs => $1)`,
+      [Math.floor(RENDEZVOUS_TTL_MS / 1000)],
+    );
+    await this.query(
+      `DELETE FROM rendezvous WHERE ctid IN (
+         SELECT ctid FROM (
+           SELECT ctid, row_number() OVER (
+             PARTITION BY to_peer_id ORDER BY received_at DESC
+           ) AS rn
+           FROM rendezvous WHERE to_peer_id = $1
+         ) ranked WHERE rn > $2
+       )`,
+      [item.toPeerId, RENDEZVOUS_MAX_PER_MAILBOX],
+    );
     await this.query(
       `INSERT INTO rendezvous (to_peer_id, from_peer_id, kind, payload)
        VALUES ($1, $2, $3, $4)`,

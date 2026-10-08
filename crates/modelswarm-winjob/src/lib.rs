@@ -159,7 +159,7 @@ mod tests {
     #[cfg(windows)]
     fn job_handle_close_kills_assigned_child() {
         use std::process::Stdio;
-        let child = std::process::Command::new("ping")
+        let mut child = std::process::Command::new("ping")
             .args(["-n", "60", "127.0.0.1"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -183,5 +183,8 @@ mod tests {
         assert_eq!(super::close_one_retained_job_for_test(), 1);
         std::thread::sleep(std::time::Duration::from_millis(1500));
         assert!(!alive(), "closing the job handle must kill the child");
+        // Reap the killed child so the test leaves no zombie behind
+        // (clippy::zombie_processes; the job kill delivers the exit).
+        let _ = child.wait();
     }
 }

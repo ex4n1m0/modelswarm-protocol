@@ -1,4 +1,7 @@
 [toolchain]
-channel = "stable"
+# Pinned exact: a floating `stable` let a clippy lint promotion (2026-10:
+# zombie_processes) break main's gate between local runs and CI. Bump
+# deliberately.
+channel = "1.99.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

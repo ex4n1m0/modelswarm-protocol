@@ -1,0 +1,29 @@
+[package]
+name = "modelswarm-relay"
+description = "MSP circuit-relay v2 host (ADR-014): standard rust-libp2p relay with stream-carrying limits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libp2p = { version = "0.57", features = [
+    "tokio",
+    "quic",
+    "noise",
+    "yamux",
+    "identify",
+    "ping",
+    "relay",
+    "macros",
+] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+futures = "0.3"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+env_logger = "0.11"
+log = "0.4"

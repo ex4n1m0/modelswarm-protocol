@@ -581,4 +581,48 @@ mod tests {
         assert_eq!((a - b).whole_seconds(), 90);
         assert_eq!((a - b), Duration::seconds(90));
     }
+
+    // Cross-language golden vector (protocol/vectors/lease-hubkey-1.json):
+    // the TS issuer (apps/tracker/lib/eligibility.ts) produced this exact
+    // token with the fixture key recorded in the file. Byte-parity here is
+    // the gate that would have caught the 2026-10-08 interop break (the
+    // tracker issued no `lease_expires_at`, so every production lease
+    // failed `from_wire` at the ADR-026 serving gate).
+    #[test]
+    fn golden_vector_token_from_ts_issuer_verifies() {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../protocol/vectors/lease-hubkey-1.json"
+        ))
+        .expect("vector json parses");
+        let token = doc["token"].as_str().expect("token").to_string();
+        let pubkey_hex = doc["signing_public_key_hex"].as_str().expect("pubkey");
+        let verify_at = doc["verify_at"].as_str().expect("verify_at");
+
+        let lease = EligibilityLease::from_wire(&token).expect("TS-issued token parses");
+        // issuer_signature is skip_serializing, so the serde form is
+        // exactly the signed fields — must equal the recorded fields.
+        assert_eq!(
+            serde_json::to_value(&lease).expect("lease to value"),
+            doc["fields"],
+            "signed fields match the vector byte-for-byte"
+        );
+
+        let key_bytes: [u8; 32] = (0..32)
+            .map(|i| u8::from_str_radix(&pubkey_hex[i * 2..i * 2 + 2], 16).expect("hex byte"))
+            .collect::<Vec<u8>>()
+            .try_into()
+            .expect("32 bytes");
+        let key = VerifyingKey::from_bytes(&key_bytes).expect("fixture key parses");
+        lease
+            .verify(&key, verify_at)
+            .expect("signature + expiry + lease-cap policy verify");
+
+        // Tampering with any byte of the signature must fail.
+        let mut tampered: Vec<char> = token.chars().collect();
+        let last = tampered.pop().expect("non-empty");
+        tampered.push(if last == 'A' { 'B' } else { 'A' });
+        let tampered: String = tampered.into_iter().collect();
+        let result = EligibilityLease::from_wire(&tampered).and_then(|l| l.verify(&key, verify_at));
+        assert!(result.is_err(), "tampered token must fail verification");
+    }
 }

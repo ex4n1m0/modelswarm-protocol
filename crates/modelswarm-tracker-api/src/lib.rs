@@ -93,9 +93,12 @@ pub struct HeartbeatResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseIssued {
-    pub lease: String, // base64url(json).base64url(sig)
-    #[serde(rename = "expiresAt")]
-    pub expires_at: String,
+    /// Wire lease token `base64url(json).base64url(sig)` — the tracker
+    /// response field `token`. The echoed `lease` field object is ignored
+    /// here; verify the token with
+    /// `modelswarm_eligibility::EligibilityLease::from_wire`.
+    #[serde(rename = "token")]
+    pub lease: String,
 }
 
 pub struct TrackerClient {

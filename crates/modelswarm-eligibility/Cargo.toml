@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+modelswarm-types = { path = "../modelswarm-types" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }

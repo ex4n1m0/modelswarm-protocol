@@ -195,22 +195,34 @@ Publishing an artifact that differs from an existing `profileId` is
 Nodes verify the signature against the pinned hub public key embedded in the
 build, then verify each downloaded artifact's SHA-256 against the profile.
 
-## 5. Capability token (ADR-006)
+## 5. Capability token (ADR-006; renamed EligibilityLease by ADR-012)
+
+The signed fields (snake_case, exactly as serialized inside the token —
+byte-pinned by the cross-language golden vector
+`protocol/vectors/lease-hubkey-1.json`):
 
 ```json
 {
-  "peerId": "12D3Koo…",
-  "installationId": "b58…",
-  "profileId": "msp:qwen3-4b:q4_k_m:v1",
-  "canHost": true,
-  "canConsume": true,
+  "peer_id": "12D3Koo…",
+  "installation_id": "b58…",
+  "model_profile_id": "msp1:<64 hex>",
+  "issued_at": "2026-10-04T14:30:00.000Z",
+  "expires_at": "2026-10-04T14:31:30.000Z",
+  "lease_expires_at": "2026-10-04T14:30:30.000Z",
+  "can_host": true,
+  "can_consume": true,
   "slots": 1,
-  "challengeId": "opaque id of the passed hosting challenge",
-  "issuedAt": "2026-10-04T14:30:00Z",
-  "expiresAt": "2026-10-04T14:31:30Z",
+  "verified_capacity": "gpu_mid",
+  "audit_epoch": 4,
+  "challenge_id": "opaque id of the passed hosting challenge",
   "nonce": "…"
 }
 ```
+
+`lease_expires_at` is the expiry of the peer's underlying tracker lease;
+`expires_at` may exceed it by at most the 60 s grace. The issuance response
+carries the wire token in its `token` field:
+`POST /peers/lease` → `{ "token": "<capabilityToken>", "lease": { …fields } }`.
 
 **Serialized form** (this is what travels in requests):
 

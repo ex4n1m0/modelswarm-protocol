@@ -40,7 +40,11 @@ const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
 const validateManifest = ajv.compile({ ...schema, $ref: "#/$defs/ModelProfileManifest" });
 
 let failures = 0;
-const files = readdirSync(vectorsDir).filter((f) => f.endsWith(".json")).sort();
+// Manifest fixtures only (lease-hubkey-1.json is a signed-lease vector
+// covered by the test suites, not the manifest schema).
+const files = readdirSync(vectorsDir)
+  .filter((f) => f.startsWith("manifest-") && f.endsWith(".json"))
+  .sort();
 if (files.length === 0) {
   console.error("FAIL no vector files found in", vectorsDir);
   process.exit(1);

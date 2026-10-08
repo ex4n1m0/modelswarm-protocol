@@ -553,7 +553,13 @@ mod tests {
         let mut checked = 0;
         for entry in entries {
             let path = entry.unwrap().path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            // Manifest fixtures only — lease-hubkey-1.json is a signed-lease
+            // vector covered by the eligibility golden test.
+            if !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("manifest-"))
+            {
                 continue;
             }
             let doc: serde_json::Value =

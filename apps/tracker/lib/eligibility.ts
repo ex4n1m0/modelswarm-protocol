@@ -15,6 +15,10 @@ export interface EligibilityLeaseFields {
   model_profile_id: string;
   issued_at: string;
   expires_at: string;
+  /** RFC 3339 expiry of the peer's underlying tracker lease; `expires_at`
+   * may exceed it by at most TOKEN_GRACE_MS (Rust verifier enforces the
+   * cap — golden vector: protocol/vectors/lease-hubkey-1.json). */
+  lease_expires_at: string;
   can_host: boolean;
   can_consume: boolean;
   slots: number;
@@ -63,6 +67,7 @@ export function issueEligibilityLease(
     model_profile_id: profileId,
     issued_at: new Date(now).toISOString(),
     expires_at: new Date(lease.expiresAt + TOKEN_GRACE_MS).toISOString(),
+    lease_expires_at: new Date(lease.expiresAt).toISOString(),
     can_host: true,
     can_consume: true,
     slots: lease.maxSlots,

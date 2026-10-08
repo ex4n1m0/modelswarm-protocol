@@ -41,7 +41,8 @@ async fn signed_flow_enroll_register_heartbeat_lookup() {
         eprintln!("set MSP_LIVE=1 to run the production wire harness");
         return;
     }
-    let base = "https://modelswarm.deepflux.space";
+    let base =
+        std::env::var("MSP_TRACKER").unwrap_or_else(|_| "https://modelswarm.deepflux.space".into());
     let dir = std::env::temp_dir().join("msp-wire-harness");
     let logs = dir.join("logs");
     std::fs::create_dir_all(&logs).unwrap();
@@ -68,7 +69,9 @@ async fn signed_flow_enroll_register_heartbeat_lookup() {
     println!("enrolled: session granted");
 
     // 2) Register a peer entry (placeholder address, one real profile).
-    let profile = "msp1:fc5a30ae36257718afbd1062f2920b47576eed72ee8d172eac35248034b2dcbe";
+    let profile = std::env::var("MSP_LIVE_PROFILE").unwrap_or_else(|_| {
+        "msp1:fc5a30ae36257718afbd1062f2920b47576eed72ee8d172eac35248034b2dcbe".into()
+    });
     let peer_id = identity.peer_id(); // valid ADR-020 multihash derivation
     let runtime = serde_json::json!({
         "name": "llama.cpp",
@@ -78,7 +81,7 @@ async fn signed_flow_enroll_register_heartbeat_lookup() {
         .register(
             &peer_id,
             &["/ip4/0.0.0.0/tcp/0".to_string()],
-            &[profile.to_string()],
+            std::slice::from_ref(&profile),
             1,
             runtime,
         )
@@ -92,7 +95,7 @@ async fn signed_flow_enroll_register_heartbeat_lookup() {
         .expect("leaseId in register response")
         .to_string();
     let hb = tracker
-        .heartbeat(&lease_id, &[profile.to_string()], 1, 0, false)
+        .heartbeat(&lease_id, std::slice::from_ref(&profile), 1, 0, false)
         .await
         .expect("heartbeat (signed POST)");
     println!("heartbeat ok: lease expires {}", hb.lease_expires_at);
@@ -100,18 +103,48 @@ async fn signed_flow_enroll_register_heartbeat_lookup() {
     // 4) Roster lookup — the call that exposed BOTH wire bugs (signed GET
     //    with query string + empty-body digest).
     let peers = tracker
-        .lookup(profile, 10)
+        .lookup(&profile, 10)
         .await
         .expect("lookup (signed GET)");
     assert!(!peers.is_empty(), "our harness peer must be on the roster");
     let found = peers.iter().any(|p| p.peer_id == peer_id);
     assert!(found, "harness peer visible via lookup");
 
-    // 5) Drain the lease so the census is not polluted.
-    // (request_lease requires a passed hosting-challenge first — the
-    // challenge flow times a REAL generation on the requesting peer; see
-    // the lease tests in serving.rs for the wire verification, and
-    // ADR-026 for the full chain.)
+    // 5) Earn a consume lease the honest way and verify the issued token
+    //    through the REAL serving gate — the exact chain whose
+    //    2026-10-08 breakage (issuance response shape + missing
+    //    lease_expires_at) shipped invisibly through both green suites.
+    //    Timings are synthesized here: the tracker cannot observe the
+    //    requesting peer's engine; the desktop reports real ones.
+    #[cfg(feature = "libp2p-backend")]
+    {
+        let ch = tracker
+            .challenge_start(&lease_id, &profile)
+            .await
+            .expect("challenge_start (signed POST)");
+        let challenge_id = ch["challengeId"].as_str().expect("challengeId").to_string();
+        tracker
+            .challenge_complete(&lease_id, &profile, &challenge_id, 1_200, 1_500)
+            .await
+            .expect("challenge_complete (signed POST)");
+        let issued = tracker
+            .request_lease(&lease_id, &profile)
+            .await
+            .expect("request_lease parses the TS issuance response (token field)");
+        let hub_hex = std::env::var("MSP_HUB_PUBLIC_KEY_HEX").unwrap_or_else(|_| {
+            include_str!("../../../protocol/keys/hub-public.hex")
+                .trim()
+                .to_string()
+        });
+        let policy =
+            modelswarm_node::serving::LeasePolicy::from_hex(&hub_hex).expect("hub key hex parses");
+        policy
+            .check(&issued.lease, &profile, &peer_id)
+            .expect("TS-issued lease passes the Rust ADR-026 serving gate");
+        println!("lease earned + verified through the production gate");
+    }
+
+    // 6) Drain the lease so the census is not polluted.
     let _ = tracker.drain(&lease_id).await;
-    println!("wire harness: enroll/register/heartbeat/lookup/drain ALL verified");
+    println!("wire harness: enroll/register/heartbeat/lookup/lease-earn/drain ALL verified");
 }

@@ -218,12 +218,14 @@ async fn lease_token_from_endpoint_parses() {
     let (client, _id) = make_client(format!("http://{addr}"));
     let payload = B64URL.encode(br#"{"peerId":"p1","profileId":"msp1:aa"}"#);
     let sig = B64URL.encode([7u8; 64]);
-    let body = format!(r#"{{"lease":"{payload}.{sig}","expiresAt":"soon"}}"#);
+    // The real route returns the wire token as `token` (plus an echoed
+    // `lease` field object we deliberately ignore).
+    let body = format!(r#"{{"token":"{payload}.{sig}","lease":{{"peer_id":"p1"}}}}"#);
     let handler = Box::new(move |_req: &Request| ("200 OK".to_string(), body.clone())) as Handler;
     let server = tokio::spawn(serve_one(listener, handler));
     let lease = client.request_lease("L1", "msp1:aa").await.unwrap();
     server.await.unwrap();
-    assert_eq!(lease.expires_at, "soon");
+    assert_eq!(lease.lease, format!("{payload}.{sig}"));
     let parsed = split_lease_token(&lease.lease).unwrap();
     assert_eq!(parsed["peerId"], "p1");
 }

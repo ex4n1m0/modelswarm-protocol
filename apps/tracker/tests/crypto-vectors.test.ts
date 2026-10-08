@@ -25,7 +25,11 @@ const here = dirname(fileURLToPath(import.meta.url));
 const vectorsDir = join(here, "..", "..", "..", "protocol", "vectors");
 
 describe("golden vector parity (ADR-011)", () => {
-  const files = readdirSync(vectorsDir).filter((f) => f.endsWith(".json")).sort();
+  // Manifest fixtures only — lease-hubkey-1.json is a signed-lease vector
+  // verified in its own describe below.
+  const files = readdirSync(vectorsDir)
+    .filter((f) => f.startsWith("manifest-") && f.endsWith(".json"))
+    .sort();
   it("finds fixtures", () => {
     expect(files.length).toBeGreaterThanOrEqual(2);
   });
@@ -157,6 +161,7 @@ describe("eligibility lease serialization (ADR-012)", () => {
     expect(JSON.parse(json)).toEqual(issued.fields);
     // expiry capped at lease expiry + 60 s
     expect(issued.fields.expires_at).toBe(new Date(lease.expiresAt + 60_000).toISOString());
+    expect(issued.fields.lease_expires_at).toBe(new Date(lease.expiresAt).toISOString());
     expect(issued.fields.peer_id).toBe(lease.peerId);
     expect(issued.fields.model_profile_id).toBe(lease.profiles[0]);
     expect(issued.fields.audit_epoch).toBe(4);
@@ -182,5 +187,82 @@ describe("eligibility lease serialization (ADR-012)", () => {
     // across the suite.
     const manifest = testManifest();
     expect(deriveProfileId(manifest)).toMatch(/^msp1:[0-9a-f]{64}$/);
+  });
+});
+
+// The Rust EligibilityLease::from_wire + LeasePolicy gate consume this
+// exact token (lease.rs golden test) — the byte-parity gate that would
+// have caught the 2026-10-08 issuance/verification interop break.
+describe("lease golden vector (ADR-012/ADR-026 interop)", () => {
+  interface LeaseVector {
+    signing_public_key_hex: string;
+    verify_at: string;
+    fields: Record<string, unknown>;
+    token: string;
+    canonical_json_sha256: string;
+  }
+  const vector = JSON.parse(
+    readFileSync(join(vectorsDir, "lease-hubkey-1.json"), "utf8"),
+  ) as LeaseVector;
+  const publicKey = Buffer.from(vector.signing_public_key_hex, "hex");
+
+  it("token signature verifies against the recorded fixture key", () => {
+    const parts = splitEligibilityLease(vector.token);
+    expect(parts).not.toBeNull();
+    expect(verifyBase64Url(parts!.signature, parts!.json, publicKey)).toBe(true);
+  });
+
+  it("payload is the byte-exact canonical JSON of the recorded fields", () => {
+    const parts = splitEligibilityLease(vector.token)!;
+    expect(parts.json).toBe(canonicalJson(vector.fields));
+    expect(sha256Hex(parts.json)).toBe(vector.canonical_json_sha256);
+    expect(JSON.parse(parts.json)).toEqual(vector.fields);
+  });
+
+  it("issuer output matches the vector form (lease_expires_at included)", () => {
+    // Re-issuing with the same inputs the vector pins must reproduce the
+    // same canonical payload (fields except the random nonce).
+    const lease: LeaseRecord = {
+      leaseId: "l".repeat(32),
+      installationId: vector.fields.installation_id as string,
+      peerId: vector.fields.peer_id as string,
+      createdAt: Date.parse(vector.fields.issued_at as string),
+      expiresAt: Date.parse(vector.fields.lease_expires_at as string),
+      profiles: [vector.fields.model_profile_id as string],
+      addresses: ["/ip4/10.0.0.9/udp/4001/quic-v1"],
+      maxSlots: vector.fields.slots as number,
+      freeSlots: 1,
+      queueMs: 0,
+      draining: false,
+      capacityClass: vector.fields.verified_capacity as LeaseRecord["capacityClass"],
+      auditEpoch: vector.fields.audit_epoch as number,
+      lastSeenAt: 0,
+    };
+    const challenge: ChallengeRecord = {
+      challengeId: vector.fields.challenge_id as string,
+      leaseId: lease.leaseId,
+      profileId: lease.profiles[0]!,
+      prompt: "ModelSwarm readiness challenge",
+      issuedAt: 0,
+      deadlineAt: 120_000,
+      outcome: "passed",
+      firstTokenMs: 100,
+      totalMs: 900,
+      completedAt: 90_000,
+    };
+    const issued = issueEligibilityLease(
+      lease,
+      challenge,
+      lease.profiles[0]!,
+      lease.auditEpoch,
+      Date.parse(vector.fields.issued_at as string),
+      Buffer.from("07".repeat(32), "hex"),
+    );
+    const parts = splitEligibilityLease(issued.token)!;
+    const expected = { ...vector.fields } as Record<string, unknown>;
+    delete expected.nonce;
+    const got = JSON.parse(parts.json) as Record<string, unknown>;
+    delete got.nonce;
+    expect(got).toEqual(expected);
   });
 });

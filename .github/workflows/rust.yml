@@ -85,3 +85,16 @@ jobs:
             echo "::error::apps/tracker/app/page.tsx download filenames do not match version $VERSION"
             exit 1
           fi
+      # The check job's tauri-shell test strips bundle.resources via the
+      # TAURI_CONFIG overlay (engines are staged only by the installer
+      # workflows, which also verify per-file hashes inside artifacts) —
+      # this assertion keeps the shipping resource set drift-detectable
+      # on every push despite that test-only overlay.
+      - name: Bundle resources are frozen
+        run: |
+          EXPECTED='["engine/*","engine-vulkan/*"]'
+          ACTUAL=$(jq -c '.bundle.resources' crates/modelswarm-desktop/tauri.conf.json)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::tauri.conf.json bundle.resources drifted: $ACTUAL (expected $EXPECTED)"
+            exit 1
+          fi

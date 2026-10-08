@@ -1,5 +1,14 @@
 # Architecture Decision Gate — 2026-10-09 (owner approval requested)
 
+> **OWNER APPROVAL RECORDED 2026-10-09: "Approved."** — D1–D3 and D6–D19
+> approved as recommended (all binding sign-off conditions remain in
+> force); D4 (k=4 harness spend) approved as RECOMMENDED = deferred
+> until the 9.6 pass-1 result; D5 (code-signing certificate) approved as
+> RECOMMENDED = owner purchases when convenient (no current blocker
+> except M13 "signed" items). Post-gate execution begins: merge audit
+> branch → main, R0 governance ADRs, P1 streaming refactor per the §C.4
+> critical path.
+
 Consolidated decision per master prompt §9, from the eleven audits
 (freeze + wave-1 six + wave-2 five), the salvage matrix, the production
 risk register, and the rewrite boundaries. **Nothing destructive starts

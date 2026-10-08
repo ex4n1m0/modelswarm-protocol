@@ -638,7 +638,43 @@ mod lan_proof {
             .execute(NormalizedRequest {
                 request_id: format!("lan-proof-{}", modelswarm_identity::new_nonce()),
                 profile_id: profile.clone(),
-                capability_token: None,
+                capability_token: (async {
+                    // F3 gated path: earn a consume lease the honest way —
+                    // hosting challenge timed against THIS machine's real
+                    // engine (the app is hosting this profile).
+                    let lease_id = std::fs::read_to_string(dir.join("lease.id"))
+                        .ok()?
+                        .trim()
+                        .to_string();
+                    let started = std::time::Instant::now();
+                    let probe: serde_json::Value = reqwest::Client::new()
+                        .post("http://127.0.0.1:11435/v1/chat/completions")
+                        .timeout(Duration::from_secs(60))
+                        .json(&serde_json::json!({
+                            "model": profile,
+                            "messages": [{ "role": "user", "content": "Say ok." }],
+                            "max_tokens": 8,
+                            "temperature": 0.0,
+                            "stream": false,
+                        }))
+                        .send()
+                        .await
+                        .ok()?
+                        .json()
+                        .await
+                        .ok()?;
+                    probe["choices"][0]["message"]["content"].as_str()?;
+                    let total_ms = started.elapsed().as_millis() as u64;
+                    let ch = tracker.challenge_start(&lease_id, profile.as_str()).await.ok()?;
+                    let ch_id = ch["challengeId"].as_str()?.to_string();
+                    tracker
+                        .challenge_complete(&lease_id, profile.as_str(), &ch_id, total_ms, total_ms)
+                        .await
+                        .ok()?;
+                    let issued = tracker.request_lease(&lease_id, profile.as_str()).await.ok()?;
+                    println!("lease earned (challenge {} ms)", total_ms);
+                    Some(issued.lease)
+                }).await,
                 messages: vec![NormalizedMessage {
                     role: "user".into(),
                     content: "Say exactly: cross-machine swarm serving works.".into(),

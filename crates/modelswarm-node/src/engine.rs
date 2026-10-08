@@ -248,10 +248,13 @@ fn ephemeral_port() -> Result<u16, EngineError> {
 
 /// Spawns and supervises the engine. Returns once `/health` is green; the
 /// supervisor task keeps the child alive (bounded restarts) until
-/// `shutdown` fires or all senders drop, then kills it.
+/// `shutdown` fires or all senders drop, then kills it. Lifecycle events
+/// (spawn failure, exit, restart, job-assign failure) go to the node
+/// telemetry sink — a GUI-supervised node has no console to eprintln at.
 pub async fn start_engine(
     spec: EngineSpec,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    telemetry: std::sync::Arc<modelswarm_telemetry::Telemetry>,
 ) -> Result<EngineHandle, EngineError> {
     let variant = if spec.backend == "cpu" {
         None
@@ -275,6 +278,7 @@ pub async fn start_engine(
         shutdown.clone(),
         3, // bounded restart attempts per session
         std::sync::Arc::clone(&dead),
+        telemetry,
     );
 
     // Block until healthy (model load) or timeout.
@@ -330,16 +334,20 @@ fn spawn_supervised(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     max_restarts: u32,
     dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    telemetry: std::sync::Arc<modelswarm_telemetry::Telemetry>,
 ) {
     let spec = spec.clone();
     let bearer = bearer.to_string();
     tokio::spawn(async move {
         let mut restarts_left = max_restarts;
         loop {
-            let mut child = match launch(&spec, port, &bearer) {
+            let mut child = match launch(&spec, port, &bearer, &telemetry) {
                 Ok(child) => child,
                 Err(e) => {
-                    eprintln!("modelswarm-node: engine spawn failed: {e}");
+                    telemetry.warn(
+                        "engine.spawn_failed",
+                        &[("code", "spawn"), ("detail", &e.to_string())],
+                    );
                     dead.store(true, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
@@ -354,12 +362,18 @@ fn spawn_supervised(
                         return;
                     }
                     if restarts_left == 0 {
-                        eprintln!("modelswarm-node: engine exited ({status:?}); restart budget exhausted");
+                        telemetry.warn(
+                            "engine.exited",
+                            &[("code", "restart_budget_exhausted"), ("status", &format!("{status:?}"))],
+                        );
                         dead.store(true, std::sync::atomic::Ordering::Relaxed);
                         return;
                     }
                     restarts_left -= 1;
-                    eprintln!("modelswarm-node: engine exited unexpectedly; restarting ({restarts_left} left)");
+                    telemetry.warn(
+                        "engine.restarting",
+                        &[("restarts_left", &restarts_left.to_string()), ("status", &format!("{status:?}"))],
+                    );
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
@@ -394,7 +408,12 @@ fn engine_args(spec: &EngineSpec, port: u16, bearer: &str) -> Vec<String> {
     args
 }
 
-fn launch(spec: &EngineSpec, port: u16, bearer: &str) -> Result<Child, EngineError> {
+fn launch(
+    spec: &EngineSpec,
+    port: u16,
+    bearer: &str,
+    telemetry: &modelswarm_telemetry::Telemetry,
+) -> Result<Child, EngineError> {
     let mut command = Command::new(&spec.exe);
     command
         .args(engine_args(spec, port, bearer))
@@ -420,7 +439,10 @@ fn launch(spec: &EngineSpec, port: u16, bearer: &str) -> Result<Child, EngineErr
         // graceful shutdown path (watch channel) already kills the child.
         if let Some(pid) = child.id() {
             if let Err(e) = modelswarm_winjob::assign_child(pid) {
-                eprintln!("modelswarm-node: job-object assignment failed: {e}");
+                telemetry.warn(
+                    "engine.job_assign_failed",
+                    &[("pid", &pid.to_string()), ("detail", &e.to_string())],
+                );
             }
         }
     }
@@ -561,7 +583,13 @@ mod tests {
                 backend: backend.clone(),
                 ..EngineSpec::default()
             };
-            let engine = start_engine(spec, rx).await.expect("engine starts");
+            let engine = start_engine(
+                spec,
+                rx,
+                std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
+            )
+            .await
+            .expect("engine starts");
             assert_eq!(engine.backend, backend);
             let config = engine.runtime_config();
             assert_eq!(engine.identity.version, "b11407");

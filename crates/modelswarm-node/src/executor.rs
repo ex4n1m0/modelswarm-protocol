@@ -10,9 +10,11 @@
 //! `modelswarm_transport`) is a documented later wiring; see the crate docs.
 //!
 //! Privacy: the request's message content is tokenized and passed to the
-//! local runtime only. It is never logged — the executor's only logging is
-//! runtime *error* text (diagnostics, never prompt/completion content), and
-//! the gateway's audit channel records counts and ids only.
+//! local runtime only. It is never logged: the executor's only logging is
+//! a closed error-code table through the node telemetry sink (code, HTTP
+//! status, byte lengths — never RuntimeError display text, which carries
+//! external-process-controlled bodies), and the gateway's audit channel
+//! records counts and ids only.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +25,7 @@ use modelswarm_gateway::{
     ExecutorError, ExecutorEvent, ExecutorStream, FinishReason, InferenceExecutor,
     NormalizedMessage, NormalizedRequest,
 };
-use modelswarm_runtime::{InferenceRuntime, SamplingParams};
+use modelswarm_runtime::{InferenceRuntime, RuntimeError, SamplingParams};
 
 /// Tokens per [`ExecutorEvent::TokenDelta`] (batching parity with the session
 /// executor's per-round batches).
@@ -33,6 +35,8 @@ pub const LOCAL_DELTA_BATCH_TOKENS: usize = 16;
 pub struct SingleLocalExecutor {
     runtime: Option<Arc<dyn InferenceRuntime>>,
     profile_id: Option<String>,
+    /// Node telemetry for redacted failure diagnostics (None in tests).
+    telemetry: Option<Arc<modelswarm_telemetry::Telemetry>>,
 }
 
 impl SingleLocalExecutor {
@@ -43,7 +47,33 @@ impl SingleLocalExecutor {
         Self {
             runtime,
             profile_id,
+            telemetry: None,
         }
+    }
+
+    /// Routes decode-failure diagnostics to the node telemetry sink.
+    pub fn with_telemetry(mut self, telemetry: Arc<modelswarm_telemetry::Telemetry>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+}
+
+/// Closed error-code table for runtime failures (AGENTS.md rule 5): the
+/// wire and audit surfaces see a stable code only — RuntimeError display
+/// text never crosses them (engine error bodies can echo request
+/// fragments). Returns `(code, http_status_or_0)`.
+fn runtime_error_code(e: &RuntimeError) -> (&'static str, u16) {
+    match e {
+        RuntimeError::Api { status, .. } => ("engine_api_error", *status),
+        RuntimeError::Http(_) => ("engine_transport", 0),
+        RuntimeError::MalformedResponse(_) => ("engine_malformed_response", 0),
+        RuntimeError::InvalidProfile(_) => ("engine_invalid_profile", 0),
+        RuntimeError::TokenOutOfRange(_) => ("engine_token_out_of_range", 0),
+        RuntimeError::NotLoaded(_) => ("engine_not_loaded", 0),
+        RuntimeError::InvalidDescriptor(_) => ("engine_invalid_descriptor", 0),
+        RuntimeError::Unsupported(_) => ("engine_unsupported", 0),
+        RuntimeError::Timeout { .. } => ("deadline_exceeded", 0),
+        RuntimeError::Cancelled(_) => ("cancelled", 0),
     }
 }
 
@@ -115,15 +145,22 @@ impl InferenceExecutor for SingleLocalExecutor {
                 return Err(fatal("cancelled"));
             }
             Err(e) => {
-                // The real cause must not vanish behind a bare Retryable: a
-                // hidden engine/adapter failure is indistinguishable from
-                // "no peer" at the gateway (cost a full diagnosis round on
-                // the 7B). RuntimeError text is diagnostics only — never
-                // prompt or completion content.
-                eprintln!("modelswarm-node: decode_stream failed: {e}");
-                return Err(ExecutorError::Retryable {
-                    peer_hint: Some(format!("local:{e}")),
-                });
+                // The cause must not vanish (a hidden engine failure is
+                // indistinguishable from "no peer" at the gateway) — but it
+                // must not leak either: a stable code on the error, redacted
+                // diagnostics (code/status/length only) in telemetry.
+                let (code, status) = runtime_error_code(&e);
+                if let Some(t) = &self.telemetry {
+                    t.warn(
+                        "executor.decode_failed",
+                        &[
+                            ("code", code),
+                            ("status", &status.to_string()),
+                            ("detail_bytes", &e.to_string().len().to_string()),
+                        ],
+                    );
+                }
+                return Err(fatal(code));
             }
         };
 

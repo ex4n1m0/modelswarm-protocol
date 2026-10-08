@@ -141,16 +141,61 @@ impl Default for NodeConfig {
     }
 }
 
-/// `%LOCALAPPDATA%\ModelSwarm` on Windows, `~/.modelswarm` elsewhere,
+/// `%LOCALAPPDATA%\ModelSwarm\Data` on Windows, `~/.modelswarm` elsewhere,
 /// `.modelswarm` when neither is resolvable.
+///
+/// The `Data` suffix (2026-10-08) keeps user state OUT of the Tauri NSIS
+/// per-user install root, which is also `%LOCALAPPDATA%\ModelSwarm` —
+/// without the split, uninstalling the app would DELETE the Ed25519
+/// identity seed (ADR-004: lost key = re-enroll), the SQLite store, and
+/// every downloaded model. Existing pre-split layouts are migrated once.
 pub fn default_data_dir() -> PathBuf {
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local).join("ModelSwarm");
+        let root = PathBuf::from(local).join("ModelSwarm");
+        migrate_pre_separation_layout(&root);
+        return root.join("Data");
     }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home).join(".modelswarm");
     }
     PathBuf::from(".modelswarm")
+}
+
+/// Moves the pre-split data layout (`%LOCALAPPDATA%\ModelSwarm\*` — the
+/// install root) into `ModelSwarm\Data\`, exactly once. Runs when `Data`
+/// holds neither an identity nor a store but the root does. `rename`
+/// first (same volume — instant even for multi-GB model files), copy as
+/// the fallback; failures leave the legacy files untouched (the next
+/// call retries). App-managed `engine*/` directories stay at the root.
+fn migrate_pre_separation_layout(root: &std::path::Path) {
+    let data = root.join("Data");
+    if data.join("identity.seed").exists() || data.join("state.sqlite").exists() {
+        return; // already migrated (or fresh install)
+    }
+    if !root.join("identity.seed").is_file() && !root.join("state.sqlite").is_file() {
+        return; // nothing legacy to move
+    }
+    let _ = std::fs::create_dir_all(&data);
+    for name in [
+        "identity.seed",
+        "state.sqlite",
+        "state.sqlite-wal",
+        "state.sqlite-shm",
+        "config.json",
+        "session.token",
+        "lease.id",
+    ] {
+        let from = root.join(name);
+        if from.is_file() && std::fs::rename(&from, data.join(name)).is_err() {
+            let _ = std::fs::copy(&from, data.join(name));
+        }
+    }
+    for dir in ["logs", "models"] {
+        let from = root.join(dir);
+        if from.is_dir() && !data.join(dir).is_dir() {
+            let _ = std::fs::rename(&from, data.join(dir));
+        }
+    }
 }
 
 /// Failures of node composition.
@@ -207,6 +252,17 @@ impl Node {
         let sink = FileSink::open(&logs_dir.join("node.jsonl"))?;
         let telemetry = Arc::new(Telemetry::with_sink(Box::new(sink)));
 
+        // Bind the gateway BEFORE spawning the engine (composition order
+        // fix): a taken port fails here in milliseconds and no multi-GB
+        // engine child is spawned-then-leaked for the whole session (the
+        // desktop's port-conflict fallback retries with an ephemeral
+        // port; the first attempt must leave nothing behind).
+        // Loopback bind — structural, re-asserted (tested).
+        let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.gateway_port);
+        assert_loopback(gateway_addr.ip())?;
+        let listener = tokio::net::TcpListener::bind(gateway_addr).await?;
+        let local_addr = listener.local_addr()?;
+
         // Store (ADR-017) — privacy-shaped schema, migrations applied.
         let store = modelswarm_store::Store::open(config.data_dir.join(STATE_FILE_NAME))?;
         telemetry.info("store.opened", &[("file", STATE_FILE_NAME)]);
@@ -247,7 +303,9 @@ impl Node {
                             startup_timeout: std::time::Duration::from_secs(600),
                             ..engine::EngineSpec::default()
                         };
-                        match engine::start_engine(spec, shutdown.clone()).await {
+                        match engine::start_engine(spec, shutdown.clone(), Arc::clone(&telemetry))
+                            .await
+                        {
                             Ok(handle) => started = Some(handle),
                             Err(e) => telemetry.warn(
                                 "engine.gpu_fallback",
@@ -265,7 +323,7 @@ impl Node {
                             threads: config.engine_threads,
                             ..engine::EngineSpec::default()
                         };
-                        engine::start_engine(spec, shutdown.clone()).await?
+                        engine::start_engine(spec, shutdown.clone(), Arc::clone(&telemetry)).await?
                     }
                 };
                 telemetry.info(
@@ -328,7 +386,10 @@ impl Node {
         }
 
         // Gateway wiring.
-        let executor = Arc::new(SingleLocalExecutor::new(runtime, config.profile_id.clone()));
+        let executor = Arc::new(
+            SingleLocalExecutor::new(runtime, config.profile_id.clone())
+                .with_telemetry(Arc::clone(&telemetry)),
+        );
         let profiles: Arc<dyn ProfileProvider> = match &config.profile_id {
             Some(profile) => Arc::new(StaticProfiles::new(vec![ModelInfo {
                 id: profile.clone(),
@@ -337,12 +398,6 @@ impl Node {
             None => Arc::new(StaticProfiles::new(Vec::new())),
         };
         let state = GatewayState::new(executor.clone(), profiles);
-
-        // Loopback bind — structural, re-asserted (tested).
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.gateway_port);
-        assert_loopback(addr.ip())?;
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let local_addr = listener.local_addr()?;
 
         let mut shutdown_rx = shutdown.clone();
         let handle_shutdown_rx = shutdown_rx.clone();
@@ -596,7 +651,54 @@ mod tests {
         assert!(!cfg.mock);
         assert!(cfg.tracker_base.is_none());
         assert!(cfg.profile_id.is_none());
-        assert!(cfg.data_dir.ends_with("ModelSwarm") || cfg.data_dir.ends_with(".modelswarm"));
+        // (default_data_dir's install-root/data-root split is covered by
+        // pre_separation_layout_migrates_once_into_data — asserting it here
+        // would touch the real %LOCALAPPDATA% layout from a unit test.)
+    }
+
+    /// Install-root/data-root separation (2026-10-08): a pre-split layout
+    /// migrates into `Data/` once, idempotently; engine dirs stay put.
+    #[test]
+    fn pre_separation_layout_migrates_once_into_data() {
+        let root = tempfile::tempdir().unwrap();
+        // Legacy layout: state at the root, engine dirs are app files.
+        std::fs::write(root.path().join("identity.seed"), b"seed").unwrap();
+        std::fs::write(root.path().join("config.json"), b"{}").unwrap();
+        std::fs::write(root.path().join("session.token"), b"tok").unwrap();
+        std::fs::create_dir_all(root.path().join("models").join("msp1_x")).unwrap();
+        std::fs::write(
+            root.path().join("models").join("msp1_x").join("model.gguf"),
+            b"gguf",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("engine")).unwrap();
+        std::fs::write(root.path().join("engine").join("llama-server.exe"), b"exe").unwrap();
+
+        super::migrate_pre_separation_layout(root.path());
+
+        let data = root.path().join("Data");
+        assert!(data.join("identity.seed").is_file());
+        assert!(data.join("config.json").is_file());
+        assert!(data.join("session.token").is_file());
+        assert!(data
+            .join("models")
+            .join("msp1_x")
+            .join("model.gguf")
+            .is_file());
+        assert!(root
+            .path()
+            .join("engine")
+            .join("llama-server.exe")
+            .is_file());
+        assert!(!root.path().join("identity.seed").exists(), "renamed away");
+        assert!(
+            !root.path().join("models").exists(),
+            "models moved wholesale"
+        );
+
+        // Idempotent: a second run must not move anything or fail.
+        super::migrate_pre_separation_layout(root.path());
+        assert!(data.join("identity.seed").is_file());
     }
 
     /// Real-engine GPU-preference test (ADR-024): set MSP_LLAMA_SERVER_CPU,

@@ -54,6 +54,11 @@ struct Inner {
     /// Cached swarm consume-lease (F3(2)): (profile, wire lease, unix expiry).
     /// Earned via the hosting-challenge chain; reused until it expires.
     swarm_lease: Option<(String, String, u64)>,
+    /// Pooled remote executor (connection reuse): keyed by profile|peer.
+    swarm_executor: Option<(
+        String,
+        std::sync::Arc<modelswarm_node::remote::RemoteExecutor>,
+    )>,
     license_accepted: bool,
     artifact: Option<EnsuredArtifact>,
     node: Option<RunningNode>,
@@ -104,6 +109,7 @@ impl DesktopState {
                 node: None,
                 chat_log: Vec::new(),
                 swarm_lease: None,
+                swarm_executor: None,
             }),
         }
     }
@@ -1318,6 +1324,7 @@ async fn earn_lease(
 /// serves identically.
 #[allow(clippy::too_many_arguments)]
 async fn try_swarm_chat(
+    inner: &tokio::sync::Mutex<Inner>,
     tracker_url: &str,
     data_dir: &std::path::Path,
     profile: &str,
@@ -1382,10 +1389,23 @@ async fn try_swarm_chat(
         stream: true,
     };
 
-    let failover = modelswarm_node::remote::FailoverExecutor::new(
-        modelswarm_node::remote::RemoteExecutor::new(peer, identity),
-        local_executor,
-    );
+    // Connection reuse: keep ONE pooled executor per (profile, peer) in
+    // the app state so chat turns share a warm QUIC session.
+    let key = format!("{profile}|{}", peer.peer_id);
+    let remote = {
+        let mut inner_state = inner.lock().await;
+        match &inner_state.swarm_executor {
+            Some((k, exec)) if k == &key => std::sync::Arc::clone(exec),
+            _ => {
+                let exec = std::sync::Arc::new(modelswarm_node::remote::RemoteExecutor::new(
+                    peer, identity,
+                ));
+                inner_state.swarm_executor = Some((key, std::sync::Arc::clone(&exec)));
+                exec
+            }
+        }
+    };
+    let failover = modelswarm_node::remote::FailoverExecutor::new(remote, local_executor);
     use futures_util::StreamExt;
     use modelswarm_gateway::{ExecutorEvent, InferenceExecutor};
     let mut events = match failover.execute(request).await {
@@ -1495,6 +1515,7 @@ async fn send_chat(
             )
             .await;
             if let Some(reply) = try_swarm_chat(
+                &state.inner,
                 &tracker_url,
                 &data_dir,
                 &profile,

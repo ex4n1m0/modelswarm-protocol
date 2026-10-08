@@ -41,16 +41,24 @@ pub struct RemotePeer {
     pub peer_id: String,
 }
 
-/// Executes requests against a single remote serving peer.
+/// Executes requests against a single remote serving peer, REUSING one
+/// QUIC session across sequential requests (connection reuse): the
+/// per-request handshake (~1 RTT + crypto) is paid once, not per chat
+/// message. The pool self-heals — a broken session is dropped and the
+/// next request dials fresh.
 pub struct RemoteExecutor {
     peer: RemotePeer,
-    /// Client identity for the dial (a fresh transport per request).
     identity: InstallationIdentity,
+    pool: std::sync::Arc<tokio::sync::Mutex<Option<Libp2pSession>>>,
 }
 
 impl RemoteExecutor {
     pub fn new(peer: RemotePeer, identity: InstallationIdentity) -> Self {
-        Self { peer, identity }
+        Self {
+            peer,
+            identity,
+            pool: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
     }
 }
 
@@ -111,44 +119,70 @@ fn frame_to_event(frame: WireMessage) -> Option<Result<ExecutorEvent, WireStream
     }
 }
 
-fn stream_events(session: Libp2pSession) -> impl Stream<Item = ExecutorEvent> {
-    // `completed` latches on the terminal frame: Completed/Cancelled END
-    // the exchange per the protocol — reading past them would only see
-    // the serving peer's post-stream connection close.
-    stream::unfold((session, false), |(mut session, completed)| async move {
-        if completed {
-            return None;
-        }
-        let frame = match session.recv(IO_DEADLINE).await {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("modelswarm-node: remote stream read failed: {e}");
-                return Some((
-                    ExecutorEvent::Error {
-                        code: "transport".into(),
-                        retryable: false,
-                        interrupted_after_tokens: None,
-                    },
-                    (session, true),
-                ));
+fn stream_events(
+    session: Libp2pSession,
+    pool: std::sync::Arc<tokio::sync::Mutex<Option<Libp2pSession>>>,
+) -> impl Stream<Item = ExecutorEvent> {
+    // Terminal frames (Completed/Cancelled) END the exchange per the
+    // protocol. A CLEAN terminal returns the session to the pool for the
+    // next request (connection reuse); errors drop it so the next request
+    // dials fresh.
+    stream::unfold(
+        (Some(session), pool, false),
+        |(slot, pool, done)| async move {
+            if done {
+                return None;
             }
-        };
-        match frame_to_event(frame) {
-            None => None, // clean end
-            Some(Ok(event)) => {
-                let done = matches!(event, ExecutorEvent::Completed { .. });
-                Some((event, (session, done)))
+            let mut session = match slot {
+                Some(s) => s,
+                None => return None,
+            };
+            let frame = match session.recv(IO_DEADLINE).await {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("modelswarm-node: remote stream read failed: {e}");
+                    return Some((
+                        ExecutorEvent::Error {
+                            code: "transport".into(),
+                            retryable: false,
+                            interrupted_after_tokens: None,
+                        },
+                        (None, pool, true),
+                    ));
+                }
+            };
+            match frame_to_event(frame) {
+                // Server closed the session: end cleanly, drop it.
+                None => None,
+                Some(Ok(event)) => {
+                    if matches!(event, ExecutorEvent::Completed { .. }) {
+                        if let Ok(mut guard) = pool.try_lock() {
+                            if guard.is_none() {
+                                *guard = Some(session);
+                            }
+                        }
+                        Some((event, (None, pool, true)))
+                    } else {
+                        Some((event, (Some(session), pool, false)))
+                    }
+                }
+                Some(Err(wire_error)) => {
+                    eprintln!(
+                        "modelswarm-node: remote peer refused: {} {}",
+                        wire_error.code, wire_error.message
+                    );
+                    Some((
+                        ExecutorEvent::Error {
+                            code: wire_error.code,
+                            retryable: wire_error.retryable_peer_hint,
+                            interrupted_after_tokens: None,
+                        },
+                        (None, pool, true),
+                    ))
+                }
             }
-            Some(Err(wire_error)) => Some((
-                ExecutorEvent::Error {
-                    code: wire_error.code,
-                    retryable: wire_error.retryable_peer_hint,
-                    interrupted_after_tokens: None,
-                },
-                (session, true),
-            )),
-        }
-    })
+        },
+    )
 }
 
 #[async_trait::async_trait]
@@ -161,31 +195,45 @@ impl InferenceExecutor for RemoteExecutor {
                 .map_err(|_| ExecutorError::Fatal {
                     code: format!("bad_peer_id: {}", self.peer.peer_id),
                 })?;
-        let client = Libp2pTransport::new(&self.identity).map_err(|e| ExecutorError::Fatal {
-            code: format!("transport: {e}"),
-        })?;
-        let mut session = client
-            .dial(self.peer.addr.as_str(), &expected_peer, DIAL_DEADLINE)
-            .await
-            .map_err(|e| {
-                eprintln!("modelswarm-node: remote dial failed: {e}");
-                ExecutorError::Retryable {
-                    peer_hint: Some(self.peer.peer_id.clone()),
-                }
-            })?;
-        session
+        // Pooled connection reuse: take a warm session if the pool holds
+        // one, otherwise dial fresh.
+        let mut guard = self.pool.lock().await;
+        let session = match guard.take() {
+            Some(s) => s,
+            None => {
+                let client =
+                    Libp2pTransport::new(&self.identity).map_err(|e| ExecutorError::Fatal {
+                        code: format!("transport: {e}"),
+                    })?;
+                client
+                    .dial(self.peer.addr.as_str(), &expected_peer, DIAL_DEADLINE)
+                    .await
+                    .map_err(|e| {
+                        eprintln!("modelswarm-node: remote dial failed: {e}");
+                        ExecutorError::Retryable {
+                            peer_hint: Some(self.peer.peer_id.clone()),
+                        }
+                    })?
+            }
+        };
+        drop(guard);
+        let mut session = session;
+        if let Err(e) = session
             .send(
                 &WireMessage::InferenceRequest(wire_request(&request)),
                 IO_DEADLINE,
             )
             .await
-            .map_err(|e| {
-                eprintln!("modelswarm-node: remote send failed: {e}");
-                ExecutorError::Retryable {
-                    peer_hint: Some(self.peer.peer_id.clone()),
-                }
-            })?;
-        Ok(Box::pin(stream_events(session)))
+        {
+            eprintln!("modelswarm-node: remote send failed: {e}");
+            return Err(ExecutorError::Retryable {
+                peer_hint: Some(self.peer.peer_id.clone()),
+            });
+        }
+        Ok(Box::pin(stream_events(
+            session,
+            std::sync::Arc::clone(&self.pool),
+        )))
     }
 }
 
@@ -305,12 +353,15 @@ mod tests {
 /// hedging. Live latency measurement (fastest-peer selection) stacks
 /// above this once real WAN numbers exist (phase-f-research, F1.5).
 pub struct FailoverExecutor {
-    remote: RemoteExecutor,
+    remote: std::sync::Arc<RemoteExecutor>,
     local: std::sync::Arc<dyn InferenceExecutor>,
 }
 
 impl FailoverExecutor {
-    pub fn new(remote: RemoteExecutor, local: std::sync::Arc<dyn InferenceExecutor>) -> Self {
+    pub fn new(
+        remote: std::sync::Arc<RemoteExecutor>,
+        local: std::sync::Arc<dyn InferenceExecutor>,
+    ) -> Self {
         Self { remote, local }
     }
 }
@@ -438,7 +489,10 @@ mod failover_tests {
         });
         let mut with_lease = request(profile);
         with_lease.capability_token = Some(token);
-        let fo = FailoverExecutor::new(RemoteExecutor::new(peer, client_identity), local.clone());
+        let fo = FailoverExecutor::new(
+            Arc::new(RemoteExecutor::new(peer, client_identity)),
+            local.clone(),
+        );
 
         let text = collect(fo.execute(with_lease).await.unwrap()).await;
         assert_eq!(text, "REMOTE");
@@ -463,7 +517,10 @@ mod failover_tests {
             label: "LOCAL",
             calls: AtomicUsize::new(0),
         });
-        let fo = FailoverExecutor::new(RemoteExecutor::new(peer, client_identity), local.clone());
+        let fo = FailoverExecutor::new(
+            Arc::new(RemoteExecutor::new(peer, client_identity)),
+            local.clone(),
+        );
         let text = collect(fo.execute(request("msp1:fo")).await.unwrap()).await;
         assert_eq!(text, "LOCAL");
         assert_eq!(local.calls.load(Ordering::SeqCst), 1);
@@ -619,5 +676,124 @@ mod lan_proof {
         let secs = started.elapsed().as_secs_f64();
         println!("REMOTE REPLY ({completion_tokens} tokens, {secs:.1}s): {text}");
         assert!(!text.trim().is_empty(), "remote peer must produce tokens");
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+    use crate::serving::{serve_sessions, LeasePolicy};
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedMessage, NormalizedRequest};
+    use modelswarm_identity::InstallationIdentity;
+    use modelswarm_transport::libp2p_backend::Libp2pTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Connection reuse: TWO sequential requests through ONE
+    /// RemoteExecutor reuse the same QUIC session (one dial, one serving
+    /// session, both requests served) — the per-request handshake
+    /// disappears.
+    #[tokio::test]
+    async fn two_requests_reuse_one_session() {
+        struct CountingExecutor {
+            served: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl modelswarm_gateway::InferenceExecutor for CountingExecutor {
+            async fn execute(
+                &self,
+                _request: NormalizedRequest,
+            ) -> Result<ExecutorStream, ExecutorError> {
+                let n = self.served.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    ExecutorEvent::TokenDelta {
+                        delta: format!("answer-{n}"),
+                        index: 0,
+                    },
+                    ExecutorEvent::Completed {
+                        finish_reason: modelswarm_gateway::FinishReason::Stop,
+                    },
+                ])))
+            }
+        }
+
+        let server_identity = InstallationIdentity::from_bytes(&[67u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[68u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let listener = server.listen("127.0.0.1:0").await.unwrap();
+        let addr = listener.bound_addr().to_string();
+        let profile = crate::serving::lease_helpers::TEST_PROFILE;
+        let client_peer_id = Libp2pTransport::new(&client_identity)
+            .unwrap()
+            .peer_id()
+            .to_string();
+        let (policy, token) =
+            crate::serving::lease_helpers::policy_and_lease(profile, &client_peer_id);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let served = Arc::new(CountingExecutor {
+            served: AtomicUsize::new(0),
+        });
+        tokio::spawn(serve_sessions(
+            listener,
+            served.clone(),
+            profile.into(),
+            policy,
+            rx,
+        ));
+
+        let executor = RemoteExecutor::new(
+            RemotePeer {
+                addr,
+                peer_id: server.peer_id().to_string(),
+            },
+            client_identity,
+        );
+
+        async fn run(executor: &RemoteExecutor, profile: &str, token: &str, id: &str) -> String {
+            let stream = executor
+                .execute(NormalizedRequest {
+                    request_id: id.into(),
+                    profile_id: profile.into(),
+                    capability_token: Some(token.to_string()),
+                    messages: vec![NormalizedMessage {
+                        role: "user".into(),
+                        content: "hi".into(),
+                    }],
+                    sampling: modelswarm_gateway::Sampling {
+                        temperature: 0.0,
+                        top_p: 1.0,
+                        top_k: 40,
+                        seed: None,
+                    },
+                    max_tokens: 8,
+                    deadline_ms: 10_000,
+                    stream: true,
+                })
+                .await
+                .expect("execute starts");
+            let mut text = String::new();
+            futures_util::pin_mut!(stream);
+            while let Some(event) = stream.next().await {
+                if let ExecutorEvent::TokenDelta { delta, .. } = event {
+                    text.push_str(&delta);
+                }
+            }
+            text
+        }
+
+        let first = run(&executor, profile, &token, "r1").await;
+        // Give the pool a beat to take the returned session.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let pooled = executor.pool.lock().await.is_some();
+        let second = run(&executor, profile, &token, "r2").await;
+
+        assert_eq!(first, "answer-0");
+        assert_eq!(second, "answer-1");
+        assert!(
+            pooled,
+            "the session returned to the pool after the clean terminal"
+        );
+        assert_eq!(served.served.load(Ordering::SeqCst), 2);
     }
 }

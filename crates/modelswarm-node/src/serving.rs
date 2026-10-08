@@ -67,116 +67,117 @@ async fn serve_one(
     profile_id: String,
     lease_policy: &LeasePolicy,
 ) -> Result<(), String> {
-    let request = match session.recv(IO_DEADLINE).await {
-        Ok(WireMessage::InferenceRequest(r)) => r,
-        Ok(other) => {
-            let code = format!("expected InferenceRequest, got {other:?}");
-            send_error(&mut session, "bad_frame", &code).await;
+    // One QUIC session, many sequential requests (connection reuse): the
+    // loop waits for the next request until the client closes. The
+    // between-requests wait is generous (chat gaps); a recv error ends
+    // the session and the client re-dials self-healingly.
+    const BETWEEN_REQUESTS: Duration = Duration::from_secs(300);
+    loop {
+        let request = match session.recv(BETWEEN_REQUESTS).await {
+            Ok(WireMessage::InferenceRequest(r)) => r,
+            Ok(other) => {
+                let code = format!("expected InferenceRequest, got {other:?}");
+                send_error(&mut session, "bad_frame", &code).await;
+                linger(&mut session).await;
+                return Err(code);
+            }
+            Err(e) => {
+                send_error(&mut session, "bad_frame", &e.to_string()).await;
+                linger(&mut session).await;
+                return Err(e.to_string());
+            }
+        };
+        if request.profile_id != profile_id {
+            send_error(
+                &mut session,
+                "profile_mismatch",
+                "this node serves another profile",
+            )
+            .await;
             linger(&mut session).await;
-            return Err(code);
+            return Err("profile_mismatch".into());
         }
-        Err(e) => {
-            send_error(&mut session, "bad_frame", &e.to_string()).await;
+
+        // F3: the hub-signed lease gate. The remote's PeerId comes from the
+        // QUIC handshake, so a lease issued to anyone else is worthless here.
+        if let Err(why) = lease_policy.check(
+            &request.capability_token,
+            &profile_id,
+            &session.remote_peer_id().to_string(),
+        ) {
+            send_error(&mut session, "invalid_lease", &why).await;
             linger(&mut session).await;
-            return Err(e.to_string());
+            return Err(format!("invalid_lease: {why}"));
         }
-    };
-    if request.profile_id != profile_id {
-        send_error(
-            &mut session,
-            "profile_mismatch",
-            "this node serves another profile",
-        )
-        .await;
-        linger(&mut session).await;
-        return Err("profile_mismatch".into());
-    }
 
-    // F3: the hub-signed lease gate. The remote's PeerId comes from the
-    // QUIC handshake, so a lease issued to anyone else is worthless here.
-    if let Err(why) = lease_policy.check(
-        &request.capability_token,
-        &profile_id,
-        &session.remote_peer_id().to_string(),
-    ) {
-        send_error(&mut session, "invalid_lease", &why).await;
-        linger(&mut session).await;
-        return Err(format!("invalid_lease: {why}"));
-    }
+        let normalized = NormalizedRequest {
+            request_id: request.request_id.clone(),
+            profile_id: request.profile_id.clone(),
+            capability_token: Some(request.capability_token.clone()),
+            messages: request
+                .messages
+                .into_iter()
+                .map(|m: ChatMessage| NormalizedMessage {
+                    role: m.role,
+                    content: m.content,
+                })
+                .collect(),
+            sampling: modelswarm_gateway::Sampling {
+                temperature: request.sampling.temperature as f32,
+                top_p: request.sampling.top_p as f32,
+                top_k: request.sampling.top_k,
+                seed: request.sampling.seed,
+            },
+            max_tokens: request.max_tokens,
+            deadline_ms: request.deadline_ms,
+            stream: true,
+        };
 
-    let normalized = NormalizedRequest {
-        request_id: request.request_id.clone(),
-        profile_id: request.profile_id.clone(),
-        capability_token: Some(request.capability_token.clone()),
-        messages: request
-            .messages
-            .into_iter()
-            .map(|m: ChatMessage| NormalizedMessage {
-                role: m.role,
-                content: m.content,
-            })
-            .collect(),
-        sampling: modelswarm_gateway::Sampling {
-            temperature: request.sampling.temperature as f32,
-            top_p: request.sampling.top_p as f32,
-            top_k: request.sampling.top_k,
-            seed: request.sampling.seed,
-        },
-        max_tokens: request.max_tokens,
-        deadline_ms: request.deadline_ms,
-        stream: true,
-    };
-
-    let mut events = match executor.execute(normalized).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            let code = format!("{e:?}");
-            send_error(&mut session, "executor_error", &code).await;
-            linger(&mut session).await;
-            return Err(code);
-        }
-    };
-    while let Some(event) = events.next().await {
-        let frame = match event {
-            ExecutorEvent::Accepted { .. } => continue,
-            ExecutorEvent::TokenDelta { delta, index } => WireMessage::TokenDelta(TokenDelta {
-                request_id: request.request_id.clone(),
-                delta,
-                index,
-            }),
-            ExecutorEvent::Usage {
-                prompt_tokens,
-                completion_tokens,
-                prefill_ms,
-                decode_ms,
-            } => WireMessage::Usage(Usage {
-                prompt_tokens,
-                completion_tokens,
-                prefill_ms: prefill_ms as u32,
-                decode_ms: decode_ms as u32,
-            }),
-            ExecutorEvent::Completed { finish_reason } => WireMessage::Completed(Completed {
-                request_id: request.request_id.clone(),
-                finish_reason: format!("{finish_reason:?}").to_lowercase(),
-            }),
-            ExecutorEvent::Error {
-                code, retryable, ..
-            } => {
-                send_error(&mut session, &code, &format!("retryable={retryable}")).await;
+        let mut events = match executor.execute(normalized).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                let code = format!("{e:?}");
+                send_error(&mut session, "executor_error", &code).await;
                 linger(&mut session).await;
                 return Err(code);
             }
         };
-        if session.send(&frame, IO_DEADLINE).await.is_err() {
-            return Err("client vanished mid-stream".into());
+        while let Some(event) = events.next().await {
+            let frame = match event {
+                ExecutorEvent::Accepted { .. } => continue,
+                ExecutorEvent::TokenDelta { delta, index } => WireMessage::TokenDelta(TokenDelta {
+                    request_id: request.request_id.clone(),
+                    delta,
+                    index,
+                }),
+                ExecutorEvent::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    prefill_ms,
+                    decode_ms,
+                } => WireMessage::Usage(Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    prefill_ms: prefill_ms as u32,
+                    decode_ms: decode_ms as u32,
+                }),
+                ExecutorEvent::Completed { finish_reason } => WireMessage::Completed(Completed {
+                    request_id: request.request_id.clone(),
+                    finish_reason: format!("{finish_reason:?}").to_lowercase(),
+                }),
+                ExecutorEvent::Error {
+                    code, retryable, ..
+                } => {
+                    send_error(&mut session, &code, &format!("retryable={retryable}")).await;
+                    linger(&mut session).await;
+                    return Err(code);
+                }
+            };
+            if session.send(&frame, IO_DEADLINE).await.is_err() {
+                return Err("client vanished mid-stream".into());
+            }
         }
-    }
-    // Linger: the requester may still be draining the frames we just
-    // wrote — dropping the session instantly can close the connection
-    // before the client reads (bit the F0(4) proof with a zero-latency
-    // executor). Wait for the client's close (or 2 s) before ending.
-    let _ = tokio::time::timeout(Duration::from_secs(2), session.recv(IO_DEADLINE)).await;
-    Ok(())
+    } // loop: await the next request on this session
 }
 
 /// Give the requester a moment to drain the last frame before the

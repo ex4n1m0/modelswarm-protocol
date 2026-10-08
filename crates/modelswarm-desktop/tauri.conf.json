@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ModelSwarm",
-  "version": "0.2.20",
   "identifier": "space.deepflux.modelswarm",
   "build": {
     "frontendDist": "ui"

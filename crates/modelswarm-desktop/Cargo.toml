@@ -16,6 +16,7 @@ build = "build.rs"
 tauri-shell = [
     "dep:tauri",
     "dep:tauri-plugin-opener",
+    "dep:tauri-plugin-single-instance",
     "dep:tauri-build",
     "dep:modelswarm-node",
     "dep:modelswarm-tracker-api",
@@ -38,6 +39,7 @@ modelswarm-transport = { path = "../modelswarm-transport", features = ["libp2p-b
 
 tauri = { version = "2", optional = true, default-features = false, features = ["wry"] }
 tauri-plugin-opener = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", optional = true }
 modelswarm-node = { path = "../modelswarm-node", optional = true, features = ["libp2p-backend"] }
 modelswarm-tracker-api = { path = "../modelswarm-tracker-api", optional = true }
 modelswarm-store = { path = "../modelswarm-store", optional = true }

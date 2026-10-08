@@ -400,7 +400,12 @@
       $("chip-hosting").dataset.state = "inactive";
       $("chip-hosting").textContent = hostingOn ? "hosting on" : "hosting off";
       $("chip-direct").dataset.state = "inactive";
-      $("chip-direct").textContent = "remote serve: off (listener ships in Phase F)";
+      // Truth, not a static label: the listener state from get_status
+      // (bound under MSP_LISTENER=1 while hosting) decides the text.
+      const listener = s.node.listener_addr;
+      $("chip-direct").textContent = listener
+        ? "remote serve: on (" + listener + ")"
+        : "remote serve: off (dev listener flag not set)";
       $("chat-input").disabled = !hostingOn;
       $("send-btn").disabled = !hostingOn;
       $("chat-input").placeholder = hostingOn ? "Ask the hosted model…" : "start hosting to chat";
@@ -468,7 +473,8 @@
       try {
         const r = await invoke("send_chat", { message: text });
         const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms`;
-        if (r.content) addMsg("assistant", r.content, meta);
+        if (r.error) addMsg("assistant", `⚠ local engine failed (${r.error.code}) — ${r.error.message || "see Diagnostics/logs/node.jsonl"}. Restart hosting or try another model.`, meta);
+        else if (r.content) addMsg("assistant", r.content, meta);
         else addMsg("assistant", "(no reply — the model ended its turn before the first token; rephrase the message and send again)", meta);
       } catch (err) { addMsg("assistant", "error: " + err); }
       $("send-btn").disabled = false; busy = false; $("chat-input").focus();

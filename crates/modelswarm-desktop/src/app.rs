@@ -43,6 +43,10 @@ pub struct DesktopState {
     inner: Mutex<Inner>,
     /// Hardware analysis, computed once per process (engine query + RAM FFI).
     hardware: tokio::sync::OnceCell<HardwareInfo>,
+    /// The ONE process telemetry sink (node log format). The desktop must
+    /// not open FileSinks per call: redaction rules apply at this boundary
+    /// and multiple writers on one file are exactly what it prevents.
+    telemetry: std::sync::Arc<Telemetry>,
 }
 
 struct Inner {
@@ -63,6 +67,11 @@ struct Inner {
     artifact: Option<EnsuredArtifact>,
     node: Option<RunningNode>,
     chat_log: Vec<ChatTurn>,
+    /// The advertised QUIC serving address while the listener is bound
+    /// (MSP_LISTENER=1 + hosting on); None = no listener. get_status
+    /// reports it so the UI's "remote serve" chip is truth, not a
+    /// static label.
+    listener_addr: Option<String>,
 }
 
 struct RunningNode {
@@ -97,8 +106,10 @@ impl DesktopState {
         let _ = std::fs::create_dir_all(&data_dir);
         let config = read_config(&data_dir);
         let license_accepted = license_accepted(&config.tracker, &data_dir).await;
+        let telemetry = std::sync::Arc::new(open_node_telemetry(&data_dir));
         Self {
             hardware: tokio::sync::OnceCell::new(),
+            telemetry,
             inner: Mutex::new(Inner {
                 data_dir,
                 tracker_url: config.tracker,
@@ -110,15 +121,32 @@ impl DesktopState {
                 chat_log: Vec::new(),
                 swarm_lease: None,
                 swarm_executor: None,
+                listener_addr: None,
             }),
         }
     }
 }
 
+/// The process-wide node-log sink (same file/format as the node daemon's
+/// own telemetry). On open failure we degrade to a memory sink — logging
+/// must never take the app down, and a missing trail shows up in
+/// diagnostics immediately.
+fn open_node_telemetry(data_dir: &std::path::Path) -> Telemetry {
+    let logs_dir = data_dir.join("logs");
+    if std::fs::create_dir_all(&logs_dir).is_ok() {
+        if let Ok(sink) = modelswarm_telemetry::FileSink::open(&logs_dir.join("node.jsonl")) {
+            return Telemetry::with_sink(Box::new(sink));
+        }
+    }
+    let (telemetry, _mem) = Telemetry::memory();
+    telemetry
+}
+
 /// Loads (or creates) the installation identity and checks the
 /// privacy-gate acceptance row. Any failure reads as "not accepted".
 async fn license_accepted(tracker_url: &str, data_dir: &std::path::Path) -> bool {
-    let Ok(tracker) = tracker_client(tracker_url, data_dir).await else {
+    let telemetry = open_node_telemetry(data_dir);
+    let Ok(tracker) = tracker_client(tracker_url, data_dir, &telemetry).await else {
         return false;
     };
     let installation_id = tracker.identity().installation_id();
@@ -201,16 +229,10 @@ fn engine_gpu_binary_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-/// Appends one event to the node log (same sink/format as the node's own
-/// events) so client-side failures — catalog fetches above all — leave a
-/// trail even when the UI is the only thing reporting them.
-fn log_event(data_dir: &std::path::Path, level: &str, event: &str, fields: &[(&str, &str)]) {
-    let _ = std::fs::create_dir_all(data_dir.join("logs"));
-    let Ok(sink) = modelswarm_telemetry::FileSink::open(&data_dir.join("logs").join("node.jsonl"))
-    else {
-        return;
-    };
-    let telemetry = Telemetry::with_sink(Box::new(sink));
+/// Appends one event to the shared process telemetry (same sink/format as
+/// the node's own events) so client-side failures — catalog fetches above
+/// all — leave a trail even when the UI is the only thing reporting them.
+fn log_event(telemetry: &Telemetry, level: &str, event: &str, fields: &[(&str, &str)]) {
     match level {
         "warn" => telemetry.warn(event, fields),
         _ => telemetry.info(event, fields),
@@ -225,20 +247,17 @@ fn log_event(data_dir: &std::path::Path, level: &str, event: &str, fields: &[(&s
 /// lands in F0(3)). None = not opted in or bind failed (log both).
 async fn bind_serving_listener(
     data_dir: &std::path::Path,
+    telemetry: &Telemetry,
 ) -> Option<(modelswarm_transport::libp2p_backend::Libp2pListener, String)> {
     if std::env::var("MSP_LISTENER").as_deref() != Ok("1") {
         return None;
     }
-    let logs_dir = data_dir.join("logs");
-    let _ = std::fs::create_dir_all(&logs_dir);
-    let sink = modelswarm_telemetry::FileSink::open(&logs_dir.join("node.jsonl")).ok()?;
-    let telemetry = Telemetry::with_sink(Box::new(sink));
-    let identity = load_or_create_identity(data_dir, &telemetry).ok()?;
+    let identity = load_or_create_identity(data_dir, telemetry).ok()?;
     let backend = match modelswarm_transport::libp2p_backend::Libp2pTransport::new(&identity) {
         Ok(b) => b,
         Err(e) => {
             log_event(
-                data_dir,
+                telemetry,
                 "warn",
                 "listener.error",
                 &[("phase", "backend"), ("error", &e.to_string())],
@@ -250,7 +269,7 @@ async fn bind_serving_listener(
         Ok(l) => l,
         Err(e) => {
             log_event(
-                data_dir,
+                telemetry,
                 "warn",
                 "listener.error",
                 &[("phase", "bind"), ("error", &e.to_string())],
@@ -270,23 +289,16 @@ async fn bind_serving_listener(
         .bound_addr()
         .to_string()
         .replace("/0.0.0.0/", &format!("/{lan_ip}/"));
-    log_event(data_dir, "info", "listener.bound", &[("addr", &addr)]);
+    log_event(telemetry, "info", "listener.bound", &[("addr", &addr)]);
     Some((listener, addr))
 }
 
 async fn tracker_client(
     tracker_url: &str,
     data_dir: &std::path::Path,
+    telemetry: &Telemetry,
 ) -> Result<Arc<TrackerClient>, String> {
-    // Telemetry sink is required by the loader; the desktop reuses the node's
-    // log file. Missing dirs are created by Node normally; here we tolerate.
-    let logs_dir = data_dir.join("logs");
-    let _ = std::fs::create_dir_all(&logs_dir);
-    let log_path = logs_dir.join("node.jsonl");
-    let sink = modelswarm_telemetry::FileSink::open(&log_path)
-        .map_err(|e| format!("telemetry sink: {e}"))?;
-    let telemetry = Telemetry::with_sink(Box::new(sink));
-    let identity = load_or_create_identity(data_dir, &telemetry).map_err(|e| e.to_string())?;
+    let identity = load_or_create_identity(data_dir, telemetry).map_err(|e| e.to_string())?;
     let client = TrackerClient::new(tracker_url, Arc::new(identity));
     // Reuse the enrolled session (the roster/lookup endpoints require it).
     if let Ok(token) = std::fs::read_to_string(data_dir.join("session.token")) {
@@ -303,9 +315,10 @@ async fn tracker_client(
 async fn resolve_profile(
     tracker_url: &str,
     data_dir: &std::path::Path,
+    telemetry: &Telemetry,
     profile_id: Option<&str>,
 ) -> Result<catalog::ProfileListing, String> {
-    let tracker = tracker_client(tracker_url, data_dir).await?;
+    let tracker = tracker_client(tracker_url, data_dir, telemetry).await?;
     let profiles = catalog::active_profiles(&tracker)
         .await
         .map_err(|e| e.to_string())?;
@@ -584,6 +597,7 @@ async fn get_status(
             "installation_id": installation_id,
             "engine_port": engine_port,
             "engine_backend": engine_backend,
+            "listener_addr": inner.listener_addr,
             "enrollment": enrollment,
         },
         "chat_turns": inner.chat_log.len(),
@@ -615,7 +629,7 @@ async fn set_tracker(state: tauri::State<'_, DesktopState>, url: String) -> Resu
 #[tauri::command]
 async fn accept_privacy(state: tauri::State<'_, DesktopState>) -> Result<(), String> {
     let mut inner = state.inner.lock().await;
-    let tracker = tracker_client(&inner.tracker_url, &inner.data_dir).await?;
+    let tracker = tracker_client(&inner.tracker_url, &inner.data_dir, &state.telemetry).await?;
     let installation_id = tracker.identity().installation_id();
     let store = modelswarm_store::Store::open(inner.data_dir.join("state.sqlite"))
         .map_err(|e| e.to_string())?;
@@ -632,7 +646,7 @@ async fn list_models(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let mut inner = state.inner.lock().await;
-    let tracker = tracker_client(&inner.tracker_url, &inner.data_dir).await?;
+    let tracker = tracker_client(&inner.tracker_url, &inner.data_dir, &state.telemetry).await?;
     // One retry after a short pause: a single reset packet between here and
     // the hub should not read as "catalog down". Both attempts are logged;
     // the second failure is what the UI shows.
@@ -640,7 +654,7 @@ async fn list_models(
         Ok(profiles) => profiles,
         Err(first) => {
             log_event(
-                &inner.data_dir,
+                &state.telemetry,
                 "warn",
                 "catalog.error",
                 &[
@@ -787,7 +801,7 @@ async fn download_model(
         let inner = state.inner.lock().await;
         (inner.data_dir.clone(), inner.tracker_url.clone())
     };
-    let profile = resolve_profile(&tracker_url, &data_dir, None).await?;
+    let profile = resolve_profile(&tracker_url, &data_dir, &state.telemetry, None).await?;
     let manager = ArtifactManager::new(&data_dir);
     let store = std::sync::Mutex::new(
         modelswarm_store::Store::open(data_dir.join("state.sqlite")).map_err(|e| e.to_string())?,
@@ -835,6 +849,7 @@ async fn set_hosting_inner(
             running.heartbeat.abort();
             let _ = running.handle.stopped().await;
         }
+        inner.listener_addr = None;
         return Ok(serde_json::json!({ "hosting": false }));
     }
 
@@ -851,6 +866,7 @@ async fn set_hosting_inner(
     let listing = resolve_profile(
         &inner.tracker_url,
         &inner.data_dir,
+        &state.telemetry,
         inner.profile_id.as_deref(),
     )
     .await
@@ -896,17 +912,19 @@ async fn set_hosting_inner(
     // bridge dies with the node via the shared shutdown watch; the
     // advertised multiaddr is the listener's real bound address.
     let mut advertised_addr: Option<String> = None;
-    if let Some((listener, addr)) = bind_serving_listener(&inner.data_dir).await {
+    if let Some((listener, addr)) = bind_serving_listener(&inner.data_dir, &state.telemetry).await {
         if let (Some(executor), Some(profile)) =
             (handle.executor.clone(), handle.profile_id.clone())
         {
             advertised_addr = Some(addr);
+            inner.listener_addr = advertised_addr.clone();
             let serving_shutdown = handle.shutdown_rx.clone();
             tokio::spawn(modelswarm_node::serving::serve_sessions(
                 listener,
                 executor,
                 profile,
                 modelswarm_node::serving::LeasePolicy::production(),
+                std::sync::Arc::clone(&state.telemetry),
                 serving_shutdown,
             ));
         }
@@ -915,13 +933,15 @@ async fn set_hosting_inner(
     // Roster heartbeat: device-enroll (approval gated) → session →
     // register + heartbeat so exact-profile peers see this machine (with
     // the honest no-listener address until transport lands).
-    let heartbeat_tracker = tracker_client(&inner.tracker_url, &inner.data_dir).await?;
+    let heartbeat_tracker =
+        tracker_client(&inner.tracker_url, &inner.data_dir, &state.telemetry).await?;
     // peerId is derived inside the heartbeat task (ADR-020); the
     // installation_id stays a UI label.
     let profile_id = listing.profile_id.clone();
     let build = listing.manifest.runtime().build_hash().to_string();
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
     let hb_data_dir = inner.data_dir.clone();
+    let hb_telemetry = std::sync::Arc::clone(&state.telemetry);
     let enrollment_view = Arc::new(tokio::sync::RwLock::new(EnrollmentView {
         phase: "enrolling".into(),
         ..EnrollmentView::default()
@@ -962,7 +982,7 @@ async fn set_hosting_inner(
                                     phase: "enrolled".into(),
                                     ..EnrollmentView::default()
                                 };
-                                log_event(&hb_data_dir, "info", "enroll.approved", &[]);
+                                log_event(&hb_telemetry, "info", "enroll.approved", &[]);
                                 lease_id = None; // register below with the new session
                             }
                             // Malformed-but-2xx: keep polling the same code.
@@ -984,7 +1004,7 @@ async fn set_hosting_inner(
                             roster_failures += 1;
                             if roster_failures == 1 || roster_failures % 20 == 0 {
                                 log_event(
-                                    &hb_data_dir,
+                                    &hb_telemetry,
                                     "warn",
                                     "enroll.error",
                                     &[("error", &error.to_string())],
@@ -1022,7 +1042,7 @@ async fn set_hosting_inner(
                                 error: String::new(),
                             };
                             log_event(
-                                &hb_data_dir,
+                                &hb_telemetry,
                                 "info",
                                 "enroll.pending",
                                 &[("user_code", &view.user_code)],
@@ -1038,7 +1058,7 @@ async fn set_hosting_inner(
                             roster_failures += 1;
                             if roster_failures == 1 || roster_failures % 20 == 0 {
                                 log_event(
-                                    &hb_data_dir,
+                                    &hb_telemetry,
                                     "warn",
                                     "enroll.error",
                                     &[("error", &error.to_string())],
@@ -1101,7 +1121,7 @@ async fn set_hosting_inner(
                 roster_failures += 1;
                 if roster_failures == 1 || roster_failures % 20 == 0 {
                     log_event(
-                        &hb_data_dir,
+                        &hb_telemetry,
                         "warn",
                         "roster.error",
                         &[
@@ -1183,7 +1203,7 @@ async fn select_model(
         let inner = state.inner.lock().await;
         (inner.tracker_url.clone(), inner.data_dir.clone())
     };
-    let listing = resolve_profile(&tracker_url, &data_dir, Some(&profile_id))
+    let listing = resolve_profile(&tracker_url, &data_dir, &state.telemetry, Some(&profile_id))
         .await
         .map_err(|e| format!("catalog: {e}"))?;
     let manager = ArtifactManager::new(&data_dir);
@@ -1232,7 +1252,7 @@ async fn lookup_peers(
             None => return Ok(Vec::new()),
         }
     };
-    let tracker = tracker_client(&tracker_url, &data_dir).await?;
+    let tracker = tracker_client(&tracker_url, &data_dir, &state.telemetry).await?;
     let peers = tracker
         .lookup(&profile, 10)
         .await
@@ -1254,11 +1274,15 @@ async fn lookup_peers(
 /// tracker grants leases only after a hosting challenge, so we run ONE
 /// small real generation against the local gateway and report its true
 /// timings. Cached per profile until expiry (challenges are not free).
+/// Every failure step logs a `lease.earn` warn with a reason code — a
+/// silent None here reads as "no peers" in the UI, which cost a full
+/// diagnosis round once already.
 #[allow(clippy::too_many_arguments)]
 async fn earn_lease(
     inner: &tokio::sync::Mutex<Inner>,
     tracker_url: &str,
     data_dir: &std::path::Path,
+    telemetry: &Telemetry,
     gateway_addr: &str,
     profile: &str,
     now_ms: u64,
@@ -1271,18 +1295,31 @@ async fn earn_lease(
             }
         }
     }
-    let lease_id = std::fs::read_to_string(data_dir.join("lease.id")).ok()?;
+    let fail = |reason: &str, detail: String| {
+        telemetry.warn("lease.earn", &[("reason", reason), ("detail", &detail)]);
+    };
+    let Ok(lease_id) = std::fs::read_to_string(data_dir.join("lease.id")) else {
+        fail("no_lease_id", "lease.id missing — register first".into());
+        return None;
+    };
     let lease_id = lease_id.trim().to_string();
     if lease_id.is_empty() {
+        fail("no_lease_id", "lease.id empty".into());
         return None;
     }
-    let tracker = tracker_client(tracker_url, data_dir).await.ok()?;
+    let tracker = match tracker_client(tracker_url, data_dir, telemetry).await {
+        Ok(t) => t,
+        Err(e) => {
+            fail("tracker_client", e);
+            return None;
+        }
+    };
 
     // Hosting challenge: one real local generation, honest timings.
     // first_token_ms is reported as the total (a conservative floor — we
     // do not game the capacity class).
     let started = Instant::now();
-    let reply: serde_json::Value = reqwest::Client::new()
+    let reply: serde_json::Value = match reqwest::Client::new()
         .post(format!("http://{gateway_addr}/v1/chat/completions"))
         .timeout(Duration::from_secs(60))
         .json(&serde_json::json!({
@@ -1294,20 +1331,60 @@ async fn earn_lease(
         }))
         .send()
         .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
+    {
+        Ok(r) => match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                fail("challenge_engine", format!("local gateway body: {e}"));
+                return None;
+            }
+        },
+        Err(e) => {
+            fail("challenge_engine", format!("local gateway: {e}"));
+            return None;
+        }
+    };
     let total_ms = started.elapsed().as_millis() as u64;
-    // Local engine did not answer: no honest timings exist.
-    reply["choices"][0]["message"]["content"].as_str()?;
-    let challenge = tracker.challenge_start(&lease_id, profile).await.ok()?;
-    let challenge_id = challenge["challengeId"].as_str()?.to_string();
-    tracker
+    // Local engine did not answer: no honest timings exist. Surface the
+    // gateway's error code (e.g. engine_failed / no_eligible_peer) — the
+    // body's message is our own static text, never prompt content.
+    if reply["choices"][0]["message"]["content"].as_str().is_none() {
+        let code = reply["error"]["code"].as_str().unwrap_or("no_choices");
+        fail("challenge_engine", format!("local gateway error: {code}"));
+        return None;
+    }
+    let challenge = match tracker.challenge_start(&lease_id, profile).await {
+        Ok(c) => c,
+        Err(e) => {
+            fail("challenge_refused", e.to_string());
+            return None;
+        }
+    };
+    let Some(challenge_id) = challenge["challengeId"].as_str().map(str::to_string) else {
+        fail("challenge_refused", "no challengeId in response".into());
+        return None;
+    };
+    if let Err(e) = tracker
         .challenge_complete(&lease_id, profile, &challenge_id, total_ms, total_ms)
         .await
-        .ok()?;
-    let issued = tracker.request_lease(&lease_id, profile).await.ok()?;
+    {
+        fail("challenge_refused", e.to_string());
+        return None;
+    }
+    let issued = match tracker.request_lease(&lease_id, profile).await {
+        Ok(i) => i,
+        Err(e) => {
+            fail("lease_denied", e.to_string());
+            return None;
+        }
+    };
+    telemetry.info(
+        "lease.earned",
+        &[
+            ("profile", profile),
+            ("challenge_ms", &total_ms.to_string()),
+        ],
+    );
     // Cache until the lease's own expiry (or a 5-minute floor).
     let expires = now_ms + 300_000;
     let mut guard = inner.lock().await;
@@ -1317,29 +1394,41 @@ async fn earn_lease(
 
 /// F1(3): swarm-first chat. Finds a peer verifiably hosting this exact
 /// profile with a REAL advertised address (not the no-listener
-/// placeholder, not ourselves), and if one exists, drives the
-/// FailoverExecutor (remote peer first, this node's local executor as
-/// honest fallback). Returns None when no remote peer is known or the
-/// whole path errored pre-token — the caller's local gateway path then
-/// serves identically.
+/// placeholder, not ourselves), and asks it first. The REMOTE executor is
+/// driven directly — not through FailoverExecutor — so the reply's mode
+/// honestly says who served: a remote peer, or this node as a logged
+/// fallback. Returns None when no remote peer is known or both sides
+/// failed pre-token; the caller's local gateway path then serves.
 #[allow(clippy::too_many_arguments)]
 async fn try_swarm_chat(
     inner: &tokio::sync::Mutex<Inner>,
     tracker_url: &str,
     data_dir: &std::path::Path,
+    telemetry: &Telemetry,
     profile: &str,
     local_executor: std::sync::Arc<dyn modelswarm_gateway::InferenceExecutor>,
     log: &[ChatTurn],
     max_tokens: Option<u32>,
     lease: Option<String>,
 ) -> Option<serde_json::Value> {
-    let tracker = tracker_client(tracker_url, data_dir).await.ok()?;
-    let peers = tracker.lookup(profile, 10).await.ok()?;
-    let logs_dir = data_dir.join("logs");
-    let _ = std::fs::create_dir_all(&logs_dir);
-    let sink = modelswarm_telemetry::FileSink::open(&logs_dir.join("node.jsonl")).ok()?;
-    let telemetry = Telemetry::with_sink(Box::new(sink));
-    let identity = load_or_create_identity(data_dir, &telemetry).ok()?;
+    let tracker = match tracker_client(tracker_url, data_dir, telemetry).await {
+        Ok(t) => t,
+        Err(e) => {
+            telemetry.warn("chat.swarm.error", &[("phase", "tracker"), ("error", &e)]);
+            return None;
+        }
+    };
+    let peers = match tracker.lookup(profile, 10).await {
+        Ok(p) => p,
+        Err(e) => {
+            telemetry.warn(
+                "chat.swarm.error",
+                &[("phase", "lookup"), ("error", &e.to_string())],
+            );
+            return None;
+        }
+    };
+    let identity = load_or_create_identity(data_dir, telemetry).ok()?;
     let own_peer_id = identity.peer_id();
 
     // First peer with a real QUIC multiaddr that is not us.
@@ -1359,6 +1448,7 @@ async fn try_swarm_chat(
         addr,
         peer_id: candidate.peer_id,
     };
+    let remote_peer_id = peer.peer_id.clone();
     telemetry.info(
         "chat.swarm",
         &[
@@ -1367,10 +1457,10 @@ async fn try_swarm_chat(
         ],
     );
 
-    let request = modelswarm_gateway::NormalizedRequest {
+    let make_request = || modelswarm_gateway::NormalizedRequest {
         request_id: format!("chat-{}", modelswarm_identity::new_nonce()),
         profile_id: profile.to_string(),
-        capability_token: lease,
+        capability_token: lease.clone(),
         messages: log
             .iter()
             .map(|t| modelswarm_gateway::NormalizedMessage {
@@ -1405,53 +1495,157 @@ async fn try_swarm_chat(
             }
         }
     };
-    let failover = modelswarm_node::remote::FailoverExecutor::new(remote, local_executor);
     use futures_util::StreamExt;
     use modelswarm_gateway::{ExecutorEvent, InferenceExecutor};
-    let mut events = match failover.execute(request).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            telemetry.warn("chat.swarm.error", &[("error", &e.to_string())]);
-            return None;
-        }
-    };
-    let started = Instant::now();
-    let mut content = String::new();
-    let mut completion_tokens = 0u64;
-    let mut completed = false;
-    while let Some(event) = events.next().await {
-        match event {
-            ExecutorEvent::TokenDelta { delta, .. } => content.push_str(&delta),
-            ExecutorEvent::Usage {
-                completion_tokens: t,
-                ..
-            } => completion_tokens = u64::from(t),
-            ExecutorEvent::Completed { .. } => {
-                completed = true;
-                break;
-            }
-            ExecutorEvent::Error { code, .. } => {
-                telemetry.warn("chat.swarm.error", &[("code", code.as_str())]);
-                return None;
-            }
-            ExecutorEvent::Accepted { .. } => {}
-        }
+
+    enum ChatOutcome {
+        Served {
+            content: String,
+            completion_tokens: u64,
+        },
+        Failed(String),
     }
-    if !completed || content.trim().is_empty() {
+    async fn drain_chat<S>(mut events: S) -> ChatOutcome
+    where
+        S: futures_util::Stream<Item = ExecutorEvent> + Unpin,
+    {
+        let mut content = String::new();
+        let mut completion_tokens = 0u64;
+        while let Some(event) = events.next().await {
+            match event {
+                ExecutorEvent::TokenDelta { delta, .. } => content.push_str(&delta),
+                ExecutorEvent::Usage {
+                    completion_tokens: t,
+                    ..
+                } => completion_tokens = u64::from(t),
+                ExecutorEvent::Completed { .. } => {
+                    return ChatOutcome::Served {
+                        content,
+                        completion_tokens,
+                    };
+                }
+                ExecutorEvent::Error { code, .. } => {
+                    return ChatOutcome::Failed(code.as_str().to_string());
+                }
+                ExecutorEvent::Accepted { .. } => {}
+            }
+        }
+        ChatOutcome::Failed("stream ended without completion".into())
+    }
+
+    let started = Instant::now();
+    // Remote first; on any pre-token failure fall back to the SAME local
+    // executor the gateway uses, with the reason in the mode label —
+    // execution mode is never hidden.
+    let (content, completion_tokens, mode, served_remote) =
+        match remote.execute(make_request()).await {
+            Ok(events) => match drain_chat(events).await {
+                ChatOutcome::Served {
+                    content,
+                    completion_tokens,
+                } => {
+                    let label: String = format!(
+                        "swarm — remote peer {}…",
+                        remote_peer_id.chars().take(12).collect::<String>()
+                    );
+                    (content, completion_tokens, label, true)
+                }
+                ChatOutcome::Failed(reason) => {
+                    telemetry.warn("chat.swarm.fallback", &[("reason", &reason)]);
+                    match local_executor.execute(make_request()).await {
+                        Ok(events) => match drain_chat(events).await {
+                            ChatOutcome::Served {
+                                content,
+                                completion_tokens,
+                            } => (
+                                content,
+                                completion_tokens,
+                                format!("local (remote failed: {reason})"),
+                                false,
+                            ),
+                            ChatOutcome::Failed(local_reason) => {
+                                telemetry.warn(
+                                    "chat.swarm.error",
+                                    &[("phase", "local_fallback"), ("error", &local_reason)],
+                                );
+                                return None;
+                            }
+                        },
+                        Err(e) => {
+                            telemetry.warn(
+                                "chat.swarm.error",
+                                &[("phase", "local_fallback"), ("error", &e.to_string())],
+                            );
+                            return None;
+                        }
+                    }
+                }
+            },
+            Err(e) => {
+                // Pre-token dial/protocol failure: honest local fallback.
+                let reason = e.to_string();
+                telemetry.warn("chat.swarm.fallback", &[("reason", &reason)]);
+                match local_executor.execute(make_request()).await {
+                    Ok(events) => match drain_chat(events).await {
+                        ChatOutcome::Served {
+                            content,
+                            completion_tokens,
+                        } => (
+                            content,
+                            completion_tokens,
+                            format!("local (remote dial failed)"),
+                            false,
+                        ),
+                        ChatOutcome::Failed(local_reason) => {
+                            telemetry.warn(
+                                "chat.swarm.error",
+                                &[("phase", "local_fallback"), ("error", &local_reason)],
+                            );
+                            return None;
+                        }
+                    },
+                    Err(le) => {
+                        telemetry.warn(
+                            "chat.swarm.error",
+                            &[("phase", "local_fallback"), ("error", &le.to_string())],
+                        );
+                        return None;
+                    }
+                }
+            }
+        };
+    if content.trim().is_empty() {
+        telemetry.warn("chat.swarm.empty", &[]);
         return None;
     }
+    let content = content.trim().to_string();
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let tok_s = if elapsed_ms > 0 && completion_tokens > 0 {
         (completion_tokens as f64) * 1000.0 / elapsed_ms as f64
     } else {
         0.0
     };
+    telemetry.info(
+        "chat.swarm.completed",
+        &[
+            (
+                "served_by",
+                if served_remote {
+                    "remote"
+                } else {
+                    "local_fallback"
+                },
+            ),
+            ("completion_tokens", &completion_tokens.to_string()),
+            ("elapsed_ms", &elapsed_ms.to_string()),
+        ],
+    );
     Some(serde_json::json!({
-        "content": content.trim(),
+        "content": content,
         "completion_tokens": completion_tokens,
         "elapsed_ms": elapsed_ms,
         "tokens_per_second": tok_s,
-        "mode": "swarm — served by a remote peer (local fallback)",
+        "mode": mode,
     }))
 }
 
@@ -1509,15 +1703,17 @@ async fn send_chat(
                 &state.inner,
                 &tracker_url,
                 &data_dir,
+                &state.telemetry,
                 &gateway,
                 &profile,
                 now_ms,
             )
             .await;
-            if let Some(reply) = try_swarm_chat(
+            if let Some(mut reply) = try_swarm_chat(
                 &state.inner,
                 &tracker_url,
                 &data_dir,
+                &state.telemetry,
                 &profile,
                 executor.clone(),
                 &log,
@@ -1526,8 +1722,19 @@ async fn send_chat(
             )
             .await
             {
+                // The remote peer's reply enters the rendered history too
+                // — without it, multi-turn swarm transcripts send only
+                // user turns and drift from local behavior.
                 let mut inner = state.inner.lock().await;
                 inner.chat_log = log;
+                let content = reply["content"].as_str().unwrap_or_default().to_string();
+                if !content.is_empty() {
+                    inner.chat_log.push(ChatTurn {
+                        role: "assistant".into(),
+                        content,
+                    });
+                }
+                reply["served_by"] = serde_json::json!("swarm");
                 return Ok(reply);
             }
         }
@@ -1561,6 +1768,31 @@ async fn send_chat(
         .await
         .map_err(|e| e.to_string())?;
 
+    // A gateway error body (engine crash, restart budget exhausted,
+    // profile mismatch) must surface as an ERROR turn — rendering it as
+    // "no reply, the model ended its turn" sends the user chasing a
+    // phantom prompt problem while hosting is actually broken.
+    if let Some(code) = response["error"]["code"].as_str() {
+        let message = response["error"]["message"].as_str().unwrap_or("");
+        log_event(
+            &state.telemetry,
+            "warn",
+            "chat.local.error",
+            &[("code", code), ("message", message)],
+        );
+        let mut inner = state.inner.lock().await;
+        inner.chat_log = log;
+        return Ok(serde_json::json!({
+            "content": "",
+            "completion_tokens": 0,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "tokens_per_second": 0.0,
+            "mode": "local error",
+            "served_by": "local",
+            "error": { "code": code, "message": message },
+        }));
+    }
+
     let content = response["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default()
@@ -1591,6 +1823,7 @@ async fn send_chat(
         "elapsed_ms": elapsed_ms,
         "tokens_per_second": tok_s,
         "mode": "local single",
+        "served_by": "local",
     }))
 }
 
@@ -1860,12 +2093,12 @@ async fn request_model(
     {
         return Err("request payload failed validation".into());
     }
-    let (tracker_url, data_dir) = {
+    let tracker_url = {
         let inner = state.inner.lock().await;
-        (inner.tracker_url.clone(), inner.data_dir.clone())
+        inner.tracker_url.clone()
     };
     log_event(
-        &data_dir,
+        &state.telemetry,
         "info",
         "model.request",
         &[("repo", &repo), ("artifact", &path)],
@@ -1896,6 +2129,15 @@ async fn request_model(
 
 pub fn run() {
     tauri::Builder::default()
+        // One app instance per machine: two nodes on one identity/data
+        // dir thrash the roster and overwrite session.token/lease.id (the
+        // two-instance confusion burned UI automation twice). A second
+        // launch focuses the existing window and exits.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }))
         // Opens the device-approval page in the system browser (capability
         // scopes it to the tracker origin only).
         .plugin(tauri_plugin_opener::init())

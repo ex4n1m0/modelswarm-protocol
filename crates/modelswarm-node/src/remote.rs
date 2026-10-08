@@ -665,16 +665,23 @@ mod lan_proof {
                         .ok()?;
                     probe["choices"][0]["message"]["content"].as_str()?;
                     let total_ms = started.elapsed().as_millis() as u64;
-                    let ch = tracker.challenge_start(&lease_id, profile.as_str()).await.ok()?;
+                    let ch = tracker
+                        .challenge_start(&lease_id, profile.as_str())
+                        .await
+                        .ok()?;
                     let ch_id = ch["challengeId"].as_str()?.to_string();
                     tracker
                         .challenge_complete(&lease_id, profile.as_str(), &ch_id, total_ms, total_ms)
                         .await
                         .ok()?;
-                    let issued = tracker.request_lease(&lease_id, profile.as_str()).await.ok()?;
+                    let issued = tracker
+                        .request_lease(&lease_id, profile.as_str())
+                        .await
+                        .ok()?;
                     println!("lease earned (challenge {} ms)", total_ms);
                     Some(issued.lease)
-                }).await,
+                })
+                .await,
                 messages: vec![NormalizedMessage {
                     role: "user".into(),
                     content: "Say exactly: cross-machine swarm serving works.".into(),

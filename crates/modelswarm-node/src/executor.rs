@@ -10,8 +10,9 @@
 //! `modelswarm_transport`) is a documented later wiring; see the crate docs.
 //!
 //! Privacy: the request's message content is tokenized and passed to the
-//! local runtime only. It is never logged (the executor logs nothing; the
-//! gateway's audit channel records counts and ids only).
+//! local runtime only. It is never logged — the executor's only logging is
+//! runtime *error* text (diagnostics, never prompt/completion content), and
+//! the gateway's audit channel records counts and ids only.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -113,7 +114,17 @@ impl InferenceExecutor for SingleLocalExecutor {
             Err(modelswarm_runtime::RuntimeError::Cancelled(_)) => {
                 return Err(fatal("cancelled"));
             }
-            Err(_) => return Err(ExecutorError::Retryable { peer_hint: None }),
+            Err(e) => {
+                // The real cause must not vanish behind a bare Retryable: a
+                // hidden engine/adapter failure is indistinguishable from
+                // "no peer" at the gateway (cost a full diagnosis round on
+                // the 7B). RuntimeError text is diagnostics only — never
+                // prompt or completion content.
+                eprintln!("modelswarm-node: decode_stream failed: {e}");
+                return Err(ExecutorError::Retryable {
+                    peer_hint: Some(format!("local:{e}")),
+                });
+            }
         };
 
         // Batched event stream (Accepted → TokenDelta×n → Usage → Completed).

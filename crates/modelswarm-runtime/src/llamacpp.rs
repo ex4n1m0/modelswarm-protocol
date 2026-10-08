@@ -290,6 +290,11 @@ struct ChoiceLogprobs {
 
 #[derive(Debug, Deserialize)]
 struct LogprobEntry {
+    /// The sampled token's id as the server itself reports it. b11407 always
+    /// includes it — including for special tokens (EOS etc.) whose byte
+    /// representation is empty, which is exactly where a bytes lookup fails.
+    #[serde(default)]
+    id: Option<u32>,
     /// Raw UTF-8 bytes of the generated token — exact id recovery including
     /// byte-fallback tokens that invalid-UTF-8 text cannot represent.
     #[serde(default)]
@@ -437,20 +442,42 @@ impl crate::InferenceRuntime for LlamaCppAdapter {
             RuntimeError::MalformedResponse("completions response had no choices".to_string())
         })?;
 
-        // Preferred path: exact id from the generated token's raw bytes.
+        // Preferred path: exact id as the server reports it. The server
+        // samples from the same GGUF vocabulary the adapter pinned (artifact
+        // identity is sha-verified), so its id is exact by construction —
+        // and it is the ONLY representation special tokens have: EOS and
+        // friends come back with empty `token` and empty `bytes`, which
+        // used to fail the bytes lookup and kill the whole decode (the
+        // Qwen2.5-7B chat failure: every reply ended in <|im_end|>).
         if let (Some(vocab), Some(entries)) = (&self.config.vocab, choice.logprobs.as_ref()) {
-            if let Some(bytes) = entries.content.first().and_then(|e| e.bytes.as_ref()) {
-                let id = vocab.bytes_to_id.get(bytes.as_slice()).copied();
-                return match id {
-                    Some(id) => {
-                        self.record_decode_rate(1, started.elapsed());
-                        Ok(id)
+            if let Some(entry) = entries.content.first() {
+                if entry.id.is_some() || entry.bytes.is_some() {
+                    let bytes_id = vocab
+                        .bytes_to_id
+                        .get(entry.bytes.as_deref().unwrap_or_default())
+                        .copied();
+                    // Both recoveries available and disagreeing = vocabulary
+                    // drift between the pinned artifact and the server —
+                    // fail closed rather than corrupt a token stream.
+                    if let (Some(server_id), Some(bytes_id)) = (entry.id, bytes_id) {
+                        if server_id != bytes_id {
+                            return Err(RuntimeError::MalformedResponse(format!(
+                                "token id disagreement: server says {server_id}, pinned vocab says {bytes_id}"
+                            )));
+                        }
                     }
-                    None => Err(RuntimeError::MalformedResponse(format!(
-                        "generated token bytes {:?} not in the pinned vocabulary",
-                        bytes
-                    ))),
-                };
+                    let id = entry.id.or(bytes_id);
+                    return match id {
+                        Some(id) => {
+                            self.record_decode_rate(1, started.elapsed());
+                            Ok(id)
+                        }
+                        None => Err(RuntimeError::MalformedResponse(format!(
+                            "generated token (id {:?}, bytes {:?}) not in the pinned vocabulary",
+                            entry.id, entry.bytes
+                        ))),
+                    };
+                }
             }
         }
 
@@ -960,6 +987,93 @@ mod tests {
                 .unwrap_err(),
             RuntimeError::MalformedResponse(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn special_token_with_empty_bytes_recovers_id_from_server() {
+        // The Qwen2.5-7B chat failure: the reply's <|im_end|> (or any special
+        // token) comes back with empty `token` AND empty `bytes` — the bytes
+        // map can never contain the empty sequence — but b11407 reports the
+        // sampled `id`, which is exact for the pinned artifact. The stream
+        // must terminate on it (eos pinned) instead of erroring.
+        let addr = start_canned_server(Arc::new(Mutex::new(|req: &str| {
+            let first = req.split_whitespace().nth(1).unwrap_or("");
+            if first.starts_with("/v1/completions") {
+                Canned::ok(
+                    r#"{"choices":[{"text":"","finish_reason":"stop","logprobs":{"content":[{"id":2,"token":"","bytes":[]}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+                )
+            } else {
+                Canned::ok(MODELS)
+            }
+        })))
+        .await
+        .unwrap();
+
+        let mut vocab = modelswarm_types::TokenVocab {
+            bytes_to_id: std::collections::HashMap::new(),
+            eos_id: Some(2),
+        };
+        vocab.bytes_to_id.insert(vec![65], 72);
+        let runtime = LlamaCppAdapter::new(
+            LlamaCppConfig::new(format!("http://{addr}"), "internal-secret")
+                .with_vocab(Arc::new(vocab)),
+        )
+        .unwrap();
+        let handle = runtime.load("msp1:aa").await.unwrap();
+        let token = runtime
+            .decode_step(&handle, &[1, 2], &SamplingParams::default())
+            .await
+            .unwrap();
+        assert_eq!(token, 2);
+        // EOS-aware termination, not an error and not an emitted token.
+        let out = runtime
+            .decode_stream(
+                &handle,
+                &[1],
+                &SamplingParams::default(),
+                5,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_id_disagreeing_with_bytes_map_fails_closed() {
+        let addr = start_canned_server(Arc::new(Mutex::new(|req: &str| {
+            let first = req.split_whitespace().nth(1).unwrap_or("");
+            if first.starts_with("/v1/completions") {
+                Canned::ok(
+                    r#"{"choices":[{"text":"A","logprobs":{"content":[{"id":70,"token":"A","bytes":[65]}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+                )
+            } else {
+                Canned::ok(MODELS)
+            }
+        })))
+        .await
+        .unwrap();
+
+        // Vocab pins bytes [65] ("A") to id 72; the server claims 70 — vocab
+        // drift must surface, never silently corrupt the token stream.
+        let mut vocab = modelswarm_types::TokenVocab {
+            bytes_to_id: std::collections::HashMap::new(),
+            eos_id: None,
+        };
+        vocab.bytes_to_id.insert(vec![65], 72);
+        let runtime = LlamaCppAdapter::new(
+            LlamaCppConfig::new(format!("http://{addr}"), "internal-secret")
+                .with_vocab(Arc::new(vocab)),
+        )
+        .unwrap();
+        let handle = runtime.load("msp1:aa").await.unwrap();
+        let err = runtime
+            .decode_step(&handle, &[1, 2], &SamplingParams::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::MalformedResponse(ref m) if m.contains("disagreement"))
+        );
     }
 
     #[tokio::test]

@@ -51,6 +51,9 @@ struct Inner {
     profile_id: Option<String>,
     /// Cached HF artifact sizes for requirement hints: profile -> (bytes, fetched_unix_ms).
     size_cache: std::collections::HashMap<String, (u64, u64)>,
+    /// Cached swarm consume-lease (F3(2)): (profile, wire lease, unix expiry).
+    /// Earned via the hosting-challenge chain; reused until it expires.
+    swarm_lease: Option<(String, String, u64)>,
     license_accepted: bool,
     artifact: Option<EnsuredArtifact>,
     node: Option<RunningNode>,
@@ -100,6 +103,7 @@ impl DesktopState {
                 artifact: None,
                 node: None,
                 chat_log: Vec::new(),
+                swarm_lease: None,
             }),
         }
     }
@@ -1074,6 +1078,10 @@ async fn set_hosting_inner(
                                 .get("leaseId")
                                 .and_then(|v| v.as_str())
                                 .map(str::to_string);
+                            // Persist for the swarm-chat lease chain (F3(2)).
+                            if let Some(id) = &lease_id {
+                                let _ = std::fs::write(hb_data_dir.join("lease.id"), id);
+                            }
                         }),
                 }
             } else {
@@ -1236,6 +1244,71 @@ async fn lookup_peers(
         .collect())
 }
 
+/// F3(2): earn a consume lease for `profile` the honest way — the
+/// tracker grants leases only after a hosting challenge, so we run ONE
+/// small real generation against the local gateway and report its true
+/// timings. Cached per profile until expiry (challenges are not free).
+#[allow(clippy::too_many_arguments)]
+async fn earn_lease(
+    inner: &tokio::sync::Mutex<Inner>,
+    tracker_url: &str,
+    data_dir: &std::path::Path,
+    gateway_addr: &str,
+    profile: &str,
+    now_ms: u64,
+) -> Option<String> {
+    {
+        let guard = inner.lock().await;
+        if let Some((p, lease, expires)) = &guard.swarm_lease {
+            if p == profile && *expires > now_ms + 30_000 {
+                return Some(lease.clone());
+            }
+        }
+    }
+    let lease_id = std::fs::read_to_string(data_dir.join("lease.id")).ok()?;
+    let lease_id = lease_id.trim().to_string();
+    if lease_id.is_empty() {
+        return None;
+    }
+    let tracker = tracker_client(tracker_url, data_dir).await.ok()?;
+
+    // Hosting challenge: one real local generation, honest timings.
+    // first_token_ms is reported as the total (a conservative floor — we
+    // do not game the capacity class).
+    let started = Instant::now();
+    let reply: serde_json::Value = reqwest::Client::new()
+        .post(format!("http://{gateway_addr}/v1/chat/completions"))
+        .timeout(Duration::from_secs(60))
+        .json(&serde_json::json!({
+            "model": profile,
+            "messages": [{ "role": "user", "content": "Say ok." }],
+            "max_tokens": 8,
+            "temperature": 0.0,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let total_ms = started.elapsed().as_millis() as u64;
+    // Local engine did not answer: no honest timings exist.
+    reply["choices"][0]["message"]["content"].as_str()?;
+    let challenge = tracker.challenge_start(&lease_id, profile).await.ok()?;
+    let challenge_id = challenge["challengeId"].as_str()?.to_string();
+    tracker
+        .challenge_complete(&lease_id, profile, &challenge_id, total_ms, total_ms)
+        .await
+        .ok()?;
+    let issued = tracker.request_lease(&lease_id, profile).await.ok()?;
+    // Cache until the lease's own expiry (or a 5-minute floor).
+    let expires = now_ms + 300_000;
+    let mut guard = inner.lock().await;
+    guard.swarm_lease = Some((profile.to_string(), issued.lease.clone(), expires));
+    Some(issued.lease)
+}
+
 /// F1(3): swarm-first chat. Finds a peer verifiably hosting this exact
 /// profile with a REAL advertised address (not the no-listener
 /// placeholder, not ourselves), and if one exists, drives the
@@ -1251,6 +1324,7 @@ async fn try_swarm_chat(
     local_executor: std::sync::Arc<dyn modelswarm_gateway::InferenceExecutor>,
     log: &[ChatTurn],
     max_tokens: Option<u32>,
+    lease: Option<String>,
 ) -> Option<serde_json::Value> {
     let tracker = tracker_client(tracker_url, data_dir).await.ok()?;
     let peers = tracker.lookup(profile, 10).await.ok()?;
@@ -1289,7 +1363,7 @@ async fn try_swarm_chat(
     let request = modelswarm_gateway::NormalizedRequest {
         request_id: format!("chat-{}", modelswarm_identity::new_nonce()),
         profile_id: profile.to_string(),
-        capability_token: None,
+        capability_token: lease,
         messages: log
             .iter()
             .map(|t| modelswarm_gateway::NormalizedMessage {
@@ -1407,6 +1481,19 @@ async fn send_chat(
                 let inner = state.inner.lock().await;
                 (inner.tracker_url.clone(), inner.data_dir.clone())
             };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let lease = earn_lease(
+                &state.inner,
+                &tracker_url,
+                &data_dir,
+                &gateway,
+                &profile,
+                now_ms,
+            )
+            .await;
             if let Some(reply) = try_swarm_chat(
                 &tracker_url,
                 &data_dir,
@@ -1414,6 +1501,7 @@ async fn send_chat(
                 executor.clone(),
                 &log,
                 max_tokens,
+                lease,
             )
             .await
             {

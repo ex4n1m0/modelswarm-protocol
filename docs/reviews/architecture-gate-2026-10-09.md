@@ -77,9 +77,10 @@ which profile performed each role (M12 exit criterion); M12 begins only
 after M10 (cooperative) and M11 (deliberation) gates. Nothing silent.
 
 **3. Phase mapping (audit-corrected M0–M13 status):**
-M0 DONE (validated; `63b98e1` verified green run 37858753428; `86450aa`
-run 37860513036 in flight at gate time — "green pending one run" until
-it completes, per the Test/Release condition) · M1 PARTIAL-seed
+M0 DONE (validated; **CI green restored** — `63b98e1` run 37858753428
+AND `86450aa` run 37860513036 both verified success; the Test/Release
+evidence-truth condition was satisfied when the latter completed green
+after sign-off) · M1 PARTIAL-seed
 (hw detection exists; profiler crate new) · M2 NEW (governor ADR incl.
 70%-vs-90% reconciliation) · M3 PARTIAL→harden · M4 NEW (top-6 seed;
 automatic selection new) · M5 PARTIAL (resume/disk/rollback absent) ·
@@ -134,8 +135,8 @@ test/dependency/agent docs — all under `docs/reviews/`, 2026-10-09.
 
 ## F. What proceeds without waiting (already-sanctioned maintenance)
 
-CI green upkeep (63b98e1 green — run 37858753428; 86450aa pushed, its
-run 37860513036 in flight at gate time), gated-proof upkeep, doc-truth
+CI green upkeep (done and verified: 63b98e1 run 37858753428, 86450aa
+run 37860513036 — both success), gated-proof upkeep, doc-truth
 fixes that change no behavior. Everything else in §C waits for this
 gate's approval.
 
@@ -161,7 +162,9 @@ gate's approval.
   `86450aa`'s run (37860513036) was IN FLIGHT at sign-off time — the
   gate and M0 may record "CI green restored" only once that run
   completes green; until then M0 records "green pending one run"
-  (applied in §C.3 and §F). (2) The future tauri-shell CLIPPY gate must
+  (applied in §C.3 and §F). **Condition satisfied: the run completed
+  success (guards + check) after sign-off — §C.3/§F updated to the
+  earned claim.** (2) The future tauri-shell CLIPPY gate must
   set the same `TAURI_CONFIG='{"bundle":{"resources":[]}}'` overlay —
   clippy executes build scripts and would otherwise fail on clean
   runners exactly like the just-fixed test step. Notes carried:

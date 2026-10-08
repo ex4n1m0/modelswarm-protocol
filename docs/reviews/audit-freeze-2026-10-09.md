@@ -96,7 +96,10 @@ completes.
   (observed 2026-10-09).** Follow-up hardening (test-release
   recommendation): a guards-job assertion freezing
   `bundle.resources` to the exact two-glob set restores push-time drift
-  detection despite the test-only overlay.
+  detection despite the test-only overlay — landed in `86450aa`, whose
+  CI run `37860513036` also completed **success** (guards + check).
+  CI on main is fully restored at the freeze baseline + the two
+  CI-only fixes.
 
 ## Freeze-time observations (non-blocking, routed to audits)
 

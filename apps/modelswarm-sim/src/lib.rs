@@ -189,6 +189,21 @@ async fn serve_canned(
 
 /// `pair`: one verified handshake + one inference round-trip + RTT probes.
 /// Returns the JSON summary object (printed by the caller).
+/// Wall-clock-tolerant fallback policy for SIMULATION: rounds are
+/// measured in real time, and a loaded CI runner stretches scheduling
+/// far beyond 2x — a healthy case would trip `rtt_spike` (observed on
+/// the 2026-10-08 feature-test run). The sim asserts the
+/// acceptance/receipt/greedy-equality contracts; rtt_spike detection is
+/// a production-network concern, so the multiplier is effectively
+/// disabled here. acceptance_collapse still fires deterministically
+/// (it is acceptance-history driven, not wall-clock).
+fn sim_fallback_policy() -> FallbackPolicy {
+    FallbackPolicy {
+        rtt_multiplier: 1_000_000.0,
+        ..FallbackPolicy::default()
+    }
+}
+
 pub async fn run_pair(rtt_samples: usize) -> Result<Value> {
     let client = sim_identity(101);
     let listener = SignedFrameTransport::listen("127.0.0.1:0")
@@ -545,7 +560,7 @@ async fn spec_case(prompt_seed: u64, window: u32, draft_accuracy: f32) -> Result
         SPEC_TOKENS,
         &coordinator,
         &verifier_id.verifying_key(),
-        FallbackPolicy::default(),
+        sim_fallback_policy(),
     )
     .await
     .context("spec speculate")?;
@@ -810,7 +825,7 @@ async fn spec_multi_case(
         SPEC_TOKENS,
         &coordinator,
         &verifier_id.verifying_key(),
-        FallbackPolicy::default(),
+        sim_fallback_policy(),
         TrieLimits::default(),
         SPEC_MULTI_COLLECT,
     )
@@ -1053,7 +1068,7 @@ async fn relay_case(prompt_seed: u64) -> Result<RelayCase> {
         RELAY_TOKENS,
         &coordinator,
         &verifier_id.verifying_key(),
-        FallbackPolicy::default(),
+        sim_fallback_policy(),
     )
     .await
     .context("relay speculate")?;

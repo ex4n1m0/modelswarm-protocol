@@ -499,3 +499,28 @@ input) — logs the plan it would choose, never acts (dependency-graph edge
 present). Network side next: the F2b Swarm-migration ADR (Option B) and
 the HIGH-2/MEDIUM-1 retryable/deadline fixes remain queued from the audit
 above.
+
+## ADDENDUM 2026-10-09 (evening): LAN pass-1 live run — TWO transport bugs found (repro included)
+
+The 9.6 LAN pass-1 exposed real transport defects the loopback dry-run cannot
+catch (in-process vs cross-process). Repro chain on ONE machine (no machine B
+needed for bug 1):
+
+1. **Bug 1 — cross-process stream-open abort (repro LOCAL):**
+   `pass1_serve --bind-ip 127.0.0.1` in one process; `pass1_lan_run` test in
+   another (env MSP_BENCH_PEER_0/1 from its output) → connection establishes,
+   then `libp2p stream open: aborted by peer ... during the handshake`
+   (~60ms, no serve-side log, no panic — RUST_LOG inert: no tracing subscriber
+   in that path, so first fix step = add one). IN-PROCESS loopback (the
+   dry-run) passes 44/0 — the difference is process separation. Suspects:
+   serve-bridge task lifecycle/shutdown-sender handling in `pass1_serve`
+   main (starved serve_sessions accept loop per the F11 lazy-inbound-streams
+   lesson), or multistream negotiation differences cross-process.
+2. **Bug 2 — cross-machine dial abort at B (192.168.100.43, bind pinned,
+   firewall rule verified, leases fresh):** `libp2p dial: aborted by peer`
+   instantly; B console clean; asymmetric NICs ruled out by the .43 bind.
+   May be the same root cause surfacing earlier in the handshake.
+
+Owner-facing impact: the harness did its job — this is a REAL production-path
+transport defect the simulator/dry-run could not reach. 9.6 pass-1 blocked
+until fixed; everything else landed today is unaffected (all CI green).

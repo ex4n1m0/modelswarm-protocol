@@ -26,6 +26,7 @@ async fn main() {
     let mut bridges: u64 = 2;
     let mut inject_ms: u64 = 0;
     let mut bind_ip = "0.0.0.0".to_string();
+    let mut print_driver_peer = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().expect("flag needs a value");
@@ -35,8 +36,17 @@ async fn main() {
             "--bridges" => bridges = value().parse().expect("--bridges <n>"),
             "--inject-rtt-ms" => inject_ms = value().parse().expect("--inject-rtt-ms <n>"),
             "--bind-ip" => bind_ip = value(),
+            "--print-driver-peer" => print_driver_peer = true,
             other => panic!("unknown flag {other:?}"),
         }
+    }
+    // Machine-A helper (the handoff's A1 step): the driver identity is
+    // the documented fixed seed, so its PeerId is deterministic — print
+    // it for --client-peer on machine B and exit.
+    if print_driver_peer {
+        let identity = modelswarm_identity::InstallationIdentity::from_bytes(&[0xB0; 32]);
+        println!("DRIVER_PEER_ID={}", identity.peer_id());
+        return;
     }
     assert!(
         profile.starts_with("msp1:") && profile.len() == 69,

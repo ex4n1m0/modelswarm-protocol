@@ -64,11 +64,26 @@ async fn main() {
         &telemetry,
     )));
 
-    println!("# pass1-serve: {bridges} bridges, inject {inject_ms} ms, profile {profile}");
+    // `--bind-ip 0.0.0.0` means "bind all interfaces and ADVERTISE the
+    // LAN IP" — resolve it the way the desktop heartbeat does (UDP
+    // connect picks the default-route source address), so the printed
+    // multiaddr is dialable cross-machine. An explicit IP binds+advertises
+    // itself. Off-loopback listens need MSP_LISTENER=1 (set by the bat).
+    let advertised_ip = if bind_ip == "0.0.0.0" {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("udp bind");
+        sock.connect("8.8.8.8:80")
+            .expect("udp connect (no packets sent)");
+        sock.local_addr().expect("local addr").ip().to_string()
+    } else {
+        bind_ip.clone()
+    };
+    std::env::set_var("MSP_LISTENER", "1");
+
+    println!("# pass1-serve: {bridges} bridges, inject {inject_ms} ms, profile {profile}, advertise {advertised_ip}");
     println!("MSP_BENCH_POLICY_NOTE=leases are throwaway-hub-signed (experiment-only)");
     for index in 0..bridges {
         // Asymmetric pool per the dry run (mid, slow, fast-drafter cycle).
-        let config = match index % 3 {
+        let mut config = match index % 3 {
             0 => BridgeConfig::new(0x11 + index, 0.30, 1.5),
             1 => BridgeConfig::new(0x22 + index, 0.20, 1.0),
             _ => {
@@ -78,6 +93,7 @@ async fn main() {
                 drafter
             }
         };
+        config.bind_addr = bind_ip.clone();
         let bridge = spawn_bridge(
             &profile,
             &identity,
@@ -92,7 +108,7 @@ async fn main() {
             "MSP_BENCH_PEER_{index}={}|{}|{}|{}|{}",
             bridge
                 .addr
-                .replace("/ip4/0.0.0.0/", &format!("/ip4/{bind_ip}/")),
+                .replace("/ip4/0.0.0.0/", &format!("/ip4/{advertised_ip}/")),
             bridge.peer_id,
             bridge.token,
             bridge.roster.advertised_queue_ms.unwrap_or(0),

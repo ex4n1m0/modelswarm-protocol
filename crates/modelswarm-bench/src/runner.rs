@@ -294,6 +294,11 @@ pub struct BridgeConfig {
     /// Determinism-divergent peer (cross-machine determinism-failure
     /// model; off by default — exact-profile peers continue identically).
     pub divergent: bool,
+    /// Socket bind address for the serving listener. Defaults to
+    /// `127.0.0.1` (loopback harness); the LAN serve side passes the
+    /// machine's real LAN IP so the advertised multiaddr is dialable
+    /// cross-machine (off-loopback requires `MSP_LISTENER=1`).
+    pub bind_addr: String,
 }
 
 impl BridgeConfig {
@@ -308,6 +313,7 @@ impl BridgeConfig {
             capacity_class: "gpu_mid",
             free_slots: 1,
             divergent: false,
+            bind_addr: "127.0.0.1".to_string(),
         }
     }
 }
@@ -410,7 +416,7 @@ pub async fn spawn_bridge(
     )))
     .map_err(|e| format!("transport: {e}"))?;
     let listener = transport
-        .listen("127.0.0.1:0")
+        .listen(&(config.bind_addr.clone() + ":0"))
         .await
         .map_err(|e| format!("listen: {e}"))?;
     let peer_id = transport.peer_id().to_string();

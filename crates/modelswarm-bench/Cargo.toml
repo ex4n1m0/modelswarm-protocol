@@ -7,6 +7,28 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# 9.6 pass-1 harness: transport-backed runner over REAL serving bridges
+# (modelswarm-node `serve_sessions` over QUIC, the F15/shadow test seam).
+# Off by default — the mock BenchEngine stays dependency-light and the
+# workspace default build is unchanged.
+quic-runner = [
+    "dep:modelswarm-node",
+    "modelswarm-node/libp2p-backend",
+    "modelswarm-transport/libp2p-backend",
+    "dep:modelswarm-transport",
+    "dep:modelswarm-gateway",
+    "dep:modelswarm-identity",
+    "dep:modelswarm-telemetry",
+    "dep:modelswarm-eligibility",
+    "dep:ed25519-dalek",
+    "dep:rand_core",
+    "dep:time",
+    "dep:tokio",
+    "dep:futures-util",
+    "dep:async-trait",
+]
+
 [dependencies]
 hex = "0.4"
 modelswarm-runtime = { path = "../modelswarm-runtime", features = ["mock-runtime"] }
@@ -17,9 +39,36 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+# 9.6 pass-1: acceptance-EWMA persistence rides the node-local store
+# (additive migration 4, same pattern as F15's migration 3).
+modelswarm-store = { path = "../modelswarm-store" }
+# Everything below powers ONLY the `quic-runner` harness feature.
+modelswarm-node = { path = "../modelswarm-node", optional = true }
+modelswarm-transport = { path = "../modelswarm-transport", optional = true }
+modelswarm-gateway = { path = "../modelswarm-gateway", optional = true }
+modelswarm-identity = { path = "../modelswarm-identity", optional = true }
+modelswarm-telemetry = { path = "../modelswarm-telemetry", optional = true }
+modelswarm-eligibility = { path = "../modelswarm-eligibility", optional = true }
+ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
+rand_core = { version = "0.6", optional = true, default-features = false }
+time = { version = "0.3", optional = true, features = ["formatting"] }
+tokio = { version = "1", optional = true, features = ["full"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+
+[[example]]
+name = "pass1_serve"
+required-features = ["quic-runner"]
+
+[[test]]
+name = "pass1_loopback"
+required-features = ["quic-runner"]
+
+
 
 [lints]
 workspace = true

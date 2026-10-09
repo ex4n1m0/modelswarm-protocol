@@ -1,0 +1,31 @@
+{
+  "corpus_id": "synthetic-pass1-v1",
+  "digest": "7342d063ad87533450492e9daea4a56646c99fac0e70f9ee89b125612b0b9864",
+  "prompts": [
+    {
+      "id": "p1-short",
+      "text": "modelswarm synthetic pass-1 short prompt: summarize the following sequence of labeled measurements in one sentence; ",
+      "documented_prompt_tokens": 29,
+      "documented_prompt_tokens_note": "ceil(chars/4); realized records carry the serving Usage.prompt_tokens"
+    },
+    {
+      "id": "p1-medium",
+      "text": "modelswarm synthetic pass-1 medium prompt: the quick brown fox jumps over the lazy dog while five wizards judge twelve identical quanta of hedged, speculative, exactly verified inference; summarize the trade-offs in two sentences and keep every number intact; ",
+      "documented_prompt_tokens": 65,
+      "documented_prompt_tokens_note": "ceil(chars/4); realized records carry the serving Usage.prompt_tokens"
+    },
+    {
+      "id": "p1-long",
+      "text": "modelswarm synthetic pass-1 long prompt: the quick brown fox jumps over the lazy dog while five wizards judge twelve identical quanta of hedged, speculative, exactly verified inference; the sluggish amber whale drifts beneath the eager cormorant as seven clerks audit fifteen mismatched ledgers of drained, verified, exactly cancelled speculation; summarize the trade-offs in three sentences, keep every number intact, and end with the word done; ",
+      "documented_prompt_tokens": 112,
+      "documented_prompt_tokens_note": "ceil(chars/4); realized records carry the serving Usage.prompt_tokens"
+    },
+    {
+      "id": "p1-xl",
+      "text": "modelswarm synthetic pass-1 extra-long prompt: the quick brown fox jumps over the lazy dog while five wizards judge twelve identical quanta of hedged, speculative, exactly verified inference; the sluggish amber whale drifts beneath the eager cormorant as seven clerks audit fifteen mismatched ledgers of drained, verified, exactly cancelled speculation; the nimble jade heron strides beside the placid ox while nine archivists index nineteen divergent folios of queued, verified, exactly reconciled attribution; summarize the trade-offs in four sentences, keep every number intact, and end with the word done; ",
+      "documented_prompt_tokens": 153,
+      "documented_prompt_tokens_note": "ceil(chars/4); realized records carry the serving Usage.prompt_tokens"
+    }
+  ],
+  "notes": "Frozen synthetic prompt corpus for the 9.6 pass-1 harness (modelswarm-bench/src/corpus.rs is the source of truth; this mirror must carry the same digest - pinned by a unit test). Synthetic content only - never real user content. digest = sha256 over the canonical JSON {corpus_id, prompts:[{id,text,documented_prompt_tokens}]} in that field order, exactly as serde_json serializes the compiled-in set."
+}

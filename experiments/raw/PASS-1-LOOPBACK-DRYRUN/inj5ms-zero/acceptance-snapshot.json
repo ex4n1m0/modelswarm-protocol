@@ -1,0 +1,20 @@
+[
+  {
+    "acceptance_ewma": 1.0,
+    "accepted_count": 16,
+    "lifetime_rate": 1.0,
+    "peer_id": "12D3KooWCpd7N85W6AnN9sksT1dZUSwp2PfeHeoAy2Qki5jemeJt",
+    "profile_id": "msp1:1111111111111111111111111111111111111111111111111111111111111111",
+    "proposed_count": 16,
+    "rounds": 4
+  },
+  {
+    "acceptance_ewma": 0.7,
+    "accepted_count": 16,
+    "lifetime_rate": 0.8,
+    "peer_id": "12D3KooWNupYHmmV1ngGhythGjLiuJ2m9TLu6hcqniu7V1vH53zZ",
+    "profile_id": "msp1:1111111111111111111111111111111111111111111111111111111111111111",
+    "proposed_count": 20,
+    "rounds": 5
+  }
+]

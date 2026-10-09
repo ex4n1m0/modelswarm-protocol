@@ -649,3 +649,218 @@ transport-backed bench runner over real peers, window/acceptance
 parameterization (audit S6), acceptance-EWMA store, RTT injection with
 manifest calibration, frozen prompt corpus. Reviewer note: the app.rs
 delta here needs Windows Product sign-off per the ownership map.
+
+---
+
+# 9.6 pass-1 experiment harness (implementation, 2026-10-09, third entry)
+
+Dependency-graph hard edge 3 (F15 -> 9.6 pass 1) and edge 11 (shadow
+planner landed at 5f799ef). **Harness + loopback dry run only - the LAN
+run is owner-gated and NOT part of this change; the production selection
+path is untouched** (`crates/modelswarm-bench` gained a feature-gated
+runner; no scheduler behavior change shipped anywhere).
+
+## What was built (against the pass-1 readiness list in section 6)
+
+1. **Transport-backed bench runner over real peers**
+   (`crates/modelswarm-bench/src/runner.rs` + `src/harness.rs`, feature
+   `quic-runner` - off by default, the Phase C mock engine is unchanged):
+   spawns N REAL serving bridges (`serve_sessions` over real QUIC
+   listeners, the F15/shadow-loopback seam) and drives them with the
+   pooled `RemoteExecutor` + F15 `PeerMetrics`. Arms from ONE candidate
+   set per cell (roster facts + warmed `PeerObservations` mapped via the
+   shadow planner): `fastest-single` (independently executed every cell
+   - audit S4 fixed for real-runtime records:
+   `fastest_single_actual_ms` = min over these real completions, never a
+   model draw), `fixed-k`, and `planner-k` - the deterministic
+   section-5 heuristic (`plan_cohort`: sweep k ascending, frozen
+   `predicted_swarm_ms` over measured inputs, stop at marginal benefit
+   <= tau (recorded placeholder, default 0), engage only through the
+   frozen margin rule). `swarm_inputs` derives `SwarmInputs` from
+   measured candidates (audit S2) with the PASS-1 WIRE adjustment
+   recorded openly: wire rounds re-post the prefix, so prefill is
+   charged per round (the S3 structural cost under measurement). Rounds
+   are real requests: proposers serve `window`-token completions, the
+   verifier `window + 1`, compared client-side at delta granularity;
+   acceptance is measured, never assumed. An observed-loss guard aborts
+   to single pre-first-token (rule 6) when round 1 realizes more than
+   2x(1+margin) the predicted per-round budget. Remote (LAN) topology
+   is supported via `RemoteBridge` + the `pass1_serve` example.
+2. **Window/acceptance parameterization (S6)**: `src/params.rs` -
+   `Pass1Params::from_env` (`MSP_BENCH_WINDOW`,
+   `MSP_BENCH_OUTPUT_TOKENS`, `MSP_BENCH_COHORT_CAP` (default 3; k=4 is
+   spend-gated per edge 9/D4), `MSP_BENCH_ACCEPTANCE`,
+   `MSP_BENCH_TAU_MS`, `MSP_BENCH_MARGIN`, `MSP_BENCH_RUNS`,
+   `MSP_BENCH_WARMUP`), clamped with visible warnings (the shadow
+   `EnvPolicy` pattern).
+3. **Acceptance-EWMA store**: `src/acceptance.rs` + additive store
+   migration 4 `speculative_acceptance_observations` (per (peer,
+   profile): ewma + rounds + accepted/proposed counters for correct
+   resume; coordinator-sanctioned store touch following the migration-3
+   pattern; counts only - the structural privacy audit covers the
+   table). The planner arm reads measured acceptance EWMAs; cold pairs
+   use the recorded TEST-ONLY prior (0.8).
+4. **RTT injection + calibration for loopback honesty**: `DelayShim`
+   (executor-seam wrapper; fixed pre-first-event delay = the injected
+   "RTT") using `precise_delay` (sleep + bounded sub-tick spin - Windows
+   timer ticks are ~15.6 ms and would blur a 5 ms injection into ~16 ms;
+   benchmark-only technique, multi-thread runtime required) and a
+   per-cell `calibration.json`: baseline-subtracted 1-token round-trip
+   p50 against a same-speed zero-delay bridge, with the manifest's 10%
+   `calibration_valid` verdict. Every artifact carries
+   `loopback+injected-delay` - never a LAN claim (testbed-ladder
+   honesty).
+5. **Frozen prompt corpus**: `src/corpus.rs` +
+   `experiments/manifests/prompt-corpus-synthetic-pass1-v1.json`
+   (`synthetic-pass1-v1`, 4 synthetic prompts, chars/4 token estimates
+   documented; digest-pinned to the compiled-in set by unit test). Every
+   arm consumes it identically.
+6. **Decision<->completion joining at request-id level**: every request
+   id is `p1-<cell>/<arm>/rep<N>[/r<R>/p<i>|/v]`; the runner joins
+   decision (arm, k, prediction, planner sweep) with realized (ttft,
+   total, accepted/proposed, rounds, status, reason) into
+   `decision-join.jsonl`; records conform to the frozen
+   `run-manifest/v1` + `mode-result/v1` schemas (arm + env label ride
+   `harness_version`; the runtime block names the TEST-ONLY synthetic
+   executor). Per-cell `candidate-set.json` records the measured
+   decision inputs and ranking.
+7. **Dry run recorded as PASS-1-LOOPBACK-DRYRUN**:
+   `experiments/raw/PASS-1-LOOPBACK-DRYRUN/` (6 cells: injected {5,20} ms
+   x regimes {high, zero, mixed}, 192 records), aggregate at
+   `experiments/processed/PASS-1-LOOPBACK-DRYRUN-summary.json`
+   (`experiments/processed/aggregate-pass1.py` - script-computed), report
+   at `experiments/reports/PASS-1-LOOPBACK-DRYRUN.md`. Headline (LOOPBACK
+   + INJECTED DELAY, NOT LAN): 131/144 cooperative runs fell back at the
+   engage gate (visible, ratio ~ 1.0 = ran single); the 13 engaged runs
+   realized 1.07-3.36x the independently executed fastest single - the
+   structural per-round prefix re-post cost (S3), exactly the honest
+   negative pass 1 exists to publish. Measured acceptance: high ~ 1.00,
+   mixed ~ 0.667 (ground truth 2/3). Calibration 5/6 cells within the
+   strict 10% (one 5 ms cell recorded invalid - visible).
+
+## Owner-gated LAN pass-1 command list (machines A + B; NOT run here)
+
+Prereqs: same profile id hosted on B (real engine, real serving); the
+serve example needs `MSP_LISTENER=1` (ADR-018 non-loopback opt-in).
+
+```bash
+# Machine B (serving side; owner-gated): print the connection lines.
+# --client-peer = machine A's driver PeerId (from step A1).
+MSP_LISTENER=1 cargo run -p modelswarm-bench --features quic-runner   --example pass1_serve -- --profile msp1:<64hex> --client-peer <A-PEER-ID>   --bridges 2 --inject-rtt-ms 0 --bind-ip <B-LAN-IP>
+
+# Machine A (driver):
+# A1: derive the driver identity/PeerId (documented seed [0xB0;32]) and
+#     print it (scratch test or serve-example helper).
+# A2: export the MSP_BENCH_PEER_* values B printed, then run the sweep:
+MSP_BENCH_WINDOW=8 MSP_BENCH_OUTPUT_TOKENS=16 MSP_BENCH_RUNS=30 MSP_BENCH_TAU_MS=0 cargo test -p modelswarm-bench --features quic-runner   --test pass1_loopback -- --ignored --nocapture
+# A3: aggregate + commit under experiments/raw/<LAN-RUN-DATE>/ with the
+#     LAN environment label; >= 30 reps/cell per the 9.6 design; record
+#     B's hardware class + runtime build in the manifest fields.
+```
+
+Owner asks (from the coordinator's gating): machine B hosting the pinned
+profile for the run window + the env above. Netem-class shaping can
+substitute for `--inject-rtt-ms` (the shim is the fallback); either way
+the manifest's measured-p50 calibration must validate.
+
+## Changed files and why
+
+- `crates/modelswarm-bench/src/runner.rs` (NEW, feature-gated) - delay
+  shim + precise_delay, synthetic token executor, bridge spawning,
+  arms/planner/wire driver.
+- `crates/modelswarm-bench/src/harness.rs` (NEW, feature-gated) - cell
+  orchestration, calibration, joins/records/summary/artifacts.
+- `crates/modelswarm-bench/src/params.rs` (NEW) - S6 sweep parameters.
+- `crates/modelswarm-bench/src/acceptance.rs` (NEW) - acceptance-EWMA
+  store over migration 4.
+- `crates/modelswarm-bench/src/corpus.rs` (NEW) - frozen corpus + digest.
+- `crates/modelswarm-bench/src/lib.rs` - module registration.
+- `crates/modelswarm-bench/Cargo.toml` - store dep + `quic-runner`
+  feature (node/gateway/transport/eligibility optional); test/example
+  entries.
+- `crates/modelswarm-bench/tests/pass1_loopback.rs` (NEW) - CI smoke
+  over real QUIC + the ignored dry-run driver.
+- `crates/modelswarm-bench/examples/pass1_serve.rs` (NEW) - LAN serve
+  side (owner-gated use).
+- `crates/modelswarm-store/src/lib.rs` - additive migration 4 +
+  `upsert_acceptance`/`acceptance_for`/`all_acceptance_rows`
+  (Integrator-held crate; coordinator-sanctioned additive pattern).
+- `crates/modelswarm-store/tests/acceptance_store.rs` (NEW) - round-trip
+  + reopen-resume tests.
+- `crates/modelswarm-bench/src/stats.rs` - `CellSummary` gains
+  `Deserialize` (processed-summary round-trip).
+- `experiments/manifests/prompt-corpus-synthetic-pass1-v1.json` (NEW) -
+  corpus mirror (digest-pinned by test).
+- `experiments/raw/PASS-1-LOOPBACK-DRYRUN/**` (NEW) - dry-run artifacts
+  (6 cells; the sqlite store is gitignored by pattern; snapshots carry
+  the state).
+- `experiments/processed/aggregate-pass1.py` +
+  `PASS-1-LOOPBACK-DRYRUN-summary.json` (NEW) - script + aggregate.
+- `experiments/reports/PASS-1-LOOPBACK-DRYRUN.md` (NEW) - the labeled
+  report with exact commands.
+
+## Commands and outcomes (all green before commit)
+
+- `cargo fmt --all --check` - PASS.
+- `cargo clippy --workspace --all-targets -- -D warnings` - PASS.
+- `cargo clippy --workspace --all-targets --features
+  modelswarm-node/libp2p-backend -- -D warnings` - PASS.
+- `cargo clippy --workspace --all-targets --features
+  modelswarm-bench/quic-runner -- -D warnings` - PASS (enables
+  node/libp2p transitively).
+- `TAURI_CONFIG='{"bundle":{"resources":[]}}' cargo clippy -p
+  modelswarm-desktop --all-targets --features tauri-shell -- -D
+  warnings` - PASS.
+- `cargo test --workspace` - **347 passed / 0 failed** (baseline 335 +
+  12 new default-feature tests).
+- `cargo test --workspace --features modelswarm-node/libp2p-backend` -
+  **367 passed / 0 failed**.
+- `cargo test --workspace --features modelswarm-bench/quic-runner` -
+  **374 passed / 0 failed** (adds the loopback smoke over real QUIC).
+- `TAURI_CONFIG='{"bundle":{"resources":[]}}' cargo test -p
+  modelswarm-desktop --features tauri-shell` - 7 passed / 0 failed.
+- Dry run (owner-invoked, ignored test): 6 cells, 192 records, ~70 s -
+  results above and in the report.
+
+## Assumptions
+
+1. The coordinator's 9.6-harness tasking sanctions the additive
+   `modelswarm-store` migration 4 (the F15 migration-3 precedent);
+   Security/Test-Release review requested via this handoff.
+2. Loopback dry-run numbers are plumbing evidence only (synthetic
+   executor behind the real serving bridge); the report and manifests
+   label them `loopback+injected-delay` - no LAN or product claims.
+3. The synthetic executor's exact-profile premise (same profile => same
+   greedy continuation for the same request seed) mirrors the project
+   rule; the `divergent` flag models determinism failure (E0
+   sub-question) and stays off by default.
+4. `precise_delay`'s bounded sub-tick spin is benchmark-only and
+   requires a multi-thread runtime (the dry-run and smoke tests use 4
+   workers); documented in the shim.
+5. Tau (marginal-benefit threshold) stays a recorded placeholder (0.0)
+   until the LAN pass measures it - the master prompt bans invented
+   scheduling constants.
+
+## Unresolved risks
+
+- The LAN driver's `RemoteBridge` wiring is built (types + serve
+  example) but the end-to-end LAN invocation is owner-gated and
+  unexecuted - the loopback dry run is the only executed evidence.
+- Warm-up contention inflates measured-queue estimates on a 4-worker
+  loopback runtime (visible in `candidate-set.json`); the candidate
+  ranking can flip between delay cells for that reason. Real machines
+  and real RTT change this; treat loopback rankings as plumbing
+  evidence.
+- Production executor batching (16 tokens/delta) coarsens acceptance to
+  delta granularity on the LAN pass unless the engine adapter (P16)
+  lands first - documented pass-1 limitation, conservative direction.
+- The profile-id adapter workaround from the shadow entry still applies
+  to every non-catalog id flowing through the frozen selector.
+
+## Suggested next task for the integrator
+
+Schedule the owner-gated LAN pass-1 run (machines A + B, command list
+above), then size the k=4 harness spend decision (D4) from its outcome.
+Parallel, inside my owned paths: the S4/S5 leftovers from the audit
+(sim rtt-spike case) and calibrating the ADR-014 path-penalty constants
+once F2A relay evidence accumulates.

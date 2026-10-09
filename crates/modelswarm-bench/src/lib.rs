@@ -18,9 +18,18 @@
 //! - every human-facing report line embeds [`TEST_ONLY_MOCK_LABEL`];
 //! - all numbers are structural evidence only — no performance claim.
 
+pub mod acceptance;
+pub mod corpus;
+#[cfg(feature = "quic-runner")]
+pub mod harness;
+pub mod params;
 pub mod records;
+#[cfg(feature = "quic-runner")]
+pub mod runner;
 pub mod stats;
 
+pub use corpus::{Pass1Prompt, PASS1_CORPUS, PASS1_CORPUS_ID};
+pub use params::Pass1Params;
 pub use records::{
     CellPath, Exactness, JitterClass, ManifestNetworkCell, ManifestRuntime, Mode, ModeMetrics,
     ModeResultRecord, RunManifest, RunOutcome, RunStatus, MODE_RESULT_RECORD_TYPE,
@@ -1201,7 +1210,8 @@ fn draw_rtt(rng: &mut Xorshift, cell: &NetworkCell) -> f64 {
     (nominal + jitter + if loss_hit { nominal } else { 0.0 }).max(0.0)
 }
 
-/// Seed mixer: separates warm-up/recorded streams and runs.
+/// Seed mixer: separates warm-up/recorded streams and runs (crate-shared
+/// with the pass-1 harness).
 fn mix(seed: u64, salt: u64) -> u64 {
     let mut z = seed ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

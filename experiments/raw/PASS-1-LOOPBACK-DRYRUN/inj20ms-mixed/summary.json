@@ -1,0 +1,77 @@
+{
+  "cell": "inj20ms-mixed",
+  "label": "loopback+injected-delay",
+  "regime": "Mixed",
+  "injected_delay_ms": 20,
+  "arms": [
+    {
+      "arm": "fastest-single",
+      "k": null,
+      "n": 8,
+      "completion_ms": {
+        "median": 93.43350000000001,
+        "p10": 67.91590000000001,
+        "p90": 111.06,
+        "iqr": 18.377749999999992,
+        "n": 8
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.0,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "fixed-k2",
+      "k": 2,
+      "n": 8,
+      "completion_ms": {
+        "median": 94.0445,
+        "p10": 78.5698,
+        "p90": 108.4094,
+        "iqr": 16.74775000000001,
+        "n": 8
+      },
+      "fallbacks": 8,
+      "failures": 0,
+      "median_vs_fastest_single": 1.007,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "fixed-k3",
+      "k": 3,
+      "n": 8,
+      "completion_ms": {
+        "median": 100.0095,
+        "p10": 74.2738,
+        "p90": 269.5790999999999,
+        "iqr": 21.3245,
+        "n": 8
+      },
+      "fallbacks": 7,
+      "failures": 0,
+      "median_vs_fastest_single": 1.07,
+      "accepted_tokens_per_round_median": 14.0,
+      "acceptance_rate_mean": 0.667
+    },
+    {
+      "arm": "planner-k",
+      "k": 3,
+      "n": 8,
+      "completion_ms": {
+        "median": 94.679,
+        "p10": 77.94720000000001,
+        "p90": 110.36170000000001,
+        "iqr": 17.433999999999997,
+        "n": 8
+      },
+      "fallbacks": 8,
+      "failures": 0,
+      "median_vs_fastest_single": 1.013,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    }
+  ],
+  "fastest_single_median_ms": 93.434
+}

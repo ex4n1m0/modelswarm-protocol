@@ -3,7 +3,7 @@
 //! bootstrap confidence intervals (bench-harness-spec: median + p10/p90 +
 //! IQR, comparisons via bootstrap 95% CIs with 10 000 resamples).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Deterministic xorshift64* RNG (no external rand dependency).
 #[derive(Debug, Clone)]
@@ -65,7 +65,7 @@ fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
 
 /// Aggregated view of one cell's completion times (bench-harness-spec:
 /// median, p10/p90, IQR computed as p75 − p25).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CellSummary {
     /// Median (p50) in milliseconds.
     pub median: f64,

@@ -3387,15 +3387,28 @@ dependencies = [
 name = "modelswarm-bench"
 version = "0.2.20"
 dependencies = [
+ "async-trait",
+ "ed25519-dalek 2.2.0",
+ "futures-util",
  "hex",
+ "modelswarm-eligibility",
+ "modelswarm-gateway",
+ "modelswarm-identity",
+ "modelswarm-node",
  "modelswarm-runtime",
  "modelswarm-scheduler",
  "modelswarm-speculation",
+ "modelswarm-store",
+ "modelswarm-telemetry",
+ "modelswarm-transport",
  "modelswarm-types",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
 ]
 

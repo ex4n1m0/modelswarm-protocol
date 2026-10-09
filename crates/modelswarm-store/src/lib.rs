@@ -116,7 +116,35 @@ CREATE TABLE IF NOT EXISTS peer_metric_observations (
 );
 "#,
     ),
+    // 9.6 pass-1 harness (Scheduler Scientist): per-(peer, profile)
+    // speculative-acceptance EWMAs. ADDITIVE, same pattern as migration 3
+    // (coordinator-sanctioned store touch; see
+    // docs/reviews/handoff-scheduler-scientist-2026-10-09.md). Counter
+    // columns (rounds / accepted / proposed) persist alongside the EWMA so
+    // a restarted process resumes the aggregate, not just the smoothed
+    // value. Counts of drafted tokens only — no token text, no prompts
+    // (structural privacy audit in tests/store.rs enumerates this table
+    // too).
+    (
+        4,
+        r#"
+CREATE TABLE IF NOT EXISTS speculative_acceptance_observations (
+    peer_id        TEXT NOT NULL,
+    profile_id     TEXT NOT NULL,
+    acceptance_ewma REAL NOT NULL,
+    rounds         INTEGER NOT NULL,
+    accepted_count INTEGER NOT NULL,
+    proposed_count INTEGER NOT NULL,
+    updated_at     TEXT NOT NULL,
+    PRIMARY KEY (peer_id, profile_id)
+);
+"#,
+    ),
 ];
+
+/// One persisted acceptance row (migration 4): `(acceptance_ewma,
+/// rounds, accepted_count, proposed_count)`.
+pub type AcceptanceRow = (f64, u64, u64, u64);
 
 /// The SQLite-backed node-local store.
 pub struct Store {
@@ -246,6 +274,104 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// 9.6 pass-1 harness: inserts or refreshes the speculative-acceptance
+    /// observation for one (peer, profile) pair (migration 4 table). The
+    /// caller owns the EWMA math; the store persists the smoothed value and
+    /// the aggregate counters so a restart resumes correctly.
+    pub fn upsert_acceptance(
+        &self,
+        peer_id: &str,
+        profile_id: &str,
+        acceptance_ewma: f64,
+        rounds: u64,
+        accepted_count: u64,
+        proposed_count: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO speculative_acceptance_observations
+                 (peer_id, profile_id, acceptance_ewma, rounds,
+                  accepted_count, proposed_count, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(peer_id, profile_id) DO UPDATE SET
+                 acceptance_ewma = excluded.acceptance_ewma,
+                 rounds = excluded.rounds,
+                 accepted_count = excluded.accepted_count,
+                 proposed_count = excluded.proposed_count,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![
+                peer_id,
+                profile_id,
+                acceptance_ewma,
+                rounds,
+                accepted_count,
+                proposed_count,
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 9.6 pass-1 harness: the stored acceptance observation for one
+    /// (peer, profile), if any, as `(acceptance_ewma, rounds, accepted,
+    /// proposed)`.
+    pub fn acceptance_for(
+        &self,
+        peer_id: &str,
+        profile_id: &str,
+    ) -> Result<Option<(f64, u64, u64, u64)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT acceptance_ewma, rounds, accepted_count, proposed_count
+                 FROM speculative_acceptance_observations
+                 WHERE peer_id = ?1 AND profile_id = ?2",
+                rusqlite::params![peer_id, profile_id],
+                |row| {
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                        row.get::<_, i64>(3)? as u64,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// 9.6 pass-1 harness: every stored acceptance row keyed by
+    /// `(peer_id, profile_id)`, ordered by (peer, profile) — the
+    /// hydration read.
+    pub fn all_acceptance_rows(&self) -> Vec<((String, String), AcceptanceRow)> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT peer_id, profile_id, acceptance_ewma, rounds,
+                    accepted_count, proposed_count
+             FROM speculative_acceptance_observations
+             ORDER BY peer_id, profile_id",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    (
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, i64>(3)? as u64,
+                        row.get::<_, i64>(4)? as u64,
+                        row.get::<_, i64>(5)? as u64,
+                    ),
+                ))
+            })
+            .map(|mapped| {
+                mapped
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        rows
     }
 
     /// Records one finished job (timings, outcome, usage digest only).

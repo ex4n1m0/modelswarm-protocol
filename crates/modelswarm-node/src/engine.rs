@@ -564,22 +564,24 @@ mod tests {
 
     /// Real-engine smoke (Phase H3 gate): set MSP_LLAMA_SERVER + MSP_REAL_GGUF
     /// to the pinned llama-server.exe and the verified Qwen GGUF. Optional
-    /// MSP_ENGINE_BACKEND (e.g. "vulkan") runs the ADR-024 GPU variant with
-    /// full offload instead of the canonical CPU engine.
+    /// MSP_ENGINE_BACKEND (e.g. "vulkan") runs the ADR-024 GPU variant —
+    /// layer offload is always engine-auto-fit (`gpu_layers: None`, ADR-024
+    /// amendment: never pass a pinned -ngl).
     #[test]
     #[ignore = "set MSP_LLAMA_SERVER and MSP_REAL_GGUF"]
     fn real_engine_starts_serves_and_dies() {
         let exe = std::env::var("MSP_LLAMA_SERVER").expect("MSP_LLAMA_SERVER");
         let model = std::env::var("MSP_REAL_GGUF").expect("MSP_REAL_GGUF");
         let backend = std::env::var("MSP_ENGINE_BACKEND").unwrap_or_else(|_| "cpu".into());
-        let gpu_layers = if backend == "cpu" { None } else { Some(999u32) };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let (_tx, rx) = tokio::sync::watch::channel(false);
             let spec = EngineSpec {
                 exe: exe.into(),
                 model: model.into(),
-                gpu_layers,
+                // ADR-024 amendment (audit L1): the engine auto-fits layers
+                // for every variant; a pinned -ngl is never passed.
+                gpu_layers: None,
                 backend: backend.clone(),
                 ..EngineSpec::default()
             };
@@ -632,6 +634,139 @@ mod tests {
                 .send()
                 .await;
             assert!(gone.is_err(), "engine must be dead after shutdown");
+        });
+    }
+
+    /// P1 real-engine validation (never a required test): the true-streaming
+    /// decode must be token-for-token identical to the per-token
+    /// `decode_step` loop under greedy sampling (temperature 0), and the
+    /// labeled TTFT/ITL numbers for both paths are printed for the
+    /// verification record. Set MSP_LLAMA_SERVER + MSP_REAL_GGUF.
+    #[test]
+    #[ignore = "set MSP_LLAMA_SERVER and MSP_REAL_GGUF"]
+    fn real_engine_streaming_parity_and_timings() {
+        let exe = std::env::var("MSP_LLAMA_SERVER").expect("MSP_LLAMA_SERVER");
+        let model = std::env::var("MSP_REAL_GGUF").expect("MSP_REAL_GGUF");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let (_tx, rx) = tokio::sync::watch::channel(false);
+            let spec = EngineSpec {
+                exe: exe.into(),
+                model: model.into(),
+                gpu_layers: None,
+                ..EngineSpec::default()
+            };
+            let engine = start_engine(
+                spec,
+                rx,
+                std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
+            )
+            .await
+            .expect("engine starts");
+            let adapter = modelswarm_runtime::llamacpp::LlamaCppAdapter::new(
+                engine.runtime_config(),
+            )
+            .unwrap();
+            use futures_util::StreamExt;
+            use modelswarm_runtime::{DecodeEvent, InferenceRuntime, SamplingParams};
+
+            let handle = adapter.load("msp1:real").await.unwrap();
+            let sampling = SamplingParams::default();
+
+            // Long prompt ≈ 1200+ tokens (the audit's 1215-token class).
+            let filler = "The swarm serves one exact profile per cohort and every peer verifies the artifact digest before hosting. ";
+            let mut long_prompt = String::new();
+            while adapter.tokenize(&long_prompt).await.unwrap().len() < 1200 {
+                long_prompt.push_str(filler);
+            }
+            let long_ids = adapter.tokenize(&long_prompt).await.unwrap();
+            let short_ids = adapter.tokenize("Hello, swarm.").await.unwrap();
+            let eos_id = engine.vocab.eos_id;
+
+            for (label, prompt) in [("16-tok-class", &short_ids), ("1200-tok-class", &long_ids)] {
+                let max_tokens = 32u32;
+                // Warm the slot cache so both paths pay no cold prefill
+                // (the audit measured that asymmetry separately).
+                let _ = adapter
+                    .decode_stream(&handle, prompt, &sampling, 1, Duration::from_secs(60))
+                    .await
+                    .unwrap();
+
+                // BEFORE-path re-measurement: the per-token POST loop with
+                // the growing prefix (what decode_stream used to do).
+                let started = std::time::Instant::now();
+                let mut loop_tokens = Vec::new();
+                let mut prefix = prompt.clone();
+                while loop_tokens.len() < max_tokens as usize {
+                    let token = adapter
+                        .decode_step(&handle, &prefix, &sampling)
+                        .await
+                        .unwrap();
+                    if Some(token) == eos_id {
+                        break;
+                    }
+                    prefix.push(token);
+                    loop_tokens.push(token);
+                }
+                let loop_elapsed = started.elapsed();
+
+                // AFTER path: one SSE connection, incremental events.
+                let started = std::time::Instant::now();
+                let mut stream = adapter.decode_stream_events(
+                    &handle,
+                    prompt,
+                    &sampling,
+                    max_tokens,
+                    Duration::from_secs(60),
+                );
+                let mut ttft: Option<std::time::Duration> = None;
+                let mut inter: Vec<std::time::Duration> = Vec::new();
+                let mut last: Option<std::time::Instant> = None;
+                let mut sse_tokens = Vec::new();
+                let mut timings_seen = false;
+                while let Some(event) = stream.next().await {
+                    match event.unwrap() {
+                        DecodeEvent::Token(id) => {
+                            let now = std::time::Instant::now();
+                            if ttft.is_none() {
+                                ttft = Some(now - started);
+                            } else if let Some(prev) = last {
+                                inter.push(now - prev);
+                            }
+                            last = Some(now);
+                            sse_tokens.push(id);
+                        }
+                        DecodeEvent::Timings(_) => timings_seen = true,
+                    }
+                }
+                let sse_elapsed = started.elapsed();
+
+                // PARITY: the release-gate claim of the streaming refactor.
+                assert_eq!(
+                    loop_tokens, sse_tokens,
+                    "{label}: SSE stream must match the per-token loop token-for-token"
+                );
+                assert!(
+                    timings_seen,
+                    "{label}: pinned server reports final-chunk timings"
+                );
+
+                let itl_p50 = {
+                    inter.sort();
+                    inter.get(inter.len() / 2).copied()
+                };
+                println!(
+                    "P1MEASURE label={label} prompt_tokens={} tokens={} | loop(before): {:0.1} ms/tok, total {:0.0} ms | sse(after): ttft {:0.1} ms, itl_p50 {:0.1} ms, total {:0.0} ms ({:0.1} ms/tok), parity=identical",
+                    prompt.len(),
+                    sse_tokens.len(),
+                    loop_elapsed.as_secs_f64() * 1000.0 / loop_tokens.len().max(1) as f64,
+                    loop_elapsed.as_secs_f64() * 1000.0,
+                    ttft.map(|d| d.as_secs_f64() * 1000.0).unwrap_or(-1.0),
+                    itl_p50.map(|d| d.as_secs_f64() * 1000.0).unwrap_or(-1.0),
+                    sse_elapsed.as_secs_f64() * 1000.0,
+                    sse_elapsed.as_secs_f64() * 1000.0 / sse_tokens.len().max(1) as f64,
+                );
+            }
         });
     }
 }

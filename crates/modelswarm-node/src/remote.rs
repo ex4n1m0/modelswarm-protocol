@@ -14,8 +14,16 @@
 //! Selection (fastest eligible peer, EWMA probing) is deliberately NOT
 //! here: this executor serves ONE peer; the choosing/swarm layer stacks
 //! on top once live measurements exist (F1.5).
+//!
+//! F15 measurement plumbing: when a [`PeerMetrics`] handle is attached
+//! ( [`RemoteExecutor::with_metrics`] ), every completed request records
+//! its requester-side distribution (TTFT / inter-token latency / total)
+//! and, after a clean completion, an idle ping/pong RTT probe runs on
+//! the pooled session BEFORE it returns to the pool — off the request
+//! critical path. Shadow data only: nothing here selects peers.
 
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use futures_util::stream::{self, Stream};
 use modelswarm_gateway::{
@@ -28,9 +36,16 @@ use modelswarm_transport::message::{
     ChatMessage as WireChat, InferenceRequest as WireRequest, Sampling as WireSampling,
     StreamError as WireStreamError, WireMessage,
 };
+use modelswarm_transport::observe::{CompletionObservation, CompletionOutcome, UsageDigest};
+
+use crate::measure::PeerMetrics;
 
 const DIAL_DEADLINE: Duration = Duration::from_secs(10);
 const IO_DEADLINE: Duration = Duration::from_secs(30);
+/// F15: ping/pong probes per post-completion RTT batch.
+const RTT_PROBE_SAMPLES: usize = 3;
+/// F15: bound for one full probe batch (all samples).
+const RTT_PROBE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// One remote serving peer.
 #[derive(Debug, Clone)]
@@ -49,7 +64,16 @@ pub struct RemotePeer {
 pub struct RemoteExecutor {
     peer: RemotePeer,
     identity: InstallationIdentity,
-    pool: std::sync::Arc<tokio::sync::Mutex<Option<Libp2pSession>>>,
+    pool: Arc<tokio::sync::Mutex<Option<Libp2pSession>>>,
+    /// F15 shadow measurements; `None` keeps the executor measurement-free
+    /// (all pre-F15 callers unchanged).
+    metrics: Option<Arc<PeerMetrics>>,
+    /// The peer's advertised `queueMs` as last known to the requester
+    /// (refreshed per roster lookup via
+    /// [`RemoteExecutor::set_advertised_queue_ms`]); recorded alongside
+    /// measured admission-to-first-token. Advertised values are untrusted
+    /// inputs, never measurements.
+    advertised_queue_ms: StdMutex<Option<u64>>,
 }
 
 impl RemoteExecutor {
@@ -57,7 +81,31 @@ impl RemoteExecutor {
         Self {
             peer,
             identity,
-            pool: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            pool: Arc::new(tokio::sync::Mutex::new(None)),
+            metrics: None,
+            advertised_queue_ms: StdMutex::new(None),
+        }
+    }
+
+    /// Attaches the F15 measurement recorder (shadow data only).
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<PeerMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Refreshes the peer's advertised `queueMs` from the latest roster
+    /// (call per lookup; pooled executors outlive single rosters).
+    pub fn set_advertised_queue_ms(&self, queue_ms: Option<u64>) {
+        *self
+            .advertised_queue_ms
+            .lock()
+            .expect("advertised queue lock") = queue_ms;
+    }
+
+    fn record_failure(&self, stage: &'static str) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_failure(&self.peer.peer_id, stage);
         }
     }
 }
@@ -119,17 +167,115 @@ fn frame_to_event(frame: WireMessage) -> Option<Result<ExecutorEvent, WireStream
     }
 }
 
+/// Requester-side wall-clock record for one in-flight request (F15).
+#[derive(Default)]
+struct Timeline {
+    first_token_at: Option<Instant>,
+    last_token_at: Option<Instant>,
+    itl_sum_ms: f64,
+    itl_max_ms: f64,
+    token_deltas: u32,
+    usage: Option<UsageDigest>,
+}
+
+impl Timeline {
+    fn on_token(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_token_at {
+            let ms = now.duration_since(last).as_secs_f64() * 1_000.0;
+            self.itl_sum_ms += ms;
+            self.itl_max_ms = self.itl_max_ms.max(ms);
+        }
+        self.first_token_at.get_or_insert(now);
+        self.last_token_at = Some(now);
+        self.token_deltas += 1;
+    }
+}
+
+/// Everything the stream needs to finalize one observation.
+struct StreamContext {
+    peer_id: String,
+    profile_id: String,
+    advertised_queue_ms: Option<u64>,
+    admitted_at: Instant,
+    metrics: Option<Arc<PeerMetrics>>,
+}
+
+fn finalize_observation(ctx: &StreamContext, timeline: &Timeline, outcome: CompletionOutcome) {
+    let Some(metrics) = &ctx.metrics else {
+        return;
+    };
+    let ttft_ms = timeline
+        .first_token_at
+        .map(|t| t.duration_since(ctx.admitted_at).as_secs_f64() * 1_000.0)
+        .unwrap_or(0.0);
+    let total_ms = Instant::now().duration_since(ctx.admitted_at).as_secs_f64() * 1_000.0;
+    let itl_count = timeline.token_deltas.saturating_sub(1);
+    metrics.record_completion(&CompletionObservation {
+        peer_id: ctx.peer_id.clone(),
+        profile_id: ctx.profile_id.clone(),
+        outcome,
+        ttft_ms,
+        total_ms,
+        itl_mean_ms: if itl_count > 0 {
+            timeline.itl_sum_ms / f64::from(itl_count)
+        } else {
+            0.0
+        },
+        itl_max_ms: timeline.itl_max_ms,
+        token_deltas: timeline.token_deltas,
+        usage: timeline.usage,
+        advertised_queue_ms: ctx.advertised_queue_ms,
+    });
+}
+
+/// Deposits a healthy session back into the executor pool (no-op when the
+/// pool is already holding one or is in use).
+fn return_to_pool(session: Libp2pSession, pool: &Arc<tokio::sync::Mutex<Option<Libp2pSession>>>) {
+    if let Ok(mut guard) = pool.try_lock() {
+        if guard.is_none() {
+            *guard = Some(session);
+        }
+    }
+}
+
+/// F15: after a clean completion, probe RTT on the now-idle session and
+/// only then return it to the pool. The probe rides the serving side's
+/// between-requests recv (which answers pings transparently). A failed
+/// probe drops the session — the next request self-heals with a fresh
+/// dial — and records a failure observation.
+async fn probe_and_return(
+    session: Libp2pSession,
+    pool: Arc<tokio::sync::Mutex<Option<Libp2pSession>>>,
+    metrics: Arc<PeerMetrics>,
+    peer_id: String,
+) {
+    let mut session = session;
+    match session
+        .measure_rtt(RTT_PROBE_SAMPLES, RTT_PROBE_DEADLINE)
+        .await
+    {
+        Ok(stats) => {
+            metrics.record_rtt(&peer_id, &stats);
+            return_to_pool(session, &pool);
+        }
+        Err(_) => metrics.record_failure(&peer_id, "rtt_probe"),
+    }
+}
+
 fn stream_events(
     session: Libp2pSession,
-    pool: std::sync::Arc<tokio::sync::Mutex<Option<Libp2pSession>>>,
+    pool: Arc<tokio::sync::Mutex<Option<Libp2pSession>>>,
+    ctx: StreamContext,
 ) -> impl Stream<Item = ExecutorEvent> {
     // Terminal frames (Completed/Cancelled) END the exchange per the
-    // protocol. A CLEAN terminal returns the session to the pool for the
-    // next request (connection reuse); errors drop it so the next request
+    // protocol. A CLEAN terminal runs the F15 RTT probe (when metrics are
+    // attached) and then returns the session to the pool for the next
+    // request (connection reuse); errors drop it so the next request
     // dials fresh.
     stream::unfold(
-        (Some(session), pool, false),
-        |(slot, pool, done)| async move {
+        (Some(session), pool, false, Timeline::default(), ctx),
+        |(slot, pool, done, mut timeline, ctx)| async move {
             if done {
                 return None;
             }
@@ -141,35 +287,95 @@ fn stream_events(
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("modelswarm-node: remote stream read failed: {e}");
+                    finalize_observation(
+                        &ctx,
+                        &timeline,
+                        CompletionOutcome::Errored {
+                            code: "transport".into(),
+                        },
+                    );
+                    if let Some(metrics) = &ctx.metrics {
+                        metrics.record_failure(&ctx.peer_id, "stream_read");
+                    }
                     return Some((
                         ExecutorEvent::Error {
                             code: "transport".into(),
                             retryable: false,
                             interrupted_after_tokens: None,
                         },
-                        (None, pool, true),
+                        (None, pool, true, timeline, ctx),
                     ));
                 }
             };
             match frame_to_event(frame) {
-                // Server closed the session: end cleanly, drop it.
-                None => None,
-                Some(Ok(event)) => {
-                    if matches!(event, ExecutorEvent::Completed { .. }) {
-                        if let Ok(mut guard) = pool.try_lock() {
-                            if guard.is_none() {
-                                *guard = Some(session);
-                            }
-                        }
-                        Some((event, (None, pool, true)))
-                    } else {
-                        Some((event, (Some(session), pool, false)))
-                    }
+                // Server closed the session: end cleanly, drop it — but
+                // the observation still records what was measured.
+                None => {
+                    finalize_observation(
+                        &ctx,
+                        &timeline,
+                        CompletionOutcome::Errored {
+                            code: "connection_closed".into(),
+                        },
+                    );
+                    None
                 }
+                Some(Ok(event)) => match &event {
+                    ExecutorEvent::TokenDelta { .. } => {
+                        timeline.on_token();
+                        Some((event, (Some(session), pool, false, timeline, ctx)))
+                    }
+                    ExecutorEvent::Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        prefill_ms,
+                        decode_ms,
+                    } => {
+                        timeline.usage = Some(UsageDigest {
+                            prompt_tokens: *prompt_tokens,
+                            completion_tokens: *completion_tokens,
+                            prefill_ms: *prefill_ms,
+                            decode_ms: *decode_ms,
+                        });
+                        Some((event, (Some(session), pool, false, timeline, ctx)))
+                    }
+                    ExecutorEvent::Completed { finish_reason } => {
+                        let finish_reason = format!("{finish_reason:?}").to_lowercase();
+                        finalize_observation(
+                            &ctx,
+                            &timeline,
+                            CompletionOutcome::Completed { finish_reason },
+                        );
+                        match &ctx.metrics {
+                            Some(metrics) => {
+                                let metrics = Arc::clone(metrics);
+                                let peer_id = ctx.peer_id.clone();
+                                tokio::spawn(probe_and_return(
+                                    session,
+                                    pool.clone(),
+                                    metrics,
+                                    peer_id,
+                                ));
+                            }
+                            None => return_to_pool(session, &pool),
+                        }
+                        Some((event, (None, pool, true, timeline, ctx)))
+                    }
+                    // Accepted never appears on this wire path today.
+                    ExecutorEvent::Accepted { .. } | ExecutorEvent::Error { .. } => {
+                        Some((event, (Some(session), pool, false, timeline, ctx)))
+                    }
+                },
                 Some(Err(wire_error)) => {
                     eprintln!(
                         "modelswarm-node: remote peer refused: {} {}",
                         wire_error.code, wire_error.message
+                    );
+                    let code = wire_error.code.clone();
+                    finalize_observation(
+                        &ctx,
+                        &timeline,
+                        CompletionOutcome::Errored { code: code.clone() },
                     );
                     Some((
                         ExecutorEvent::Error {
@@ -177,7 +383,7 @@ fn stream_events(
                             retryable: wire_error.retryable_peer_hint,
                             interrupted_after_tokens: None,
                         },
-                        (None, pool, true),
+                        (None, pool, true, timeline, ctx),
                     ))
                 }
             }
@@ -205,19 +411,35 @@ impl InferenceExecutor for RemoteExecutor {
                     Libp2pTransport::new(&self.identity).map_err(|e| ExecutorError::Fatal {
                         code: format!("transport: {e}"),
                     })?;
-                client
+                match client
                     .dial(self.peer.addr.as_str(), &expected_peer, DIAL_DEADLINE)
                     .await
-                    .map_err(|e| {
+                {
+                    Ok(s) => s,
+                    Err(e) => {
                         eprintln!("modelswarm-node: remote dial failed: {e}");
-                        ExecutorError::Retryable {
+                        self.record_failure("dial");
+                        return Err(ExecutorError::Retryable {
                             peer_hint: Some(self.peer.peer_id.clone()),
-                        }
-                    })?
+                        });
+                    }
+                }
             }
         };
         drop(guard);
         let mut session = session;
+        let ctx = StreamContext {
+            peer_id: self.peer.peer_id.clone(),
+            profile_id: request.profile_id.clone(),
+            advertised_queue_ms: *self
+                .advertised_queue_ms
+                .lock()
+                .expect("advertised queue lock"),
+            // Admission time: the request leaves right now — measured
+            // admission-to-first-token starts at this instant (F15).
+            admitted_at: Instant::now(),
+            metrics: self.metrics.clone(),
+        };
         if let Err(e) = session
             .send(
                 &WireMessage::InferenceRequest(wire_request(&request)),
@@ -226,6 +448,7 @@ impl InferenceExecutor for RemoteExecutor {
             .await
         {
             eprintln!("modelswarm-node: remote send failed: {e}");
+            self.record_failure("send");
             return Err(ExecutorError::Retryable {
                 peer_hint: Some(self.peer.peer_id.clone()),
             });
@@ -233,6 +456,7 @@ impl InferenceExecutor for RemoteExecutor {
         Ok(Box::pin(stream_events(
             session,
             std::sync::Arc::clone(&self.pool),
+            ctx,
         )))
     }
 }
@@ -509,9 +733,15 @@ mod failover_tests {
         // No listener at that address: the dial must fail and the local
         // executor answers instead.
         let client_identity = InstallationIdentity::from_bytes(&[39u8; 32]);
+        // A REAL PeerId derivation with an unreachable address: the DIAL
+        // must fail (a placeholder-style base58 string would fail
+        // `PeerId::parse` first and never reach the dial at all).
         let peer = RemotePeer {
             addr: "/ip4/127.0.0.1/udp/9/udt".into(), // nothing listens here
-            peer_id: "12D3KooWExamplePeerIdThatIsValidBase58ForTheParseCheck1111111111111".into(),
+            peer_id: Libp2pTransport::new(&InstallationIdentity::from_bytes(&[83u8; 32]))
+                .unwrap()
+                .peer_id()
+                .to_string(),
         };
         let local = Arc::new(CountingExecutor {
             label: "LOCAL",
@@ -839,5 +1069,242 @@ mod reuse_tests {
             "the session returned to the pool after the clean terminal"
         );
         assert_eq!(served.served.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod measure_tests {
+    use super::*;
+    use crate::serving::serve_sessions;
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedMessage, NormalizedRequest};
+    use modelswarm_identity::InstallationIdentity;
+    use modelswarm_transport::libp2p_backend::Libp2pTransport;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// F15 end-to-end over REAL loopback QUIC against the real serving
+    /// bridge (environment label: loopback-proven): a metrics-attached
+    /// RemoteExecutor records the completion distribution
+    /// (TTFT/ITL/total, advertised queue alongside the measured
+    /// admission-to-first-token), the post-completion idle RTT probe
+    /// lands via the serving side's transparent ping answering, and the
+    /// pooled session returns to the pool afterwards (connection reuse
+    /// preserved).
+    #[tokio::test]
+    async fn remote_executor_measures_completions_and_rtt_over_quic() {
+        struct TwoTokenExecutor;
+        #[async_trait::async_trait]
+        impl modelswarm_gateway::InferenceExecutor for TwoTokenExecutor {
+            async fn execute(
+                &self,
+                _request: NormalizedRequest,
+            ) -> Result<ExecutorStream, ExecutorError> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    ExecutorEvent::TokenDelta {
+                        delta: "a".into(),
+                        index: 0,
+                    },
+                    ExecutorEvent::TokenDelta {
+                        delta: "b".into(),
+                        index: 1,
+                    },
+                    ExecutorEvent::Usage {
+                        prompt_tokens: 3,
+                        completion_tokens: 2,
+                        prefill_ms: 1.0,
+                        decode_ms: 2.0,
+                    },
+                    ExecutorEvent::Completed {
+                        finish_reason: modelswarm_gateway::FinishReason::Stop,
+                    },
+                ])))
+            }
+        }
+
+        let server_identity = InstallationIdentity::from_bytes(&[77u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[78u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let listener = server.listen("127.0.0.1:0").await.unwrap();
+        let server_peer = server.peer_id().to_string();
+        let peer = RemotePeer {
+            addr: listener.bound_addr().to_string(),
+            peer_id: server_peer.clone(),
+        };
+        let client_peer_id = Libp2pTransport::new(&client_identity)
+            .unwrap()
+            .peer_id()
+            .to_string();
+        let profile_id = crate::serving::lease_helpers::TEST_PROFILE;
+        let (policy, token) =
+            crate::serving::lease_helpers::policy_and_lease(profile_id, &client_peer_id);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_sessions(
+            listener,
+            Arc::new(TwoTokenExecutor),
+            profile_id.into(),
+            policy,
+            Arc::new(modelswarm_telemetry::Telemetry::memory().0),
+            rx,
+        ));
+
+        let metrics = Arc::new(PeerMetrics::memory(Arc::new(
+            modelswarm_telemetry::Telemetry::memory().0,
+        )));
+        let executor =
+            RemoteExecutor::new(peer, client_identity).with_metrics(Arc::clone(&metrics));
+        executor.set_advertised_queue_ms(Some(120));
+
+        let stream = executor
+            .execute(NormalizedRequest {
+                request_id: "req-f15".into(),
+                profile_id: profile_id.into(),
+                capability_token: Some(token),
+                messages: vec![NormalizedMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                sampling: modelswarm_gateway::Sampling {
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: 40,
+                    seed: None,
+                },
+                max_tokens: 8,
+                deadline_ms: 10_000,
+                stream: true,
+            })
+            .await
+            .expect("execute starts");
+        let mut text = String::new();
+        futures_util::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            if let ExecutorEvent::TokenDelta { delta, .. } = event {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "ab");
+
+        // The completion distribution and the (asynchronous) RTT probe
+        // both land; then the session is back in the pool.
+        let wait_until = std::time::Instant::now() + Duration::from_secs(5);
+        let obs = loop {
+            let obs = metrics.observe(&server_peer);
+            if obs.rtt_ewma_ms.is_some() {
+                break obs;
+            }
+            assert!(
+                std::time::Instant::now() < wait_until,
+                "post-completion RTT probe did not land within 5 s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        assert!(obs.rtt_ewma_ms.unwrap() > 0.0, "loopback rtt positive");
+        assert!(obs.rtt_jitter_ewma_ms.unwrap() >= 0.0);
+        assert_eq!(obs.rtt_probe_count, 1);
+        assert_eq!(obs.failure_count, 0);
+
+        let profile = obs.profile(profile_id).expect("completion recorded");
+        assert!(profile.ttft_ewma_ms.unwrap() > 0.0, "measured ttft");
+        assert!(profile.itl_mean_ewma_ms.unwrap() >= 0.0);
+        assert!(profile.total_ewma_ms.unwrap() >= profile.ttft_ewma_ms.unwrap());
+        assert_eq!(profile.advertised_queue_ms_last, Some(120));
+        assert_eq!(profile.completion_count, 1);
+        assert_eq!(profile.decode_tokens_per_ms_ewma, Some(1.0)); // 2 tokens / 2 ms
+        assert_eq!(profile.prefill_tokens_per_ms_ewma, Some(3.0)); // 3 tokens / 1 ms
+
+        // Connection reuse survives measurement: the probed session is
+        // pooled again.
+        let pooled = loop {
+            if executor.pool.lock().await.is_some() {
+                break true;
+            }
+            assert!(
+                std::time::Instant::now() < wait_until,
+                "session never returned to the pool after the probe"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(pooled);
+    }
+
+    /// F15: dial failures are counted (the shadow failure signal), and a
+    /// metrics-free executor stays measurement-silent.
+    #[tokio::test]
+    async fn dial_failures_count_and_unmeasured_executors_stay_silent() {
+        let metrics = Arc::new(PeerMetrics::memory(Arc::new(
+            modelswarm_telemetry::Telemetry::memory().0,
+        )));
+        // A REAL PeerId derivation (the placeholder-style base58 string
+        // fails PeerId::parse before any dial) with an unreachable
+        // address: the dial itself must fail and be counted.
+        let dead_peer_id = Libp2pTransport::new(&InstallationIdentity::from_bytes(&[81u8; 32]))
+            .unwrap()
+            .peer_id()
+            .to_string();
+        let dead_peer = RemotePeer {
+            addr: "/ip4/127.0.0.1/udp/9/udt".into(), // nothing listens here
+            peer_id: dead_peer_id,
+        };
+        let peer_id = dead_peer.peer_id.clone();
+        let executor =
+            RemoteExecutor::new(dead_peer, InstallationIdentity::from_bytes(&[79u8; 32]))
+                .with_metrics(Arc::clone(&metrics));
+        let request = NormalizedRequest {
+            request_id: "req-dead".into(),
+            profile_id: "msp1:dead".into(),
+            capability_token: None,
+            messages: vec![NormalizedMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            sampling: modelswarm_gateway::Sampling {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 40,
+                seed: None,
+            },
+            max_tokens: 8,
+            deadline_ms: 10_000,
+            stream: true,
+        };
+        assert!(executor.execute(request).await.is_err());
+        assert_eq!(metrics.observe(&peer_id).failure_count, 1);
+
+        // Without metrics attached, nothing is recorded anywhere.
+        let silent = Arc::new(PeerMetrics::memory(Arc::new(
+            modelswarm_telemetry::Telemetry::memory().0,
+        )));
+        let silent_exec = RemoteExecutor::new(
+            RemotePeer {
+                addr: "/ip4/127.0.0.1/udp/9/udt".into(),
+                peer_id: Libp2pTransport::new(&InstallationIdentity::from_bytes(&[82u8; 32]))
+                    .unwrap()
+                    .peer_id()
+                    .to_string(),
+            },
+            InstallationIdentity::from_bytes(&[80u8; 32]),
+        );
+        let request = NormalizedRequest {
+            request_id: "req-silent".into(),
+            profile_id: "msp1:dead".into(),
+            capability_token: None,
+            messages: vec![NormalizedMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            sampling: modelswarm_gateway::Sampling {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 40,
+                seed: None,
+            },
+            max_tokens: 8,
+            deadline_ms: 10_000,
+            stream: true,
+        };
+        assert!(silent_exec.execute(request).await.is_err());
+        assert!(silent.observe_all().is_empty());
     }
 }

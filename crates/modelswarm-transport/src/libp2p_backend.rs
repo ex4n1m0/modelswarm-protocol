@@ -19,7 +19,7 @@
 //! This backend is experimental and feature-gated (`libp2p-backend`); the
 //! workspace stays green without it (ADR-018: the trait is the swap point).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::AsyncReadExt as _;
 use futures::AsyncWriteExt as _;
@@ -33,7 +33,8 @@ use modelswarm_identity::InstallationIdentity;
 
 use crate::error::{invalid_data, TransportError};
 use crate::frame::MAX_FRAME_BYTES;
-use crate::message::WireMessage;
+use crate::message::{Control, WireMessage};
+use crate::transport::Stats;
 
 /// Builds the libp2p keypair from the installation seed (same key ⇒ same
 /// PeerId as [`InstallationIdentity::peer_id`]).
@@ -139,10 +140,76 @@ impl Libp2pSession {
         Ok(())
     }
 
-    /// Receives one typed message, deadline-bounded. The announced length is
-    /// validated against [`MAX_FRAME_BYTES`] BEFORE the body is read or
-    /// allocated (same rule as the staged frame codec).
+    /// Receives one typed application message, deadline-bounded.
+    ///
+    /// F15: control PINGS are answered transparently in-band and never
+    /// delivered to the application — the same contract as the staged
+    /// backend's reader task, so a serving loop waiting for the next
+    /// `InferenceRequest` doubles as an RTT responder without knowing it.
+    /// Pongs and every other frame are delivered. The deadline bounds the
+    /// WHOLE call including any ping answering: a ping flood cannot extend
+    /// a caller's wait beyond what it asked for.
     pub async fn recv(&mut self, deadline: Duration) -> Result<WireMessage, TransportError> {
+        let started = Instant::now();
+        loop {
+            let remaining = deadline
+                .checked_sub(started.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                return Err(TransportError::Timeout);
+            }
+            let frame = self.recv_frame(remaining).await?;
+            if let WireMessage::Control(control) = &frame {
+                if control.kind == Control::PING {
+                    let pong = Control::pong(&control.nonce);
+                    self.send(&WireMessage::Control(pong), remaining).await?;
+                    continue;
+                }
+            }
+            return Ok(frame);
+        }
+    }
+
+    /// Measures round-trip times with `samples` ping/pong probes over this
+    /// QUIC session — F15's requester-side RTT source on the production
+    /// path. Every probe (write + reply) is bounded by `deadline`.
+    ///
+    /// CONTRACT: call only BETWEEN requests on an idle session (the pooled
+    /// executor probes after a clean completion, before returning the
+    /// session to its pool). Application frames that arrive meanwhile are
+    /// skipped and lost — the identical contract to the staged backend's
+    /// [`crate::Session::measure_rtt`].
+    pub async fn measure_rtt(
+        &mut self,
+        samples: usize,
+        deadline: Duration,
+    ) -> Result<Stats, TransportError> {
+        let mut durations = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let ping = Control::ping();
+            let nonce = ping.nonce.clone();
+            let started = Instant::now();
+            self.send(&WireMessage::Control(ping), deadline).await?;
+            loop {
+                match self.recv(deadline).await? {
+                    WireMessage::Control(control)
+                        if control.kind == Control::PONG && control.nonce == nonce =>
+                    {
+                        break;
+                    }
+                    // A stale pong from an earlier (lost) probe: skip.
+                    _ => continue,
+                }
+            }
+            durations.push(started.elapsed());
+        }
+        Ok(Stats::from_durations(&durations))
+    }
+
+    /// One raw frame off the stream: length prefix validated against
+    /// [`MAX_FRAME_BYTES`] BEFORE the body is read or allocated (same rule
+    /// as the staged frame codec).
+    async fn recv_frame(&mut self, deadline: Duration) -> Result<WireMessage, TransportError> {
         let mut stream = self.stream_pin(deadline).await?;
         let mut prefix = [0u8; 4];
         let mut read = stream.read_exact(&mut prefix);
@@ -424,7 +491,9 @@ mod tests {
         let mut session_server = listener.accept(Duration::from_secs(10)).await.unwrap();
         let mut session_client = dialing.await.unwrap().unwrap();
 
-        let msg = WireMessage::Control(crate::Control::ping());
+        // A PONG is a delivered application frame (pings are now answered
+        // transparently inside recv, never delivered — see measure_rtt).
+        let msg = WireMessage::Control(Control::pong("round-trip"));
         session_client
             .send(&msg, Duration::from_secs(5))
             .await
@@ -464,7 +533,7 @@ mod tests {
             });
             let mut session_server = listener.accept(Duration::from_secs(10)).await.unwrap();
             let mut session_client = dialing.await.unwrap().unwrap();
-            let msg = WireMessage::Control(crate::Control::ping());
+            let msg = WireMessage::Control(Control::pong("per-session"));
             session_client
                 .send(&msg, Duration::from_secs(5))
                 .await
@@ -474,5 +543,67 @@ mod tests {
                 msg
             );
         }
+    }
+
+    /// F15: `measure_rtt` over real loopback QUIC. The dialer probes; the
+    /// LISTENER side never sees a ping — `recv` answers them transparently
+    /// (its one `recv` call returns the application frame sent AFTER the
+    /// probes, proving pings were consumed in-band), and the dialer gets
+    /// sane stats back. Quinn's own RTT/loss estimates are not exposed by
+    /// libp2p-quic (see `observe::QUINN_STATS_UNAVAILABLE`) — these probes
+    /// are the production RTT source.
+    #[tokio::test]
+    async fn libp2p_measure_rtt_answers_pings_transparently() {
+        let server_identity = InstallationIdentity::from_bytes(&[31u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[32u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let client = Libp2pTransport::new(&client_identity).unwrap();
+        let mut listener = server.listen("127.0.0.1:0").await.unwrap();
+
+        let bound = listener.bound_addr().clone();
+        let expected = server.peer_id();
+        let dialing = tokio::spawn(async move {
+            client
+                .dial(
+                    bound.to_string().as_str(),
+                    &expected,
+                    Duration::from_secs(10),
+                )
+                .await
+        });
+        let mut session_server = listener.accept(Duration::from_secs(10)).await.unwrap();
+        let mut session_client = dialing.await.unwrap().unwrap();
+
+        // The server must be INSIDE recv while the dialer probes — that is
+        // who answers the pings. Its single recv call answers all three
+        // transparently and then returns the application frame.
+        let server_recv =
+            tokio::spawn(
+                async move { session_server.recv(Duration::from_secs(10)).await.unwrap() },
+            );
+
+        // Probe batch BEFORE any application traffic (the documented
+        // between-requests contract).
+        let stats = session_client
+            .measure_rtt(3, Duration::from_secs(5))
+            .await
+            .expect("rtt probes complete over loopback quic");
+        assert!(stats.p50_ms > 0.0, "loopback quic rtt is positive");
+        assert!(stats.p95_ms >= stats.p50_ms);
+        assert!(stats.jitter_ms.is_finite() && stats.jitter_ms >= 0.0);
+
+        // Application traffic still flows on the same session, and the
+        // server's recv hands the APP frame to the application — the pings
+        // were answered inside recv, never delivered.
+        let msg = WireMessage::Control(Control::pong("app-marker"));
+        session_client
+            .send(&msg, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            server_recv.await.unwrap(),
+            msg,
+            "pings were transparent; the app frame arrives intact"
+        );
     }
 }

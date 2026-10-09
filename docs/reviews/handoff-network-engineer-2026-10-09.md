@@ -332,3 +332,170 @@ Tests: none run by me (constraint); frozen suite green: 301 (default) / 313
 (libp2p-backend) tests, 0 failed; relay suite 2/2 green per F2A record.
 Evidence: every finding carries file:line at `730cebf`; verification docs
 phase-f-lan-2026-10-07, f2a-relay-2026-10-08.
+
+
+---
+
+# F15 — measurement plumbing (implementation, 2026-10-09, second entry)
+
+Owner-approved critical-path item after gate D2 (master-roadmap §critical
+path; dependency-graph hard edge 2: F15 BEFORE scheduler wiring and BEFORE
+the 9.6 pass-1 experiment). Node-local only — NO wire or protocol changes
+(the `Control` ping/pong frames already existed in `message.rs` as
+transport bookkeeping; msp-v1 defines no ping). Closes audit HIGH-1.
+
+## What was built
+
+1. **Per-peer RTT EWMA on the production QUIC path.**
+   `Libp2pSession::measure_rtt` (request-round-trip ping/pong probing,
+   mirroring the staged TCP backend) plus TRANSPARENT in-band ping
+   answering inside `Libp2pSession::recv` — a serving loop waiting for the
+   next `InferenceRequest` is an RTT responder without knowing it; pings
+   are never delivered to application recv loops, and the caller's
+   deadline bounds the whole call (a ping flood cannot extend a wait).
+   The pooled `RemoteExecutor` probes AFTER a clean completion, before
+   returning the session to its pool (off the request critical path; the
+   probe batch is 3 samples bounded by 2 s). A failed probe drops the
+   session (next request self-heals with a fresh dial) and counts a
+   failure.
+2. **Completion distributions.** Requester-side wall-clock per completed
+   request: TTFT (admission-to-first-token), mean/max inter-token latency,
+   total; Usage-frame prefill/decode throughput EWMAs; keyed by
+   (peer, profile). Recorded for Completed AND Errored outcomes (stable
+   code only).
+3. **Measured queue vs. advertised.** The roster's advertised `queueMs`
+   rides the executor (`set_advertised_queue_ms`, refreshed per lookup)
+   and is recorded alongside the measured TTFT — recorded as-is, labeled
+   untrusted, never blended into a measured EWMA. The discount derivation
+   belongs to the scheduler wiring step (shadow data only; nothing selects
+   peers yet).
+4. **Typed read API.** `modelswarm_transport::observe::PeerObservations`
+   (+ `ProfileObservations`, `CompletionObservation`,
+   `QUINN_STATS_UNAVAILABLE`) and `modelswarm_node::measure::PeerMetrics`
+   with `observe(peer)` / `observe_all()` — hydrating from SQLite on first
+   touch so a fresh process resumes persisted EWMAs.
+5. **Persistence** via `modelswarm-store` (Integrator-owned; additive,
+   coordinator-sanctioned): migration 3 adds
+   `peer_metric_observations(peer_id, profile_id, metric, value,
+   updated_at)`; peer-scoped metrics keep riding `ewma_observations`.
+   Persistence is best-effort (warn + in-memory continue).
+
+## Measured vs. honestly unavailable
+
+- Measured: RTT p50/p95 + jitter EWMA (ping probes), TTFT/ITL/total
+  distributions, prefill/decode rate EWMAs, advertised-vs-measured queue
+  pair, failure counts. **Environment labels: loopback-proven (the
+  end-to-end test drives the real serving bridge over real QUIC);
+  LAN-proven for RTT magnitude: NOT yet re-run cross-machine (the ignored
+  `lan_cross_machine_completion` remains the re-probe vehicle); WAN:
+  unproven — no WAN claims exist.**
+- Unavailable: **loss and quinn's smoothed-RTT/congestion stats** — the
+  wrapped `quinn::Connection` is private in libp2p-quic 0.14 and
+  `Connection` exposes only the `StreamMuxer` surface
+  (`observe::QUINN_STATS_UNAVAILABLE` records this; jitter from ping
+  samples is the only network-quality proxy). Re-check on libp2p upgrade.
+
+## Changed files and why
+
+- `crates/modelswarm-transport/src/observe.rs` (NEW) — pure observation
+  types + the unavailability record (scheduler-consumable, no new deps).
+- `crates/modelswarm-transport/src/lib.rs` — register the module.
+- `crates/modelswarm-transport/src/libp2p_backend.rs` — transparent ping
+  answering in `recv`, `measure_rtt`, tests; two pre-existing loopback
+  tests switched from ping-as-app-frame to pong (pings are consumed
+  in-band now).
+- `crates/modelswarm-store/src/lib.rs` — additive migration 3 +
+  `upsert_peer_metric`/`get_peer_metric`/`peer_metrics_for`.
+- `crates/modelswarm-store/tests/store.rs` — round-trip test; the
+  structural privacy audit now also enumerates the new table (green).
+- `crates/modelswarm-node/src/measure.rs` (NEW) — `PeerMetrics` recorder
+  (in-memory EWMA + lazy store hydration + redacted telemetry events
+  `net.rtt` / `net.completion` / `net.failure`, numbers and ids only).
+- `crates/modelswarm-node/src/lib.rs` — module registration (also removed
+  the doubled `#[cfg]` lines on remote/serving).
+- `crates/modelswarm-node/src/remote.rs` — executor instrumentation
+  (`with_metrics`, `set_advertised_queue_ms`, timeline in `stream_events`,
+  post-completion probe, dial/send failure counting) + F15 integration
+  tests; fixed the pre-existing failover test's placeholder PeerId (it
+  failed `PeerId::parse` before ever dialing, so the "remote down" test
+  exercised the bad_peer_id path, not the dial).
+- `crates/modelswarm-desktop/src/app.rs` — minimal wiring, no UI surface:
+  one lazily-opened store-backed `PeerMetrics` in `Inner`, attached to
+  pooled swarm executors; advertised `queueMs` refreshed per lookup;
+  `try_swarm_chat`'s telemetry param became `&Arc<Telemetry>` (call site
+  unchanged).
+
+## Commands and outcomes (all green before commit)
+
+- `cargo fmt --all --check` — PASS.
+- `cargo clippy --workspace --all-targets -- -D warnings` — PASS.
+- `cargo clippy --workspace --all-targets --features
+  modelswarm-node/libp2p-backend -- -D warnings` — PASS.
+- `TAURI_CONFIG='{"bundle":{"resources":[]}}' cargo clippy -p
+  modelswarm-desktop --all-targets --features tauri-shell -- -D warnings`
+  — PASS.
+- `cargo test --workspace` — 49 suites, **316 passed / 0 failed**.
+- `cargo test --workspace --features modelswarm-node/libp2p-backend` —
+  49 suites, **335 passed / 0 failed** (node-side env-gated ignores
+  unchanged: LAN proof, real-engine pair).
+- `TAURI_CONFIG='{"bundle":{"resources":[]}}' cargo test -p
+  modelswarm-desktop --features tauri-shell` — 7 passed / 0 failed.
+
+Key new tests: `libp2p_measure_rtt_answers_pings_transparently`
+(transport), `peer_metric_rows_round_trip_per_profile` (store),
+`measure::tests::*` (EWMA math, queue-alongside-ttft, persistence across
+reopen), and `remote_executor_measures_completions_and_rtt_over_quic`
+(node; the end-to-end loopback QUIC proof against the real serving
+bridge, including pool return after the probe and reuse preservation).
+
+## Assumptions
+
+1. Touching `modelswarm-store` additively is sanctioned by the
+   coordinator's F15 instruction (the crate is Integrator-held per the
+   ownership map); Security/Test-Release review of migration 3 is
+   requested below.
+2. `measure_rtt` is contractually BETWEEN requests only; the pooled
+   executor honors it (post-completion idle). Application frames arriving
+   during a probe would be dropped — same contract as the staged backend.
+3. RTT probes add no latency to any request path (they run after the
+   terminal event, off the critical path); a request arriving during a
+   probe finds an empty pool and dials fresh (self-heal; k=1 chat cadence
+   makes this rare).
+4. The desktop opening a second SQLite connection to `state.sqlite`
+   mirrors existing app practice (`license_accepted`); persistence
+   failures degrade to memory-only with a logged warning rather than
+   blocking chat.
+5. No scheduler crate dependency added anywhere (shadow data only; the
+   EWMA alpha is restated locally and documented as matching the frozen
+   ADR-013 value).
+
+## Unresolved risks
+
+- RTT magnitude is loopback-proven only; the LAN re-probe
+  (`lan_cross_machine_completion` + a manual `measure_rtt` run) and WAN
+  baselines remain open (M9).
+- The post-completion probe races a fast follow-up request for the pooled
+  session (loser dials fresh) — acceptable at k=1, revisit under
+  multi-peer/hedged fan-out (LOW-2's shared-endpoint work).
+- `between_requests` recv deadline semantics: ping answering now consumes
+  the SAME overall budget (a peer cannot keep a session alive forever by
+  pinging), but a very chatty prober could starve the between-requests
+  window within one call — bounded by the 2 s probe deadline in practice.
+- SQLite multi-connection writes (node daemon + desktop metrics) rely on
+  short best-effort upserts; a `database is locked` burst would show as
+  `net.metrics.persist_failed` warnings, not lost requests.
+- The advertised-queueMs discount policy (how the scheduler should blend
+  measured TTFT against advertised queueMs) is deliberately NOT decided
+  here — that is the shadow-wiring step's first reviewed decision.
+
+## Suggested next task for the integrator
+
+Scheduler Scientist: wire the shadow planner over `PeerObservations`
+(`measure(peer).profile(profile)` supplies `measured_rtt_ms`,
+`prefill/decode_tokens_per_ms`, and the advertised-vs-measured queue pair
+for `Candidate` construction; failure counts feed the failure-penalty
+input) — logs the plan it would choose, never acts (dependency-graph edge
+11). Then the 9.6 pass-1 harness (edge 3: needs `measure_rtt` — now
+present). Network side next: the F2b Swarm-migration ADR (Option B) and
+the HIGH-2/MEDIUM-1 retryable/deadline fixes remain queued from the audit
+above.

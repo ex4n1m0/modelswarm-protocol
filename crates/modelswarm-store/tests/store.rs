@@ -92,6 +92,66 @@ fn ewma_round_trips_and_updates() {
     assert_eq!(store.get_ewma("peer-2", "ttft_ms").unwrap(), None);
 }
 
+/// F15: per-(peer, profile) metric rows round-trip, stay scoped to the
+/// exact profile they were measured against, and the migration is additive
+/// (an existing v2 database gains the table; user_version >= 3).
+#[test]
+fn peer_metric_rows_round_trip_per_profile() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let store = Store::open(file.path()).unwrap();
+    assert_eq!(
+        store
+            .get_peer_metric("peer-1", "msp1:aa", "ttft_ms")
+            .unwrap(),
+        None
+    );
+    store
+        .upsert_peer_metric("peer-1", "msp1:aa", "ttft_ms", 42.0)
+        .unwrap();
+    store
+        .upsert_peer_metric("peer-1", "msp1:aa", "ttft_ms", 38.5)
+        .unwrap();
+    store
+        .upsert_peer_metric("peer-1", "msp1:bb", "ttft_ms", 90.0)
+        .unwrap();
+    store
+        .upsert_peer_metric("peer-2", "msp1:aa", "itl_mean_ms", 12.0)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_peer_metric("peer-1", "msp1:aa", "ttft_ms")
+            .unwrap(),
+        Some(38.5),
+        "same triple updates in place"
+    );
+    assert_eq!(
+        store
+            .get_peer_metric("peer-1", "msp1:bb", "ttft_ms")
+            .unwrap(),
+        Some(90.0),
+        "same peer + metric under another profile is a separate row"
+    );
+    let mut rows = store.peer_metrics_for("peer-1").unwrap();
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    assert_eq!(
+        rows,
+        vec![
+            ("msp1:aa".to_string(), "ttft_ms".to_string(), 38.5),
+            ("msp1:bb".to_string(), "ttft_ms".to_string(), 90.0),
+        ]
+    );
+    assert!(store.peer_metrics_for("peer-3").unwrap().is_empty());
+
+    let conn = Connection::open(file.path()).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        version >= 3,
+        "migration 3 applied, got user_version {version}"
+    );
+}
+
 #[test]
 fn job_accounting_counts_and_is_idempotent_per_request() {
     let file = tempfile::NamedTempFile::new().unwrap();

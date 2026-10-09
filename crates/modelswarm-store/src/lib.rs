@@ -97,6 +97,25 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 "#,
     ),
+    // F15 (measurement plumbing): per-(peer, profile) EWMA observations —
+    // completion distributions keyed by the exact profile the measurements
+    // were taken against. ADDITIVE and backward-compatible: peer-scoped
+    // metrics keep riding `ewma_observations` untouched; existing rows and
+    // callers are unaffected. Values are timings/rates/counts only — the
+    // structural privacy audit in tests/store.rs covers this table too.
+    (
+        3,
+        r#"
+CREATE TABLE IF NOT EXISTS peer_metric_observations (
+    peer_id    TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    metric     TEXT NOT NULL,
+    value      REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (peer_id, profile_id, metric)
+);
+"#,
+    ),
 ];
 
 /// The SQLite-backed node-local store.
@@ -169,6 +188,64 @@ impl Store {
             )
             .optional()?;
         Ok(value)
+    }
+
+    /// F15: inserts or refreshes the EWMA observation for one
+    /// (peer, profile, metric) triple (migration 3 table).
+    pub fn upsert_peer_metric(
+        &self,
+        peer_id: &str,
+        profile_id: &str,
+        metric: &str,
+        value: f64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO peer_metric_observations
+                 (peer_id, profile_id, metric, value, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(peer_id, profile_id, metric) DO UPDATE SET
+                 value = excluded.value, updated_at = excluded.updated_at",
+            rusqlite::params![peer_id, profile_id, metric, value, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// F15: the stored (peer, profile, metric) value, if any.
+    pub fn get_peer_metric(
+        &self,
+        peer_id: &str,
+        profile_id: &str,
+        metric: &str,
+    ) -> Result<Option<f64>> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM peer_metric_observations
+                 WHERE peer_id = ?1 AND profile_id = ?2 AND metric = ?3",
+                rusqlite::params![peer_id, profile_id, metric],
+                |row| row.get::<_, f64>(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    /// F15: every stored `(profile_id, metric, value)` row for one peer —
+    /// the read side used to hydrate per-peer observations after a restart.
+    pub fn peer_metrics_for(&self, peer_id: &str) -> Result<Vec<(String, String, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT profile_id, metric, value FROM peer_metric_observations
+             WHERE peer_id = ?1 ORDER BY profile_id, metric",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![peer_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Records one finished job (timings, outcome, usage digest only).

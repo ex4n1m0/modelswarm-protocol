@@ -33,6 +33,7 @@ pub mod handshake;
 #[cfg(feature = "libp2p-backend")]
 pub mod libp2p_backend;
 pub mod message;
+pub mod observe;
 pub mod transport;
 
 /// Re-exported so callers can name the key type that

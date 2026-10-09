@@ -63,6 +63,10 @@ struct Inner {
         String,
         std::sync::Arc<modelswarm_node::remote::RemoteExecutor>,
     )>,
+    /// F15 shadow measurements (per-peer RTT EWMA, completion
+    /// distributions): lazily opened store-backed recorder shared by the
+    /// swarm executors. Shadow data only — nothing selects peers yet.
+    peer_metrics: Option<std::sync::Arc<modelswarm_node::measure::PeerMetrics>>,
     license_accepted: bool,
     artifact: Option<EnsuredArtifact>,
     node: Option<RunningNode>,
@@ -121,6 +125,7 @@ impl DesktopState {
                 chat_log: Vec::new(),
                 swarm_lease: None,
                 swarm_executor: None,
+                peer_metrics: None,
                 listener_addr: None,
             }),
         }
@@ -1404,7 +1409,7 @@ async fn try_swarm_chat(
     inner: &tokio::sync::Mutex<Inner>,
     tracker_url: &str,
     data_dir: &std::path::Path,
-    telemetry: &Telemetry,
+    telemetry: &std::sync::Arc<Telemetry>,
     profile: &str,
     local_executor: std::sync::Arc<dyn modelswarm_gateway::InferenceExecutor>,
     log: &[ChatTurn],
@@ -1445,6 +1450,9 @@ async fn try_swarm_chat(
         .iter()
         .find(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))?
         .clone();
+    // F15: the roster's advertised queueMs rides along (untrusted input,
+    // recorded next to the measured admission-to-first-token).
+    let advertised_queue_ms = candidate.queue_ms;
     let peer = modelswarm_node::remote::RemotePeer {
         addr,
         peer_id: candidate.peer_id,
@@ -1485,17 +1493,34 @@ async fn try_swarm_chat(
     let key = format!("{profile}|{}", peer.peer_id);
     let remote = {
         let mut inner_state = inner.lock().await;
+        // F15: one measurement recorder per app, store-backed (best
+        // effort; degrades to memory-only with a logged warning).
+        let metrics = match &inner_state.peer_metrics {
+            Some(m) => std::sync::Arc::clone(m),
+            None => {
+                let m = std::sync::Arc::new(modelswarm_node::measure::PeerMetrics::open(
+                    inner_state.data_dir.join("state.sqlite"),
+                    std::sync::Arc::clone(telemetry),
+                ));
+                inner_state.peer_metrics = Some(std::sync::Arc::clone(&m));
+                m
+            }
+        };
         match &inner_state.swarm_executor {
             Some((k, exec)) if k == &key => std::sync::Arc::clone(exec),
             _ => {
-                let exec = std::sync::Arc::new(modelswarm_node::remote::RemoteExecutor::new(
-                    peer, identity,
-                ));
+                let exec = std::sync::Arc::new(
+                    modelswarm_node::remote::RemoteExecutor::new(peer, identity)
+                        .with_metrics(metrics),
+                );
                 inner_state.swarm_executor = Some((key, std::sync::Arc::clone(&exec)));
                 exec
             }
         }
     };
+    // F15: keep the advertised queueMs fresh from THIS roster lookup —
+    // the pooled executor outlives any single roster.
+    remote.set_advertised_queue_ms(Some(advertised_queue_ms));
     use futures_util::StreamExt;
     use modelswarm_gateway::{ExecutorEvent, InferenceExecutor};
 

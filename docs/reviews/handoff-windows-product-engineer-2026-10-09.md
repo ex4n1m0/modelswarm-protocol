@@ -297,3 +297,63 @@ pool drop, F6 parse hardening (+tests), F11 telemetry routing, F13/F14/F15 doc+d
 cleanups. Separately schedule the F4 uninstall VM test and the M1/M2 extraction ADR
 (platform-neutral profiler/governor crate shape per §4/§5) — the gate decision for M4 depends
 on both. Reviewers per AGENTS.md: Protocol Architect + Test and Release.
+
+---
+
+# Follow-up batch (2026-10-09 night): F15 closed metric vocabulary, off-path hydration, failure-sampled shadow telemetry
+
+Branch: `main` on `989748f`. The earlier attempt at this batch died mid-work leaving four
+uncommitted files; they were reviewed, completed, and corrected here (the WIP's own store test
+assert was consistent on disk — verified against `git show` — and the unused `mut` flagged in
+the network handoff ADDENDUM 2 at app.rs:1429 is fixed).
+
+## Changed files and why
+
+| File | Change |
+|---|---|
+| `crates/modelswarm-store/src/lib.rs` | Fix 1 (store layer): `upsert_peer_metric` rejects keys outside the closed vocabulary's SHAPE (non-empty, <=64 bytes, `[a-z0-9_]`) with a new `StoreError::InvalidMetricKey { metric_len }` — the key itself is never echoed (an unknown key is suspect content). New `persisted_peer_ids()` unions both observation tables for whole-store hydration. Backward compatible: every const key still writes. |
+| `crates/modelswarm-node/src/measure.rs` | Fix 1 (node layer, where the consts live — store cannot depend on node without a cycle): `known_metric_key` enumerates exactly the 11 const keys; both persist paths call `refuse_unknown_metric` (telemetry `net.metrics.invalid_key` with LENGTH only, `debug_assert!` in debug). Fix 2 (node side): `PeerMetrics::open` eagerly hydrates EVERY persisted peer (`hydrate_all_from_store`), so `observe()` is now a pure in-memory read — the first-touch SQLite read moved off the request path, once per peer per process preserved. Two new tests (debug-refusal pin + closed-set membership pin). |
+| `crates/modelswarm-desktop/src/app.rs` | Fix 2 (desktop side): `gather_shadow_plan`'s lazy `PeerMetrics::open` now runs under `tokio::task::spawn_blocking` (store open + migrations + hydration are blocking I/O); panic in the open degrades to memory-only instead of failing the chat; race-safe publish keeps one shared instance per process. Unused `mut` on the first lock removed (network handoff note). Fix 3: new `record_shadow_failure` emits `sched.shadow.realized` with `served_by=failed` on ALL TEN total-failure `return None` paths in `try_swarm_chat` (tracker/lookup/identity get a fresh trace + honest `wall_ms=unknown`; no-candidate/no-quic-addr also log the shadow decision with production pick `none`/the candidate; the four remote+local-fallback failures and the empty-reply path carry trace, production peer, shadow pick, wall time, and a `reason`). New unit test over both row shapes. |
+| `crates/modelswarm-store/tests/store.rs` | (from the WIP, reviewed) `upsert_peer_metric_rejects_keys_outside_the_closed_shape` (7 malformed keys rejected pre-SQL, nothing written, 8 in-vocabulary keys still round-trip) and `persisted_peer_ids_unions_both_observation_tables`. |
+
+## Commands and outcomes (all on this machine, 2026-10-09 night)
+
+- `cargo fmt --all` then `cargo fmt --all --check` — clean.
+- clippy `-D warnings` × 5, all clean: default `--workspace --all-targets`;
+  `--features modelswarm-node/libp2p-backend`; `--features modelswarm-bench/quic-runner`;
+  `--features modelswarm-runtime/capi-adapter`;
+  `TAURI_CONFIG='{"bundle":{"resources":[]}}' cargo clippy -p modelswarm-desktop --all-targets --features tauri-shell`.
+- `cargo test --workspace` — 51 suites, **349 passed / 0 failed** (HEAD baseline re-measured
+  via stash: 347 — the earlier attempt's WIP is not in any committed baseline; +2 store tests).
+- `cargo test --workspace --features modelswarm-node/libp2p-backend` — **372 passed / 0 failed**
+  (HEAD-style baseline 370 per network handoff; +2 measure tests).
+- `TAURI_CONFIG='{"bundle":{"resources":[]}}' cargo test -p modelswarm-desktop --features tauri-shell`
+  — **8 passed / 0 failed** (7 baseline + `shadow_failure_rows_sample_total_failure_paths`).
+
+## Assumptions
+
+1. Fix 1's two-layer split is deliberate: exact enumeration membership lives in
+   `measure.rs` (the consts' home); the store enforces the structural bound as defense in
+   depth (a structurally valid unknown key passing the STORE is intentional — the node layer
+   is the enumeration authority; pinned by test).
+2. Pre-plan failure rows (tracker/lookup/identity) intentionally have no
+   `sched.shadow.decision` to join against — they are realized-only samples; that is the
+   honest representation of "failed before planning".
+3. `debug_assert!` refusal means release builds skip the write silently apart from the
+   telemetry warning — accepted (matches the store's release-path rejection test).
+4. `record_shadow_failure`'s `reason` values are closed-table error codes / fixed phase
+   names, never prompt-adjacent text; the telemetry redactor still scrubs/truncates.
+
+## Unresolved risks
+
+- The `reason` field on failure rows is desktop-local telemetry vocabulary (not protocol);
+   the 9.6 bench join should treat it as optional.
+- Pre-plan failures mint traces with no decision row: dataset consumers must left-join, not
+  inner-join, or they will still drop these samples (documented here for the Scheduler
+  Scientist).
+
+## Suggested next task
+
+Proceed with the audit §12 batch (F1 copy button, F2 chat_log clear, F5 stop drain + pool
+drop, F6 parse hardening) — this follow-up closes none of those; it was scoped to the three
+signed-off fixes only.

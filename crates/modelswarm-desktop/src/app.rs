@@ -1426,16 +1426,44 @@ async fn gather_shadow_plan(
     max_tokens: Option<u32>,
 ) -> ShadowPlan {
     let metrics = {
-        let mut guard = inner.lock().await;
+        let guard = inner.lock().await;
         match &guard.peer_metrics {
             Some(m) => std::sync::Arc::clone(m),
             None => {
-                let m = std::sync::Arc::new(modelswarm_node::measure::PeerMetrics::open(
-                    guard.data_dir.join("state.sqlite"),
-                    std::sync::Arc::clone(telemetry),
-                ));
-                guard.peer_metrics = Some(std::sync::Arc::clone(&m));
-                m
+                let path = guard.data_dir.join("state.sqlite");
+                // F9-class fix: the one-shot store open (SQLite open +
+                // migrations + whole-store hydration) is blocking I/O —
+                // run it on the blocking pool, never the async runtime.
+                drop(guard);
+                let t = std::sync::Arc::clone(telemetry);
+                let opened = tokio::task::spawn_blocking(move || {
+                    modelswarm_node::measure::PeerMetrics::open(path, t)
+                })
+                .await;
+                let m = match opened {
+                    Ok(m) => std::sync::Arc::new(m),
+                    Err(join_err) => {
+                        // A panic in the one-shot open must never take a
+                        // chat request down: degrade to memory-only.
+                        telemetry.warn(
+                            "chat.swarm.error",
+                            &[("phase", "metrics_open"), ("error", &join_err.to_string())],
+                        );
+                        std::sync::Arc::new(modelswarm_node::measure::PeerMetrics::memory(
+                            std::sync::Arc::clone(telemetry),
+                        ))
+                    }
+                };
+                // Re-lock and publish; if a concurrent chat won the race,
+                // keep the single shared instance (one per process).
+                let mut guard = inner.lock().await;
+                match &guard.peer_metrics {
+                    Some(existing) => std::sync::Arc::clone(existing),
+                    None => {
+                        guard.peer_metrics = Some(std::sync::Arc::clone(&m));
+                        m
+                    }
+                }
             }
         }
     };
@@ -1521,6 +1549,50 @@ fn log_shadow_decision(
     pick
 }
 
+/// 9.6 dataset completeness: the realized-outcome row for a TOTAL-FAILURE
+/// path in [`try_swarm_chat`] (every `return None`), with
+/// `served_by=failed` so a swarm attempt that produced no reply is still
+/// sampled in the pass-1 join instead of silently vanishing. Shares the
+/// success-path row's correlation keys (label/trace/profile/
+/// production_peer/shadow_pick). `plan` is `None` only for failures that
+/// happen BEFORE the shadow plan could be gathered (tracker/lookup/
+/// identity) — those get a fresh trace so the row remains a realizable
+/// sample, honestly without any decision row to join against.
+fn record_shadow_failure(
+    telemetry: &Telemetry,
+    plan: Option<&ShadowPlan>,
+    profile: &str,
+    production_peer: &str,
+    shadow_pick: Option<&str>,
+    reason: &str,
+    wall_ms: Option<u64>,
+) {
+    let fresh_trace;
+    let trace = match plan {
+        Some(p) => p.trace_id.as_str(),
+        None => {
+            fresh_trace = format!("shadow-{}", modelswarm_identity::new_nonce());
+            fresh_trace.as_str()
+        }
+    };
+    let wall = wall_ms
+        .map(|ms| ms.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    telemetry.info(
+        "sched.shadow.realized",
+        &[
+            ("label", modelswarm_scheduler::shadow::SHADOW_LABEL),
+            ("trace", trace),
+            ("profile", profile),
+            ("production_peer", production_peer),
+            ("shadow_pick", shadow_pick.unwrap_or("none")),
+            ("served_by", "failed"),
+            ("reason", reason),
+            ("wall_ms", &wall),
+        ],
+    );
+}
+
 /// F1(3): swarm-first chat. Finds a peer verifiably hosting this exact
 /// profile with a REAL advertised address (not the no-listener
 /// placeholder, not ourselves), and asks it first. The REMOTE executor is
@@ -1545,6 +1617,7 @@ async fn try_swarm_chat(
         Ok(t) => t,
         Err(e) => {
             telemetry.warn("chat.swarm.error", &[("phase", "tracker"), ("error", &e)]);
+            record_shadow_failure(telemetry, None, profile, "none", None, "tracker", None);
             return None;
         }
     };
@@ -1555,10 +1628,18 @@ async fn try_swarm_chat(
                 "chat.swarm.error",
                 &[("phase", "lookup"), ("error", &e.to_string())],
             );
+            record_shadow_failure(telemetry, None, profile, "none", None, "lookup", None);
             return None;
         }
     };
-    let identity = load_or_create_identity(data_dir, telemetry).ok()?;
+    let identity = match load_or_create_identity(data_dir, telemetry) {
+        Ok(i) => i,
+        Err(_) => {
+            // load_or_create_identity already warned with the cause.
+            record_shadow_failure(telemetry, None, profile, "none", None, "identity", None);
+            return None;
+        }
+    };
     let own_peer_id = identity.peer_id();
 
     // SHADOW PLANNER (dependency-graph edge 11; M10 build item 3,
@@ -1570,18 +1651,53 @@ async fn try_swarm_chat(
         gather_shadow_plan(inner, telemetry, &peers, &own_peer_id, log, max_tokens).await;
 
     // First peer with a real QUIC multiaddr that is not us.
-    let candidate = peers.into_iter().find(|p| {
+    let candidate = match peers.into_iter().find(|p| {
         p.peer_id != own_peer_id
             && p.free_slots > 0
             && p.addresses
                 .iter()
                 .any(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))
-    })?;
-    let addr = candidate
+    }) {
+        Some(c) => c,
+        None => {
+            // Log the shadow decision anyway (production pick: none) and
+            // a realized failure row — the swarm had no eligible peer, and
+            // the 9.6 dataset must sample that, not drop it.
+            let pick = log_shadow_decision(telemetry, &shadow_plan, profile, "none");
+            record_shadow_failure(
+                telemetry,
+                Some(&shadow_plan),
+                profile,
+                "none",
+                pick.as_deref(),
+                "no_eligible_peer",
+                None,
+            );
+            return None;
+        }
+    };
+    let addr = match candidate
         .addresses
         .iter()
-        .find(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))?
-        .clone();
+        .find(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))
+    {
+        Some(a) => a.clone(),
+        None => {
+            // Unreachable in practice (the candidate predicate above
+            // requires a QUIC addr) but fail visible if it ever fires.
+            let pick = log_shadow_decision(telemetry, &shadow_plan, profile, &candidate.peer_id);
+            record_shadow_failure(
+                telemetry,
+                Some(&shadow_plan),
+                profile,
+                &candidate.peer_id,
+                pick.as_deref(),
+                "no_quic_addr",
+                None,
+            );
+            return None;
+        }
+    };
     // F15: the roster's advertised queueMs rides along (untrusted input,
     // recorded next to the measured admission-to-first-token).
     let advertised_queue_ms = candidate.queue_ms;
@@ -1725,6 +1841,15 @@ async fn try_swarm_chat(
                                     "chat.swarm.error",
                                     &[("phase", "local_fallback"), ("error", &local_reason)],
                                 );
+                                record_shadow_failure(
+                                    telemetry,
+                                    Some(&shadow_plan),
+                                    profile,
+                                    &remote_peer_id,
+                                    shadow_pick.as_deref(),
+                                    &format!("local_fallback:{local_reason}"),
+                                    Some(started.elapsed().as_millis() as u64),
+                                );
                                 return None;
                             }
                         },
@@ -1732,6 +1857,15 @@ async fn try_swarm_chat(
                             telemetry.warn(
                                 "chat.swarm.error",
                                 &[("phase", "local_fallback"), ("error", &e.to_string())],
+                            );
+                            record_shadow_failure(
+                                telemetry,
+                                Some(&shadow_plan),
+                                profile,
+                                &remote_peer_id,
+                                shadow_pick.as_deref(),
+                                &format!("local_fallback:{}", e),
+                                Some(started.elapsed().as_millis() as u64),
                             );
                             return None;
                         }
@@ -1758,6 +1892,15 @@ async fn try_swarm_chat(
                                 "chat.swarm.error",
                                 &[("phase", "local_fallback"), ("error", &local_reason)],
                             );
+                            record_shadow_failure(
+                                telemetry,
+                                Some(&shadow_plan),
+                                profile,
+                                &remote_peer_id,
+                                shadow_pick.as_deref(),
+                                &format!("local_fallback:{local_reason}"),
+                                Some(started.elapsed().as_millis() as u64),
+                            );
                             return None;
                         }
                     },
@@ -1766,6 +1909,15 @@ async fn try_swarm_chat(
                             "chat.swarm.error",
                             &[("phase", "local_fallback"), ("error", &le.to_string())],
                         );
+                        record_shadow_failure(
+                            telemetry,
+                            Some(&shadow_plan),
+                            profile,
+                            &remote_peer_id,
+                            shadow_pick.as_deref(),
+                            &format!("local_fallback:{le}"),
+                            Some(started.elapsed().as_millis() as u64),
+                        );
                         return None;
                     }
                 }
@@ -1773,6 +1925,15 @@ async fn try_swarm_chat(
         };
     if content.trim().is_empty() {
         telemetry.warn("chat.swarm.empty", &[]);
+        record_shadow_failure(
+            telemetry,
+            Some(&shadow_plan),
+            profile,
+            &remote_peer_id,
+            shadow_pick.as_deref(),
+            "empty_reply",
+            Some(started.elapsed().as_millis() as u64),
+        );
         return None;
     }
     let content = content.trim().to_string();
@@ -2603,5 +2764,61 @@ mod tests {
 
         // Unknown size -> no invented numbers (fail-closed display).
         assert!(hardware_requirements(None).is_none());
+    }
+
+    #[test]
+    fn shadow_failure_rows_sample_total_failure_paths() {
+        // 9.6 dataset completeness: every total-failure `return None` in
+        // try_swarm_chat must leave a realized row with served_by=failed,
+        // so failures are sampled instead of silently dropped from the
+        // decision/realized join.
+        let (t, sink) = Telemetry::memory();
+        let telemetry = Arc::new(t);
+
+        // Pre-plan failure (tracker/lookup/identity): no shadow plan
+        // exists yet, so the row carries a fresh trace, production_peer
+        // none, and an honest unknown wall time.
+        record_shadow_failure(&telemetry, None, "msp1:aa", "none", None, "lookup", None);
+        let rows = sink.snapshot();
+        assert_eq!(rows.len(), 1, "exactly one realized row: {rows:?}");
+        assert!(rows[0].contains("\"event\":\"sched.shadow.realized\""));
+        assert!(rows[0].contains("\"served_by\":\"failed\""));
+        assert!(rows[0].contains("\"reason\":\"lookup\""));
+        assert!(rows[0].contains("\"production_peer\":\"none\""));
+        assert!(rows[0].contains("\"shadow_pick\":\"none\""));
+        assert!(rows[0].contains("\"wall_ms\":\"unknown\""));
+        assert!(rows[0].contains("\"trace\":\"shadow-"));
+        assert!(rows[0].contains("\"label\":\"shadow-no-action\""));
+
+        // Post-plan failure: correlates the plan's trace, the production
+        // peer that was attempted, and the shadow pick, with the wall
+        // time when known.
+        let plan = ShadowPlan {
+            trace_id: "shadow-fixed".into(),
+            own_peer_id: "me".into(),
+            inputs: vec![],
+            policy: modelswarm_scheduler::shadow::QueueDiscountPolicy::from_env(),
+            prompt_tokens: 10,
+            output_tokens: 5,
+            metrics: Arc::new(modelswarm_node::measure::PeerMetrics::memory(Arc::clone(
+                &telemetry,
+            ))),
+        };
+        record_shadow_failure(
+            &telemetry,
+            Some(&plan),
+            "msp1:aa",
+            "peer-9",
+            Some("peer-7"),
+            "empty_reply",
+            Some(42),
+        );
+        let rows = sink.snapshot();
+        assert_eq!(rows.len(), 2, "one row per failure: {rows:?}");
+        assert!(rows[1].contains("\"trace\":\"shadow-fixed\""));
+        assert!(rows[1].contains("\"production_peer\":\"peer-9\""));
+        assert!(rows[1].contains("\"shadow_pick\":\"peer-7\""));
+        assert!(rows[1].contains("\"reason\":\"empty_reply\""));
+        assert!(rows[1].contains("\"wall_ms\":\"42\""));
     }
 }

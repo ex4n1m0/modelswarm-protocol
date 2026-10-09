@@ -152,6 +152,85 @@ fn peer_metric_rows_round_trip_per_profile() {
     );
 }
 
+/// F15 security condition: `upsert_peer_metric` accepts only keys shaped
+/// like the closed observation vocabulary (non-empty, <=64 bytes,
+/// `[a-z0-9_]`). Free-form names — the smuggling vector for arbitrary
+/// text, worst case prompt content, into the schema — are rejected BEFORE
+/// any SQL runs, and every key the node's const enumeration actually uses
+/// still round-trips (backward compatible).
+#[test]
+fn upsert_peer_metric_rejects_keys_outside_the_closed_shape() {
+    use modelswarm_store::StoreError;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let store = Store::open(file.path()).unwrap();
+
+    // The shape check, not enumeration membership: structurally valid
+    // unknown names still pass at the store layer (the node's closed const
+    // set is enforced one layer up); everything malformed is refused.
+    for junk in [
+        "",
+        "has spaces",
+        "UPPER_MS",
+        "ttft-ms",
+        "prompt: hello there",
+        "a".repeat(65).as_str(),
+        " café",
+    ] {
+        let err = store
+            .upsert_peer_metric("peer-1", "msp1:aa", junk, 1.0)
+            .expect_err("malformed metric key must be rejected");
+        assert!(
+            matches!(err, StoreError::InvalidMetricKey { .. }),
+            "expected InvalidMetricKey for {junk:?}, got {err:?}"
+        );
+        // And nothing was written.
+        assert!(
+            store.peer_metrics_for("peer-1").unwrap().is_empty(),
+            "rejected key {junk:?} must not create a row"
+        );
+    }
+
+    // Every key the F15 const enumeration persists today still works.
+    for legacy in [
+        "ttft_ms",
+        "itl_mean_ms",
+        "total_ms",
+        "prefill_tokens_per_ms",
+        "decode_tokens_per_ms",
+        "advertised_queue_ms",
+        "completion_count",
+        "failure_count",
+    ] {
+        store
+            .upsert_peer_metric("peer-1", "msp1:aa", legacy, 1.0)
+            .unwrap_or_else(|e| panic!("legacy key {legacy} must keep working: {e}"));
+    }
+    assert_eq!(store.peer_metrics_for("peer-1").unwrap().len(), 8);
+}
+
+/// F15 hydration support: `persisted_peer_ids` returns the union of peers
+/// with any observation row across both metric tables, so the recorder
+/// can hydrate the whole store once at open time.
+#[test]
+fn persisted_peer_ids_unions_both_observation_tables() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let store = Store::open(file.path()).unwrap();
+    assert!(store.persisted_peer_ids().unwrap().is_empty());
+
+    store.upsert_ewma("peer-b", "rtt_p50_ms", 10.0).unwrap();
+    store
+        .upsert_peer_metric("peer-a", "msp1:aa", "ttft_ms", 42.0)
+        .unwrap();
+    store
+        .upsert_peer_metric("peer-b", "msp1:aa", "ttft_ms", 7.0)
+        .unwrap();
+    // A peer that appears in both tables is listed once.
+    assert_eq!(
+        store.persisted_peer_ids().unwrap(),
+        vec!["peer-a".to_string(), "peer-b".to_string()]
+    );
+}
+
 #[test]
 fn job_accounting_counts_and_is_idempotent_per_request() {
     let file = tempfile::NamedTempFile::new().unwrap();

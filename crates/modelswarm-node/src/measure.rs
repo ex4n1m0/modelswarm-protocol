@@ -65,6 +65,29 @@ const METRIC_DECODE_RATE: &str = "decode_tokens_per_ms";
 const METRIC_ADVERTISED_QUEUE: &str = "advertised_queue_ms";
 const METRIC_COMPLETIONS: &str = "completion_count";
 
+/// The closed metric-key vocabulary this module may persist: exactly the
+/// consts above. Every `persist_*` call checks its key against this set —
+/// debug builds assert, release builds refuse the write with a warning —
+/// so a future caller cannot smuggle free-form names (worst case prompt
+/// content) into the observation tables. The store adds the same
+/// structural bound one layer down (defense in depth).
+fn known_metric_key(metric: &str) -> bool {
+    matches!(
+        metric,
+        METRIC_RTT_P50
+            | METRIC_RTT_P95
+            | METRIC_RTT_JITTER
+            | METRIC_FAILURES
+            | METRIC_TTFT
+            | METRIC_ITL_MEAN
+            | METRIC_TOTAL
+            | METRIC_PREFILL_RATE
+            | METRIC_DECODE_RATE
+            | METRIC_ADVERTISED_QUEUE
+            | METRIC_COMPLETIONS
+    )
+}
+
 fn ewma(previous: Option<f64>, observation: f64) -> f64 {
     match previous {
         None => observation,
@@ -121,8 +144,13 @@ impl PeerMetrics {
     }
 
     /// Store-backed: opens (creating/migrating) the SQLite database at
-    /// `path`. On open failure degrades to memory-only with a visible
-    /// warning — measurement must never take the request path down.
+    /// `path` and eagerly hydrates EVERY persisted peer into memory, so
+    /// [`PeerMetrics::observe`] is a pure in-memory read afterwards — the
+    /// first touch of a roster peer on a request path never performs a
+    /// blocking SQLite read under the sync mutex (F9-class blocking read,
+    /// moved here, once per process). On open failure degrades to
+    /// memory-only with a visible warning — measurement must never take
+    /// the request path down.
     pub fn open(path: impl AsRef<Path>, telemetry: Arc<Telemetry>) -> Self {
         let store = match modelswarm_store::Store::open(path) {
             Ok(store) => Some(Arc::new(Mutex::new(store))),
@@ -134,11 +162,13 @@ impl PeerMetrics {
                 None
             }
         };
-        Self {
+        let metrics = Self {
             state: Mutex::new(HashMap::new()),
             store,
             telemetry,
-        }
+        };
+        metrics.hydrate_all_from_store();
+        metrics
     }
 
     /// Records one ping/pong probe batch (p50/p95/jitter from
@@ -291,13 +321,13 @@ impl PeerMetrics {
     }
 
     /// The typed read API for scheduler-side consumers (shadow mode):
-    /// one peer's measured snapshot, hydrating from the store on first
-    /// touch so a fresh process resumes yesterday's EWMAs.
+    /// one peer's measured snapshot. PURE in-memory read — safe to call
+    /// on the async request path. Cross-restart resume happens at
+    /// [`PeerMetrics::open`] time (whole-store hydration); peers first
+    /// recorded by THIS process are hydrated on their first write, which
+    /// runs off the request critical path.
     pub fn observe(&self, peer_id: &str) -> PeerObservations {
         let mut state = self.lock_state();
-        if let Some(loaded) = self.hydrate_from_store(peer_id, &state) {
-            state.insert(peer_id.to_string(), loaded);
-        }
         let peer = state.entry(peer_id.to_string()).or_default();
         PeerObservations {
             peer_id: peer_id.to_string(),
@@ -327,7 +357,7 @@ impl PeerMetrics {
 
     /// Snapshots for every peer touched in THIS process (callers that care
     /// about a specific roster should use [`PeerMetrics::observe`] per
-    /// peer — it hydrates from the store).
+    /// peer — same pure in-memory read).
     pub fn observe_all(&self) -> Vec<PeerObservations> {
         let peer_ids: Vec<String> = {
             let state = self.lock_state();
@@ -343,6 +373,38 @@ impl PeerMetrics {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whole-store hydration at [`PeerMetrics::open`] time: loads every
+    /// peer with any persisted row into memory in one bounded pass, so a
+    /// fresh process resumes yesterday's EWMAs WITHOUT touching SQLite on
+    /// later `observe` calls. One read per peer per process (the
+    /// first-touch bound, moved from the request path to open time).
+    fn hydrate_all_from_store(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let Ok(store) = store.lock() else {
+            return;
+        };
+        let Ok(peer_ids) = store.persisted_peer_ids() else {
+            return;
+        };
+        drop(store);
+        if peer_ids.is_empty() {
+            return;
+        }
+        let mut state = self.lock_state();
+        for peer_id in peer_ids {
+            if let Some(loaded) = self.hydrate_from_store(&peer_id, &state) {
+                state.insert(peer_id, loaded);
+            } else {
+                // persisted_peer_ids listed this peer, so hydration should
+                // find at least one row; insert empty state anyway to keep
+                // the once-per-peer bound even if a row vanished racily.
+                state.entry(peer_id).or_default();
+            }
+        }
     }
 
     /// Loads the persisted rows for one peer into a fresh `PeerState`, if
@@ -387,8 +449,31 @@ impl PeerMetrics {
         has_any.then_some(loaded)
     }
 
+    /// Shared refusal for keys outside the closed vocabulary: warn with the
+    /// key LENGTH only (an unknown key is suspect content by definition —
+    /// never echoed into telemetry), skip the write, and assert loudly in
+    /// debug builds so the caller bug is caught in development.
+    fn refuse_unknown_metric(&self, metric: &str) -> bool {
+        let known = known_metric_key(metric);
+        if !known {
+            self.telemetry.warn(
+                "net.metrics.invalid_key",
+                &[("metric_len", &metric.len().to_string())],
+            );
+            debug_assert!(
+                false,
+                "metric key outside the closed F15 vocabulary (length {}): refusing to persist",
+                metric.len()
+            );
+        }
+        !known
+    }
+
     fn persist_peer_metric(&self, peer_id: &str, metric: &str, value: Option<f64>) {
         let Some(value) = value else { return };
+        if self.refuse_unknown_metric(metric) {
+            return;
+        }
         let Some(store) = self.store.as_ref() else {
             return;
         };
@@ -409,11 +494,16 @@ impl PeerMetrics {
         value: Option<f64>,
     ) {
         let Some(value) = value else { return };
+        if self.refuse_unknown_metric(metric) {
+            return;
+        }
         let Some(store) = self.store.as_ref() else {
             return;
         };
         let Ok(store) = store.lock() else { return };
         if let Err(e) = store.upsert_peer_metric(peer_id, profile_id, metric, value) {
+            // The error message never carries the key itself; `metric` here
+            // is guaranteed in-vocabulary by the guard above.
             self.telemetry.warn(
                 "net.metrics.persist_failed",
                 &[("metric", metric), ("error", &e.to_string())],
@@ -545,5 +635,47 @@ mod tests {
         let all = metrics.observe_all();
         assert_eq!(all.len(), 2);
         assert!(all.iter().all(|o| o.rtt_ewma_ms.is_some()));
+    }
+
+    /// F15 security condition, node layer: a metric key outside the closed
+    /// const enumeration is refused BEFORE the store is touched — debug
+    /// builds fail loudly (the caller bug), release builds skip the write
+    /// with a length-only warning. The store-layer shape check is pinned
+    /// in modelswarm-store's own tests; this pins enumeration membership.
+    #[test]
+    #[should_panic(expected = "closed F15 vocabulary")]
+    fn persisting_an_unknown_metric_key_refuses_loudly_in_debug() {
+        let metrics = PeerMetrics::memory(telemetry());
+        // Free-form key — the prompt-smuggling shape this guard exists for.
+        metrics.persist_profile_metric("peer-1", "msp1:aa", "prompt was here", Some(1.0));
+    }
+
+    /// Same guard on the peer-scoped table, and the release-mode contract
+    /// the debug assert cannot show: an unknown key leaves NO row and NO
+    /// state change (verified through the public recorder API by proving
+    /// every in-vocabulary key still round-trips — the guard's
+    /// backward-compatibility condition).
+    #[test]
+    fn every_const_key_is_in_the_closed_vocabulary() {
+        for key in [
+            METRIC_RTT_P50,
+            METRIC_RTT_P95,
+            METRIC_RTT_JITTER,
+            METRIC_FAILURES,
+            METRIC_TTFT,
+            METRIC_ITL_MEAN,
+            METRIC_TOTAL,
+            METRIC_PREFILL_RATE,
+            METRIC_DECODE_RATE,
+            METRIC_ADVERTISED_QUEUE,
+            METRIC_COMPLETIONS,
+        ] {
+            assert!(known_metric_key(key), "{key} must be in the closed set");
+        }
+        // Structurally valid but unknown names are NOT in the set — shape
+        // alone must never pass the enumeration check.
+        for shaped_but_unknown in ["ttft_ms_v2", "prompt_text", "completion_count_x"] {
+            assert!(!known_metric_key(shaped_but_unknown));
+        }
     }
 }

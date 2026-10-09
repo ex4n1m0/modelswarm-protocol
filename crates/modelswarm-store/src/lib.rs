@@ -19,17 +19,28 @@ use rusqlite::{Connection, OptionalExtension};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-/// Store errors. All database failures surface as [`StoreError::Sqlite`].
+/// Store errors. Database failures surface as [`StoreError::Sqlite`].
 #[derive(Debug)]
 pub enum StoreError {
     /// A SQLite operation failed.
     Sqlite(rusqlite::Error),
+    /// A caller tried to persist a metric key outside the closed
+    /// observation vocabulary (empty, longer than 64 bytes, or containing
+    /// characters other than `a-z`, `0-9`, `_`). The key itself is
+    /// deliberately NOT carried in the error — an unknown key is suspect
+    /// content by definition and must never be echoed into logs.
+    InvalidMetricKey { metric_len: usize },
 }
 
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::Sqlite(e) => write!(f, "sqlite error: {e}"),
+            StoreError::InvalidMetricKey { metric_len } => write!(
+                f,
+                "invalid metric key (length {metric_len}): empty, >64 bytes, or characters \
+                 outside [a-z0-9_] — the observation-key vocabulary is closed"
+            ),
         }
     }
 }
@@ -146,6 +157,26 @@ CREATE TABLE IF NOT EXISTS speculative_acceptance_observations (
 /// rounds, accepted_count, proposed_count)`.
 pub type AcceptanceRow = (f64, u64, u64, u64);
 
+/// Upper bound for a persisted metric key. Every key in the closed F15
+/// observation vocabulary (see `modelswarm-node::measure`) is far shorter;
+/// the bound exists so a future caller cannot smuggle arbitrary-length
+/// free-form text (worst case: prompt content) into the schema as a
+/// "metric name".
+const METRIC_KEY_MAX_LEN: usize = 64;
+
+/// The structural shape every persisted metric key must have: non-empty,
+/// at most [`METRIC_KEY_MAX_LEN`] bytes, lowercase snake_case. The node
+/// layer additionally enforces exact membership in its closed const
+/// enumeration; this store-side check is defense in depth so no caller
+/// can write free-form names even if that enumeration is bypassed.
+fn valid_metric_key(metric: &str) -> bool {
+    !metric.is_empty()
+        && metric.len() <= METRIC_KEY_MAX_LEN
+        && metric
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// The SQLite-backed node-local store.
 pub struct Store {
     conn: Connection,
@@ -219,7 +250,11 @@ impl Store {
     }
 
     /// F15: inserts or refreshes the EWMA observation for one
-    /// (peer, profile, metric) triple (migration 3 table).
+    /// (peer, profile, metric) triple (migration 3 table). The metric key
+    /// must match the closed vocabulary's shape
+    /// (see [`valid_metric_key`]); anything else is rejected before the
+    /// SQL runs so a future caller cannot smuggle free-form names into
+    /// the schema.
     pub fn upsert_peer_metric(
         &self,
         peer_id: &str,
@@ -227,6 +262,11 @@ impl Store {
         metric: &str,
         value: f64,
     ) -> Result<()> {
+        if !valid_metric_key(metric) {
+            return Err(StoreError::InvalidMetricKey {
+                metric_len: metric.len(),
+            });
+        }
         self.conn.execute(
             "INSERT INTO peer_metric_observations
                  (peer_id, profile_id, metric, value, updated_at)
@@ -272,6 +312,24 @@ impl Store {
                     row.get::<_, f64>(2)?,
                 ))
             })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// F15: every peer id that has ANY persisted observation row (union of
+    /// the peer-scoped `ewma_observations` and per-profile
+    /// `peer_metric_observations` tables), sorted. The read side for
+    /// whole-store hydration at recorder-open time, so the requester-side
+    /// measurement snapshot never needs a blocking SQLite read on a
+    /// request path afterwards.
+    pub fn persisted_peer_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT peer_id FROM ewma_observations
+             UNION SELECT peer_id FROM peer_metric_observations
+             ORDER BY peer_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }

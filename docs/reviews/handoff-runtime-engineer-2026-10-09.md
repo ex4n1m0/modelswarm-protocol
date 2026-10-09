@@ -1,4 +1,4 @@
-# Handoff — Runtime Engineer audit (2026-10-09)
+# Handoff — Runtime Engineer audit (2026-10-09) + P1 implementation record
 
 Branch `audit/master-prompt-2026-10-09` (baseline `730cebf`; main at `63b98e1`
 is a CI-only fix). READ-ONLY audit: this file is the only artifact created in
@@ -300,3 +300,155 @@ labeled format. Sequence it **before** any M9 baseline freeze — every TTFT
 comparison made against the fake-streaming path would have to be redone.
 Route H4+L1 (engine file, ~2.5 h) to me immediately; H3 resume next;
 M1 to the Protocol Architect.
+
+---
+
+# P1 — true streaming end to end (implemented 2026-10-09, post-gate)
+
+Owner-approved architecture-gate §C.4 critical-path item #1. Commits:
+`3b64562` (implementation) and `7c7d78e` (real-engine validation + L1).
+Branch: `main`. Status: **complete and green**; C1(a)+(b)+(c)+(d) of my fix
+plan landed plus M2 metrics and audit-L1.
+
+## What changed (files, why)
+
+- `crates/modelswarm-runtime/src/lib.rs` — new frozen-trait-compatible
+  incremental API: `DecodeEvent {Token(u32), Timings(DecodeTimings)}`,
+  `DecodeEventStream<'a>`, and `InferenceRuntime::decode_stream_events` with
+  a collect-then-emit default (wraps the unchanged `decode_stream`, so
+  MockRuntime and every non-overriding runtime stays conformant; pinned by
+  `default_decode_stream_events_matches_decode_stream`). Existing
+  `decode_stream` (Vec) is untouched in signature — bench/session/sim/
+  selftest all keep compiling unchanged.
+- `crates/modelswarm-runtime/src/llamacpp.rs` — `decode_stream_events`
+  override: ONE `POST /v1/completions {stream:true, logprobs:true}` parsed
+  incrementally (probe-verified b11407 wire format, §"Measured results" for
+  the chunk shapes). Exact-id recovery is the SAME fail-closed contract as
+  `decode_step`, now factored into `exact_token_id` (server `id`
+  authoritative — the Qwen2.5-7B `<|im_end|>` fix; pinned-vocab `bytes`
+  cross-check; disagreement ⇒ `MalformedResponse`; unknown bytes ⇒ error).
+  EOS terminates the stream without being emitted (vocab `eos_id`; the EOS
+  chunk arrives with `id` + empty `bytes`). The caller's deadline is the
+  reqwest per-request timeout across the whole body ⇒ same
+  `RuntimeError::Timeout` surface. Mid-stream engine error events map to
+  `RuntimeError::Api`; unparsable chunks fail closed. `decode_stream` is now
+  a fold over the same stream — one decode code path. `Shared` metrics moved
+  behind `Arc` so the stream records prefill/decode rates from the final
+  chunk's server-reported `timings` (M2: prompt-eval split out of decode;
+  client-observed fallback when the server reports none).
+- `crates/modelswarm-node/src/executor.rs` — `SingleLocalExecutor::execute`
+  now spawns a driver over `decode_stream_events` + an mpsc channel:
+  `Accepted` immediately, one `TokenDelta` per 16 committed tokens
+  (batched detokenize — the protected event sequence is byte-identical in
+  shape and order, only timely). Mid-stream runtime failures become
+  `ExecutorEvent::Error` with the SAME stable code the pre-stream
+  `Err(Fatal)` carried (`runtime_error_code` mapping, redacted telemetry
+  unchanged); the gateway's ADR-007 machine (failover only before the first
+  token, `interrupted` after) consumes it as designed. Dropping the
+  consumer drops the decode stream ⇒ SSE connection abort ⇒ the pinned
+  server cancels the request (partial H2 relief, connection-scoped).
+  `Usage` now carries server-reported `prefill_ms`/`decode_ms` when the
+  engine provided timings, else the previous client-elapsed fallback.
+- `crates/modelswarm-gateway/src/lib.rs` — no behavior change was needed:
+  `stream_response` already forwarded per-delta once the executor streams
+  (the audit's burst was upstream materialization). Added the pin:
+  `sse_content_chunks_arrive_before_the_executor_completes` (slow executor
+  double; first content chunk readable from the body before completion).
+- `crates/modelswarm-desktop/src/app.rs` (+ `Cargo.toml` reqwest `stream`
+  feature, `ui/index.html`) — `send_chat` emits a `chat-delta` Tauri event
+  per delta on EVERY producing path: swarm remote, local fallback
+  (`drain_chat` now takes an `on_delta` callback) and the local gateway
+  request, which switched `stream:false` → `stream:true` with incremental
+  SSE parsing. Error surface preserved in shape: HTTP-level gateway errors
+  and mid-stream SSE error events both render the same ERROR-turn JSON;
+  empty-reply and mode-label behavior untouched. The UI renders a live
+  assistant bubble per delta (generation-guarded), replaced by the
+  authoritative final message with its meta line.
+
+## What did NOT change (protected seams)
+
+`InferenceExecutor::execute` signature, `ExecutorEvent` vocabulary,
+`InferenceRuntime::decode_stream` signature, `decode_step`, `propose`
+(still the greedy per-token loop per fix-plan (d)), `prefill`, `cancel`,
+serving.rs (untouched — consumes the same executor interface), protocol/,
+ADR files, `.github/workflows`, tracker.
+
+## Measured results (environment-labeled)
+
+**Environment: dev machine (Windows 11, CPU-only), pinned llama.cpp b11407
+(hash-verified against `runtime-pins.json` windows-x64), SmolLM2-135M-
+Instruct Q4_K_M, loopback, warm slot cache, greedy (temperature 0).**
+
+Fresh same-instance A/B (both paths back-to-back against one engine
+instance, 32 tokens each; env-gated test `real_engine_streaming_parity_
+and_timings`, two consecutive runs):
+
+| Prompt | Loop (before-path, per-token POST + growing prefix) | SSE (after) | Parity |
+|---|---|---|---|
+| 4 tokens | 5.0–5.2 ms/tok; total 159–166 ms | TTFT 6.2–6.6 ms; ITL p50 4.7–4.9 ms; total 137–153 ms (4.3–4.8 ms/tok) | identical |
+| 1217 tokens | 5.7–6.0 ms/tok; total 182–193 ms | TTFT 5.3–6.5 ms; ITL p50 5.1–5.3 ms; total 154–158 ms (4.8–4.9 ms/tok) | identical |
+
+The client-visible TTFT change is structural, not incremental: pre-P1 the
+executor materialized the whole decode before the first `TokenDelta`, so
+client TTFT ≈ total decode time (159–193 ms here; the audit's longer-run
+measurements: 437 ms @ 48 toks / 791 ms @ 32 toks incl. 512.8 ms cold
+re-prefill) — now the first delta surfaces at TTFT ≈ 6 ms + one 16-token
+batch. Cross-checking the audit's probe (same machine, busier load that
+day): loop 9.11–24.73 ms/tok and native SSE TTFT 4.0 ms / ITL p50 3.94 ms —
+the machine's absolute numbers move with load; the fresh table above is the
+honest apples-to-apples record, and the parity assertion is load-independent.
+The O(prefix) per-token cost (H1) is gone by construction: one request per
+decode. `decode_tokens_per_ms` semantics note: when the server reports
+timings it is now the engine's decode-phase rate (smoke test printed
+384.6 tok/s engine-side) rather than client-observed ms/token incl. HTTP
+RTT — label accordingly in future verification docs.
+
+## Test evidence
+
+`cargo test -p modelswarm-runtime` 23/23 (9 new/rewritten SSE tests: exact
+id recovery incl. bytes-only + EOS-empty-bytes + id/bytes disagreement +
+SSE error events + deadline→Timeout + no-vocab server-id path + ONE-POST
+assertion + max_tokens cap + incremental arrival); `cargo test
+-p modelswarm-node` executor 6/6 (2 new: deltas-before-completion,
+mid-stream-failure→Error-event) + engine suite incl. 2 env-gated real-engine
+tests (both executed against the staged pinned engine, then verified no
+llama-server process remains); gateway 20/20 (1 new timeliness pin);
+workspace totals 310 (default) / 322 (libp2p) / 7 (tauri-shell), 0 failed.
+clippy `-D warnings` clean on all three gate configurations; fmt clean.
+
+## Assumptions
+
+- b11407's SSE chunk shapes as probed (content chunks carry
+  `logprobs.content[].{id,bytes}`; final chunk carries `timings`
+  `{prompt_n,prompt_ms,predicted_n,predicted_ms}`; `[DONE]` terminator;
+  generation errors as `data: {"error":…}` events). The parser tolerates
+  comment/keep-alive lines and `\r\n` framing but fails closed on
+  unparsable `data:` payloads.
+- The no-vocab streaming path requires server-reported `id`s (production
+  always attaches the GGUF vocab; dev/test adapters without one get an
+  explicit MalformedResponse instead of the loop path's lossy text
+  round-trip).
+- Desktop `tauri-shell` tests don't exercise the new SSE client loop (it
+  is UI-path code); its correctness is pinned by the runtime-level SSE
+  tests + gateway tests on the same wire format.
+
+## Unresolved risks / notes for the integrator
+
+- H2 is only partially addressed (connection-drop cancellation). The
+  gateway still spawns an unbounded-channel task that drives the executor
+  to `max_tokens`/deadline if the SSE client disconnects — an abandoned
+  request can still burn a serving slot. Next runtime task: cancellation
+  token threaded gateway→executor→adapter.
+- Detokenization remains one `POST /detokenize` per 16-token batch (event-
+  shape parity); local vocab-side detokenization would drop that RTT but
+  changes delta boundaries at UTF-8 splits — needs a decision before M9
+  baseline freeze.
+- No standalone `docs/verification/p1-streaming.md` yet (measurement table
+  lives here); create it at the M9 baseline freeze with P50/P95 across
+  both staged models.
+- Remote P2P serving (`serving.rs`) now streams timely events over QUIC for
+  free (same executor interface) but the wire burst behavior was never
+  measured — scheduler's F15 measurement plumbing should capture it.
+- Desktop live bubble is a placeholder-per-turn (generation-guarded); if
+  concurrent chat turns ever become possible the UI needs a turn id.
+- M1 (value-equality greedy mapping) still open — Architect's call.

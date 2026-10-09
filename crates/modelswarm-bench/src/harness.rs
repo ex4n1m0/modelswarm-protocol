@@ -221,6 +221,11 @@ pub struct Pass1Harness {
     harness_version: String,
     /// Artifact root directory.
     out_root: PathBuf,
+    /// Environment label stamped on every record/manifest/join.
+    env_label: &'static str,
+    /// Pre-connected LAN bridges (owner-gated pass); when set, cells run
+    /// against them instead of spawning local loopback bridges.
+    lan_bridges: Option<Vec<LiveBridge>>,
 }
 
 impl Pass1Harness {
@@ -242,7 +247,25 @@ impl Pass1Harness {
             acceptance,
             harness_version: harness_version.into(),
             out_root: out_root.into(),
+            env_label: ENV_LABEL_LOOPBACK_INJECTED,
+            lan_bridges: None,
         }
+    }
+
+    /// Owner-gated LAN mode: run cells against pre-connected remote
+    /// bridges (`pass1_serve` on the other machine) with LAN labels.
+    #[must_use]
+    pub fn lan_mode(mut self, bridges: Vec<LiveBridge>) -> Self {
+        self.env_label = crate::runner::ENV_LABEL_LAN;
+        self.lan_bridges = Some(bridges);
+        self
+    }
+
+    /// Re-arms LAN bridges for the next cell (cells consume the pool;
+    /// reconnect per cell for fresh warm-up, matching the dry run's
+    /// per-cell bridge lifetimes).
+    pub fn set_lan_bridges(&mut self, bridges: Vec<LiveBridge>) {
+        self.lan_bridges = Some(bridges);
     }
 
     /// The F15 recorder (observations for the candidate set).
@@ -259,7 +282,7 @@ impl Pass1Harness {
 
     /// Runs one loopback cell end-to-end and writes artifacts.
     pub async fn run_loopback_cell(
-        &self,
+        &mut self,
         spec: &LoopbackCellSpec,
         params: &Pass1Params,
         env: &EnvPolicy,
@@ -272,44 +295,66 @@ impl Pass1Harness {
                 spec.injected_delay_ms
             ));
         }
-        // Spawn the cell's bridges over the REAL serving path.
-        let mut bridges = Vec::with_capacity(spec.bridges.len());
-        for config in &spec.bridges {
-            bridges.push(
+        // Bridge source: LAN mode uses the pre-connected remote bridges
+        // (owner-gated; real QUIC + real RTT); loopback spawns locally
+        // with the injected-delay shim.
+        let lan_mode = self.lan_bridges.is_some();
+        let bridges = match self.lan_bridges.take() {
+            Some(lan) => {
+                if lan.len() < 2 {
+                    return Err("lan cell needs >= 2 bridges".into());
+                }
+                lan
+            }
+            None => {
+                let mut bridges = Vec::with_capacity(spec.bridges.len());
+                for config in &spec.bridges {
+                    bridges.push(
+                        spawn_bridge(
+                            &self.profile_id,
+                            &self.identity,
+                            config,
+                            injected,
+                            Arc::clone(&self.telemetry),
+                            Arc::clone(&self.metrics),
+                        )
+                        .await?,
+                    );
+                }
+                if bridges.len() < 2 {
+                    return Err("loopback cell needs >= 2 bridges".into());
+                }
+                bridges
+            }
+        };
+        // Calibration bridge: the SAME engine speeds as the probed cell
+        // bridge (the first config) but ZERO injected delay, so the p50
+        // subtraction isolates exactly the injected term. Distinct seed ⇒
+        // distinct peer id, same workload shape. LAN cells have no
+        // injected delay to isolate (the RTT is real), so calibration is
+        // recorded as skipped with the LAN label.
+        let calibration_bridge = if lan_mode {
+            None
+        } else {
+            let mut calibration_config = BridgeConfig::new(0xCA1, 0.30, 1.5);
+            if let Some(first) = spec.bridges.first() {
+                calibration_config.decode_tokens_per_ms = first.decode_tokens_per_ms;
+                calibration_config.prefill_tokens_per_ms = first.prefill_tokens_per_ms;
+                calibration_config.advertised_queue_ms = first.advertised_queue_ms;
+                calibration_config.capacity_class = first.capacity_class;
+            }
+            Some(
                 spawn_bridge(
                     &self.profile_id,
                     &self.identity,
-                    config,
-                    injected,
+                    &calibration_config,
+                    Duration::ZERO,
                     Arc::clone(&self.telemetry),
                     Arc::clone(&self.metrics),
                 )
                 .await?,
-            );
-        }
-        if bridges.len() < 2 {
-            return Err("loopback cell needs >= 2 bridges".into());
-        }
-        // Calibration bridge: the SAME engine speeds as the probed cell
-        // bridge (the first config) but ZERO injected delay, so the p50
-        // subtraction isolates exactly the injected term. Distinct seed ⇒
-        // distinct peer id, same workload shape.
-        let mut calibration_config = BridgeConfig::new(0xCA1, 0.30, 1.5);
-        if let Some(first) = spec.bridges.first() {
-            calibration_config.decode_tokens_per_ms = first.decode_tokens_per_ms;
-            calibration_config.prefill_tokens_per_ms = first.prefill_tokens_per_ms;
-            calibration_config.advertised_queue_ms = first.advertised_queue_ms;
-            calibration_config.capacity_class = first.capacity_class;
-        }
-        let calibration_bridge = spawn_bridge(
-            &self.profile_id,
-            &self.identity,
-            &calibration_config,
-            Duration::ZERO,
-            Arc::clone(&self.telemetry),
-            Arc::clone(&self.metrics),
-        )
-        .await?;
+            )
+        };
 
         // Warm-up: real completions + idle RTT probes per bridge.
         for bridge in &bridges {
@@ -335,10 +380,26 @@ impl Pass1Harness {
             .filter_map(|i| i.observed.rtt_ewma_ms)
             .fold(f64::EPSILON, f64::max);
 
-        // Calibration probes (after warm-up so pools are hot).
-        let calibration = self
-            .calibrate(&bridges[0], &calibration_bridge, spec.injected_delay_ms)
-            .await;
+        // Calibration probes (after warm-up so pools are hot). LAN cells
+        // skip them: the RTT is real, there is no injected term to
+        // isolate, and the local baseline would contaminate the diff.
+        let calibration = match &calibration_bridge {
+            Some(cb) => {
+                self.calibrate(&bridges[0], cb, spec.injected_delay_ms)
+                    .await
+            }
+            None => CalibrationRecord {
+                label: self.env_label.to_string(),
+                method: "skipped-lan-real-rtt",
+                nominal_injected_ms: spec.injected_delay_ms,
+                measured_injected_ms_p50: 0.0,
+                calibration_valid: None,
+                baseline_p50_ms: 0.0,
+                cell_p50_ms: 0.0,
+                probes: 0,
+                transport_note: QUINN_STATS_UNAVAILABLE.to_string(),
+            },
+        };
 
         // Arms × corpus × reps; single arm FIRST per prompt so later arms
         // cite its independently executed completions (S4).
@@ -469,9 +530,9 @@ impl Pass1Harness {
             .collect();
         let join_rows: Vec<JoinRow> = joined
             .iter()
-            .map(|run| build_join_row(run, &manifest_id_for))
+            .map(|run| build_join_row(run, &manifest_id_for, self.env_label))
             .collect();
-        let summary = build_summary(spec, &join_rows);
+        let summary = build_summary(spec, &join_rows, self.env_label);
 
         let dir = self.write_artifacts(
             spec,
@@ -538,7 +599,7 @@ impl Pass1Harness {
             })
             .collect();
         serde_json::json!({
-            "label": ENV_LABEL_LOOPBACK_INJECTED,
+            "label": self.env_label,
             "prompt_tokens_basis": tokens,
             "output_tokens_basis": Pass1Params::default().output_tokens_target,
             "ranking": ordered.iter().map(|c| c.peer_id.clone()).collect::<Vec<_>>(),
@@ -635,7 +696,7 @@ impl Pass1Harness {
             Some((measured - f64::from(nominal_ms)).abs() <= 0.10 * f64::from(nominal_ms))
         };
         CalibrationRecord {
-            label: ENV_LABEL_LOOPBACK_INJECTED.to_string(),
+            label: self.env_label.to_string(),
             method: CALIBRATION_METHOD,
             nominal_injected_ms: nominal_ms,
             measured_injected_ms_p50: round3(measured),
@@ -1042,7 +1103,7 @@ impl Pass1Harness {
                         "{}+arm={}+env={}",
                         self.harness_version,
                         arm.tag(),
-                        ENV_LABEL_LOOPBACK_INJECTED
+                        self.env_label
                     ),
                     self.profile_id.clone(),
                     ManifestRuntime {
@@ -1230,7 +1291,11 @@ fn rep_of(root: &str) -> u32 {
         .unwrap_or(0)
 }
 
-fn build_join_row(run: &RunJoined, manifest_id_for: &impl Fn(Arm) -> String) -> JoinRow {
+fn build_join_row(
+    run: &RunJoined,
+    manifest_id_for: &impl Fn(Arm) -> String,
+    env_label: &str,
+) -> JoinRow {
     JoinRow {
         request_root: run.root.clone(),
         arm: run.arm.tag(),
@@ -1251,11 +1316,15 @@ fn build_join_row(run: &RunJoined, manifest_id_for: &impl Fn(Arm) -> String) -> 
         reason: run.reason.clone(),
         run_manifest_id: manifest_id_for(run.arm),
         planner_sweep: run.planner_sweep.clone(),
-        label: ENV_LABEL_LOOPBACK_INJECTED.to_string(),
+        label: env_label.to_string(),
     }
 }
 
-fn build_summary(spec: &LoopbackCellSpec, join_rows: &[JoinRow]) -> CellArtifactsSummary {
+fn build_summary(
+    spec: &LoopbackCellSpec,
+    join_rows: &[JoinRow],
+    env_label: &str,
+) -> CellArtifactsSummary {
     let single_totals: Vec<f64> = join_rows
         .iter()
         .filter(|r| r.arm == "fastest-single" && r.status == "Completed")
@@ -1305,7 +1374,7 @@ fn build_summary(spec: &LoopbackCellSpec, join_rows: &[JoinRow]) -> CellArtifact
     }
     CellArtifactsSummary {
         cell: spec.name(),
-        label: ENV_LABEL_LOOPBACK_INJECTED.to_string(),
+        label: env_label.to_string(),
         regime: format!("{:?}", spec.regime),
         injected_delay_ms: spec.injected_delay_ms,
         arms,
@@ -1490,7 +1559,7 @@ mod tests {
                 label: ENV_LABEL_LOOPBACK_INJECTED.into(),
             },
         ];
-        let summary = build_summary(&spec, &rows);
+        let summary = build_summary(&spec, &rows, ENV_LABEL_LOOPBACK_INJECTED);
         assert_eq!(summary.fastest_single_median_ms, Some(100.0));
         let planner = summary.arms.iter().find(|a| a.arm == "planner-k").unwrap();
         // 200ms realized vs 100ms single: a VISIBLE NEGATIVE (ratio 2.0).

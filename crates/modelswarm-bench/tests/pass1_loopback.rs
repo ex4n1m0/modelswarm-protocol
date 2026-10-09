@@ -20,6 +20,7 @@ use modelswarm_bench::params::Pass1Params;
 use modelswarm_bench::records::{Mode, RunStatus};
 use modelswarm_bench::runner::{AcceptanceRegime, BridgeConfig, ENV_LABEL_LOOPBACK_INJECTED};
 use modelswarm_identity::InstallationIdentity;
+use std::sync::Arc;
 
 /// The experiment client identity (documented seed; the serving-side
 /// leases bind to its derived PeerId).
@@ -65,7 +66,7 @@ fn smoke_params() -> Pass1Params {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runner_smoke_over_real_quic() {
     let out = tempfile::tempdir().unwrap();
-    let harness = Pass1Harness::new(
+    let mut harness = Pass1Harness::new(
         profile_id(),
         harness_identity(),
         modelswarm_bench::acceptance::AcceptanceStore::memory(),
@@ -239,7 +240,7 @@ async fn pass1_loopback_dryrun() {
     let acceptance_path = out.join("acceptance.sqlite");
     let acceptance = modelswarm_bench::acceptance::AcceptanceStore::open(&acceptance_path)
         .expect("open acceptance store");
-    let harness = Pass1Harness::new(
+    let mut harness = Pass1Harness::new(
         profile_id(),
         harness_identity(),
         acceptance,
@@ -296,5 +297,111 @@ fn regime_discriminant(regime: AcceptanceRegime) -> u64 {
         AcceptanceRegime::High => 1,
         AcceptanceRegime::Zero => 2,
         AcceptanceRegime::Mixed => 3,
+    }
+}
+
+/// Owner-gated LAN pass-1 (machines A + B). The serve side is the
+/// `pass1_serve` example on machine B (real QUIC listener, real RTT,
+/// TEST-ONLY synthetic executor); the driver dials the addresses B
+/// printed. Env: `MSP_BENCH_PEER_0..9` (B's lines), `MSP_BENCH_RUNS`
+/// (default 30), `MSP_BENCH_WINDOW` (default 8), `MSP_BENCH_OUT` (default
+/// `experiments/raw/PASS-1-LAN-<unix-secs>`). Labels: lan-2machine-quic —
+/// never WAN claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "owner-invoked LAN run (needs pass1_serve on machine B)"]
+async fn pass1_lan_run() {
+    let mut remotes = Vec::new();
+    for i in 0..10 {
+        if let Ok(line) = std::env::var(format!("MSP_BENCH_PEER_{i}")) {
+            remotes.push(
+                modelswarm_bench::runner::parse_peer_line(&line)
+                    .expect("MSP_BENCH_PEER line parses"),
+            );
+        }
+    }
+    assert!(
+        remotes.len() >= 2,
+        "need at least MSP_BENCH_PEER_0 and _1 from the serve side"
+    );
+    let runs: u32 = std::env::var("MSP_BENCH_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let window: u32 = std::env::var("MSP_BENCH_WINDOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let out = std::env::var("MSP_BENCH_OUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../experiments/raw/PASS-1-LAN-{stamp}"))
+        });
+    std::fs::create_dir_all(&out).expect("create out dir");
+    let acceptance =
+        modelswarm_bench::acceptance::AcceptanceStore::open(out.join("acceptance.sqlite"))
+            .expect("open acceptance store");
+    let mut harness = Pass1Harness::new(
+        profile_id(),
+        harness_identity(),
+        acceptance,
+        "9.6-pass1-lan",
+        out.clone(),
+    );
+    let env = modelswarm_scheduler::shadow::EnvPolicy {
+        policy: modelswarm_scheduler::shadow::QueueDiscountPolicy::DEFAULT,
+        env_overrides: 0,
+        warnings: Vec::new(),
+    };
+    for regime in [
+        AcceptanceRegime::High,
+        AcceptanceRegime::Zero,
+        AcceptanceRegime::Mixed,
+    ] {
+        // Fresh connections per cell (per-cell pools + warm-up, matching
+        // the dry run's bridge lifetimes).
+        let metrics = Arc::clone(harness.metrics());
+        let mut bridges = Vec::with_capacity(remotes.len());
+        for remote in &remotes {
+            bridges.push(
+                modelswarm_bench::runner::connect_remote(
+                    remote,
+                    &harness_identity(),
+                    Arc::clone(&metrics),
+                )
+                .await
+                .expect("connect remote bridge"),
+            );
+        }
+        harness.set_lan_bridges(bridges);
+        let spec = LoopbackCellSpec {
+            injected_delay_ms: 0,
+            regime,
+            bridges: Vec::new(),
+        };
+        let params = Pass1Params {
+            proposal_window: window,
+            output_tokens_target: 16,
+            cohort_cap: 3,
+            runs_per_arm: runs,
+            warmup_completions: 2,
+            ..Pass1Params::default()
+        };
+        let seed = 0xD2A1_0000 | regime_discriminant(regime);
+        let artifacts = harness
+            .run_loopback_cell(&spec, &params, &env, seed)
+            .await
+            .expect("lan cell");
+        assert!(artifacts.dir.join("mode-results.jsonl").exists());
+        eprintln!(
+            "[PASS-1-LAN] cell {} -> {} records, label {}",
+            spec.name(),
+            artifacts.records.len(),
+            modelswarm_bench::runner::ENV_LABEL_LAN,
+        );
     }
 }

@@ -354,6 +354,74 @@ pub struct RemoteBridge {
     pub capacity_class: &'static str,
 }
 
+/// Environment label for the two-machine LAN cells (real QUIC, real RTT,
+/// synthetic executor on the serve side — never a WAN claim).
+pub const ENV_LABEL_LAN: &str = "lan-2machine-quic";
+
+/// Parses one `MSP_BENCH_PEER_N` line as printed by `pass1_serve`:
+/// `addr|peer_id|capability_token|advertised_queue_ms|capacity_class`.
+pub fn parse_peer_line(line: &str) -> Result<RemoteBridge, String> {
+    let parts: Vec<&str> = line.trim().split('|').collect();
+    if parts.len() != 5 {
+        return Err(format!(
+            "peer line needs 5 '|'-separated fields, got {}: {line:?}",
+            parts.len()
+        ));
+    }
+    let capacity_class = match parts[4] {
+        "gpu_high" => "gpu_high",
+        "gpu_low" => "gpu_low",
+        "cpu" => "cpu",
+        _ => "gpu_mid",
+    };
+    Ok(RemoteBridge {
+        addr: parts[0].to_string(),
+        peer_id: parts[1].to_string(),
+        capability_token: parts[2].to_string(),
+        advertised_queue_ms: parts[3]
+            .parse()
+            .map_err(|_| format!("queue ms not a number: {:?}", parts[3]))?,
+        capacity_class,
+    })
+}
+
+/// Connects the driver to a LAN serve-side bridge (`pass1_serve` on the
+/// other machine) and returns a `LiveBridge` handle whose pooled executor
+/// dials the real remote. No local serving happens on this side.
+pub async fn connect_remote(
+    remote: &RemoteBridge,
+    client_identity: &InstallationIdentity,
+    metrics: Arc<PeerMetrics>,
+) -> Result<LiveBridge, String> {
+    let executor = RemoteExecutor::new(
+        RemotePeer {
+            addr: remote.addr.clone(),
+            peer_id: remote.peer_id.clone(),
+        },
+        client_identity.clone(),
+    )
+    .with_metrics(metrics);
+    executor.set_advertised_queue_ms(Some(remote.advertised_queue_ms));
+    let roster = RosterFacts {
+        peer_id: remote.peer_id.clone(),
+        free_slots: 1,
+        advertised_queue_ms: Some(remote.advertised_queue_ms),
+        capacity_class: Some(remote.capacity_class.to_string()),
+        has_direct_quic_addr: true,
+    };
+    // No local serving: the sender is only held to satisfy the handle
+    // shape (never fired; the remote outlives this cell).
+    let (shutdown, _hold) = tokio::sync::watch::channel(false);
+    Ok(LiveBridge {
+        addr: remote.addr.clone(),
+        peer_id: remote.peer_id.clone(),
+        token: remote.capability_token.clone(),
+        roster,
+        executor,
+        shutdown,
+    })
+}
+
 /// Mints a (policy, wire token) pair binding `client_peer_id` to
 /// `profile` under a fresh throwaway hub key. Loopback/experiment only —
 /// production leases come from the tracker (ADR-026).

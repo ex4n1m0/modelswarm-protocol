@@ -41,6 +41,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --features modelswarm-node/libp2p-backend -- -D warnings
       - name: Tests (libp2p-backend feature)
         run: cargo test --workspace --features modelswarm-node/libp2p-backend
+      # ADR-031: the C-API research adapter carries the workspace's unsafe
+      # FFI — an uncompiled feature is the same CI blind spot that hid the
+      # 2026-10-08 lease break (review ruling: land now, not at
+      # productionization).
+      - name: Clippy (capi-adapter feature)
+        run: cargo clippy --workspace --all-targets --features modelswarm-runtime/capi-adapter -- -D warnings
+      - name: Tests (capi-adapter feature)
+        run: cargo test --workspace --features modelswarm-runtime/capi-adapter
       # Desktop chat orchestration (send_chat/try_swarm_chat/earn_lease)
       # compiles only with tauri-shell; the stub build runs zero of it.
       # app.rs (2,300+ lines) previously shipped with ZERO clippy coverage

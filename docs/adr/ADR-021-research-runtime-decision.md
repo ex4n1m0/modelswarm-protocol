@@ -1,7 +1,7 @@
 # ADR-021: Research runtime for real speculative-decoding measurements (Phase D entry)
 
 Status: **Accepted for the beta engine (Phase H, 2026-10-05); research path
-partially decided.** The owner's Phase H direction (a real small model shipped
+partially decided** (in-process C-API research adapter: ADR-031). The owner's Phase H direction (a real small model shipped
 to test machines) closes the immediate-runtime question: the pinned,
 **unforked** llama.cpp `llama-server` (CPU x64, `runtime-pins.json`) behind
 the existing HTTP `LlamaCppAdapter` is the beta/production engine — this is

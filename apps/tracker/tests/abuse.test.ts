@@ -6,6 +6,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import * as deviceStart from "@/app/api/v1/auth/device/start/route";
 import * as registerRoute from "@/app/api/v1/peers/register/route";
 import * as peersList from "@/app/api/v1/peers/route";
+import * as modelRequestsRoute from "@/app/api/v1/catalog/requests/route";
 import * as sessionAuthorize from "@/app/api/v1/session-authorize/route";
 import * as receiptRoute from "@/app/api/v1/receipt/route";
 import {
@@ -217,5 +218,51 @@ describe("F7 garbage to peer endpoints is rejected cheaply", () => {
     }
     // the 61st unsigned call from this IP crossed the 60/min limit
     expect(lastStatus).toBe(429);
+  });
+});
+
+describe("F8 unknown-installation envelope floods hit the per-IP unsigned bucket (T4)", () => {
+  it("well-formed envelopes naming an unenrolled id: 401s, then 429 after 60/min", async () => {
+    // A real keypair signs real envelopes, but the installation never
+    // enrolled — previously these burned a DB read per request without
+    // touching ANY limiter bucket.
+    const keys = makeKeypair();
+    const { installationId } = keyPairIds(keys);
+    let sawUnknownInstallation = false;
+    let lastStatus = 200;
+    for (let i = 0; i < 61; i += 1) {
+      const res = await peersList.GET(
+        signedRequest(keys, installationId, "any", "/api/v1/peers", undefined, rig.ctx.now, {
+          ip: "203.0.113.121",
+        }),
+      );
+      lastStatus = res.status;
+      if (res.status === 401) {
+        const body = (await res.json()) as { error: { code: string } };
+        expect(body.error.code).toBe("unknown_installation");
+        sawUnknownInstallation = true;
+      } else if (res.status !== 429) {
+        await res.json();
+      }
+    }
+    expect(sawUnknownInstallation).toBe(true);
+    expect(lastStatus).toBe(429);
+  });
+});
+
+describe("F9 /catalog/requests body is read under the shared 64 KiB cap (T4)", () => {
+  it("oversized bodies -> 413 payload_too_large before any parse", async () => {
+    const bigNote = "x".repeat(70_000);
+    const res = await modelRequestsRoute.POST(
+      new Request("http://tracker.local/api/v1/catalog/requests", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": "203.0.113.130" },
+        body: JSON.stringify({ note: bigNote }),
+      }),
+    );
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("payload_too_large");
+    // no row was created by the rejected call
+    expect(await rig.store.listModelRequests()).toHaveLength(0);
   });
 });

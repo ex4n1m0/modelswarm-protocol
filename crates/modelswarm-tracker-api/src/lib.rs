@@ -22,6 +22,88 @@ use std::time::Duration;
 
 pub const API_PREFIX: &str = "/api/v1";
 
+// ---------------------------------------------------------------------------
+// Hosting-challenge prompt (D16, owner gate 2026-10-09 / ADR-028 §7)
+// ---------------------------------------------------------------------------
+// The served `challengePrompt` value of POST /peers/challenge/start is
+// nonce-bound to the challenge instance and, when the profile has a pinned
+// digest, carries a greedy-canary possession digest. Construction is
+// byte-pinned by `protocol/vectors/challenge-prompt-1.json`, consumed by the
+// tests below and by the tracker suite (TS `lib/challenge.ts`). Hash-only:
+// canary token streams never travel to or through the hub.
+
+const CHALLENGE_PROMPT_PREFIX: &str = "ModelSwarm readiness challenge ";
+const CANARY_SUFFIX_PREFIX: &str = "; greedy-canary ";
+
+/// A parsed `challengePrompt` wire value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChallengePrompt {
+    /// 32 lowercase hex chars; the per-instance nonce.
+    pub challenge_id: String,
+    /// `Some("sha256:<64 hex>")` when the profile has a pinned greedy-canary
+    /// digest. A hosting client SHOULD generate greedily and refuse to
+    /// report timings when its local digest differs (self-verification
+    /// hook; hub-side spot-verification is deferred to the reputation
+    /// chassis).
+    pub canary_digest: Option<String>,
+}
+
+/// Builds the challenge prompt exactly as the tracker serves it.
+pub fn build_challenge_prompt(
+    challenge_id: &str,
+    canary_digest: Option<&str>,
+) -> Result<String, TrackerError> {
+    let valid_id = challenge_id.len() == 32
+        && challenge_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !valid_id {
+        return Err(TrackerError::InvalidResponse(
+            "challengeId must be 32 lowercase hex chars".into(),
+        ));
+    }
+    let valid_digest = canary_digest.map(|d| {
+        d.len() == 71
+            && d.starts_with("sha256:")
+            && d.as_bytes()[7..]
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    });
+    if valid_digest == Some(false) {
+        return Err(TrackerError::InvalidResponse(
+            "canary digest must be \"sha256:<64 hex>\"".into(),
+        ));
+    }
+    Ok(match canary_digest {
+        None => format!("{CHALLENGE_PROMPT_PREFIX}{challenge_id}"),
+        Some(d) => format!("{CHALLENGE_PROMPT_PREFIX}{challenge_id}{CANARY_SUFFIX_PREFIX}{d}"),
+    })
+}
+
+/// Parses a served `challengePrompt` back into (challengeId, canary digest).
+/// Returns `Err` on any deviation from the frozen format.
+pub fn parse_challenge_prompt(prompt: &str) -> Result<ChallengePrompt, TrackerError> {
+    let rest = prompt
+        .strip_prefix(CHALLENGE_PROMPT_PREFIX)
+        .ok_or_else(|| TrackerError::InvalidResponse("challengePrompt prefix mismatch".into()))?;
+    match rest.split_once(CANARY_SUFFIX_PREFIX) {
+        None => {
+            build_challenge_prompt(rest, None)?;
+            Ok(ChallengePrompt {
+                challenge_id: rest.to_string(),
+                canary_digest: None,
+            })
+        }
+        Some((id, digest)) => {
+            build_challenge_prompt(id, Some(digest))?;
+            Ok(ChallengePrompt {
+                challenge_id: id.to_string(),
+                canary_digest: Some(digest.to_string()),
+            })
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum TrackerError {
     Network(String),
@@ -549,6 +631,49 @@ pub fn split_lease_token(token: &str) -> Result<serde_json::Value, TrackerError>
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    // Cross-language golden vector (protocol/vectors/challenge-prompt-1.json):
+    // the TS suite (apps/tracker) consumes the same fixture — this is the
+    // D16 parity gate (Security's binding condition, gate §G).
+    #[test]
+    fn challenge_prompt_matches_golden_vector() {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../protocol/vectors/challenge-prompt-1.json"
+        ))
+        .expect("vector json");
+        let cases = doc["cases"].as_array().expect("cases array");
+        assert!(cases.len() >= 2, "vector must pin both forms");
+        for case in cases {
+            let id = case["challenge_id"].as_str().expect("challenge_id");
+            let digest = case["canary_digest"].as_str();
+            let expected = case["expected_prompt"].as_str().expect("expected_prompt");
+            let built = build_challenge_prompt(id, digest).expect("build");
+            assert_eq!(built, expected, "build mismatch for challenge_id {id}");
+            let parsed = parse_challenge_prompt(expected).expect("parse");
+            assert_eq!(parsed.challenge_id, id);
+            assert_eq!(parsed.canary_digest.as_deref(), digest);
+        }
+    }
+
+    #[test]
+    fn challenge_prompt_rejects_malformed_values() {
+        assert!(build_challenge_prompt("short", None).is_err());
+        assert!(build_challenge_prompt(&"a".repeat(32), Some("md5:xyz")).is_err());
+        assert!(parse_challenge_prompt("Some other prompt 0123").is_err());
+        assert!(parse_challenge_prompt(
+            "ModelSwarm readiness challenge 0123456789abcdef0123456789abcdef; greedy-canary nothex"
+        )
+        .is_err());
+        // Round-trip of the base form with a valid id.
+        let base = build_challenge_prompt("0123456789abcdef0123456789abcdef", None).unwrap();
+        assert_eq!(
+            parse_challenge_prompt(&base).unwrap(),
+            ChallengePrompt {
+                challenge_id: "0123456789abcdef0123456789abcdef".into(),
+                canary_digest: None,
+            }
+        );
+    }
 
     #[test]
     fn lease_token_roundtrip() {

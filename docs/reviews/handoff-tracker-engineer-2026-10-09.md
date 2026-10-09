@@ -333,3 +333,191 @@ gap-study track with an ADR for migration 0004 semantics. Do not deploy from
 this branch; deploy remains owner-run Vercel CLI from `apps/tracker/` after
 review, with `npm run typecheck && npm test && npm run build &&
 npm run validate:vectors` green locally.
+
+---
+
+# Post-Gate Batch — D7 + D16 + T4 + T5 prep (2026-10-09, second section)
+
+Branch `main`. Scope: owner gate §D D7/D16 with Security's §G conditions,
+plus the §4 package and T4 fixes from THIS audit above. All gates green
+locally; committed after gates (see §B.2 of this section).
+
+## B.1 What landed (per item)
+
+### D7 — honest relabel of self-attested capacity (§4-A + gate D7)
+
+- `apps/tracker/lib/eligibility.ts` — `capacityFromTimings` docblock now
+  states the input is the challenger's OWN attested number; the class is
+  ranking telemetry, NOT a hub-verified measurement; the wire name
+  `verified_capacity` stays (frozen signed shape, byte-pinned by
+  `protocol/vectors/lease-hubkey-1.json` — a rename would be an ADR'd schema
+  change). Field comment on `EligibilityLeaseFields.verified_capacity`.
+- `apps/tracker/app/api/v1/peers/challenge/complete/route.ts` — header
+  comment carries the D7 label; NEW plausibility checks: `totalMs > 0` and
+  `firstTokenMs <= totalMs` (400 invalid_body; challenge stays open).
+- `apps/tracker/DESIGN.md` — new "Honest-label posture (D7)" section.
+- `protocol/msp-v1.md` §5 — honest-label note under the lease object
+  (surgical; changelog row added per ADR-028 §6 — flagged for Protocol
+  Architect review below).
+- UI: `capacityClass`/`verified_capacity` appear in no UI page (grep); the
+  website renders download counts/peer counts only, so no UI renaming was
+  needed.
+
+### D16 — nonce-bound prompt + pinned canary digest (§4-B/C, ADR-028 §7)
+
+Design (tracker half of the earn-chain hardening; no wire schema change —
+the built value rides the EXISTING `challengePrompt` field; the frozen
+`ChallengeCompleteSchema` body is byte-untouched):
+
+- `apps/tracker/lib/challenge.ts` (new): `buildChallengePrompt(id, digest)` /
+  `parseChallengePrompt` with the frozen format
+  `"ModelSwarm readiness challenge <challengeId>"` +
+  optional `"; greedy-canary sha256:<64hex>"`; `parseCanaryPins` reads env
+  `MSP_CANARY_PINS` (JSON profileId→digest, ≤256 entries; malformed env
+  FAILS CLOSED at context build — strict mode is never silently dropped).
+- `challenge/start`: serves the nonce-bound prompt (challengeId is the
+  existing fresh 128-bit id — kills precomputed/replayed timing pairs
+  across challenges/installations). STRICT MODE: when `MSP_CANARY_PINS` is
+  configured, a profile without a pin is refused (`403 no_capability`) —
+  unpinned profiles cannot earn leases. Default (env unset, current
+  production): nonce-bound prompt only.
+- Pinned digests are HASH-ONLY (content-blind): sha256 of the greedy canary
+  token stream computed OFFLINE by the resolver under the pinned runtime
+  (E0 determinism: greedy decoding is stable across vendors/threads, so
+  every honest host of the exact ModelProfileId reproduces it). The hub
+  never sees token streams. Pin source is owner-maintained env until a
+  signed catalog field lands via its own ADR (ADR-028 §7 boundary).
+- Hub-side verification = serve-time integrity (strict-mode pin required +
+  shape-validated + embedded by construction). Client possession
+  self-verification is the DESKTOP/NODE follow-up: parse the served prompt
+  (`parse_challenge_prompt`, now in modelswarm-tracker-api) and refuse to
+  report timings when the local greedy digest ≠ pinned digest. Spot-check
+  audits by other peers stay deferred to the reputation chassis (§4-D).
+- SAMPLING RATE (Security's §G condition): TBD-NUMERIC with the formula —
+  Sarmenta spot-check math, P(detect a cheater within n spot-checked
+  challenges) = 1-(1-s)^n; the numeric s is deliberately NOT invented and
+  lands only with the E-A measured detection curves (master prompt §12).
+  Recorded in `lib/challenge.ts`, DESIGN.md, and the vector's `format`
+  block.
+- GOLDEN VECTOR (Security's §G condition): `protocol/vectors/challenge-prompt-1.json`
+  pins both forms (base + pinned-canary). Consumed THREE ways: TS suite
+  (`tests/crypto-vectors.test.ts` build+parse round-trips), Rust suite
+  (`modelswarm-tracker-api` `challenge_prompt_matches_golden_vector`), and
+  `npm run validate:vectors` (`scripts/validate-vectors.mjs` re-derives
+  build/parse independently of both suites).
+- `protocol/msp-v1.md` §3.3 challenge/start row now states the nonce-bound
+  value semantics + vector pointer; changelog row added (post-gate R0.5
+  batch, D7/D16). SURGICAL SPEC EDITS — Protocol Architect should review
+  these three lines (start-row note, §5 note, changelog row); they are the
+  msp-v1 changelog mechanism ADR-028 §6 itself mandates, applied by the
+  Tracker seat because the change is tracker-surface code. No §2/§5 field
+  lists were touched.
+
+### T4 — API hygiene
+
+- `app/api/v1/catalog/requests/route.ts` — body now read through the shared
+  capped reader (`readBody` 64 KiB + content-length pre-check) +
+  `parseJsonBody` (redacted, structured errors) instead of raw `req.json()`.
+  Limiter key `modelreq:<ip>` (enroll grade) preserved. Test: abuse F9
+  (70 KB body → 413, no row).
+- `app/api/download/[file]/route.ts` — per-IP rate limit at the public
+  class (`download:<ip>`, 120/min) before the counted bump. Test:
+  downloads (121st GET/min/IP → 429 retryable).
+- `lib/envelope.ts` — well-formed envelopes naming an UNKNOWN installation
+  now count against the same per-IP unsigned bucket BEFORE the 401 (was: a
+  DB read per request, no bucket). Test: abuse F8 (401s then 429 at 61/min).
+- Rate-limiter semantics documented (audit T4 ask): `lib/ratelimit.ts`
+  header (per-warm-lambda-instance buckets; effective ceiling = configured
+  × warm instances; `rate_counters` table + `bumpRateCounter` are
+  intentionally-unwired observability seams — a DB write per request would
+  cost more than the bound) and DESIGN.md "Rate-limiting semantics".
+
+### T5 — retention prep (write-time pruning; NO migration-0004, no DDL)
+
+Rendezvous-mailbox pattern applied at write time in BOTH stores
+(MemoryStore logic + PgStore SQL mirrors; constants in `lib/constants.ts`):
+
+- `peer_observations`: newest 240/peer + 7-day TTL (was unbounded in Pg).
+- `sessions`: CENSUS-SAFE — expired-beyond-24h rows deleted EXCEPT the
+  newest per installation, so `countEnrolledInstallations()` (the
+  `DEVICE_APPROVAL_CAP` basis) stays cumulative; the cap's monotonicity is
+  documented as intentional.
+- `device_codes`, `capability_tokens`: swept 24h past expiry.
+- `session_authorizations`: expired rows dropped at write (10-min TTL).
+- `peer_notices`: `{all:true}` fan-out now (a) clears queues of leases dead
+  >24h and (b) EXCLUDES those leases from the fan-out (a test failure
+  during development caught the first version re-queuing to dead leases).
+- Migration-0004 (suspension DDL) NOT touched, per the ruling — awaits its
+  gated nonproduction-first deploy with snapshot + rollback SQL (gate D6
+  amendment).
+
+## B.2 Commands + outcomes (all green, 2026-10-09)
+
+| Command | Result |
+|---|---|
+| `npm run typecheck` (apps/tracker) | PASS |
+| `npx vitest run` (apps/tracker) | 136 passed / 2 skipped (pg suite, needs DATABASE_URL) / 0 failed — incl. new `challenge-d16.test.ts` (10), `retention.test.ts` (10), abuse F8/F9, downloads 429, crypto-vector describe |
+| `npm run validate:vectors` | PASS ×6 (5 manifests + challenge-prompt-1) |
+| `npm run build` (apps/tracker) | PASS (next build, all routes) |
+| `cargo fmt --check` (workspace) | PASS (after `cargo fmt -p modelswarm-tracker-api`) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
+| `cargo test --workspace` | 49 suites ok, 0 failed (incl. tracker-api's 2 new challenge-vector tests) |
+| `cargo test -p modelswarm-tracker-api` | 10 passed / 0 failed |
+
+No vercel commands, no production/Neon access, no deploy (owner step).
+
+## B.3 Files changed (this batch)
+
+Code/tests: `apps/tracker/lib/{challenge.ts(new),constants.ts,context.ts,
+eligibility.ts,envelope.ts,ratelimit.ts,store.ts}`,
+`apps/tracker/app/api/v1/peers/challenge/{start,complete}/route.ts`,
+`apps/tracker/app/api/v1/catalog/requests/route.ts`,
+`apps/tracker/app/api/download/[file]/route.ts`,
+`apps/tracker/tests/{challenge-d16.test.ts(new),retention.test.ts(new),
+abuse.test.ts,downloads.test.ts,crypto-vectors.test.ts}`,
+`apps/tracker/scripts/validate-vectors.mjs`,
+`crates/modelswarm-tracker-api/src/lib.rs` (+~100 lines: ChallengePrompt
+type, build/parse, 2 vector tests; no existing signature touched),
+`protocol/vectors/challenge-prompt-1.json` (new). Docs:
+`apps/tracker/DESIGN.md`, `protocol/msp-v1.md` (3 surgical spots),
+this handoff.
+
+## B.4 Assumptions
+
+1. D16's "digest verification riding the EXISTING challengePrompt field" is
+   implemented as serve-side pinning + strict-mode enforcement: with no
+   client→hub digest field (forbidden without a new ADR), the hub cannot
+   check a returned digest at complete-time; possession enforcement at the
+   client (self-verify via the new parse helper) and spot-audits remain the
+   desktop/chassis follow-ups. This is the honest maximum under the ruling.
+2. `MSP_CANARY_PINS` unset (current production) = legacy-but-nonce-bound
+   posture; production behavior changes only by the served prompt VALUE
+   (existing clients read `challengeId` only — desktop `app.rs:1356-1375`,
+   node `remote.rs:669-676`, live harness `live_tracker.rs:122-129` all
+   ignore the prompt string; wire-compat verified by reading those sites).
+3. The msp-v1.md edits are the ADR-028 §6 changelog mechanism applied to a
+   tracker-surface change; Protocol Architect review requested (B.1).
+4. Rust workspace gates re-ran fully because tracker-api is a workspace
+   member; downstream crates consume only additive items.
+
+## B.5 Unresolved risks / what awaits deploy
+
+- DEPLOY (owner step, Vercel CLI from apps/tracker/): the nonce-bound
+  prompt + T4/T5 fixes take effect only after the owner deploys. Old
+  clients are unaffected (B.4.2). Strict canary mode needs the owner to
+  populate `MSP_CANARY_PINS` from resolver output — until then the free-rider
+  envelope (fabricated timings) remains open, now without precompute/replay.
+- The pinned digests themselves do not exist yet (resolver pipeline
+  offline step + an ADR for a signed catalog field are prerequisites).
+- Per-instance rate limits still under-coordinate during bursts (documented
+  posture, not fixed).
+- Suspension (migration-0004), token revocation routes, admin block route
+  (T2) remain open, unchanged by this batch.
+
+## B.6 Suggested next task
+
+Owner: deploy this batch (checks: typecheck/test/build/validate:vectors —
+all recorded green above). Integrator: route the msp-v1 three-line review
+to the Protocol Architect; schedule the desktop challenge self-verify
+(uses `parse_challenge_prompt`) with the Windows Product Engineer; keep
+migration-0004 gated per D6.

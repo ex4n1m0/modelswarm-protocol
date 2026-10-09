@@ -7,7 +7,8 @@
 //   - per-IP public bucket (health/catalog) and enrollment bucket (device/*)
 //     are checked before any body parsing beyond the size cap;
 //   - per-IP unsigned bucket counts peer-endpoint calls that never reach a
-//     verifiable envelope;
+//     verifiable envelope — unparseable headers AND well-formed envelopes
+//     naming an unknown installation (both can never verify);
 //   - the per-installation peer bucket is checked after full verification
 //     (last, per the frozen precedence).
 
@@ -131,6 +132,14 @@ export async function verifySignedRequest(
 
   const installation = await store.getInstallation(env.installationId);
   if (!installation) {
+    // A well-formed envelope naming an unenrolled installation would
+    // otherwise burn a DB read per request with no limiter bucket ever
+    // filling (audit T4). A call that can never reach a verifiable
+    // envelope is unsigned in effect — count it against the same per-IP
+    // bucket (msp-v1 §3.4), THEN fail.
+    if (!ctx.limiter.hit(`unsigned:${ip}`, ctx.limits.unsignedPerIp)) {
+      return failRateLimited();
+    }
     return fail(401, "unknown_installation", "installation is not enrolled");
   }
 

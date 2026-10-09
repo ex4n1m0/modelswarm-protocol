@@ -18,6 +18,7 @@ import {
   verifyBase64Url,
 } from "@/lib/crypto";
 import { issueEligibilityLease, splitEligibilityLease } from "@/lib/eligibility";
+import { buildChallengePrompt, parseChallengePrompt } from "@/lib/challenge";
 import { HUB_SEED, testManifest } from "./helpers";
 import type { ChallengeRecord, LeaseRecord } from "@/lib/store";
 
@@ -187,6 +188,47 @@ describe("eligibility lease serialization (ADR-012)", () => {
     // across the suite.
     const manifest = testManifest();
     expect(deriveProfileId(manifest)).toMatch(/^msp1:[0-9a-f]{64}$/);
+  });
+});
+
+// D16 (owner gate 2026-10-09 / ADR-028 §7): the nonce-bound challengePrompt
+// construction is byte-pinned here AND in modelswarm-tracker-api — the
+// Rust↔TS golden-vector update required by Security's binding condition.
+describe("challenge prompt golden vector (D16 / ADR-028 §7)", () => {
+  interface ChallengePromptVector {
+    cases: Array<{ challenge_id: string; canary_digest: string | null; expected_prompt: string }>;
+  }
+  const vector = JSON.parse(
+    readFileSync(join(vectorsDir, "challenge-prompt-1.json"), "utf8"),
+  ) as ChallengePromptVector;
+
+  it("pins both forms (base + pinned-canary)", () => {
+    expect(vector.cases.length).toBeGreaterThanOrEqual(2);
+    expect(vector.cases.some((c) => c.canary_digest === null)).toBe(true);
+    expect(vector.cases.some((c) => c.canary_digest !== null)).toBe(true);
+  });
+
+  it.each(vector.cases.map((c) => [c.challenge_id, c] as const))(
+    "builds and round-trips %s",
+    (_id, c) => {
+      const built = buildChallengePrompt(c.challenge_id, c.canary_digest);
+      expect(built).toBe(c.expected_prompt);
+      const parsed = parseChallengePrompt(c.expected_prompt);
+      expect(parsed).not.toBeNull();
+      expect(parsed!.challengeId).toBe(c.challenge_id);
+      expect(parsed!.canaryDigest).toBe(c.canary_digest);
+    },
+  );
+
+  it("rejects deviations from the frozen format", () => {
+    expect(parseChallengePrompt("ModelSwarm readiness challenge")).toBeNull();
+    expect(parseChallengePrompt("Some other prompt")).toBeNull();
+    expect(parseChallengePrompt("ModelSwarm readiness challenge NOTHEX32")).toBeNull();
+    expect(
+      parseChallengePrompt("ModelSwarm readiness challenge 0123456789abcdef0123456789abcdef; greedy-canary nothex"),
+    ).toBeNull();
+    expect(() => buildChallengePrompt("short", null)).toThrow();
+    expect(() => buildChallengePrompt("a".repeat(32), "md5:xyz")).toThrow();
   });
 });
 

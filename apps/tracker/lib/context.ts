@@ -4,6 +4,7 @@
 
 import { getStore, type TrackerStore } from "@/lib/store";
 import { publicKeyOf, type KeyPair } from "@/lib/crypto";
+import { parseCanaryPins } from "@/lib/challenge";
 import { RateLimiter, DEFAULT_RATE_LIMITS, type RateLimits } from "@/lib/ratelimit";
 
 export interface TrackerContext {
@@ -26,6 +27,12 @@ export interface TrackerContext {
   /** Max distinct enrolled installations under auto-approval (env
    *  DEVICE_APPROVAL_CAP, default 250). */
   deviceApprovalCap: number;
+  /** Pinned greedy-canary possession digests per profile (env
+   *  MSP_CANARY_PINS, JSON profileId -> "sha256:<64 hex>"; D16 / ADR-028
+   *  §7). Null = unset (v0 legacy mode: nonce-bound prompt, no digest).
+   *  When set, strict mode applies: challenging a profile without a pin
+   *  is refused — hash-only values, never token streams (content-blind). */
+  canaryPins: ReadonlyMap<string, string> | null;
 }
 
 /** Development-only deterministic seed so local/CI builds can sign catalogs
@@ -80,6 +87,8 @@ function buildDefaultContext(): TrackerContext {
     verifyUrl: process.env.DEVICE_VERIFY_URL ?? "https://modelswarm.deepflux.space/verify",
     autoApproveDevices: process.env.DEVICE_AUTO_APPROVE === "1",
     deviceApprovalCap: envInt("DEVICE_APPROVAL_CAP", 250),
+    // Malformed pins fail closed at context build (see parseCanaryPins).
+    canaryPins: parseCanaryPins(process.env.MSP_CANARY_PINS),
   };
 }
 

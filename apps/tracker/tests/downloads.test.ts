@@ -11,10 +11,13 @@ beforeEach(() => {
   rig = makeRig();
 });
 
-const hit = (file: string) =>
-  downloadRoute.GET(new Request(`http://tracker.local/api/download/${file}`), {
-    params: Promise.resolve({ file }),
-  });
+const hit = (file: string, ip?: string) =>
+  downloadRoute.GET(
+    new Request(`http://tracker.local/api/download/${file}`, {
+      headers: ip ? { "x-forwarded-for": ip } : {},
+    }),
+    { params: Promise.resolve({ file }) },
+  );
 
 describe("I5 GET /api/download/<file>", () => {
   it("rejects non-installer and traversal names", async () => {
@@ -44,5 +47,21 @@ describe("I5 GET /api/download/<file>", () => {
     expect(await rig.store.bumpDownloadCount("x.deb")).toBe(1);
     expect(await rig.store.bumpDownloadCount("x.deb")).toBe(2);
     expect(await rig.store.downloadCounts()).toEqual({ "x.deb": 2 });
+  });
+
+  it("rate-limits per IP at the public class (T4: unthrottled counted DB writes otherwise)", async () => {
+    const file = "ModelSwarm-9.9.9-flood.exe"; // name-shaped; 404s are fine — the limit fires first
+    let lastStatus = 200;
+    for (let i = 0; i < 121; i += 1) {
+      const res = await hit(file, "203.0.113.140");
+      lastStatus = res.status;
+      if (lastStatus === 429) break;
+    }
+    expect(lastStatus).toBe(429);
+    const body = (await hit(file, "203.0.113.140").then((r) => r.json())) as {
+      error: { code: string; retryable: boolean };
+    };
+    expect(body.error.code).toBe("rate_limited");
+    expect(body.error.retryable).toBe(true);
   });
 });

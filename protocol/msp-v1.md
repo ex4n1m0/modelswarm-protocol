@@ -111,7 +111,7 @@ installation**; referencing another installation's lease is `401 unauthorized`.
 
 | Endpoint | Body | Result |
 |---|---|---|
-| `POST /peers/challenge/start` | `{leaseId, profileId}` | `{challengeId, challengePrompt, deadlineAt}`; one open challenge per lease+profile |
+| `POST /peers/challenge/start` | `{leaseId, profileId}` | `{challengeId, challengePrompt, deadlineAt}`; one open challenge per lease+profile. `challengePrompt` is **nonce-bound** (D16, gate 2026-10-09 / ADR-028 §7): `"ModelSwarm readiness challenge <challengeId>"`, plus `"; greedy-canary sha256:<64hex>"` when the profile has a pinned possession digest (hash-only, content-blind; construction byte-pinned by `protocol/vectors/challenge-prompt-1.json`) |
 | `POST /peers/register` | `{peerId, addresses:[multiaddr], profiles:[profileId…], maxSlots, runtime:{name,build}}` | `{leaseId, leaseExpiresAt}` |
 | `POST /peers/heartbeat` | `{leaseId, activeProfiles:[profileId…], freeSlots, queueMs, draining:bool}` | `{leaseExpiresAt, notices:[Notice]}` (below) |
 | `POST /peers/drain` | `{leaseId}` | `{draining:true}` |
@@ -227,6 +227,12 @@ byte-pinned by the cross-language golden vector
 `expires_at` may exceed it by at most the 60 s grace. The issuance response
 carries the wire token in its `token` field:
 `POST /peers/lease` → `{ "token": "<capabilityToken>", "lease": { …fields } }`.
+
+**Honest-label note (D7, owner gate 2026-10-09 / ADR-028 §7):**
+`verified_capacity` (this object) and `capacityClass` (§3.3 responses) are
+**self-reported labels** — they derive deterministically from the
+challenger's own attested timings, never from a hub-side measurement. The
+field names are frozen wire shapes; the label honesty is normative.
 
 **Serialized form** (this is what travels in requests):
 
@@ -371,6 +377,7 @@ undocumented amendments.
 | 2026-10-09 | ADR-028 (tracker-surface and wire reconciliation) | §3.3 folds: `/peers/lease` row, `challenge/complete` result, `capacityClass`; §3.3 `session-authorize` + `/receipt` routes folded (mode → ADR-013 registry enum); §3.5 `/audit`; §3 appendix: `GET /stats`, `GET /download/[file]` declared non-protocol website surface; §6.3 `accepted` emission DEFERRED to M10 fair queueing; §6.4 `maxTokens` global cap 2048 (dead `profile.maxOutputTokens` reference removed); effective §6.5 registry: `duplicate_request`→`replayed_request`, `over_limit`→`overloaded` renames land as R0.5 code (client+server together); `invalid_lease`/`bad_frame`/`executor_error` added |
 | 2026-10-09 | ADR-029 (execution presets) | Creates `protocol/msp-cooperative-v1.md` (SessionOffer/preset namespace); this document stays byte-identical to its pre-ADR-029 frozen text |
 | 2026-10-09 | ADR-030 (receipts v2) | §7 additive successor: ReceiptV2 is a new signed object (v1 §7 shape unchanged in place); `/events/job-result` `receiptDigest` preimage defined as SHA-256 over the canonical counter-signed ReceiptV2 |
+| 2026-10-09 | Post-gate R0.5 code batch (owner gate D7/D16; ADR-028 §7) | §3.3 `challenge/start` row: `challengePrompt` is nonce-bound (`"ModelSwarm readiness challenge <challengeId>"` + optional `"; greedy-canary sha256:<64hex>"` pinned possession digest, hash-only) — value-level change riding the existing field, NO schema edit, golden vector `protocol/vectors/challenge-prompt-1.json`; §5 honest-label note: `verified_capacity`/`capacityClass` are self-reported labels, not hub-verified measurements |
 
 ### §3 appendix — non-protocol website surface
 

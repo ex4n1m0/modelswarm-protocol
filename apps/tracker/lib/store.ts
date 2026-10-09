@@ -17,7 +17,12 @@
 //     multiaddrs, opaque rendezvous blobs, notice objects).
 
 import type { Pool } from "pg";
-import { CHALLENGE_PROMPT } from "@/lib/constants";
+import { buildChallengePrompt } from "@/lib/challenge";
+import {
+  EXPIRED_ROW_GRACE_MS,
+  OBSERVATION_MAX_PER_PEER,
+  OBSERVATION_TTL_MS,
+} from "@/lib/constants";
 
 // Bounded rendezvous mailboxes (store-invariant extension 2026-10-08):
 // rows for peers that never drain are pruned at WRITE time — TTL first,
@@ -387,6 +392,12 @@ export class MemoryStore implements TrackerStore {
 
   async createDeviceAuth(rec: DeviceAuthRecord): Promise<void> {
     this.deviceAuths.set(rec.deviceCode, { ...rec });
+    // Write-time prune (T5): codes that expired more than a day ago serve
+    // nothing — neither approval nor the /verify queue can reach them.
+    const cutoff = this.clock() - EXPIRED_ROW_GRACE_MS;
+    for (const [code, auth] of this.deviceAuths) {
+      if (auth.expiresAt < cutoff) this.deviceAuths.delete(code);
+    }
   }
 
   async getDeviceAuth(deviceCode: string): Promise<DeviceAuthRecord | null> {
@@ -412,6 +423,29 @@ export class MemoryStore implements TrackerStore {
 
   async createSession(rec: SessionRecord): Promise<void> {
     this.sessions.set(rec.token, { ...rec });
+    // Write-time prune (T5), CENSUS-SAFE: expired sessions may be deleted
+    // EXCEPT the newest row per installation — countEnrolledInstallations
+    // counts DISTINCT installation_id over sessions (the
+    // DEVICE_APPROVAL_CAP basis) and must stay cumulative, so each
+    // installation keeps exactly one tombstone row at minimum.
+    const cutoff = this.clock() - EXPIRED_ROW_GRACE_MS;
+    // The newest expiry per installation is the tombstone that survives;
+    // ties both survive (err toward keeping rows — the census is cumulative).
+    const newestExpiryPerInstallation = new Map<string, number>();
+    for (const s of this.sessions.values()) {
+      const newest = newestExpiryPerInstallation.get(s.installationId);
+      if (newest === undefined || s.expiresAt > newest) {
+        newestExpiryPerInstallation.set(s.installationId, s.expiresAt);
+      }
+    }
+    for (const [token, s] of this.sessions) {
+      if (
+        s.expiresAt < cutoff &&
+        s.expiresAt !== newestExpiryPerInstallation.get(s.installationId)
+      ) {
+        this.sessions.delete(token);
+      }
+    }
   }
 
   async getSession(token: string): Promise<SessionRecord | null> {
@@ -503,6 +537,17 @@ export class MemoryStore implements TrackerStore {
     queueMs: number;
     observedAt: number;
   }): Promise<void> {
+    // Write-time prune (T5; rendezvous pattern): one row per heartbeat is
+    // the highest-churn table and is read by nothing — bound it per peer
+    // (newest N) plus a hard TTL, then keep the global cap as a backstop.
+    const ttlCutoff = rec.observedAt - OBSERVATION_TTL_MS;
+    this.observations = this.observations.filter((o) => o.observedAt >= ttlCutoff);
+    const perPeer = this.observations.filter((o) => o.peerId === rec.peerId);
+    if (perPeer.length >= OBSERVATION_MAX_PER_PEER) {
+      const excess = perPeer.length - OBSERVATION_MAX_PER_PEER + 1;
+      const drop = new Set(perPeer.slice(0, excess));
+      this.observations = this.observations.filter((o) => !drop.has(o));
+    }
     this.observations.push({ ...rec });
     if (this.observations.length > 10_000) this.observations.splice(0, this.observations.length - 10_000);
   }
@@ -625,6 +670,12 @@ export class MemoryStore implements TrackerStore {
 
   async recordToken(rec: TokenRecord): Promise<void> {
     this.tokens.set(rec.nonce, { ...rec });
+    // Write-time prune (T5): one row per issuance; rows whose grace window
+    // closed more than a day ago can never be authoritative again (E3).
+    const cutoff = this.clock() - EXPIRED_ROW_GRACE_MS;
+    for (const [nonce, token] of this.tokens) {
+      if (token.expiresAt < cutoff) this.tokens.delete(nonce);
+    }
   }
 
   async getTokenByNonce(nonce: string): Promise<TokenRecord | null> {
@@ -725,8 +776,22 @@ export class MemoryStore implements TrackerStore {
   }
 
   async pushNotice(target: { all: true } | { leaseId: string }, notice: Notice): Promise<void> {
+    const now = this.clock();
+    // Write-time prune (T5): leases dead for over a day will never heartbeat
+    // to drain a queue — drop their existing queues AND exclude them from
+    // the {all:true} fan-out (one orphan row per dead lease otherwise).
+    const deadCutoff = now - EXPIRED_ROW_GRACE_MS;
+    if ("all" in target) {
+      for (const [leaseId, lease] of this.leases) {
+        if (lease.expiresAt < deadCutoff) this.notices.delete(leaseId);
+      }
+    }
     const targets: string[] =
-      "all" in target ? [...this.leases.keys()] : [target.leaseId];
+      "all" in target
+        ? [...this.leases.entries()]
+            .filter(([, lease]) => lease.expiresAt >= deadCutoff)
+            .map(([leaseId]) => leaseId)
+        : [target.leaseId];
     for (const leaseId of targets) {
       const queue = this.notices.get(leaseId) ?? [];
       queue.push(structuredClone(notice));
@@ -797,6 +862,9 @@ export class MemoryStore implements TrackerStore {
     createdAt: number;
     expiresAt: number;
   }): Promise<void> {
+    // Write-time prune (T5): write-only rows with a 10-minute TTL; expired
+    // rows can never be read usefully.
+    this.sessionAuthorizations = this.sessionAuthorizations.filter((a) => a.expiresAt > this.clock());
     this.sessionAuthorizations.push({ ...rec });
   }
 }
@@ -889,6 +957,12 @@ export class PgStore implements TrackerStore {
   }
 
   async createDeviceAuth(rec: DeviceAuthRecord): Promise<void> {
+    // Write-time prune (T5; rendezvous pattern): expired-beyond-grace
+    // codes are dead rows — neither approval nor /verify reaches them.
+    await this.query(
+      `DELETE FROM device_codes WHERE expires_at < now() - make_interval(secs => $1)`,
+      [Math.floor(EXPIRED_ROW_GRACE_MS / 1000)],
+    );
     await this.query(
       `INSERT INTO device_codes (device_code, installation_id, user_code, verify_url, approved, expires_at)
        VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -940,6 +1014,21 @@ export class PgStore implements TrackerStore {
   }
 
   async createSession(rec: SessionRecord): Promise<void> {
+    // Write-time prune (T5), CENSUS-SAFE: expired-beyond-grace sessions are
+    // deleted EXCEPT the newest row per installation —
+    // countEnrolledInstallations (DISTINCT installation_id) is the
+    // DEVICE_APPROVAL_CAP basis and must stay cumulative, so every
+    // installation keeps one tombstone row.
+    await this.query(
+      `DELETE FROM sessions WHERE ctid IN (
+         SELECT ctid FROM (
+           SELECT ctid,
+                  ROW_NUMBER() OVER (PARTITION BY installation_id ORDER BY expires_at DESC) AS rn
+           FROM sessions WHERE expires_at < now() - make_interval(secs => $1)
+         ) ranked WHERE rn > 1
+       )`,
+      [Math.floor(EXPIRED_ROW_GRACE_MS / 1000)],
+    );
     await this.query(
       `INSERT INTO sessions (token, installation_id, expires_at) VALUES ($1, $2, $3)`,
       [rec.token, rec.installationId, PgStore.iso(rec.expiresAt)],
@@ -1108,6 +1197,23 @@ export class PgStore implements TrackerStore {
     queueMs: number;
     observedAt: number;
   }): Promise<void> {
+    // Write-time prune (T5; rendezvous pattern): peer_observations grows one
+    // row per heartbeat and is read by nothing — bound it per peer (newest
+    // N) plus a hard TTL, at write time.
+    await this.query(
+      `DELETE FROM peer_observations WHERE observed_at < now() - make_interval(secs => $1)`,
+      [Math.floor(OBSERVATION_TTL_MS / 1000)],
+    );
+    await this.query(
+      `DELETE FROM peer_observations WHERE ctid IN (
+         SELECT ctid FROM (
+           SELECT ctid,
+                  ROW_NUMBER() OVER (PARTITION BY peer_id ORDER BY observed_at DESC) AS rn
+           FROM peer_observations WHERE peer_id = $1
+         ) ranked WHERE rn > $2
+       )`,
+      [rec.peerId, OBSERVATION_MAX_PER_PEER - 1],
+    );
     await this.query(
       `INSERT INTO peer_observations (lease_id, peer_id, free_slots, queue_ms, observed_at)
        VALUES ($1, $2, $3, $4, $5)`,
@@ -1212,7 +1318,10 @@ export class PgStore implements TrackerStore {
       challengeId: row.challenge_id as string,
       leaseId: row.lease_id as string,
       profileId: row.profile_id as string,
-      prompt: CHALLENGE_PROMPT,
+      // The prompt is never a stored column: rows rehydrate to the base
+      // nonce-bound form; the serving route rebuilds the full value (with
+      // canary suffix, when pinned) from the challengeId (D16).
+      prompt: buildChallengePrompt(row.challenge_id as string, null),
       issuedAt: (row.issued_at as Date).getTime(),
       deadlineAt: (row.deadline_at as Date).getTime(),
       outcome: row.outcome as ChallengeOutcome,
@@ -1272,6 +1381,12 @@ export class PgStore implements TrackerStore {
   }
 
   async recordToken(rec: TokenRecord): Promise<void> {
+    // Write-time prune (T5): rows whose grace window closed more than a day
+    // ago can never be authoritative again (E3); the expires_at index exists.
+    await this.query(
+      `DELETE FROM capability_tokens WHERE expires_at < now() - make_interval(secs => $1)`,
+      [Math.floor(EXPIRED_ROW_GRACE_MS / 1000)],
+    );
     await this.query(
       `INSERT INTO capability_tokens
          (nonce, lease_id, peer_id, installation_id, profile_id, challenge_id,
@@ -1500,10 +1615,21 @@ export class PgStore implements TrackerStore {
 
   async pushNotice(target: { all: true } | { leaseId: string }, notice: Notice): Promise<void> {
     if ("all" in target) {
+      // Write-time prune (T5): leases dead for over a day will never
+      // heartbeat to drain a queue — clear their existing rows AND exclude
+      // them from the fan-out.
+      await this.query(
+        `DELETE FROM peer_notices WHERE lease_id IN (
+           SELECT lease_id FROM peer_leases
+           WHERE expires_at < now() - make_interval(secs => $1)
+         )`,
+        [Math.floor(EXPIRED_ROW_GRACE_MS / 1000)],
+      );
       await this.query(
         `INSERT INTO peer_notices (lease_id, notice)
-         SELECT lease_id, $1::jsonb FROM peer_leases`,
-        [JSON.stringify(notice)],
+         SELECT lease_id, $1::jsonb FROM peer_leases
+         WHERE expires_at >= now() - make_interval(secs => $2)`,
+        [JSON.stringify(notice), Math.floor(EXPIRED_ROW_GRACE_MS / 1000)],
       );
     } else {
       await this.query(
@@ -1624,6 +1750,8 @@ export class PgStore implements TrackerStore {
     createdAt: number;
     expiresAt: number;
   }): Promise<void> {
+    // Write-time prune (T5): write-only rows with a 10-minute TTL.
+    await this.query(`DELETE FROM session_authorizations WHERE expires_at < now()`, []);
     await this.query(
       `INSERT INTO session_authorizations (session_id, profile_id, mode, peer_ids, expires_at)
        VALUES ($1, $2, $3, $4, $5)`,
@@ -1632,9 +1760,9 @@ export class PgStore implements TrackerStore {
   }
 }
 
-/** The challenge prompt is a fixed per-profile protocol constant (see
- *  lib/constants.ts); never stored as a column. */
-export { CHALLENGE_PROMPT as CHALLENGE_PROMPT_DEFAULT } from "@/lib/constants";
+// (Removed 2026-10-09, D16: the challenge prompt is no longer a fixed
+// constant — it is built per challenge instance in lib/challenge.ts and
+// never stored as a column. No import sites referenced the old re-export.)
 
 // ---------------------------------------------------------------------------
 // Factory

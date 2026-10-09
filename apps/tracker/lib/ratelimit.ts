@@ -1,6 +1,21 @@
 // Fixed-window rate limiter (msp-v1 §3.4 defaults, tunable via env).
 // Deliberately in-memory and timer-free: windows are computed from the
 // injectable clock (row-aging style), never from background eviction jobs.
+//
+// SEMANTICS (documented posture, audit T4; not a bug):
+// - Buckets live in the Node.js process, so on Vercel they are
+//   PER WARM LAMBDA INSTANCE. The effective limit under burst traffic is the
+//   configured value times the number of concurrently warm instances
+//   handling the same key; a cold start begins with empty buckets. Limits
+//   are therefore per-instance ceilings, not global ones — acceptable for
+//   abuse-cost shaping (every request still pays the full verification
+//   pipeline), not for exact quota accounting.
+// - The durable `rate_counters` table (migrations/0001) plus
+//   `Store.bumpRateCounter` exist for observability and as the seam a
+//   durable limiter would use, but are intentionally unwired: a DB write
+//   per request on the serverless Pg connection would cost more than the
+//   bound it provides. Backing the limiter with the table is a future
+//   option behind this same interface; nothing else reads the table today.
 
 export interface RateLimits {
   /** per installation on peer endpoints (signed) */

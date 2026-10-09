@@ -22,6 +22,9 @@ export interface EligibilityLeaseFields {
   can_host: boolean;
   can_consume: boolean;
   slots: number;
+  /** Wire name frozen (ADR-012 + golden vector); VALUE is a self-reported
+   *  label from the challenger's own timings, not a hub-verified
+   *  measurement (D7 relabel, gate 2026-10-09). */
   verified_capacity: CapacityClass;
   audit_epoch: number;
   challenge_id: string;
@@ -35,8 +38,18 @@ export interface IssuedEligibilityLease {
 }
 
 /**
- * Deterministic verified-capacity table from measured challenge timings
- * (ADR-012: self-reported hardware never raises capacity).
+ * Deterministic SELF-REPORTED capacity table (D7 honest relabel, owner gate
+ * 2026-10-09 / ADR-028 §7).
+ *
+ * The input `totalMs` is the challenger's own attested number — the hub
+ * cannot observe the challenger's engine, so the resulting class is a
+ * telemetry label used for roster ranking, NOT a hub-verified measurement.
+ * The lease field it feeds is named `verified_capacity` on the wire (frozen
+ * signed shape, byte-pinned by protocol/vectors/lease-hubkey-1.json — a
+ * rename would be a schema change under its own ADR); the honesty lives in
+ * this label and the docs. ADR-012's "self-reported hardware never raises
+ * capacity" invariant holds: only the challenger's OWN timings can raise
+ * its class, and only within this fixed table.
  */
 export function capacityFromTimings(totalMs: number): CapacityClass {
   if (totalMs <= 2_000) return "gpu_high";

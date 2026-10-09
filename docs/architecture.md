@@ -83,6 +83,8 @@ Naming and phases updated Phase A per ADR-010/015 (A–G phases).
 | `modelswarm-bench` | Benchmark harness + network emulation (ADR-013 schemas) | C |
 | `modelswarm-node` | Windows daemon composition | B+ |
 | `modelswarm-desktop` | Tauri 2 UI | G |
+| `modelswarm-relay` | Circuit-relay v2 host (ADR-014); F2A verified 2026-10-08, node-side usage (F2b Swarm migration) pending; internet exposure blocked until auth + per-circuit caps | F |
+| `modelswarm-winjob` | Windows job objects: kill-on-close, total-RAM detection (the M2 governor seed; governor generalizes cross-platform) | G |
 
 Apps: `apps/tracker` (control plane), `apps/modelswarm-sim` (multi-peer
 simulator, Phase C).
@@ -101,10 +103,14 @@ simulator, Phase C).
 
 ## 6. Model profiles and the catalog
 
-A profile (schema: `catalog/schema.json`) is immutable: `profileId`,
-`hfRepo`, `hfRevision` (full 40-char hash), `filename`, `sha256`, byte size,
-`quantization`, `runtime {name, minBuild}`, `contextTokens`,
-`maxOutputTokens`, `licenseId`, `status ∈ {candidate, active, deprecated}`.
+A profile (schema: `catalog/schema-v2.json`, per ADR-011/022) is immutable:
+the manifest-derived `profileId` (`msp1:` + hash over the GGUF-anchored
+identity fields), `hf_repo`, `hf_revision` (full 40-char hash), `filename`,
+`sha256`, byte size, `quantization`, `runtime {name, build_hash}` — plus
+the ADR-022 identity-hash block and license evidence URL. The v1 shape
+(`catalog/schema.json`, camelCase, `contextTokens`/`maxOutputTokens`,
+`licenseId`) is dead-but-retained; `maxTokens` today uses the global
+wire cap (ADR-028). `status ∈ {candidate, active, deprecated}`.
 
 Lifecycle: hub detects new HF revision → admin promotes to `candidate` → test
 nodes validate → hub publishes a **new immutable profile id** → nodes download
@@ -124,7 +130,9 @@ the license + network privacy disclosure.
 After a successful hosting challenge the tracker issues a short-lived signed
 capability token (see `protocol/msp-v1.md` §Capability tokens). Every inference
 request carries it; the serving peer independently verifies signature, expiry,
-profile binding, requesting peer identity, and nonce. Pausing hosting stops new
+profile binding, and requesting peer identity. The token `nonce` is for
+issuance-dedup and revocation only — per-request replay protection is the
+single-use `requestId` (msp-v1 §5, §6.6). Pausing hosting stops new
 token issuance and blocks consumption after the documented grace window.
 
 This is deterrence against casual misuse, not remote attestation; a determined
@@ -145,7 +153,12 @@ may talk to it; the GGUF file and runtime never leave the machine.
 3. Requester asks the tracker for candidates filtered by profile id.
 4. Tracker-assisted signaling (short offer/answer exchange) lets peers attempt
    a direct QUIC connection; if hole punching fails, the failure is reported
-   explicitly as a direct-connect failure. No relay exists in v0.1 (ADR-003).
+   explicitly as a direct-connect failure. A standalone circuit-relay v2 host
+   now exists (`crates/modelswarm-relay`, ADR-014) and was verified 2026-10-08
+   (F2A, `docs/verification/f2a-relay-2026-10-08.md`); nodes do not use it
+   yet — that rides the F2b libp2p Swarm migration, and internet exposure is
+   blocked until relay auth + per-circuit caps land. No universal
+   NAT-traversal claims (ADR-014).
 
 ## 10. Gateway and scheduling
 
@@ -221,4 +234,20 @@ out of scope. Details: `docs/privacy.md`.
 ADR-001 Vercel control-plane boundary · ADR-002 llama.cpp sidecar ·
 ADR-003 tracker-first discovery · ADR-004 Ed25519 installation identity ·
 ADR-005 immutable HF revisions · ADR-006 capability tokens ·
-ADR-007 retry-before-first-token · ADR-008 Windows packaging via Tauri/NSIS.
+ADR-007 retry-before-first-token · ADR-008 Windows packaging via Tauri/NSIS ·
+ADR-009 revised positioning and differentiation · ADR-010 workspace
+restructure · ADR-011 manifest-derived profile id · ADR-012 eligibility
+lease · ADR-013 execution modes and cost model v2 · ADR-014 NAT traversal
+roadmap · ADR-015 plan supersession map (A–G governs; superseded as
+governing plan by ADR-027) · ADR-016 **conditionally reserved Phase A slot,
+never issued** — closed as not-needed ("no code reuse adopted"), see
+`docs/verification/phase-a.md`; numbering continued at 017 · ADR-017 node
+persistence (rusqlite) · ADR-018 transport staging · ADR-019 runtime
+adapters and benchmark honesty · ADR-020 identity derivations · ADR-021
+research runtime decision · ADR-022 real profile registration
+(GGUF-anchored hashes) · ADR-023 community model requests · ADR-024 GPU
+engine variant · ADR-025 chat-template application point · ADR-026
+hub-signed lease gate at session open · ADR-027 plan supersession — master
+roadmap M0–M13 governs · ADR-028 tracker-surface and wire reconciliation ·
+ADR-029 execution presets and the msp-cooperative-v1 namespace · ADR-030
+receipts v2 (counter-signed work receipts, granted accounting).

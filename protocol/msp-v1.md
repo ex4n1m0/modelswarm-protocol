@@ -115,12 +115,15 @@ installation**; referencing another installation's lease is `401 unauthorized`.
 | `POST /peers/register` | `{peerId, addresses:[multiaddr], profiles:[profileId…], maxSlots, runtime:{name,build}}` | `{leaseId, leaseExpiresAt}` |
 | `POST /peers/heartbeat` | `{leaseId, activeProfiles:[profileId…], freeSlots, queueMs, draining:bool}` | `{leaseExpiresAt, notices:[Notice]}` (below) |
 | `POST /peers/drain` | `{leaseId}` | `{draining:true}` |
-| `POST /peers/challenge/complete` | `{leaseId, profileId, challengeId, timings:{firstTokenMs, totalMs}}` | capability token (§5) |
-| `GET /peers?profile_id=…&limit=…` | — | `{peers:[{peerId, addresses, queueMs, freeSlots, leaseExpiresAt, lastSeenAt}]}`, limit ≤ 50 |
+| `POST /peers/challenge/complete` | `{leaseId, profileId, challengeId, timings:{firstTokenMs, totalMs}}` | `{passed, challengeId, capacityClass}`; token issuance moved to `/peers/lease` (ADR-012) |
+| `POST /peers/lease` | `{leaseId, profileId}` | `{token, lease}` — the hub-signed EligibilityLease (§5; ADR-012) |
+| `GET /peers?profile_id=…&limit=…` | — | `{peers:[{peerId, addresses, queueMs, freeSlots, capacityClass, leaseExpiresAt, lastSeenAt}]}`, limit ≤ 50 (`capacityClass` folded by ADR-028, field per ADR-012) |
 | `GET /rendezvous/pending` | — | `{items:[{fromPeerId, offer, receivedAt}]}`; items are deleted on read |
 | `POST /rendezvous/offer` | `{toPeerId, offer}` | `{accepted:true}`; `offer`/`answer` are opaque strings ≤ 4 KiB |
 | `POST /rendezvous/answer` | `{toPeerId, answer}` | `{accepted:true}` |
 | `POST /events/job-result` | signed `{receiptDigest, outcome}` | `{recorded:true}` |
+| `POST /session-authorize` | `{peerIds:[…], profileId, mode}` | `{authorized:true}` — metadata-only; `mode` MUST be a registered ADR-013 execution mode (registry-enum constraint per ADR-028); unconsumed by the node today |
+| `POST /receipt` | signed `{receiptDigest, outcome}` | `{recorded:true}` — duplicate of `/events/job-result` intake; superseded by receipts-v2 (ADR-030) |
 
 Validation: `peerId` must derive from the registered `pubKey`; `addresses`
 must parse as multiaddrs; every `profileId` must exist in the catalog
@@ -173,10 +176,11 @@ Phase 1). These are the only endpoints that mutate `model_profiles`:
 
 | Endpoint | Body | Result |
 |---|---|---|
-| `POST /admin/catalog/candidates` | resolver output validated against `catalog/schema.json` | `201 {profileId}` (status `candidate`) |
+| `POST /admin/catalog/candidates` | resolver output validated against `catalog/schema-v2.json` (ADR-011/022) | `201 {profileId}` (status `candidate`) |
 | `POST /admin/catalog/promote` | `{profileId}` | `200 {profileId, status:"active"}` |
 | `GET /admin/catalog/requests` | — (ADR-023) | `200 {requests:[…]}` open first (oldest first), then resolved |
 | `POST /admin/catalog/requests/resolve` | `{id, resolution:"promoted"\|"rejected"}` (ADR-023) | `200 {id, resolution}` or `404 unknown_request` |
+| `POST /audit` | admin auth (no body) | bumps the suspension audit epoch (ADR-012); enforced at lease refresh (folded by ADR-028) |
 
 Publishing an artifact that differs from an existing `profileId` is
 `400 invalid_body` (immutability, ADR-005). Non-admins get `403 forbidden`.
@@ -187,7 +191,7 @@ Publishing an artifact that differs from an existing `profileId` is
 {
   "catalogVersion": 17,
   "generatedAt": "2026-10-04T00:00:00Z",
-  "profiles": [ { …ModelProfile per catalog/schema.json… } ],
+  "profiles": [ { …ModelProfile per catalog/schema-v2.json… } ],
   "signature": "base64 ed25519 over canonical {catalogVersion, generatedAt, profiles}"
 }
 ```
@@ -255,6 +259,10 @@ ADR; fields below are frozen either way).
 
 ### 6.1 Flow
 
+> ADR-028 records that the production libp2p path SKIPS the application
+> Handshake frames below (QUIC+Noise PeerId authentication replaces them;
+> the dialer sends `inference_request` first) — see the §9 changelog.
+
 ```text
 Requester                                 Serving peer
    │ handshake(protocol, peerId, profileId,        │
@@ -292,14 +300,23 @@ runtime), `sampling: {temperature, top_p, top_k, seed?}`,
 
 ### 6.4 Limits (defaults; env-tunable on each side)
 
+> Serving-peer sampling clamps remain BACKLOG (ADR-028); `maxTokens` uses
+> the global cap — see the §9 changelog.
+
 Max prompt 32 KiB UTF-8; max frames 256 KiB; max concurrent requests =
 advertised slots; per-request deadline 120 s; queue admission deadline 10 s;
 slow-consumer backpressure via bounded libp2p buffers. The serving peer clamps
 requester-supplied values: `deadlineMs` ∈ [1 000, 120 000], `maxTokens` ∈
-[1, profile.maxOutputTokens], `temperature` ∈ [0, 2], `top_p` ∈ (0, 1],
+[1, 2048] (node-global default; the v1 per-profile `maxOutputTokens` field
+was dropped with schema v2 — a per-profile cap may return only additively
+via ADR, ADR-028 §4), `temperature` ∈ [0, 2], `top_p` ∈ (0, 1],
 `top_k` ∈ [1, 200]; out-of-range values are clamped, not rejected.
 
 ### 6.5 Error codes (P2P, initial set)
+
+> Effective registry amended by ADR-028 §5 — `replayed_request`/
+> `overloaded` renames land as R0.5 code (client+server together);
+> `invalid_lease`/`bad_frame`/`executor_error` added — see §9.
 
 `handshake_failed`, `incompatible_protocol`, `profile_mismatch`,
 `invalid_token`, `expired_token`, `revoked_token`, `replayed_request`,
@@ -337,3 +354,27 @@ contribution policy.
 - Pause hosting → drain → lease expiry → token grace window → consumption
   blocked.
 - Tracker outage → streams continue → lookup fails with degraded status.
+
+## 9. Changelog (post-freeze amendments; maintained by ADR-028 §6)
+
+Every amendment to this frozen document is listed here with its ADR. No
+undocumented amendments.
+
+| Date | ADR / note | Sections touched |
+|---|---|---|
+| Phase A–B | ADR-012 (EligibilityLease) | §5 renamed/reworked: capability token → EligibilityLease, wire form, `POST /peers/lease` issuance; §3.3 `challenge/complete` result became `{passed, challengeId, capacityClass}`; `capacityClass` added to the `GET /peers` response (folded into §3.3 by ADR-028) |
+| Phase A–B | ADR-011 / ADR-022 | §3.5 and §4 catalog validation now references `catalog/schema-v2.json` (stale v1 references corrected by ADR-028) |
+| 2026-10-05 | ADR-018 (transport staging, Phase C amendment) | §6 wire encoding: JSON external-tag framing is the staged encoding (the §6 preamble's "fixed in the Phase 3 opening ADR" wording refers to this); the libp2p path's application-handshake skip is a recorded ADR-018 scope extension (ADR-028 §2) |
+| 2026-10-06 | ADR-023 | §3.1 `POST /catalog/requests`; §3.5 admin request-queue rows |
+| 2026-10-06 | deployment option (no ADR number; threat-model pointer) | §3.2 automatic-approval note (`DEVICE_AUTO_APPROVE=1`) |
+| 2026-10-08 | ADR-026 (lease gate at session open) | Effective §6.5 registry gains `invalid_lease` (recorded by ADR-028 §5); serving gate before the executor |
+| 2026-10-09 | ADR-028 (tracker-surface and wire reconciliation) | §3.3 folds: `/peers/lease` row, `challenge/complete` result, `capacityClass`; §3.3 `session-authorize` + `/receipt` routes folded (mode → ADR-013 registry enum); §3.5 `/audit`; §3 appendix: `GET /stats`, `GET /download/[file]` declared non-protocol website surface; §6.3 `accepted` emission DEFERRED to M10 fair queueing; §6.4 `maxTokens` global cap 2048 (dead `profile.maxOutputTokens` reference removed); effective §6.5 registry: `duplicate_request`→`replayed_request`, `over_limit`→`overloaded` renames land as R0.5 code (client+server together); `invalid_lease`/`bad_frame`/`executor_error` added |
+| 2026-10-09 | ADR-029 (execution presets) | Creates `protocol/msp-cooperative-v1.md` (SessionOffer/preset namespace); this document stays byte-identical to its pre-ADR-029 frozen text |
+| 2026-10-09 | ADR-030 (receipts v2) | §7 additive successor: ReceiptV2 is a new signed object (v1 §7 shape unchanged in place); `/events/job-result` `receiptDigest` preimage defined as SHA-256 over the canonical counter-signed ReceiptV2 |
+
+### §3 appendix — non-protocol website surface
+
+`GET /api/v1/stats` and `GET /api/v1/download/[file]` are website features
+(content-blind counters and installer downloads). They are NOT protocol
+endpoints, carry no peer state, and may change with the website without an
+ADR (ADR-028 §1).

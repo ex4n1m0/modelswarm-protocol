@@ -1593,7 +1593,7 @@ async fn try_swarm_chat(
                         } => (
                             content,
                             completion_tokens,
-                            format!("local (remote dial failed)"),
+                            "local (remote dial failed)".to_string(),
                             false,
                         ),
                         ChatOutcome::Failed(local_reason) => {

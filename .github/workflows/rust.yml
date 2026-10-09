@@ -43,10 +43,15 @@ jobs:
         run: cargo test --workspace --features modelswarm-node/libp2p-backend
       # Desktop chat orchestration (send_chat/try_swarm_chat/earn_lease)
       # compiles only with tauri-shell; the stub build runs zero of it.
-      # Clean runners have no staged engine (engines are gitignored; only
-      # the installer workflows stage + hash-verify the real ones), so the
-      # bundle resources glob matches nothing and the build fails — strip
-      # the resources for this test-only build via the TAURI_CONFIG overlay.
+      # app.rs (2,300+ lines) previously shipped with ZERO clippy coverage
+      # (audit F11) — this pass is the lint-clean baseline the gate
+      # requires before any app.rs refactor. Same TAURI_CONFIG overlay as
+      # the test step: clippy executes build scripts, and clean runners
+      # never stage the gitignored engines.
+      - name: Clippy (tauri-shell feature)
+        env:
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
+        run: cargo clippy -p modelswarm-desktop --all-targets --features tauri-shell -- -D warnings
       - name: Desktop tests (tauri-shell feature)
         env:
           TAURI_CONFIG: '{"bundle":{"resources":[]}}'

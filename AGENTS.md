@@ -84,27 +84,35 @@ Windows integration). It does **not** modify the rules above; it adds:
   `ms-network-model`, `apps/ms-bench`, `apps/ms-coop-sim`, `research/`,
   `experiments/`) to the ownership map above under the same rules: ADR-gated
   shared-schema changes, `HANDOFF.md` per agent, sequential integration, and
-  no invented fields outside `protocol/msp-cooperative-v1.md`.
+  no invented fields outside `protocol/msp-cooperative-v1.md`. (2026-10-09
+  note: those `ms-*` names are pre-ADR-010; the restructured workspace uses the
+  `modelswarm-*` crate set — when P0 opens, use current names such as
+  `crates/modelswarm-speculation` and never recreate `ms-*` paths.)
 - Scientific rule for the follow-up: every cooperative claim compares against
   the **fastest eligible single host at that moment**, never an average or
   slower host; slowdowns are reported as visibly as speedups.
 
 ## Ownership map
 
-Updated Phase A to the revision roster (ADR-010/015):
+Updated Phase A to the revision roster (ADR-010/015); expanded 2026-10-09 by
+architecture-gate decision D19 — Resource Engineer, Gateway Engineer, and
+Architecture Reviewer added; `crates/modelswarm-relay` assigned to Network:
 
 | Agent | Owned paths | Output required | Required reviewers |
 |---|---|---|---|
 | Prior-Art Auditor | `docs/research/` | Verified comparison matrices, differentiation evidence | Protocol Architect |
 | Protocol Architect | `protocol/`, `catalog/`, `crates/modelswarm-types`, `crates/modelswarm-session`, `crates/modelswarm-eligibility` | Contracts, ADRs, golden vectors, state machines | Security, Test and Release |
 | Runtime Engineer | `crates/modelswarm-runtime`, `scripts/` | Runtime trait, llama.cpp adapter, HF acquisition, metrics | Scheduler, Security, Test and Release |
-| Network Engineer | `crates/modelswarm-transport` | Transport, NAT/relay (ADR-014), limits, diagnostics | Security, Test and Release |
+| Network Engineer | `crates/modelswarm-transport`, `crates/modelswarm-relay` | Transport, NAT/relay (ADR-014), limits, diagnostics | Security, Test and Release |
 | Scheduler Scientist | `crates/modelswarm-scheduler`, `crates/modelswarm-speculation`, `crates/modelswarm-bench`, `experiments/` | Cost model v2, harness, honest (incl. negative) results | Runtime, Test and Release |
 | Security Engineer | `crates/modelswarm-identity`, threat model, adversarial/fuzz tests, identity review | Adversary matrices, challenge/audit flows, gates | Test and Release |
 | Tracker Engineer | `apps/tracker/`, `crates/modelswarm-tracker-api` | API, migrations, content-blind enforcement | Protocol, Security, Test and Release |
 | Windows Product Engineer | `crates/modelswarm-desktop`, `crates/modelswarm-node`, `crates/modelswarm-winjob`, `installer/` | UI, daemon composition, installer, disclosures | Protocol, Test and Release |
+| Resource Engineer | `crates/modelswarm-resource` (new: M1 hardware profiler + M2 resource governor; integrates the `crates/modelswarm-winjob` Windows seam) | Hardware-profile matrix, governor policy (the governor enforces the 70% ceiling — gate D11), memory-exhaustion/responsiveness tests | Runtime, Windows Product, Test and Release |
+| Gateway Engineer | `crates/modelswarm-gateway` (local OpenAI-compatible API; serving-admission policy jointly with Windows Product) | Loopback API, queue semantics (msp-v1 §6), fair queueing from receipts-v2, DNS-rebinding hardening (P11) | Protocol, Security, Test and Release |
 | Test and Release Engineer | `.github/workflows/`, `tests/` | CI, golden/property tests, release gates | Owner of the component under test |
-| Integrator | `AGENTS.md`, merges, `crates/modelswarm-store`, `crates/modelswarm-gateway`, `crates/modelswarm-telemetry` (held pending ADR reassignment) | Cross-cutting decisions, sequential integration | — |
+| Architecture Reviewer | none (read-only; findings and approvals recorded under `docs/reviews/` via the Integrator) | Independent §9-gate, ADR, and plan-of-record reviews | — (reports to the Integrator) |
+| Integrator | `AGENTS.md`, merges, `crates/modelswarm-store`, `crates/modelswarm-telemetry` | Cross-cutting decisions, sequential integration | — |
 
 `apps/modelswarm-sim` is owned by Test and Release. No agent merges a
 cross-boundary change without review from the listed reviewers.

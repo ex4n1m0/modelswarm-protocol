@@ -1,12 +1,11 @@
-// Every installer bundles the full pinned inference engine; the model
-// weights download from HuggingFace on first use. v0.2.20: GPU auto-fit
-// + chat-template fix (ADR-025) + force-kill-safe engine; v0.2.20: GPU
-// compute (Vulkan) — Windows bundles a second pinned engine that offloads
-// to any NVIDIA/AMD/Intel GPU with honest CPU fallback; v0.2.16: one-click model
-// switch + stop (swap keeps the old swarm serving during download);
-// v0.2.15: community model requests (ADR-023) — search Hugging Face in
-// the app; v0.2.14: zero-click enrollment + registration fixes.
-// Same version on every OS = same build.
+// Landing page copy contract (2026-10-09 refresh):
+// - every performance number on this page is measured, real-model, recorded
+//   (GPU: ADR-024 engine benchmark; LAN serving: docs/verification/phase-f-lan)
+// - no claim of Internet/NAT-traversing serving — direct P2P is LAN-proven
+// - presets beyond FAST are labeled DESIGN, not shipped
+// - no payments/credits surface (AGENTS.md constraint 8)
+// Download notes per OS live in DOWNLOADS below.
+
 const DOWNLOADS = [
   { os: "Windows x64", file: "ModelSwarm-Setup-0.2.20-windows-x64.exe", note: "SmartScreen will warn (unsigned) — More info → Run anyway. WebView2 installs automatically if missing." },
   { os: "Linux amd64 (.deb)", file: "ModelSwarm-0.2.20-linux-amd64.deb", note: "sudo apt install ./modelswarm…deb — webkit dependencies are declared and pulled in." },
@@ -25,6 +24,44 @@ const DOWNLOAD = {
 const CHAT_JOIN = "https://onlyhumans.deepflux.space/join#room=ModelSwarm";
 const CHAT_SERVICE = "https://onlyhumans.deepflux.space";
 
+// Ordered newest-first. Numbers must stay sourced (see copy contract above).
+const NEWS: Array<{ date: string; title: string; body: string }> = [
+  {
+    date: "2026-10-09",
+    title: "Cooperative-inference research harness",
+    body: "The speculation/experimentation stack landed in-repo: latency-aware micro-swarm selection with a shadow planner, a reproducible benchmark harness, and the C-API verifier spike. Research tooling — not a shipped product mode yet; results get published negative-first.",
+  },
+  {
+    date: "2026-10-08",
+    title: "v0.2.20 — cross-machine swarm serving",
+    body: "First real swarm completions peer-to-peer over QUIC between two machines on one LAN. Consume rights are now earned, not assumed: a peer must pass a hosting challenge to mint a hub-signed lease, and every serving peer verifies it. Pooled connections cut the per-request handshake.",
+  },
+  {
+    date: "2026-10-06 → 08",
+    title: "GPU compute, honestly measured",
+    body: "Windows bundles a second pinned Vulkan engine (any NVIDIA/AMD/Intel card) with automatic CPU fallback. Measured on real hardware (laptop RTX 5080): Qwen2.5-0.5B 126.6 → 517.0 tok/s (4.1×), Qwen3.8-27B 4.20 → 8.25 tok/s (2.0×). Full methodology recorded in ADR-024.",
+  },
+  {
+    date: "2026-10-06",
+    title: "v0.2.19 — hardware-aware onboarding",
+    body: "The app profiles your machine (RAM, CPU, largest GPU) and recommends the six best-fitting models instead of an endless list. The catalog grew to 15 pinned profiles (Qwen ladder + SmolLM2); this site only lists models someone is actually hosting.",
+  },
+  {
+    date: "2026-10-06",
+    title: "v0.2.15/16 — community model requests",
+    body: "Search Hugging Face from inside the app and request new quantized models for review; one-click model switching keeps the old swarm serving while the new artifact downloads.",
+  },
+];
+
+// Protocol-level execution presets (master prompt §3 / gap-engineering study §2).
+// status must stay honest: only FAST is live today.
+const PRESETS: Array<{ name: string; status: "live" | "design"; allows: string; correctness: string }> = [
+  { name: "FAST", status: "live", allows: "single host", correctness: "lossless — the baseline" },
+  { name: "BALANCED", status: "design", allows: "single + hedged (≤3 raced peers)", correctness: "lossless" },
+  { name: "DEEP", status: "design", allows: "BALANCED + best-of-n + deliberation roles", correctness: "approximate — never lossless" },
+  { name: "VERIFIED", status: "design", allows: "BALANCED + audited chain", correctness: "detection-oriented, carries audit proofs" },
+  { name: "MAXIMUM", status: "design", allows: "sanctioned composition of gated modes", correctness: "union of component labels" },
+];
 
 const ENDPOINTS: Array<{ method: string; path: string; note: string }> = [
   { method: "GET", path: "/api/v1/health", note: "liveness + protocol version" },
@@ -58,7 +95,7 @@ const css = `
   body { background: #00060f; color: #e8f4ff; font-family: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace; line-height: 1.6; }
   a { color: #2fd4ff; }
   .wrap { max-width: 1080px; margin: 0 auto; padding: 0 1.25rem; }
-  nav { display: flex; align-items: center; gap: 1rem; padding: 0.9rem 0; font-size: 0.85rem; }
+  nav { display: flex; align-items: center; gap: 1rem; padding: 0.9rem 0; font-size: 0.85rem; flex-wrap: wrap; }
   nav .brand { color: #e8f4ff; font-weight: 700; letter-spacing: 0.08em; }
   nav .spacer { flex: 1; }
   .badge { border: 1px solid #2fd4ff55; color: #2fd4ff; border-radius: 999px; padding: 0.1rem 0.65rem; font-size: 0.72rem; letter-spacing: 0.1em; }
@@ -69,6 +106,12 @@ const css = `
   section { padding: 2.2rem 0 0.6rem; }
   h2 { font-size: 0.85rem; letter-spacing: 0.22em; text-transform: uppercase; color: #2fd4ff; margin-bottom: 1.1rem; }
   .card { border: 1px solid #1c2b52; background: #0a1030; border-radius: 14px; padding: 1.5rem; }
+  .news { display: flex; flex-direction: column; gap: 0.9rem; }
+  .news-item { border: 1px solid #1c2b52; background: #0a1030; border-radius: 12px; padding: 1rem 1.2rem; }
+  .news-item .nhead { display: flex; align-items: baseline; gap: 0.8rem; flex-wrap: wrap; }
+  .news-item .ndate { color: #7d95b8; font-size: 0.75rem; letter-spacing: 0.06em; white-space: nowrap; }
+  .news-item .ntitle { color: #e8f4ff; font-weight: 600; font-size: 0.95rem; }
+  .news-item .nbody { color: #c7d8ef; font-size: 0.85rem; margin-top: 0.4rem; }
   .dl { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: center; justify-content: space-between; }
   .dl h3 { font-size: 1.15rem; color: #e8f4ff; }
   .dl .meta { color: #9fb8d8; font-size: 0.8rem; margin-top: 0.35rem; }
@@ -83,8 +126,12 @@ const css = `
   .rule { border-left: 3px solid #2fd4ff; background: #0a1030; padding: 0.9rem 1.1rem; border-radius: 0 10px 10px 0; color: #c7d8ef; font-size: 0.88rem; margin-bottom: 1.2rem; }
   code { color: #a855f7; font-size: 0.85em; }
   table { width: 100%; border-collapse: collapse; font-size: 0.8rem; color: #9fb8d8; }
-  td { padding: 0.28rem 0.6rem 0.28rem 0; border-bottom: 1px solid #101a38; }
+  td, th { padding: 0.28rem 0.6rem 0.28rem 0; border-bottom: 1px solid #101a38; text-align: left; }
   td:first-child { color: #2fd4ff; white-space: nowrap; }
+  th { color: #7d95b8; font-size: 0.7rem; letter-spacing: 0.12em; text-transform: uppercase; }
+  .pill { display: inline-block; border-radius: 999px; padding: 0.05rem 0.6rem; font-size: 0.68rem; letter-spacing: 0.1em; white-space: nowrap; }
+  .pill.live { border: 1px solid #43c78f66; color: #7fe0b8; }
+  .pill.design { border: 1px solid #7d95b855; color: #9fb8d8; }
   .models { display: flex; flex-direction: column; gap: 10px; }
   .model-row { border: 1px solid #1c2b52; background: #0a1030; border-radius: 10px; padding: 12px 14px; display: flex; justify-content: space-between; gap: 12px; align-items: center; }
   .model-row .mname { font-weight: 600; }
@@ -93,7 +140,7 @@ const css = `
   .chat-meta { color: #9fb8d8; font-size: 0.8rem; margin-bottom: 0.9rem; }
   .chat-meta b { color: #e8f4ff; }
   .chat-frame { width: 100%; height: 640px; border: 1px solid #1c2b52; border-radius: 12px; background: #0e1518; display: block; }
-  @media (max-width: 720px) { .chat-frame { height: 540px; } }
+  @media (max-width: 720px) { .chat-frame { height: 540px; } table { font-size: 0.72rem; } td:first-child { white-space: normal; } }
   .chat-note { font-size: 0.72rem; color: #7d95b8; margin-top: 0.7rem; }
   footer { color: #7d95b8; font-size: 0.75rem; padding: 2.4rem 0 2rem; text-align: center; }
 `;
@@ -137,6 +184,21 @@ export default function Home() {
       </p>
 
       <div className="wrap">
+        <section aria-labelledby="news-heading">
+          <h2 id="news-heading">What&rsquo;s new</h2>
+          <div className="news">
+            {NEWS.map((n) => (
+              <article key={n.date + n.title} className="news-item">
+                <div className="nhead">
+                  <span className="ndate">{n.date}</span>
+                  <span className="ntitle">{n.title}</span>
+                </div>
+                <p className="nbody">{n.body}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+
         <section aria-labelledby="download-heading">
           <h2 id="download-heading">Download the client — v{DOWNLOAD.version}, all platforms, everything bundled</h2>
           <div className="card">
@@ -188,29 +250,6 @@ export default function Home() {
           </p>
         </section>
 
-        <section aria-labelledby="chat-h">
-          <h2 id="chat-h">Community chat · dedicated ModelSwarm room</h2>
-          <div className="card">
-            <p className="chat-meta">
-              Type a name to join — the room word is preset to this site&rsquo;s
-              dedicated <b>ModelSwarm</b> room. No other room is offered here.
-            </p>
-            <iframe
-              className="chat-frame"
-              src={CHAT_JOIN}
-              title="ModelSwarm community chat (OnlyHumans)"
-              loading="lazy"
-            />
-            <p className="chat-note">
-              Sealed end-to-end by{" "}
-              <a href={CHAT_SERVICE} target="_blank" rel="noopener noreferrer">OnlyHumans</a>{" "}
-              — a separate service from the tracker; chat content never touches the
-              ModelSwarm control plane.{" "}
-              <a href={CHAT_JOIN} target="_blank" rel="noopener noreferrer">Open the room in a new tab</a>
-            </p>
-          </div>
-        </section>
-
         <section aria-labelledby="what-heading">
           <h2 id="what-heading">What it is</h2>
           <div className="rule">
@@ -239,11 +278,80 @@ export default function Home() {
               don&rsquo;t.
             </div>
             <div className="feat">
+              <b>Reciprocity, not currency</b>
+              You earn swarm access by hosting the same profile you consume —
+              challenges, leases and receipts make contribution verifiable. No
+              credits, tokens, or payments.
+            </div>
+            <div className="feat">
               <b>Content-blind hub</b>
               This site&rsquo;s tracker handles metadata, leases and rendezvous only.
               Prompts and completions never touch it — asserted against the
               production database.
             </div>
+            <div className="feat">
+              <b>Adversarial resistance</b>
+              Every serving session carries a hub-signed lease bound to the
+              QUIC-authenticated peer identity; stale or foreign leases are refused
+              before the first token.
+            </div>
+          </div>
+        </section>
+
+        <section aria-labelledby="presets-heading">
+          <h2 id="presets-heading">Execution presets — the contract layer</h2>
+          <p className="sum" style={{ margin: "0 0 1rem", fontSize: "0.78rem" }}>
+            A preset is a protocol-level contract, not a UI preference: it fixes which
+            execution modes may run, the cohort cap, and the correctness label the
+            swarm must honor. Each preset declares its compute budget on the wire —
+            no hidden costs. FAST is the default and live today; the others activate
+            exactly when their component modes pass their correctness gates.
+          </p>
+          <table>
+            <caption className="visually-hidden" style={{ position: "absolute", left: "-9999px" }}>
+              Execution presets and their status
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">Preset</th>
+                <th scope="col">Status</th>
+                <th scope="col">Modes allowed</th>
+                <th scope="col">Correctness label</th>
+              </tr>
+            </thead>
+            <tbody>
+              {PRESETS.map((p) => (
+                <tr key={p.name}>
+                  <td>{p.name}</td>
+                  <td><span className={"pill " + p.status}>{p.status === "live" ? "LIVE" : "DESIGN"}</span></td>
+                  <td>{p.allows}</td>
+                  <td>{p.correctness}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+
+        <section aria-labelledby="chat-h">
+          <h2 id="chat-h">Community chat · dedicated ModelSwarm room</h2>
+          <div className="card">
+            <p className="chat-meta">
+              Type a name to join — the room word is preset to this site&rsquo;s
+              dedicated <b>ModelSwarm</b> room. No other room is offered here.
+            </p>
+            <iframe
+              className="chat-frame"
+              src={CHAT_JOIN}
+              title="ModelSwarm community chat (OnlyHumans)"
+              loading="lazy"
+            />
+            <p className="chat-note">
+              Sealed end-to-end by{" "}
+              <a href={CHAT_SERVICE} target="_blank" rel="noopener noreferrer">OnlyHumans</a>{" "}
+              — a separate service from the tracker; chat content never touches the
+              ModelSwarm control plane.{" "}
+              <a href={CHAT_JOIN} target="_blank" rel="noopener noreferrer">Open the room in a new tab</a>
+            </p>
           </div>
         </section>
 

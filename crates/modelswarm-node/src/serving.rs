@@ -73,7 +73,7 @@ pub async fn serve_sessions(
                     session_telemetry
                         .warn("serving.refused", &[("peer", &peer_id), ("reason", reason)]);
                     let mut session = session;
-                    send_error(&mut session, "over_limit", reason).await;
+                    send_error(&mut session, "overloaded", reason).await;
                     return;
                 }
             };
@@ -291,12 +291,12 @@ async fn serve_one(
         if !admission.check_request_fresh(&peer_id, &request.request_id) {
             send_error(
                 &mut session,
-                "duplicate_request",
+                "replayed_request",
                 "request id already served",
             )
             .await;
             linger(&mut session).await;
-            return Err("duplicate_request".into());
+            return Err("replayed_request".into());
         }
 
         // F3: the hub-signed lease gate. The remote's PeerId comes from the

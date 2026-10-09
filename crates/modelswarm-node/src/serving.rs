@@ -33,9 +33,11 @@ use modelswarm_transport::message::{
 
 const IO_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Serves accepted sessions until `shutdown` flips to true. Never panics
-/// on a bad session: malformed input becomes a `StreamError` frame, then
-/// the session closes.
+/// Serves accepted sessions until `shutdown` flips to true OR its watch
+/// sender is dropped (no owner left to signal stop ⇒ stop serving). Callers
+/// that want serving to continue MUST hold the sender for the bridge's
+/// lifetime. Never panics on a bad session: malformed input becomes a
+/// `StreamError` frame, then the session closes.
 pub async fn serve_sessions(
     mut listener: Libp2pListener,
     executor: Arc<dyn InferenceExecutor>,
@@ -48,13 +50,33 @@ pub async fn serve_sessions(
     loop {
         let session = tokio::select! {
             // watch::changed() fires immediately for the unseen INITIAL
-            // value — only an actual true flip stops serving.
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            // value — only an actual true flip stops serving. A CLOSED
+            // channel (every Sender dropped) must ALSO stop serving: a
+            // closed channel makes changed() permanently Ready, and a
+            // permanently-ready branch cancels the in-flight `accept` on
+            // (nearly) every poll — dropping the listener's mid-handshake
+            // QUIC upgrade, which quinn then application-closes as
+            // transport error 0xC while the connection is unconfirmed.
+            // The dialer sees exactly "aborted by peer: the application
+            // or application protocol caused the connection to be closed
+            // during the handshake" (the 2026-10-09 LAN pass-1 bug). With
+            // no Sender left, nobody can ever signal stop, so stop now,
+            // visibly, instead of silently killing every fresh connection.
+            changed = shutdown.changed() => match changed {
+                Err(_) => {
+                    telemetry.warn(
+                        "serving.stopped",
+                        &[("reason", "shutdown_sender_dropped")],
+                    );
                     return;
                 }
-                continue;
-            }
+                Ok(()) => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            },
             accepted = listener.accept(Duration::from_secs(1)) => match accepted {
                 Ok(s) => s,
                 Err(_) => continue, // timeout/accept miss: keep serving
@@ -615,6 +637,54 @@ mod tests {
         assert!(saw_usage);
         assert_eq!(finish, "stop");
         shutdown_tx.send(true).ok();
+    }
+
+    /// 2026-10-09 LAN pass-1 bug (regression pin): dropping the shutdown
+    /// watch SENDER must terminate the serving task — never spin with a
+    /// permanently-ready `changed()` branch cancelling in-flight accepts
+    /// (each cancellation dropped a mid-handshake QUIC upgrade; quinn then
+    /// application-closed the unconfirmed connection as transport error
+    /// 0xC, surfacing on the dialer as "libp2p stream open: aborted by
+    /// peer: ... during the handshake"). The pre-fix task never exited,
+    /// so a resolving JoinHandle is the pin.
+    #[tokio::test]
+    async fn serve_sessions_stops_when_shutdown_sender_drops() {
+        use super::serve_sessions;
+        use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedRequest};
+        use modelswarm_identity::InstallationIdentity;
+        use modelswarm_transport::libp2p_backend::Libp2pTransport;
+        use std::time::Duration;
+
+        struct NeverExecutor;
+        #[async_trait::async_trait]
+        impl modelswarm_gateway::InferenceExecutor for NeverExecutor {
+            async fn execute(
+                &self,
+                _request: NormalizedRequest,
+            ) -> Result<ExecutorStream, ExecutorError> {
+                unreachable!("no request is ever accepted in this test")
+            }
+        }
+
+        let server_identity = InstallationIdentity::from_bytes(&[67u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let listener = server.listen("127.0.0.1:0").await.unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let serving = tokio::spawn(serve_sessions(
+            listener,
+            Arc::new(NeverExecutor),
+            super::lease_helpers::TEST_PROFILE.into(),
+            super::LeasePolicy::production(),
+            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
+            shutdown_rx,
+        ));
+        // Drop the last sender: no owner can ever signal stop — the
+        // bridge must stop serving on its own, promptly.
+        drop(shutdown_tx);
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("serve_sessions exits when the shutdown sender drops")
+            .expect("serve_sessions task did not panic");
     }
 
     /// The honest-refusal path (wrong profile → StreamError frame, then

@@ -19,6 +19,20 @@ use std::time::Duration;
 
 use modelswarm_bench::runner::{spawn_bridge, BridgeConfig};
 
+/// Env-gated stderr telemetry sink (`MSP_SERVE_LOG=1`): the 2026-10-09
+/// LAN bug was invisible on the serve side because its telemetry went to
+/// a memory sink only — no subscriber existed, so `RUST_LOG` did nothing.
+/// This surfaces serving lifecycle events (spawn/stop/refuse/ended)
+/// without adding a logging dependency; field payloads stay redacted by
+/// the telemetry layer (privacy rule 5).
+struct StderrSink;
+
+impl modelswarm_telemetry::Sink for StderrSink {
+    fn write_line(&self, line: &str) {
+        eprintln!("# pass1-serve telemetry: {line}");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let mut profile = String::new();
@@ -57,9 +71,24 @@ async fn main() {
         "--client-peer <driver PeerId> is required"
     );
 
-    // Machine B's harness identity (documented experiment seed).
-    let identity = modelswarm_identity::InstallationIdentity::from_bytes(&[0xB1; 32]);
-    let telemetry = Arc::new(modelswarm_telemetry::Telemetry::memory().0);
+    // The DRIVER identity (documented fixed seed on machine A): leases
+    // must bind to ITS derived PeerId, and --client-peer exists to pin
+    // exactly that (a typo would otherwise surface only as a runtime
+    // invalid_lease refusal per bridge — the 2026-10-09 repro minted
+    // leases for the SERVE identity instead, binding them to a peer id
+    // no client ever presents). Assert the pin up front.
+    let driver_identity = modelswarm_identity::InstallationIdentity::from_bytes(&[0xB0; 32]);
+    assert_eq!(
+        driver_identity.peer_id(),
+        client_peer,
+        "--client-peer must equal the driver's PeerId (print it on machine A \
+         with --print-driver-peer)"
+    );
+    let telemetry = Arc::new(if std::env::var("MSP_SERVE_LOG").as_deref() == Ok("1") {
+        modelswarm_telemetry::Telemetry::with_sink(Box::new(StderrSink))
+    } else {
+        modelswarm_telemetry::Telemetry::memory().0
+    });
     let metrics = Arc::new(modelswarm_node::measure::PeerMetrics::memory(Arc::clone(
         &telemetry,
     )));
@@ -81,6 +110,14 @@ async fn main() {
 
     println!("# pass1-serve: {bridges} bridges, inject {inject_ms} ms, profile {profile}, advertise {advertised_ip}");
     println!("MSP_BENCH_POLICY_NOTE=leases are throwaway-hub-signed (experiment-only)");
+    // HOLD every bridge handle for the process lifetime (the 2026-10-09
+    // LAN bug): each LiveBridge owns its serving task's shutdown watch
+    // sender; dropping the handle at the end of a loop iteration dropped
+    // the sender, which made serve_sessions' shutdown branch
+    // permanently ready — every inbound QUIC upgrade was then cancelled
+    // mid-handshake and the dialer saw "aborted by peer ... during the
+    // handshake". The in-process harness holds bridges the same way.
+    let mut live = Vec::with_capacity(usize::try_from(bridges).unwrap_or(0));
     for index in 0..bridges {
         // Asymmetric pool per the dry run (mid, slow, fast-drafter cycle).
         let mut config = match index % 3 {
@@ -96,7 +133,7 @@ async fn main() {
         config.bind_addr = bind_ip.clone();
         let bridge = spawn_bridge(
             &profile,
-            &identity,
+            &driver_identity,
             &config,
             Duration::from_millis(inject_ms),
             Arc::clone(&telemetry),
@@ -114,7 +151,13 @@ async fn main() {
             bridge.roster.advertised_queue_ms.unwrap_or(0),
             bridge.roster.capacity_class.as_deref().unwrap_or("cpu"),
         );
+        live.push(bridge);
     }
-    println!("# serving until Ctrl+C");
+    println!(
+        "# serving until Ctrl+C ({} bridge handles held)",
+        live.len()
+    );
     tokio::signal::ctrl_c().await.expect("ctrl-c");
+    drop(live);
+    println!("# pass1-serve: bridges released");
 }

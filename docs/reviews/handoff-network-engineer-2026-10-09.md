@@ -524,3 +524,102 @@ needed for bug 1):
 Owner-facing impact: the harness did its job — this is a REAL production-path
 transport defect the simulator/dry-run could not reach. 9.6 pass-1 blocked
 until fixed; everything else landed today is unaffected (all CI green).
+
+## ADDENDUM 2 (2026-10-09, late): bug 1 ROOT-CAUSED and FIXED — local cross-process repro green
+
+### Root cause (bug 1, and almost certainly bug 2)
+
+`pass1_serve` spawned each bridge in a loop and let the returned
+`LiveBridge` (which owns the serving task's `watch::Sender<bool>`) DROP at
+the end of each iteration. With the sender gone, `watch::changed()` in
+`serve_sessions`' select is permanently `Ready(Err)` — a permanently-ready
+select branch. Every poll then cancels the in-flight `listener.accept()`
+future; when `accept` had pulled the libp2p-quic `Incoming` upgrade, the
+cancellation dropped that upgrade MID-HANDSHAKE. Quinn application-closes
+an unconfirmed connection as transport error 0xC (quinn-proto
+`connection/mod.rs` close-encode path; RFC 9000 §10.2.3), which the dialer
+reports verbatim: "libp2p stream open: aborted by peer: the application or
+application protocol caused the connection to be closed during the
+handshake" (~60 ms — client-side TLS confirmed, server side not yet). The
+serve side logged nothing because `changed()`'s Err path just `continue`d
+(a hot spin, no error, memory-only telemetry, no subscriber). In-process
+runs pass because the harness HOLDS its `LiveBridge` handles for the whole
+cell — process separation merely exposed the lifecycle bug. Bug 2 (machine
+B instant "libp2p dial: aborted by peer") is the same kill racing the dial
+upgrade itself; expected fixed, needs the owner's 2-machine re-run to
+CONFIRM (honest label: cross-process loopback-proven, LAN re-probe pending).
+
+TWO more bugs found under it once connections flowed (both fixed):
+
+1. `pass1_serve` minted leases for the SERVE identity (`[0xB1]`) — it
+   parsed `--client-peer` but never used it, so every lease bound a peer
+   id no client presents (`invalid_lease` on first request).
+2. Harness warm-up request ids (`p1-warmup-{peer}/{round}`) were
+   cell-agnostic; LAN cells re-dial the SAME long-lived serve bridges
+   whose replay dedup persists across cells → `replayed_request` from
+   cell 2 on. Loopback never hit it (fresh bridges per cell).
+
+### Fix (files)
+
+- `crates/modelswarm-node/src/serving.rs` — `serve_sessions`: a CLOSED
+  watch channel now STOPS serving (fail-visible: `serving.stopped` warn +
+  listener drop; no owner left can ever signal stop) instead of spinning
+  with a permanently-ready branch that murdered every fresh connection.
+  Regression pin: `serve_sessions_stops_when_shutdown_sender_drops`.
+  (Windows Product path — review requested below; no behavior change for
+  any current caller, all of which hold the sender: desktop `app.rs`
+  stores `shutdown_tx` in State (line ~1174), node `main.rs` holds it,
+  every node/bench test binds it to a named variable. Production node
+  UNAFFECTED — that is exactly why it worked Oct 7–8.)
+- `crates/modelswarm-bench/examples/pass1_serve.rs` — holds all
+  `LiveBridge` handles in a `Vec` until Ctrl+C (matches the in-process
+  harness + production pattern); builds the DRIVER identity (`[0xB0]`)
+  and asserts it equals `--client-peer` (kills the lease-binding bug
+  loudly at startup); `MSP_SERVE_LOG=1` env-gates a stderr telemetry sink
+  (the "add a subscriber" directive, dependency-free — no logging crate
+  exists in the workspace, which is why RUST_LOG was inert).
+- `crates/modelswarm-bench/src/harness.rs` — warm-up request ids now
+  carry the cell name (`p1-warmup-{cell}/{peer}/{round}`); loopback
+  semantics unchanged.
+
+### Evidence (commands + outcomes)
+
+- LOCAL cross-process repro (exact addendum-1 commands, serve +
+  `pass1_lan_run` as separate processes): BEFORE — panic at warm-up
+  "libp2p stream open: aborted by peer: ... during the handshake";
+  AFTER — 3 cells × 12 records, labels `lan-2machine-quic`, test PASS
+  (5.5 s). Serve-side telemetry now visible (46 events with
+  `MSP_SERVE_LOG=1`).
+- Loopback dry-run: `cargo test --release -p modelswarm-bench --features
+  quic-runner` — 44 passed / 0 failed (2 ignored: LAN + engine-gated).
+- Gates: `cargo fmt --all --check` PASS; clippy `-D warnings` PASS ×
+  default / node+libp2p-backend / bench quic-runner / runtime capi /
+  desktop tauri-overlay; `cargo test --workspace` 349/0 (default) and
+  370/0 (libp2p-backend); desktop overlay tests 7/0.
+  NOTE: the desktop clippy gate was verified with another agent's
+  UNCOMMITTED app.rs/measure/store WIP briefly stashed (their WIP has an
+  unused `mut` at app.rs:1429 — theirs to fix, not committed by me).
+
+### Assumptions / risks
+
+- Bug 2 (machine B) is same-root-cause by mechanism, NOT yet re-proven
+  cross-machine — owner LAN re-run is the confirmation gate.
+- `serve_sessions` sender-drop-stop is a lifecycle contract change for
+  FUTURE callers only (all current callers hold the sender; verified by
+  grep + full suites). Reviewer: Windows Product (serving.rs) + Test and
+  Release.
+- A spurious `false→false` watch send still cancels an in-flight accept
+  (tokio select semantics); every current caller sends only `true` —
+  noted in the new comment, acceptable.
+- The transport-level generalization (listener driver completing upgrades
+  so caller-side accept cancellation can never drop a mid-handshake
+  upgrade) is deliberately NOT done here — minimal fix for the blocker;
+  folds into F2b's Swarm migration (audit §5 Option B).
+
+### Suggested next task
+
+Owner re-runs the two-machine 9.6 LAN pass-1 (A1 print-driver-peer, B
+serve with `--client-peer` + `MSP_SERVE_LOG=1`, A driver with the printed
+`MSP_BENCH_PEER_*` lines). Then Windows Product reviews the serving.rs
+lifecycle change; then the queued audit items (HIGH-2 retryable mapping,
+MEDIUM-1 deadline, F2b ADR).

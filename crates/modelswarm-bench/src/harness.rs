@@ -358,7 +358,7 @@ impl Pass1Harness {
 
         // Warm-up: real completions + idle RTT probes per bridge.
         for bridge in &bridges {
-            self.warm_up(bridge, params).await?;
+            self.warm_up(bridge, params, &spec.name()).await?;
         }
 
         // The candidate set: roster facts + F15 observations, shared by
@@ -608,9 +608,19 @@ impl Pass1Harness {
     }
 
     /// Warm-up completions + RTT-probe wait for one bridge (unrecorded).
-    async fn warm_up(&self, bridge: &LiveBridge, params: &Pass1Params) -> Result<(), String> {
+    /// `cell` rides the request id: LAN cells re-dial the SAME long-lived
+    /// serve-side bridges, whose replay dedup persists across cells — a
+    /// cell-agnostic id would be refused as `replayed_request` from the
+    /// second cell on (loopback cells spawn fresh bridges per cell, so
+    /// only LAN can hit this).
+    async fn warm_up(
+        &self,
+        bridge: &LiveBridge,
+        params: &Pass1Params,
+        cell: &str,
+    ) -> Result<(), String> {
         for round in 0..params.warmup_completions {
-            let request_id = format!("p1-warmup-{}/{}", bridge.peer_id, round);
+            let request_id = format!("p1-warmup-{cell}/{}/{}", bridge.peer_id, round);
             execute_on(&WireRequest {
                 executor: &bridge.executor,
                 profile_id: &self.profile_id,

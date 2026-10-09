@@ -24,6 +24,7 @@ tauri-shell = [
     "dep:modelswarm-gateway",
     "dep:modelswarm-identity",
     "dep:modelswarm-telemetry",
+    "dep:modelswarm-scheduler",
     "dep:futures-util",
     "dep:tokio",
     "dep:reqwest",
@@ -46,6 +47,10 @@ modelswarm-store = { path = "../modelswarm-store", optional = true }
 modelswarm-gateway = { path = "../modelswarm-gateway", optional = true }
 modelswarm-identity = { path = "../modelswarm-identity", optional = true }
 modelswarm-telemetry = { path = "../modelswarm-telemetry", optional = true }
+# Shadow-mode scheduler wiring (dependency-graph edge 11): ranks the
+# roster with the frozen cost model over F15 measurements and logs the
+# decision; never acts on it.
+modelswarm-scheduler = { path = "../modelswarm-scheduler", optional = true }
 tokio = { version = "1", optional = true, features = ["macros", "rt", "sync", "time"] }
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }

@@ -3407,6 +3407,7 @@ dependencies = [
  "modelswarm-gateway",
  "modelswarm-identity",
  "modelswarm-node",
+ "modelswarm-scheduler",
  "modelswarm-store",
  "modelswarm-telemetry",
  "modelswarm-tracker-api",
@@ -3482,6 +3483,7 @@ dependencies = [
  "modelswarm-gateway",
  "modelswarm-identity",
  "modelswarm-runtime",
+ "modelswarm-scheduler",
  "modelswarm-store",
  "modelswarm-telemetry",
  "modelswarm-tracker-api",
@@ -3531,8 +3533,10 @@ dependencies = [
 name = "modelswarm-scheduler"
 version = "0.2.20"
 dependencies = [
+ "modelswarm-transport",
  "modelswarm-types",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

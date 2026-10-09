@@ -46,6 +46,10 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 
 [dev-dependencies]
 modelswarm-runtime = { path = "../modelswarm-runtime", features = ["mock-runtime"] }
+# Shadow-planner integration test only (tests join F15 PeerMetrics
+# observations with the frozen cost model); the production node crate
+# does NOT depend on the scheduler.
+modelswarm-scheduler = { path = "../modelswarm-scheduler" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 

@@ -1397,6 +1397,130 @@ async fn earn_lease(
     Some(issued.lease)
 }
 
+/// Shadow-planner context gathered BEFORE production selection
+/// (dependency-graph edge 11: shadow planner before any acting
+/// planner): the F15 measurement snapshots joined with THIS roster
+/// lookup, the env-tunable queue-discount policy, and coarse token
+/// estimates. Shadow data only — nothing here influences which peer
+/// serves.
+struct ShadowPlan {
+    trace_id: String,
+    own_peer_id: String,
+    inputs: Vec<modelswarm_scheduler::shadow::ShadowCandidateInput>,
+    policy: modelswarm_scheduler::shadow::EnvPolicy,
+    prompt_tokens: u32,
+    output_tokens: u32,
+    metrics: std::sync::Arc<modelswarm_node::measure::PeerMetrics>,
+}
+
+/// Builds the shadow inputs from the roster + the shared F15 recorder
+/// (lazily opened, store-backed, same instance the pooled executors
+/// use), and resolves the env-tunable discount policy with visible
+/// warnings. Never dials, never selects.
+async fn gather_shadow_plan(
+    inner: &tokio::sync::Mutex<Inner>,
+    telemetry: &std::sync::Arc<Telemetry>,
+    peers: &[modelswarm_tracker_api::PeerEntry],
+    own_peer_id: &str,
+    log: &[ChatTurn],
+    max_tokens: Option<u32>,
+) -> ShadowPlan {
+    let metrics = {
+        let mut guard = inner.lock().await;
+        match &guard.peer_metrics {
+            Some(m) => std::sync::Arc::clone(m),
+            None => {
+                let m = std::sync::Arc::new(modelswarm_node::measure::PeerMetrics::open(
+                    guard.data_dir.join("state.sqlite"),
+                    std::sync::Arc::clone(telemetry),
+                ));
+                guard.peer_metrics = Some(std::sync::Arc::clone(&m));
+                m
+            }
+        }
+    };
+    let inputs = peers
+        .iter()
+        .filter(|p| p.peer_id != own_peer_id)
+        .map(|p| modelswarm_scheduler::shadow::ShadowCandidateInput {
+            roster: modelswarm_scheduler::shadow::RosterFacts {
+                peer_id: p.peer_id.clone(),
+                free_slots: u32::from(p.free_slots),
+                advertised_queue_ms: Some(p.queue_ms),
+                capacity_class: p.capacity_class.clone(),
+                has_direct_quic_addr: p
+                    .addresses
+                    .iter()
+                    .any(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0")),
+            },
+            observed: metrics.observe(&p.peer_id),
+        })
+        .collect();
+    let policy = modelswarm_scheduler::shadow::QueueDiscountPolicy::from_env();
+    for warning in &policy.warnings {
+        telemetry.warn("sched.shadow.policy", &[("warning", warning.as_str())]);
+    }
+    let prompt_chars: usize = log.iter().map(|t| t.content.chars().count()).sum();
+    ShadowPlan {
+        trace_id: format!("shadow-{}", modelswarm_identity::new_nonce()),
+        own_peer_id: own_peer_id.to_string(),
+        inputs,
+        policy,
+        prompt_tokens: modelswarm_scheduler::shadow::estimate_tokens_from_chars(prompt_chars),
+        output_tokens: max_tokens.unwrap_or(256),
+        metrics,
+    }
+}
+
+/// Computes and logs the shadow decision — the peer
+/// `select_microswarm` would rank first over the F15 measurements —
+/// next to the peer production actually picked. Returns the shadow pick
+/// for the post-completion divergence record. Logs only; NEVER acts.
+fn log_shadow_decision(
+    telemetry: &Telemetry,
+    plan: &ShadowPlan,
+    profile: &str,
+    production_pick: &str,
+) -> Option<String> {
+    let decision = modelswarm_scheduler::shadow::shadow_decision(
+        &plan.inputs,
+        &plan.own_peer_id,
+        profile,
+        Some(production_pick),
+        plan.prompt_tokens,
+        plan.output_tokens,
+        &plan.policy,
+    );
+    let pick = decision.pick.clone();
+    let pick_predicted = decision
+        .ranked
+        .first()
+        .and_then(|r| r.predicted_ms)
+        .map(|ms| format!("{ms:.1}"))
+        .unwrap_or_else(|| "unmeasured".into());
+    let agree = decision
+        .agree
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let json = serde_json::to_string(&decision).unwrap_or_else(|_| "{}".into());
+    telemetry.info(
+        "sched.shadow.decision",
+        &[
+            ("label", decision.label.as_str()),
+            ("trace", plan.trace_id.as_str()),
+            ("profile", profile),
+            ("pick", decision.pick.as_deref().unwrap_or("none")),
+            ("pick_predicted_ms", &pick_predicted),
+            ("production_pick", production_pick),
+            ("agree", agree.as_str()),
+            ("candidates", &decision.candidate_count.to_string()),
+            ("measured", &decision.measured_count.to_string()),
+            ("decision", json.as_str()),
+        ],
+    );
+    pick
+}
+
 /// F1(3): swarm-first chat. Finds a peer verifiably hosting this exact
 /// profile with a REAL advertised address (not the no-listener
 /// placeholder, not ourselves), and asks it first. The REMOTE executor is
@@ -1437,6 +1561,14 @@ async fn try_swarm_chat(
     let identity = load_or_create_identity(data_dir, telemetry).ok()?;
     let own_peer_id = identity.peer_id();
 
+    // SHADOW PLANNER (dependency-graph edge 11; M10 build item 3,
+    // restricted single-pick shape): join the F15 measurements with
+    // THIS roster before production selection so the decision below
+    // logs what `select_microswarm` would have chosen. It never acts —
+    // production selection stays first-found, byte-for-byte below.
+    let shadow_plan =
+        gather_shadow_plan(inner, telemetry, &peers, &own_peer_id, log, max_tokens).await;
+
     // First peer with a real QUIC multiaddr that is not us.
     let candidate = peers.into_iter().find(|p| {
         p.peer_id != own_peer_id
@@ -1465,6 +1597,10 @@ async fn try_swarm_chat(
             ("addr", peer.addr.as_str()),
         ],
     );
+    // SHADOW DECISION (logged only; never acts): the frozen cost
+    // model's pick over the F15 measurements vs. this first-found
+    // production pick — the 9.6 pass-1 divergence seed.
+    let shadow_pick = log_shadow_decision(telemetry, &shadow_plan, profile, &remote_peer_id);
 
     let make_request = || modelswarm_gateway::NormalizedRequest {
         request_id: format!("chat-{}", modelswarm_identity::new_nonce()),
@@ -1494,18 +1630,10 @@ async fn try_swarm_chat(
     let remote = {
         let mut inner_state = inner.lock().await;
         // F15: one measurement recorder per app, store-backed (best
-        // effort; degrades to memory-only with a logged warning).
-        let metrics = match &inner_state.peer_metrics {
-            Some(m) => std::sync::Arc::clone(m),
-            None => {
-                let m = std::sync::Arc::new(modelswarm_node::measure::PeerMetrics::open(
-                    inner_state.data_dir.join("state.sqlite"),
-                    std::sync::Arc::clone(telemetry),
-                ));
-                inner_state.peer_metrics = Some(std::sync::Arc::clone(&m));
-                m
-            }
-        };
+        // effort; degrades to memory-only with a logged warning) —
+        // opened by the shadow-plan gathering above, which always runs
+        // before selection.
+        let metrics = std::sync::Arc::clone(&shadow_plan.metrics);
         match &inner_state.swarm_executor {
             Some((k, exec)) if k == &key => std::sync::Arc::clone(exec),
             _ => {
@@ -1669,6 +1797,44 @@ async fn try_swarm_chat(
             ("elapsed_ms", &elapsed_ms.to_string()),
         ],
     );
+    // 9.6 pass-1 dataset seed: the realized outcome vs. the shadow
+    // prediction, correlated by trace + peer ids. TTFT/total are the
+    // requester-measured EWMAs the executor recorded for THIS request
+    // (per-request values live in `net.completion`); everything here is
+    // numbers and ids only.
+    {
+        let observed = shadow_plan.metrics.observe(&remote_peer_id);
+        let profile_obs = observed.profile(profile);
+        let ttft_ewma = profile_obs
+            .and_then(|p| p.ttft_ewma_ms)
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "unmeasured".into());
+        let total_ewma = profile_obs
+            .and_then(|p| p.total_ewma_ms)
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "unmeasured".into());
+        telemetry.info(
+            "sched.shadow.realized",
+            &[
+                ("label", modelswarm_scheduler::shadow::SHADOW_LABEL),
+                ("trace", shadow_plan.trace_id.as_str()),
+                ("profile", profile),
+                ("production_peer", remote_peer_id.as_str()),
+                ("shadow_pick", shadow_pick.as_deref().unwrap_or("none")),
+                (
+                    "served_by",
+                    if served_remote {
+                        "remote"
+                    } else {
+                        "local_fallback"
+                    },
+                ),
+                ("wall_ms", &elapsed_ms.to_string()),
+                ("ttft_ewma_ms", &ttft_ewma),
+                ("total_ewma_ms", &total_ewma),
+            ],
+        );
+    }
     Some(serde_json::json!({
         "content": content,
         "completion_tokens": completion_tokens,

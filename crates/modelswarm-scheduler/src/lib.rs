@@ -3,6 +3,9 @@
 //! ADR-013 cost model v2 for cooperative modes, the frozen engage rule with
 //! its margin floor, bounded micro-swarm selection, and the EWMA estimator
 //! that keeps requester-measured values dominant over self-reported ones.
+//! The [`shadow`] module wires those formulas over the F15 measurement
+//! plumbing in shadow mode — it logs the plan it would choose and never
+//! acts (dependency-graph edge 11).
 //!
 //! # Frozen rules (ADR-013)
 //!
@@ -16,6 +19,8 @@
 
 use modelswarm_types::ModelProfileId;
 use serde::{Deserialize, Serialize};
+
+pub mod shadow;
 
 /// Default confidence margin for the engage rule (ADR-013: 0.15).
 pub const DEFAULT_CONFIDENCE_MARGIN: f64 = 0.15;

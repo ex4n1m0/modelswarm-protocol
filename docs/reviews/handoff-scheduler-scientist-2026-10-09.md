@@ -472,3 +472,180 @@ shadow planner), with the 9.6 pass-1 harness (§6) as the Scheduler
 Scientist's next implementation assignment. Immediately mergeable
 independently of the gate: the S4 comparator fix and the S5 sim rtt-spike
 case (both inside owned paths, small, evidence-only).
+
+---
+
+# Shadow-mode scheduler wiring (implementation, 2026-10-09, second entry)
+
+Critical-path item after F15 (master-roadmap §critical path;
+dependency-graph hard edge 11: "Shadow planner BEFORE any acting
+planner"). **Shadow only: production peer selection is unchanged**
+(first-found in `try_swarm_chat` — the `find(...)` is byte-identical);
+the planner logs the plan it would choose and never acts.
+
+## What was built
+
+1. **Shadow planner module** — `crates/modelswarm-scheduler/src/shadow.rs`
+   (owned path): `candidate_from_observations` maps one roster row + its
+   F15 `PeerObservations`/`ProfileObservations` into a frozen-model
+   `Candidate` (rtt_ewma_ms → measured_rtt_ms; Usage-derived prefill/
+   decode rate EWMAs → token rates; failure_count × 50 ms →
+   failure_penalty; capacityClass → CapacityClass, unknown → conservative
+   `cpu`); `shadow_decision` runs the frozen `select_microswarm(want=1)`
+   over the mapped candidates and returns a serializable
+   `ShadowDecision` (full ranking + pick + production pick + agree flag +
+   policy record). All-cold rosters record `pick: null` with every
+   `predicted_ms: null` (insufficient measurement) instead of an
+   alphabetical INFINITY-tie-break guess.
+2. **Reviewed decision: the advertised-vs-measured queue discount**
+   (deferred to me in the F15 handoff). Conservative policy, frozen
+   formula untouched — the discount shapes the
+   `Candidate.advertised_queue_ms` input:
+   `effective = clamp(max(w_adv·min(advertised, cap),
+   w_meas·clamp(measured_estimate, 0, cap)), 0, cap)` where
+   `measured_estimate = max(0, ttft_ewma − rtt_ewma −
+   prompt_tokens/prefill_rate)` (upper bound; missing prefill rate
+   subtracts nothing). Invariants: measured dominates (a `0`-queue liar
+   is charged the measured delay), advertised only ever penalizes
+   (relative to measured-only, an advertisement can only ADD), cap bounds
+   garbage (default 120 000 ms = gateway max deadline), weights clamped
+   to [0,1] (untrusted input never amplified). **Env-tunable for 9.6:**
+   `MSP_SHADOW_QUEUE_ADVERTISED_WEIGHT` (default 1.0),
+   `MSP_SHADOW_QUEUE_MEASURED_WEIGHT` (default 1.0),
+   `MSP_SHADOW_QUEUE_CAP_MS` (default 120000); unparsable/non-positive
+   values keep defaults with a logged `sched.shadow.policy` warning; the
+   decision record carries `policy.env_overrides` so experiment runs are
+   distinguishable from defaults.
+3. **Desktop shadow wiring** — `try_swarm_chat` (app.rs, sanctioned
+   surface per coordinator tasking; minimal delta): gathers shadow inputs
+   from the roster + the shared F15 recorder BEFORE the unchanged
+   first-found `find`, then emits structured telemetry —
+   `sched.shadow.decision` (label `shadow-no-action`, trace id, pick,
+   pick_predicted_ms, production_pick, agree, counts, full JSON ranking
+   with per-candidate advertised/measured/effective queue) and, after the
+   stream completes, `sched.shadow.realized` (trace, production peer,
+   shadow pick, served_by remote|local_fallback, wall_ms, ttft/total
+   EWMAs) — the 9.6 pass-1 divergence dataset seed. Numbers and ids only
+   (AGENTS rule 5). The executor block's duplicated metrics lazy-init was
+   deduplicated into the gathering step (same Arc, same store path).
+4. **Loopback integration test** —
+   `remote::shadow_tests::shadow_planner_diverges_from_first_found_over_quic`
+   (modelswarm-node, behind `libp2p-backend`, F15's
+   `remote_executor_measures_completions_and_rtt_over_quic` pattern): two
+   REAL serving bridges in production roster order, one real completion +
+   idle RTT probe against the second, then the shadow decision over the
+   real observations. Asserts: pick = measured-fast peer,
+   production_pick = first-found, agree = false, finite queue-charged
+   prediction (120 < predicted < 400 ms), cold peer ranked with
+   `predicted_ms: null`, effective queue = advertised 120 (advertised ≥
+   small measured estimate), AND that the never-measured peer's executor
+   served 0 requests — the shadow provably does not dial.
+
+## Found and recorded: a profile-id type mismatch
+
+Production profile ids are ADR-011 **derived** ids (`msp1:<64 hex>`,
+`modelswarm_types::manifest::PROFILE_ID_PREFIX`); the frozen
+`scheduler::Candidate.profile_id` is the catalog format
+(`ModelProfileId`, `msp:family:quant:version`) — production strings FAIL
+`ModelProfileId::new`. Root cause: `ModelProfileId` has no production
+consumer (bench's synthetic `msp:mock-4b:q4_k_m:v1` only). Handled with a
+deterministic injective adapter in the shadow module
+(`shadow_profile_id`: catalog format passes through; anything else
+hex-encodes into `msp:s<hex>:x:v1`) so the frozen selector's
+exact-profile filter stays structurally satisfied — all candidates of one
+profile-keyed lookup map to one synthetic id; different profiles never
+collide. The proper fix (Candidate carrying the production id string) is
+an API change to the frozen crate reserved for the acting-wiring step
+(§5 item 5) with review; flagged as the top wiring-step prerequisite.
+
+## Zero-behavior-change proof points
+
+- The production `find(...)` and everything after it (executor keying,
+  dial, fallback) are byte-identical; only additive gathering/logging
+  around them.
+- The shadow path performs no I/O beyond `PeerMetrics::observe` (in-memory
+  read + lazy store hydration) and one telemetry event; no dials (asserted
+  in the integration test).
+- Early-return paths unchanged: no dialable peer → `?` returns before any
+  decision event (nothing served, nothing to diverge from).
+
+## Changed files and why
+
+- `crates/modelswarm-scheduler/src/shadow.rs` (NEW) — mapping, discount
+  policy + env resolution, decision record, adapter; 19 unit tests.
+- `crates/modelswarm-scheduler/src/lib.rs` — register `pub mod shadow`.
+- `crates/modelswarm-scheduler/Cargo.toml` — dep `modelswarm-transport`
+  (observe types only, default features; acyclic — transport does not
+  depend on the scheduler); dev-dep `serde_json`.
+- `crates/modelswarm-desktop/Cargo.toml` — dep `modelswarm-scheduler`
+  (tauri-shell feature only).
+- `crates/modelswarm-desktop/src/app.rs` — `ShadowPlan` +
+  `gather_shadow_plan` + `log_shadow_decision`; three call-site insertions
+  in `try_swarm_chat`; metrics init dedup. Windows Product owns this file;
+  the coordinator's shadow-wiring tasking sanctions the minimal delta
+  (same pattern as F15's sanctioned app.rs wiring).
+- `crates/modelswarm-node/Cargo.toml` — **dev-dep only**
+  `modelswarm-scheduler` (the integration test joins observations with the
+  frozen model; the production node crate does NOT depend on the
+  scheduler).
+- `crates/modelswarm-node/src/remote.rs` — `shadow_tests` module (Runtime/
+  Windows-owned file; test-only addition beside F15's measure_tests).
+- `Cargo.lock` — dependency graph additions.
+
+## Commands and outcomes (all green before commit)
+
+- `cargo fmt --all --check` — PASS.
+- `cargo clippy --workspace --all-targets -- -D warnings` — PASS.
+- `cargo clippy --workspace --all-targets --features
+  modelswarm-node/libp2p-backend -- -D warnings` — PASS.
+- `TAURI_CONFIG='{"bundle":{"resources":[]}}' cargo clippy -p
+  modelswarm-desktop --all-targets --features tauri-shell -- -D warnings`
+  — PASS.
+- `cargo test --workspace` — 49 suites, **335 passed / 0 failed** (F15
+  baseline 316 + 19 scheduler shadow unit tests).
+- `cargo test --workspace --features modelswarm-node/libp2p-backend` —
+  **355 passed / 0 failed** (F15 baseline 335 + 19 + 1 shadow integration
+  test over the real serving bridge; env-gated ignores unchanged).
+- `TAURI_CONFIG='{"bundle":{"resources":[]}}' cargo test -p
+  modelswarm-desktop --features tauri-shell` — 7 passed / 0 failed.
+
+## Assumptions
+
+1. The coordinator's tasking sanctions the minimal `app.rs` +
+   `remote.rs`-test deltas (Windows Product / Runtime surfaces), matching
+   F15's precedent; review requested below.
+2. Roster `capacityClass` uses the run-manifest vocabulary
+   (`cpu|gpu_entry|gpu_mid|gpu_high`, snake_case); anything else maps to
+   the eligibility floor `cpu` (never excludes, never boosts).
+3. `nat_path = Direct` for every candidate: production dials only direct
+   QUIC multiaddrs until F2b; the ADR-014 penalties therefore add 0 today
+   and activate with relay dialing.
+4. Prompt-token estimates (chars/4) parameterize logged predictions only;
+   they never gate anything.
+5. `stale_advertisement_penalty_ms` stays 0.0 — roster freshness is not
+   plumbed (unchanged from the audit's S2 list).
+
+## Unresolved risks
+
+- The profile-id adapter is a workaround; the wiring step must move
+  `Candidate` to production id strings (or a shared profile-id type) with
+  ADR-grade review — until then every non-catalog id flows through the
+  hex adapter.
+- Shadow decisions on cold rosters are `pick: null` by design; the 9.6
+  divergence dataset will be sparse until peers accumulate measurements
+  (the store persists EWMAs across restarts, so this warms up).
+- The realized record's ttft/total are EWMAs read post-completion (the
+  per-request values are in `net.completion`); request-id-level joining
+  of decision↔completion rows is future harness work, not a product gap.
+- Env-tunable policy is read per request (a `std::env::var` read per
+  chat turn — negligible at chat cadence, documented behavior for
+  experiments).
+
+## Suggested next task for the integrator
+
+9.6 pass-1 harness (dependency-graph edge 3; F15's `measure_rtt` is in
+place and the shadow planner now exists as the deterministic arm):
+transport-backed bench runner over real peers, window/acceptance
+parameterization (audit S6), acceptance-EWMA store, RTT injection with
+manifest calibration, frozen prompt corpus. Reviewer note: the app.rs
+delta here needs Windows Product sign-off per the ownership map.

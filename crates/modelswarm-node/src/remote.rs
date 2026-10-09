@@ -1308,3 +1308,256 @@ mod measure_tests {
         assert!(silent.observe_all().is_empty());
     }
 }
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::*;
+    use crate::serving::serve_sessions;
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{
+        ExecutorError, ExecutorStream, NormalizedMessage, NormalizedRequest, Sampling,
+    };
+    use modelswarm_identity::InstallationIdentity;
+    use modelswarm_scheduler::shadow::{
+        self, QueueDiscountPolicy, RosterFacts, ShadowCandidateInput,
+    };
+    use modelswarm_transport::libp2p_backend::Libp2pTransport;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Two tokens + a Usage frame (deterministic rates: prefill 3 tok/ms,
+    /// decode 1 tok/ms), counting invocations so the test can prove the
+    /// SHADOW never caused a dial.
+    struct CountingTwoTokenExecutor {
+        served: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl modelswarm_gateway::InferenceExecutor for CountingTwoTokenExecutor {
+        async fn execute(
+            &self,
+            _request: NormalizedRequest,
+        ) -> Result<ExecutorStream, ExecutorError> {
+            self.served
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                ExecutorEvent::TokenDelta {
+                    delta: "a".into(),
+                    index: 0,
+                },
+                ExecutorEvent::TokenDelta {
+                    delta: "b".into(),
+                    index: 1,
+                },
+                ExecutorEvent::Usage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    prefill_ms: 1.0,
+                    decode_ms: 2.0,
+                },
+                ExecutorEvent::Completed {
+                    finish_reason: modelswarm_gateway::FinishReason::Stop,
+                },
+            ])))
+        }
+    }
+
+    fn request(profile_id: &str, token: &str) -> NormalizedRequest {
+        NormalizedRequest {
+            request_id: "req-shadow".into(),
+            profile_id: profile_id.into(),
+            capability_token: Some(token.to_string()),
+            messages: vec![NormalizedMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            sampling: Sampling {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 40,
+                seed: None,
+            },
+            max_tokens: 8,
+            deadline_ms: 10_000,
+            stream: true,
+        }
+    }
+
+    /// Shadow-planner wiring over the REAL serving bridge (F15 pattern;
+    /// environment label: loopback-proven). Two serving peers come up in
+    /// PRODUCTION roster order — `first` (never measured) then `fast`
+    /// (measured via one real completion + the idle RTT probe). Production
+    /// semantics pick first-found; the shadow planner must pick the
+    /// measured-fast peer, record the divergence, and NEVER dial anything
+    /// on its own behalf (`first`'s served counter must stay 0).
+    #[tokio::test]
+    async fn shadow_planner_diverges_from_first_found_over_quic() {
+        // The PRODUCTION profile shape end-to-end: ADR-011 derived id
+        // (valid for the lease gate; the shadow's profile-id adapter
+        // carries it into the frozen selector).
+        let profile_id = crate::serving::lease_helpers::TEST_PROFILE;
+
+        let transport_first =
+            Libp2pTransport::new(&InstallationIdentity::from_bytes(&[91u8; 32])).unwrap();
+        let transport_fast =
+            Libp2pTransport::new(&InstallationIdentity::from_bytes(&[92u8; 32])).unwrap();
+        let listener_first = transport_first.listen("127.0.0.1:0").await.unwrap();
+        let listener_fast = transport_fast.listen("127.0.0.1:0").await.unwrap();
+        let first_peer = transport_first.peer_id().to_string();
+        let fast_peer = transport_fast.peer_id().to_string();
+        let first_addr = listener_first.bound_addr().to_string();
+        let fast_addr = listener_fast.bound_addr().to_string();
+        // The roster dialability filter (app.rs) matches on this suffix —
+        // pin the contract the shadow inputs rely on.
+        assert!(first_addr.ends_with("quic-v1"));
+        assert!(fast_addr.ends_with("quic-v1"));
+
+        let client_identity = InstallationIdentity::from_bytes(&[93u8; 32]);
+        let client_peer_id = Libp2pTransport::new(&client_identity)
+            .unwrap()
+            .peer_id()
+            .to_string();
+        // One independent (policy, token) pair per serving side (the
+        // first-found side is never dialed — its token goes unused).
+        let (policy_first, _token_first) =
+            crate::serving::lease_helpers::policy_and_lease(profile_id, &client_peer_id);
+        let (policy_fast, token_fast) =
+            crate::serving::lease_helpers::policy_and_lease(profile_id, &client_peer_id);
+        let first_executor = Arc::new(CountingTwoTokenExecutor {
+            served: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (_tx_a, rx_a) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_sessions(
+            listener_first,
+            first_executor.clone(),
+            profile_id.into(),
+            policy_first,
+            Arc::new(modelswarm_telemetry::Telemetry::memory().0),
+            rx_a,
+        ));
+        let (_tx_b, rx_b) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_sessions(
+            listener_fast,
+            Arc::new(CountingTwoTokenExecutor {
+                served: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            profile_id.into(),
+            policy_fast,
+            Arc::new(modelswarm_telemetry::Telemetry::memory().0),
+            rx_b,
+        ));
+
+        // ONE real completion against the fast peer (production would
+        // have picked FIRST here — roster order; we dial fast directly to
+        // create the measurement asymmetry the shadow must detect).
+        let metrics = Arc::new(PeerMetrics::memory(Arc::new(
+            modelswarm_telemetry::Telemetry::memory().0,
+        )));
+        let executor = RemoteExecutor::new(
+            RemotePeer {
+                addr: fast_addr,
+                peer_id: fast_peer.clone(),
+            },
+            client_identity,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        executor.set_advertised_queue_ms(Some(120));
+        let stream = executor
+            .execute(request(profile_id, &token_fast))
+            .await
+            .expect("execute starts");
+        let mut text = String::new();
+        futures_util::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            if let ExecutorEvent::TokenDelta { delta, .. } = event {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "ab");
+
+        // The F15 idle RTT probe lands after the clean completion.
+        let wait_until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if metrics.observe(&fast_peer).rtt_ewma_ms.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < wait_until,
+                "post-completion RTT probe did not land within 5 s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Shadow inputs in production roster order: FIRST is first-found
+        // and advertises no queue; FAST advertises 120 ms.
+        let roster = |peer: &str, queue: u64| ShadowCandidateInput {
+            roster: RosterFacts {
+                peer_id: peer.to_string(),
+                free_slots: 1,
+                advertised_queue_ms: Some(queue),
+                capacity_class: Some("gpu_mid".into()),
+                has_direct_quic_addr: true,
+            },
+            observed: metrics.observe(peer),
+        };
+        let inputs = vec![roster(&first_peer, 0), roster(&fast_peer, 120)];
+        let env = shadow::EnvPolicy {
+            policy: QueueDiscountPolicy::DEFAULT,
+            env_overrides: 0,
+            warnings: Vec::new(),
+        };
+        let decision = shadow::shadow_decision(
+            &inputs,
+            &client_peer_id,
+            profile_id,
+            Some(&first_peer), // what first-found production picks
+            2,
+            8,
+            &env,
+        );
+
+        // The divergence the shadow exists to surface.
+        assert_eq!(decision.pick.as_deref(), Some(fast_peer.as_str()));
+        assert_eq!(
+            decision.production_pick.as_deref(),
+            Some(first_peer.as_str())
+        );
+        assert_eq!(decision.agree, Some(false));
+        assert_eq!(decision.candidate_count, 2);
+        assert_eq!(decision.measured_count, 1);
+        assert_eq!(decision.label, "shadow-no-action");
+
+        // Ranking: the measured peer first with a finite, queue-charged
+        // prediction; the cold peer last with NO prediction (not a fake
+        // alphabetical one).
+        assert_eq!(decision.ranked[0].peer_id, fast_peer);
+        let predicted = decision.ranked[0].predicted_ms.expect("finite prediction");
+        assert!(
+            predicted > 120.0 && predicted < 400.0,
+            "queue must be charged and loopback rates must keep it small: {predicted}"
+        );
+        // Discount record: advertised 120 dominates the small measured
+        // estimate (advertised only ever penalizes), and the measured
+        // estimate exists (measured dominates when it would be larger).
+        assert!((decision.ranked[0].effective_queue_ms - 120.0).abs() < 1e-6);
+        assert!(decision.ranked[0].measured_queue_estimate_ms.is_some());
+        assert!(decision.ranked[0].measured);
+        assert_eq!(decision.ranked[1].peer_id, first_peer);
+        assert_eq!(decision.ranked[1].predicted_ms, None);
+        assert!(!decision.ranked[1].measured);
+
+        // The shadow NEVER acts: the first-found peer was never dialed by
+        // the planner (only the explicit completion above moved bytes).
+        assert_eq!(
+            first_executor
+                .served
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "shadow planning must not dial anyone"
+        );
+        // And the serialized record is telemetry-safe (finite numbers).
+        let json = serde_json::to_string(&decision).expect("serializes");
+        assert!(json.contains("\"predicted_ms\":null"));
+        assert!(!json.contains("infinity") && !json.contains("NaN"));
+    }
+}

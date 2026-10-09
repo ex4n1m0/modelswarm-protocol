@@ -1410,6 +1410,7 @@ async fn try_swarm_chat(
     log: &[ChatTurn],
     max_tokens: Option<u32>,
     lease: Option<String>,
+    on_delta: &(dyn Fn(&str) + Send + Sync),
 ) -> Option<serde_json::Value> {
     let tracker = match tracker_client(tracker_url, data_dir, telemetry).await {
         Ok(t) => t,
@@ -1505,7 +1506,7 @@ async fn try_swarm_chat(
         },
         Failed(String),
     }
-    async fn drain_chat<S>(mut events: S) -> ChatOutcome
+    async fn drain_chat<S>(mut events: S, on_delta: &(dyn Fn(&str) + Send + Sync)) -> ChatOutcome
     where
         S: futures_util::Stream<Item = ExecutorEvent> + Unpin,
     {
@@ -1513,7 +1514,10 @@ async fn try_swarm_chat(
         let mut completion_tokens = 0u64;
         while let Some(event) = events.next().await {
             match event {
-                ExecutorEvent::TokenDelta { delta, .. } => content.push_str(&delta),
+                ExecutorEvent::TokenDelta { delta, .. } => {
+                    on_delta(&delta);
+                    content.push_str(&delta);
+                }
                 ExecutorEvent::Usage {
                     completion_tokens: t,
                     ..
@@ -1539,7 +1543,7 @@ async fn try_swarm_chat(
     // execution mode is never hidden.
     let (content, completion_tokens, mode, served_remote) =
         match remote.execute(make_request()).await {
-            Ok(events) => match drain_chat(events).await {
+            Ok(events) => match drain_chat(events, on_delta).await {
                 ChatOutcome::Served {
                     content,
                     completion_tokens,
@@ -1553,7 +1557,7 @@ async fn try_swarm_chat(
                 ChatOutcome::Failed(reason) => {
                     telemetry.warn("chat.swarm.fallback", &[("reason", &reason)]);
                     match local_executor.execute(make_request()).await {
-                        Ok(events) => match drain_chat(events).await {
+                        Ok(events) => match drain_chat(events, on_delta).await {
                             ChatOutcome::Served {
                                 content,
                                 completion_tokens,
@@ -1586,7 +1590,7 @@ async fn try_swarm_chat(
                 let reason = e.to_string();
                 telemetry.warn("chat.swarm.fallback", &[("reason", &reason)]);
                 match local_executor.execute(make_request()).await {
-                    Ok(events) => match drain_chat(events).await {
+                    Ok(events) => match drain_chat(events, on_delta).await {
                         ChatOutcome::Served {
                             content,
                             completion_tokens,
@@ -1652,9 +1656,17 @@ async fn try_swarm_chat(
 #[tauri::command]
 async fn send_chat(
     state: tauri::State<'_, DesktopState>,
+    window: tauri::Window,
     message: String,
     max_tokens: Option<u32>,
 ) -> Result<serde_json::Value, String> {
+    // Per-delta surface (P1): every path that produces tokens (remote swarm
+    // peer, local fallback, local gateway SSE) calls this so the UI renders
+    // text as it arrives. Content only — the final turn (mode label, error
+    // surface, empty-reply note) is still decided by the paths below.
+    let on_delta = move |delta: &str| {
+        let _ = window.emit("chat-delta", serde_json::json!({ "delta": delta }));
+    };
     let (gateway, profile, mut log, node_ctx) = {
         let inner = state.inner.lock().await;
         let running = inner.node.as_ref().ok_or("hosting is off")?;
@@ -1719,6 +1731,7 @@ async fn send_chat(
                 &log,
                 max_tokens,
                 lease,
+                &on_delta,
             )
             .await
             {
@@ -1752,33 +1765,102 @@ async fn send_chat(
         .timeout(Duration::from_secs(180))
         .build()
         .map_err(|e| e.to_string())?;
-    let response: serde_json::Value = http
+    // P1: stream=true — the gateway (and through it the executor) now
+    // forwards deltas as tokens are produced; this loop renders each one via
+    // `on_delta` while accumulating the final turn. The error surface is
+    // unchanged in shape: HTTP-level failures carry the same
+    // {"error":{code,message}} body, and mid-stream failures arrive as an
+    // SSE error event instead — both become the ERROR turn below.
+    let response = http
         .post(format!("http://{gateway}/v1/chat/completions"))
         .json(&serde_json::json!({
             "model": profile,
             "messages": turns,
             "max_tokens": max_tokens.unwrap_or(256),
             "temperature": 0.0,
-            "stream": false,
+            "stream": true,
         }))
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
         .map_err(|e| e.to_string())?;
+
+    let mut stream_error: Option<(String, String)> = None;
+    if !response.status().is_success() {
+        let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+        if let Some(code) = body["error"]["code"].as_str() {
+            stream_error = Some((
+                code.to_string(),
+                body["error"]["message"].as_str().unwrap_or("").to_string(),
+            ));
+        } else {
+            return Err(format!(
+                "gateway answered {} without an error body",
+                code_str_of(body)
+            ));
+        }
+    } else {
+        use futures_util::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut content = String::new();
+        let mut completion_tokens = 0u64;
+        'sse: while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| e.to_string())?;
+            buffer.extend_from_slice(&chunk);
+            while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
+                let raw: Vec<u8> = buffer.drain(..pos + 2).collect();
+                for line in raw.split(|b| *b == b'\n') {
+                    let line = line.strip_suffix(b"\r").unwrap_or(line);
+                    let Some(payload) = line.strip_prefix(b"data: ") else {
+                        continue;
+                    };
+                    if payload == b"[DONE]" {
+                        continue;
+                    }
+                    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+                        continue;
+                    };
+                    if let Some(error) = value.get("error") {
+                        stream_error = Some((
+                            error["code"].as_str().unwrap_or("stream_error").to_string(),
+                            error["message"].as_str().unwrap_or("").to_string(),
+                        ));
+                        break 'sse;
+                    }
+                    if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
+                        if !delta.is_empty() {
+                            on_delta(delta);
+                            content.push_str(delta);
+                        }
+                    }
+                    if let Some(tokens) = value["usage"]["completion_tokens"].as_u64() {
+                        completion_tokens = tokens;
+                    }
+                }
+            }
+        }
+        return finish_local_turn(
+            &state,
+            started,
+            log,
+            content,
+            completion_tokens,
+            stream_error,
+        )
+        .await;
+    }
 
     // A gateway error body (engine crash, restart budget exhausted,
     // profile mismatch) must surface as an ERROR turn — rendering it as
     // "no reply, the model ended its turn" sends the user chasing a
     // phantom prompt problem while hosting is actually broken.
-    if let Some(code) = response["error"]["code"].as_str() {
-        let message = response["error"]["message"].as_str().unwrap_or("");
+    if let Some((code, message)) = stream_error {
+        let message = message.as_str().to_string();
         log_event(
             &state.telemetry,
             "warn",
             "chat.local.error",
-            &[("code", code), ("message", message)],
+            &[("code", code.as_str()), ("message", message.as_str())],
         );
         let mut inner = state.inner.lock().await;
         inner.chat_log = log;
@@ -1792,13 +1874,46 @@ async fn send_chat(
             "error": { "code": code, "message": message },
         }));
     }
+    unreachable!("stream_error is set on every non-success path")
+}
 
-    let content = response["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let completion_tokens = response["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+/// Tiny helper: the raw body of an unrecognized error response, for the
+/// invoke-error bubble only.
+fn code_str_of(body: serde_json::Value) -> String {
+    body.to_string().chars().take(200).collect()
+}
+
+/// Shared tail of the local streaming path: identical bookkeeping to the
+/// pre-streaming version (empty replies never enter the rendered history;
+/// the mode label stays "local single").
+async fn finish_local_turn(
+    state: &tauri::State<'_, DesktopState>,
+    started: Instant,
+    log: Vec<ChatTurn>,
+    content_raw: String,
+    completion_tokens: u64,
+    stream_error: Option<(String, String)>,
+) -> Result<serde_json::Value, String> {
+    if let Some((code, message)) = stream_error {
+        log_event(
+            &state.telemetry,
+            "warn",
+            "chat.local.error",
+            &[("code", code.as_str()), ("message", message.as_str())],
+        );
+        let mut inner = state.inner.lock().await;
+        inner.chat_log = log;
+        return Ok(serde_json::json!({
+            "content": "",
+            "completion_tokens": 0,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "tokens_per_second": 0.0,
+            "mode": "local error",
+            "served_by": "local",
+            "error": { "code": code, "message": message },
+        }));
+    }
+    let content = content_raw.trim().to_string();
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let tok_s = if elapsed_ms > 0 && completion_tokens > 0 {
         (completion_tokens as f64) * 1000.0 / elapsed_ms as f64

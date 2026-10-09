@@ -14,13 +14,18 @@ mock-runtime = []
 
 [dependencies]
 async-trait = "0.1"
+# `bytes` + `futures-util` name the SSE body-chunk stream the llama.cpp
+# adapter consumes (both are already in the graph via reqwest/tokio).
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "time"] }
 # 0.12 to match the workspace (two HTTP stacks compiled into the node
-# binary otherwise; unified 2026-10-08).
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# binary otherwise; unified 2026-10-08). "stream" enables the SSE body
+# consumption (`bytes_stream`) the true-streaming decode path needs.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 sha2 = "0.10"
 modelswarm-types = { path = "../modelswarm-types" }
 

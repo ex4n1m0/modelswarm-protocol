@@ -20,12 +20,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures_util::stream;
+use futures_util::StreamExt;
 use modelswarm_gateway::{
     ExecutorError, ExecutorEvent, ExecutorStream, FinishReason, InferenceExecutor,
     NormalizedMessage, NormalizedRequest,
 };
-use modelswarm_runtime::{InferenceRuntime, RuntimeError, SamplingParams};
+use modelswarm_runtime::{
+    DecodeEvent, DecodeTimings, InferenceRuntime, RuntimeError, SamplingParams,
+};
+use tokio::sync::mpsc;
 
 /// Tokens per [`ExecutorEvent::TokenDelta`] (batching parity with the session
 /// executor's per-round batches).
@@ -106,7 +109,7 @@ pub fn render_chatml(messages: &[NormalizedMessage]) -> String {
 #[async_trait]
 impl InferenceExecutor for SingleLocalExecutor {
     async fn execute(&self, request: NormalizedRequest) -> Result<ExecutorStream, ExecutorError> {
-        let runtime = self.runtime.as_ref().ok_or(ExecutorError::NoPeer)?;
+        let runtime = self.runtime.as_ref().ok_or(ExecutorError::NoPeer)?.clone();
         let profile = self.profile_id.as_deref().ok_or(ExecutorError::NoPeer)?;
         if request.profile_id != profile {
             return Err(fatal("profile_mismatch"));
@@ -132,67 +135,129 @@ impl InferenceExecutor for SingleLocalExecutor {
             seed: request.sampling.seed,
         };
         let budget = Duration::from_millis(u64::from(request.deadline_ms.max(1)));
-        let started = Instant::now();
-        let tokens = match runtime
-            .decode_stream(&handle, &prompt, &sampling, request.max_tokens, budget)
-            .await
-        {
-            Ok(tokens) => tokens,
-            Err(modelswarm_runtime::RuntimeError::Timeout { .. }) => {
-                return Err(fatal("deadline_exceeded"));
-            }
-            Err(modelswarm_runtime::RuntimeError::Cancelled(_)) => {
-                return Err(fatal("cancelled"));
-            }
-            Err(e) => {
-                // The cause must not vanish (a hidden engine failure is
-                // indistinguishable from "no peer" at the gateway) — but it
-                // must not leak either: a stable code on the error, redacted
-                // diagnostics (code/status/length only) in telemetry.
-                let (code, status) = runtime_error_code(&e);
-                if let Some(t) = &self.telemetry {
-                    t.warn(
-                        "executor.decode_failed",
-                        &[
-                            ("code", code),
-                            ("status", &status.to_string()),
-                            ("detail_bytes", &e.to_string().len().to_string()),
-                        ],
-                    );
-                }
-                return Err(fatal(code));
-            }
-        };
 
-        // Batched event stream (Accepted → TokenDelta×n → Usage → Completed).
-        let mut events = Vec::with_capacity(tokens.len() / LOCAL_DELTA_BATCH_TOKENS + 3);
-        events.push(ExecutorEvent::Accepted {
-            queue_position: 0,
-            eta_ms: 0,
-        });
-        for (index, chunk) in tokens.chunks(LOCAL_DELTA_BATCH_TOKENS).enumerate() {
-            let delta = runtime
-                .detokenize(chunk)
-                .await
-                .map_err(|_| fatal("detokenize_failed"))?;
-            events.push(ExecutorEvent::TokenDelta {
-                delta,
-                index: index as u32,
+        // Incremental execution (P1): a driver task forwards events as the
+        // runtime produces them — Accepted immediately, one TokenDelta per
+        // [`LOCAL_DELTA_BATCH_TOKENS`] committed tokens (detokenized in
+        // batch, same event shape as before), Usage + Completed at the end.
+        // The event sequence is unchanged from the materialized version;
+        // only its timeliness changes. Mid-stream runtime failures become
+        // `ExecutorEvent::Error` with the same stable code the pre-stream
+        // `Err(Fatal)` carried (ADR-007: the gateway may fail over only
+        // before the first token). Dropping the consumer drops the decode
+        // stream with it, which aborts the engine-side request.
+        let (tx, rx) = mpsc::unbounded_channel::<ExecutorEvent>();
+        let telemetry = self.telemetry.clone();
+        let max_tokens = request.max_tokens;
+        let prompt_len = prompt.len() as u32;
+        tokio::spawn(async move {
+            let mut decode =
+                runtime.decode_stream_events(&handle, &prompt, &sampling, max_tokens, budget);
+            let _ = tx.send(ExecutorEvent::Accepted {
+                queue_position: 0,
+                eta_ms: 0,
             });
-        }
-        events.push(ExecutorEvent::Usage {
-            prompt_tokens: prompt.len() as u32,
-            completion_tokens: tokens.len() as u32,
-            prefill_ms: 0.0,
-            decode_ms: started.elapsed().as_secs_f64() * 1_000.0,
+            let started = Instant::now();
+            let mut batch: Vec<u32> = Vec::with_capacity(LOCAL_DELTA_BATCH_TOKENS);
+            let mut batch_index: u32 = 0;
+            let mut produced: u32 = 0;
+            let mut timings: Option<DecodeTimings> = None;
+            /// Detokenize failure → the same `detokenize_failed` code the
+            /// pre-streaming executor's fatal path carried.
+            fn detokenize_failure() -> ExecutorEvent {
+                ExecutorEvent::Error {
+                    code: "detokenize_failed".to_string(),
+                    retryable: false,
+                    interrupted_after_tokens: None,
+                }
+            }
+            while let Some(event) = decode.next().await {
+                match event {
+                    Ok(DecodeEvent::Token(id)) => {
+                        produced += 1;
+                        batch.push(id);
+                        if batch.len() >= LOCAL_DELTA_BATCH_TOKENS {
+                            match runtime.detokenize(&batch).await {
+                                Ok(delta) => {
+                                    if tx
+                                        .send(ExecutorEvent::TokenDelta {
+                                            delta,
+                                            index: batch_index,
+                                        })
+                                        .is_err()
+                                    {
+                                        return; // consumer gone: abort the decode
+                                    }
+                                }
+                                Err(_) => {
+                                    let _ = tx.send(detokenize_failure());
+                                    return;
+                                }
+                            }
+                            batch_index += 1;
+                            batch.clear();
+                        }
+                    }
+                    Ok(DecodeEvent::Timings(t)) => timings = Some(t),
+                    Err(e) => {
+                        // The cause must not vanish (a hidden engine failure
+                        // is indistinguishable from "no peer" at the
+                        // gateway) — but it must not leak either: a stable
+                        // code on the event, redacted diagnostics
+                        // (code/status/length only) in telemetry.
+                        let (code, status) = runtime_error_code(&e);
+                        if let Some(t) = &telemetry {
+                            t.warn(
+                                "executor.decode_failed",
+                                &[
+                                    ("code", code),
+                                    ("status", &status.to_string()),
+                                    ("detail_bytes", &e.to_string().len().to_string()),
+                                ],
+                            );
+                        }
+                        let _ = tx.send(ExecutorEvent::Error {
+                            code: code.to_string(),
+                            retryable: false,
+                            interrupted_after_tokens: Some(produced),
+                        });
+                        return;
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                match runtime.detokenize(&batch).await {
+                    Ok(delta) => {
+                        let _ = tx.send(ExecutorEvent::TokenDelta {
+                            delta,
+                            index: batch_index,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = tx.send(detokenize_failure());
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(ExecutorEvent::Usage {
+                prompt_tokens: prompt_len,
+                completion_tokens: produced,
+                prefill_ms: timings.map(|t| t.prompt_ms).unwrap_or(0.0),
+                decode_ms: timings
+                    .map(|t| t.decode_ms)
+                    .unwrap_or_else(|| started.elapsed().as_secs_f64() * 1_000.0),
+            });
+            let finish_reason = if produced >= max_tokens {
+                FinishReason::Length
+            } else {
+                FinishReason::Stop
+            };
+            let _ = tx.send(ExecutorEvent::Completed { finish_reason });
         });
-        let finish_reason = if tokens.len() >= request.max_tokens as usize {
-            FinishReason::Length
-        } else {
-            FinishReason::Stop
-        };
-        events.push(ExecutorEvent::Completed { finish_reason });
-        Ok(Box::pin(stream::iter(events)))
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        });
+        Ok(Box::pin(stream))
     }
 }
 
@@ -201,6 +266,82 @@ mod tests {
     use super::*;
     use modelswarm_gateway::{NormalizedMessage, Sampling};
     use modelswarm_runtime::MockRuntime;
+
+    /// Test runtime whose `decode_stream_events` yields tokens with real
+    /// wall delays (and can fail mid-stream): pins the executor's
+    /// incremental behavior — deltas must reach the consumer as they are
+    /// produced, not after the decode completes.
+    struct SlowStreamRuntime {
+        per_token: Duration,
+        fail_after: Option<u32>,
+    }
+
+    #[async_trait]
+    impl InferenceRuntime for SlowStreamRuntime {
+        fn id(&self) -> modelswarm_runtime::RuntimeDescriptor {
+            modelswarm_runtime::RuntimeDescriptor::new("slow-stream", "1", "a".repeat(64)).unwrap()
+        }
+        async fn load(&self, profile_id: &str) -> Result<modelswarm_runtime::Handle, RuntimeError> {
+            Ok(modelswarm_runtime::Handle::new(profile_id, 1))
+        }
+        async fn tokenize(&self, text: &str) -> Result<Vec<u32>, RuntimeError> {
+            Ok(text.as_bytes().iter().map(|b| u32::from(*b)).collect())
+        }
+        async fn detokenize(&self, ids: &[u32]) -> Result<String, RuntimeError> {
+            let bytes: Vec<u8> = ids.iter().map(|t| *t as u8).collect();
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        async fn prefill(
+            &self,
+            _handle: &modelswarm_runtime::Handle,
+            _ids: &[u32],
+        ) -> Result<modelswarm_runtime::KvCommitment, RuntimeError> {
+            unreachable!("serving never calls prefill")
+        }
+        async fn decode_step(
+            &self,
+            _handle: &modelswarm_runtime::Handle,
+            _prefix: &[u32],
+            _sampling: &SamplingParams,
+        ) -> Result<u32, RuntimeError> {
+            unreachable!("streaming runtime under test")
+        }
+        fn metrics(&self) -> modelswarm_runtime::RuntimeMetrics {
+            modelswarm_runtime::RuntimeMetrics::default()
+        }
+        fn cancel(&self, _task: modelswarm_runtime::TaskId) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+        fn decode_stream_events<'a>(
+            &'a self,
+            _handle: &'a modelswarm_runtime::Handle,
+            _prefix: &'a [u32],
+            _sampling: &SamplingParams,
+            max_tokens: u32,
+            _deadline: Duration,
+        ) -> modelswarm_runtime::DecodeEventStream<'a> {
+            let fail_after = self.fail_after;
+            let per_token = self.per_token;
+            Box::pin(futures_util::stream::unfold(
+                0u32,
+                move |count| async move {
+                    if count >= max_tokens {
+                        return None;
+                    }
+                    if let Some(fail_after) = fail_after {
+                        if count >= fail_after {
+                            return Some((
+                                Err(RuntimeError::Http("engine died".into())),
+                                count + 1,
+                            ));
+                        }
+                    }
+                    tokio::time::sleep(per_token).await;
+                    Some((Ok(DecodeEvent::Token(65)), count + 1))
+                },
+            ))
+        }
+    }
 
     #[test]
     fn chatml_rendering_marks_roles_and_opens_assistant_turn() {
@@ -322,6 +463,76 @@ mod tests {
             ExecutorEvent::Completed {
                 finish_reason: FinishReason::Length
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn token_deltas_arrive_before_the_decode_completes() {
+        use futures_util::StreamExt;
+        // 40 tokens at 15 ms/token ≈ 600 ms decode; the first 16-token
+        // delta must surface well before the completion event (~240 ms vs
+        // ~600 ms — generous margins, the property is what matters).
+        let runtime = Arc::new(SlowStreamRuntime {
+            per_token: Duration::from_millis(15),
+            fail_after: None,
+        });
+        let executor = SingleLocalExecutor::new(Some(runtime), Some("msp1:x".to_string()));
+        let mut stream = executor.execute(request("msp1:x", 40)).await.unwrap();
+        let started = Instant::now();
+        let mut first_delta_after = None;
+        let mut completion_after = None;
+        while let Some(event) = stream.next().await {
+            if matches!(event, ExecutorEvent::TokenDelta { .. }) && first_delta_after.is_none() {
+                first_delta_after = Some(started.elapsed());
+            }
+            if matches!(event, ExecutorEvent::Completed { .. }) {
+                completion_after = Some(started.elapsed());
+            }
+        }
+        let first = first_delta_after.expect("at least one delta");
+        let completed = completion_after.expect("completion event");
+        assert!(
+            first + Duration::from_millis(100) < completed,
+            "first delta at {first:?} must precede completion at {completed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_failure_becomes_an_error_event_with_deltas_intact() {
+        use futures_util::StreamExt;
+        // The engine dies after 20 tokens: one 16-token delta reached the
+        // consumer, so ADR-007 forbids failover — the stream must end with
+        // an explicit Error carrying the transport code, never a fake
+        // completion and never a silent drop.
+        let runtime = Arc::new(SlowStreamRuntime {
+            per_token: Duration::from_millis(1),
+            fail_after: Some(20),
+        });
+        let executor = SingleLocalExecutor::new(Some(runtime), Some("msp1:x".to_string()));
+        let stream = executor.execute(request("msp1:x", 40)).await.unwrap();
+        let events: Vec<ExecutorEvent> = stream.collect().await;
+        let deltas = events
+            .iter()
+            .filter(|e| matches!(e, ExecutorEvent::TokenDelta { .. }))
+            .count();
+        assert_eq!(deltas, 1, "one 16-token delta before the failure");
+        match events.last() {
+            Some(ExecutorEvent::Error {
+                code,
+                retryable,
+                interrupted_after_tokens,
+            }) => {
+                assert_eq!(code, "engine_transport");
+                assert!(!*retryable, "local failures are not failover-eligible");
+                assert_eq!(*interrupted_after_tokens, Some(20));
+            }
+            other => panic!("expected terminal Error event, got {other:?}"),
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ExecutorEvent::Completed { .. })),
+            "no fabricated completion"
         );
     }
 }

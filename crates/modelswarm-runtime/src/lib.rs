@@ -19,6 +19,11 @@
 //! - [`InferenceRuntime::decode_stream`] has a default implementation that
 //!   loops [`InferenceRuntime::decode_step`] under the caller's deadline.
 //!   Adapters may override it (MockRuntime does, to observe cancellation).
+//! - [`InferenceRuntime::decode_stream_events`] is the incremental variant:
+//!   events arrive as the engine produces them (one SSE connection on the
+//!   llama.cpp adapter; the default wraps `decode_stream` collect-then-emit).
+//!   `decode_stream` remains the materialized API every existing consumer
+//!   (bench, session, sim) is written against.
 //! - [`KvCommitment`]'s digest is `sha256(token_span || token ids)` — the
 //!   documented llama.cpp-era approximation from the runtime trait spec
 //!   (exact KV introspection is not exposed by llama.cpp).
@@ -39,6 +44,7 @@ pub use mock::{
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 use sha2::{Digest as ShaDigest, Sha256};
 
 /// Identity of a runtime build. See the crate docs for why this is a separate
@@ -196,6 +202,39 @@ impl std::fmt::Display for TaskId {
     }
 }
 
+/// Server-reported phase split of one decode (the pinned b11407 server's
+/// final SSE chunk `timings`). When the server does not report timings,
+/// [`DecodeEvent::Timings`] is never emitted and callers fall back to
+/// client-side measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeTimings {
+    /// Prompt-eval token count (`prompt_n`).
+    pub prompt_tokens: u64,
+    /// Prompt-eval wall time in milliseconds (`prompt_ms`).
+    pub prompt_ms: f64,
+    /// Generated token count (`predicted_n`).
+    pub completion_tokens: u64,
+    /// Decode wall time in milliseconds (`predicted_ms`).
+    pub decode_ms: f64,
+}
+
+/// Event emitted by [`InferenceRuntime::decode_stream_events`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DecodeEvent {
+    /// One committed generated token. EOS is never emitted as a token; the
+    /// stream ends there (exact parity with `decode_stream`'s Vec output).
+    Token(u32),
+    /// Final server-reported phase timings; emitted at most once, after the
+    /// last token and before the stream ends.
+    Timings(DecodeTimings),
+}
+
+/// Incremental decode stream returned by
+/// [`InferenceRuntime::decode_stream_events`].
+pub type DecodeEventStream<'a> = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<DecodeEvent, RuntimeError>> + Send + 'a>,
+>;
+
 /// Errors produced by inference runtimes.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum RuntimeError {
@@ -296,6 +335,35 @@ pub trait InferenceRuntime: Send + Sync {
         Ok(produced)
     }
 
+    /// Incremental decode: same contract as [`InferenceRuntime::decode_stream`]
+    /// (up to `max_tokens` tokens, EOS-terminated, under `deadline`), but
+    /// events arrive as the engine produces them instead of after the whole
+    /// completion materializes. The default implementation wraps
+    /// `decode_stream` (collect-then-emit) so adapters without native
+    /// streaming stay conformant; the llama.cpp adapter overrides it with a
+    /// single SSE request.
+    fn decode_stream_events<'a>(
+        &'a self,
+        handle: &'a Handle,
+        prefix: &'a [u32],
+        sampling: &'a SamplingParams,
+        max_tokens: u32,
+        deadline: Duration,
+    ) -> DecodeEventStream<'a> {
+        Box::pin(
+            futures_util::stream::once(async move {
+                let tokens = self
+                    .decode_stream(handle, prefix, sampling, max_tokens, deadline)
+                    .await?;
+                let events = futures_util::stream::iter(
+                    tokens.into_iter().map(|id| Ok(DecodeEvent::Token(id))),
+                );
+                Ok::<_, RuntimeError>(events)
+            })
+            .try_flatten(),
+        )
+    }
+
     /// Current throughput and queue metrics.
     fn metrics(&self) -> RuntimeMetrics;
 
@@ -385,5 +453,70 @@ mod tests {
         assert_eq!(splitmix64(42), splitmix64(42));
         assert_ne!(splitmix64(42), splitmix64(43));
         assert_ne!(splitmix64(0), 0);
+    }
+
+    #[tokio::test]
+    async fn default_decode_stream_events_matches_decode_stream() {
+        use futures_util::StreamExt;
+        // Minimal runtime exercising only the default `decode_stream_events`
+        // wrapper: its token sequence must equal `decode_stream` exactly.
+        struct FixedStep;
+        #[async_trait]
+        impl InferenceRuntime for FixedStep {
+            fn id(&self) -> RuntimeDescriptor {
+                RuntimeDescriptor::new("fixed", "1", "a".repeat(64)).unwrap()
+            }
+            async fn load(&self, profile_id: &str) -> Result<Handle, RuntimeError> {
+                Ok(Handle::new(profile_id, 1))
+            }
+            async fn tokenize(&self, text: &str) -> Result<Vec<u32>, RuntimeError> {
+                Ok(vec![u32::try_from(text.len()).unwrap_or(0)])
+            }
+            async fn detokenize(&self, _ids: &[u32]) -> Result<String, RuntimeError> {
+                Ok(String::new())
+            }
+            async fn prefill(
+                &self,
+                _handle: &Handle,
+                _ids: &[u32],
+            ) -> Result<KvCommitment, RuntimeError> {
+                panic!("not under test")
+            }
+            async fn decode_step(
+                &self,
+                _handle: &Handle,
+                prefix: &[u32],
+                _sampling: &SamplingParams,
+            ) -> Result<u32, RuntimeError> {
+                Ok(u32::try_from(prefix.len()).unwrap_or(0) + 7)
+            }
+            fn metrics(&self) -> RuntimeMetrics {
+                RuntimeMetrics::default()
+            }
+            fn cancel(&self, _task: TaskId) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+        }
+        let runtime = FixedStep;
+        let handle = runtime.load("msp1:t").await.unwrap();
+        let sampling = SamplingParams::default();
+        let expected = runtime
+            .decode_stream(&handle, &[1, 2, 3], &sampling, 5, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let events: Vec<Result<DecodeEvent, RuntimeError>> = runtime
+            .decode_stream_events(&handle, &[1, 2, 3], &sampling, 5, Duration::from_secs(5))
+            .collect()
+            .await;
+        let tokens: Vec<u32> = events
+            .into_iter()
+            .map(|e| match e {
+                Ok(DecodeEvent::Token(id)) => id,
+                other => panic!("expected token event, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(tokens, expected);
+        // [1,2,3] → len 3 → 10, then the prefix grows each step.
+        assert_eq!(tokens, vec![10, 11, 12, 13, 14]);
     }
 }

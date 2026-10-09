@@ -389,6 +389,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_content_chunks_arrive_before_the_executor_completes() {
+        // P1 pin: with an executor that yields deltas over time, the SSE
+        // body must surface each chunk as it is produced — not buffer the
+        // whole completion. 7 events at 40 ms/event ≈ 280 ms total; the
+        // first content chunk must be readable well before that.
+        use std::time::{Duration, Instant};
+
+        use futures_util::StreamExt;
+
+        let executor =
+            StaticExecutor::slow_consumer(&["alpha", "beta", "gamma"], Duration::from_millis(40));
+        let response = router(std::sync::Arc::new(executor))
+            .oneshot(chat_request({
+                let mut b = basic_body();
+                b["stream"] = json!(true);
+                b
+            }))
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let mut stream = response.into_body().into_data_stream();
+        let mut seen = Vec::new();
+        let mut first_content_after = None;
+        while let Some(frame) = stream.next().await {
+            let frame = frame.expect("sse frame");
+            seen.extend_from_slice(&frame);
+            if first_content_after.is_none()
+                && String::from_utf8_lossy(&seen).contains("\"content\":\"alpha\"")
+            {
+                first_content_after = Some(started.elapsed());
+            }
+        }
+        let total = started.elapsed();
+        let first = first_content_after.expect("first content chunk observed");
+        assert!(
+            first + Duration::from_millis(60) < total,
+            "first content at {first:?} vs completion at {total:?} — SSE is buffering"
+        );
+    }
+
+    #[tokio::test]
     async fn non_stream_response_shape_is_openai() {
         let executor = StaticExecutor::happy_with(&["Hel", "lo"], 7, FinishReason::Length);
         let response = router(std::sync::Arc::new(executor))

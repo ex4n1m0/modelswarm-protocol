@@ -3516,6 +3516,8 @@ name = "modelswarm-runtime"
 version = "0.2.20"
 dependencies = [
  "async-trait",
+ "bytes",
+ "futures-util",
  "modelswarm-types",
  "reqwest 0.12.28",
  "serde",

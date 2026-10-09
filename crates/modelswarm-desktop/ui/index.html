@@ -464,19 +464,44 @@
       $("transcript").appendChild(div);
       $("transcript").scrollTop = $("transcript").scrollHeight;
     }
+
+    // Live token rendering (P1): the node emits one chat-delta per token
+    // batch as the model produces it; the placeholder bubble is replaced by
+    // the authoritative final message when send_chat returns (same meta,
+    // error and empty-reply handling as before — this only adds interim text).
+    let liveBubble = null, chatGen = 0, bubbleGen = 0;
+    listen("chat-delta", (e) => {
+      if (busy && bubbleGen === chatGen && !liveBubble) {
+        liveBubble = document.createElement("div");
+        liveBubble.className = "msg assistant";
+        liveBubble.setAttribute("aria-label", "generating…");
+        $("transcript").appendChild(liveBubble);
+      }
+      if (liveBubble) {
+        liveBubble.textContent += e.payload.delta;
+        $("transcript").scrollTop = $("transcript").scrollHeight;
+      }
+    });
+    function startChatTurn() { chatGen += 1; bubbleGen = chatGen; }
+    function clearLiveBubble() {
+      if (liveBubble) { liveBubble.remove(); liveBubble = null; }
+      bubbleGen = 0; // late deltas from a finished turn are ignored
+    }
     $("chat-form").onsubmit = async (e) => {
       e.preventDefault();
       const text = $("chat-input").value.trim();
       if (!text || busy) return;
       $("chat-input").value = ""; busy = true; $("send-btn").disabled = true;
+      startChatTurn();
       addMsg("user", text);
       try {
         const r = await invoke("send_chat", { message: text });
+        clearLiveBubble();
         const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms`;
         if (r.error) addMsg("assistant", `⚠ local engine failed (${r.error.code}) — ${r.error.message || "see Diagnostics/logs/node.jsonl"}. Restart hosting or try another model.`, meta);
         else if (r.content) addMsg("assistant", r.content, meta);
         else addMsg("assistant", "(no reply — the model ended its turn before the first token; rephrase the message and send again)", meta);
-      } catch (err) { addMsg("assistant", "error: " + err); }
+      } catch (err) { clearLiveBubble(); addMsg("assistant", "error: " + err); }
       $("send-btn").disabled = false; busy = false; $("chat-input").focus();
     };
 

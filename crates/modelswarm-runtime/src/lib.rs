@@ -33,7 +33,17 @@ pub mod llamacpp;
 #[cfg(feature = "mock-runtime")]
 pub mod mock;
 
+/// P16 research spike: in-process runtime over the pinned llama.cpp C API.
+/// Feature-gated OFF by default; production serving stays on the HTTP
+/// adapter (ADR-021). The unsafe FFI surface is confined to
+/// `capi::ffi` (see its module docs for the pinned-binary identity story).
+#[cfg(feature = "capi-adapter")]
+pub mod capi;
+
 pub use llamacpp::LlamaCppAdapter;
+
+#[cfg(feature = "capi-adapter")]
+pub use capi::{CapiConfig, LlamaCppCapi, VerifyOutcome};
 
 #[cfg(feature = "mock-runtime")]
 pub use mock::{

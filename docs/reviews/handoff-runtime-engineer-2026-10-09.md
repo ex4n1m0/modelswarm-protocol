@@ -452,3 +452,214 @@ clippy `-D warnings` clean on all three gate configurations; fmt clean.
 - Desktop live bubble is a placeholder-per-turn (generation-guarded); if
   concurrent chat turns ever become possible the UI needs a turn id.
 - M1 (value-equality greedy mapping) still open — Architect's call.
+
+---
+
+# P16 — in-process C-API engine adapter spike (2026-10-09, post-9.6)
+
+Verdict up front: **VIABLE on Windows with zero new artifacts.** The pinned
+b11407 bundles already ship the C-API shared library on every OS
+(`llama.dll` / `libllama.so` / `libllama.dylib`, each sha256-pinned in
+`runtime-pins.json` `platforms{}.files`), the pinned `llama.dll` exports the
+full capability surface the cooperative modes need (KV rollback via
+`llama_memory_seq_rm`, per-row logits via `llama_get_logits_ith`, the same
+sampler-chain machinery `llama-server` uses), and a feature-gated prototype
+adapter behind the unchanged `InferenceRuntime` trait proves prefix/KV
+reuse, logits access, and batched linear draft verification with
+token-exact parity against the HTTP adapter on the same binaries + model.
+Production HTTP adapter untouched; feature OFF by default; node never
+enables it.
+
+## What changed (files, why)
+
+- `crates/modelswarm-runtime/Cargo.toml` — new feature `capi-adapter =
+  ["dep:libloading"]` (OFF by default). The crate now defines its own
+  `[lints]` table instead of inheriting the workspace one, with
+  `unsafe_code = "deny"` (workspace: forbid) so the FFI module can carry a
+  module-scoped `#![allow(unsafe_code)]`; every other file in every crate
+  still rejects unsafe code exactly as before (verified: no `unsafe`
+  outside `src/capi/ffi.rs`).
+- `crates/modelswarm-runtime/src/capi/ffi.rs` (NEW) — the workspace's single
+  unsafe scope. Runtime-loads the pinned `llama.dll` from the hash-verified
+  engine bundle (`LoadLibraryExW` + `LOAD_WITH_ALTERED_SEARCH_PATH` so the
+  sibling ggml*.dll dependencies resolve) plus `ggml.dll` for
+  `ggml_backend_load_all_from_path(<bundle dir>)` (mandatory on modern
+  llama.cpp — model load fails with "no backends are loaded" otherwise, the
+  first thing the spike proved). Every required symbol is resolved by name
+  at construction and a missing export fails closed. Struct mirrors
+  (`llama_model_params` 80 B, `llama_context_params` 160 B, `llama_batch`
+  56 B) are derived from the pinned tag's public `include/llama.h` and
+  pinned by layout tests; constructor + `load()` run ABI canaries (default-
+  params sanity, `n_ctx` write/read-back). Safe wrapper methods for
+  backend-init, model/context lifecycle, tokenize/detokenize (b11407's
+  negative-return sizing convention handled),
+  decode-with-logits-mode (`None`/`Last`/`All`),
+  `memory_seq_rm`/`memory_seq_pos_max`, logits rows, and the sampler chain
+  (`llama_sampler_init_greedy` for greedy — bit-parity with the server's
+  temperature-0 path; `temp→top_k→top_p→dist` otherwise, mirroring
+  `sampling_body` semantics incl. the default-equal→greedy mapping).
+- `crates/modelswarm-runtime/src/capi/mod.rs` (NEW) — `LlamaCppCapi`
+  implementing the frozen trait: per-handle contexts (own KV) sharing one
+  model; `sync` = longest-common-prefix rollback + delta-only decode (the
+  structural fix for per-round prefix re-post, with a single-token
+  tail-logits re-materialization path when the KV already matches);
+  `decode_step`/`decode_stream_events` (one-token in-context steps);
+  `prefill`; `propose` (greedy self-continuation, now KV-cheap); `cancel`
+  (cooperative flag, deadline-class like the HTTP adapter). New capability
+  as an INHERENT method (no trait change): `verify_drafts(prefix, draft)` —
+  syncs to prefix-minus-last, ONE `llama_decode` batch of
+  `[prefix_last, draft…]` with logits on every row, accepts while the
+  sampler chain would sample each draft token from its row, rolls the KV
+  back to the first rejection and samples the replacement. Sampling uses
+  llama.cpp's own chain, so greedy results are the server's results.
+- `crates/modelswarm-runtime/tests/capi_loopback.rs` (NEW) — env-gated
+  `#[ignore]`d A/B measurement vs the HTTP adapter on the same pinned
+  engine + GGUF; verifies bundle sha256s against `runtime-pins.json`,
+  spawns the sidecar with the node's exact argv, ServerGuard-kills it on
+  panic paths. Correctness pins (all asserted): tokenize parity with
+  `/tokenize`, 32-token greedy stream parity, detokenize parity, eos
+  agreement (GGUF-derived vs `llama_vocab_eos`), verification outcomes ==
+  HTTP ground truth, reject-path rollback + continuation exactness.
+- `crates/modelswarm-runtime/src/lib.rs` — module declaration + re-exports
+  only (`cfg(feature = "capi-adapter")`).
+
+## Measured results (single machine, single run; labeled)
+
+**ENVIRONMENT: dev machine (Windows 11, CPU-only, 24 logical CPUs, under
+dev-session load), pinned llama.cpp b11407 (bundle sha256-verified against
+`runtime-pins.json` windows-x64; llama-server.exe + llama.dll + ggml.dll +
+ggml-base.dll), SmolLM2-135M-Instruct Q4_K_M (100.6 MiB), ctx 4096, greedy
+(both adapters map default sampling to temperature 0), loopback, both arms
+back-to-back against one warm engine each. NOT LAN. NOT a product claim.
+Machine-load caveat: P1 recorded 4.3–4.9 ms/tok on a quieter day on this
+same machine; here both arms measured ~7.5 ms/tok — relative comparisons
+hold, absolutes are noisy.**
+
+| Measurement (1217-tok prompt class) | HTTP adapter (today) | C-API in-process |
+|---|---|---|
+| Tokenize (1217 tok) | — | identical ids (asserted) |
+| Greedy 32-tok stream | 7.58 ms/tok | 7.50 ms/tok (identical tokens, asserted) |
+| `decode_step`, growing ~1233-tok prefix | 11.20 ms/step (whole prefix POSTed) | 7.69 ms/step (1-token KV append) |
+| Repeated identical prefill ×5 | 9.3–11.1 ms/round (slot cache warm) | **0.14–0.16 ms/round (delta = 0)** |
+| Growing-prefix rounds ×5 (+3 tok) | 12.8–15.0 ms/round | 0.15 ms (delta-0 round) but 12.1–13.9 ms on shape-change rounds — see honest finding below |
+| Speculative round, k=8 (propose+verify) | 83.8 ms (r1), 180.2 ms (r2) | 91.8 ms (r1), 90.1 ms (r2); verify alone 33–36 ms (one 9-row batched decode) |
+| 2-round speculative total | 264.0 ms | **181.9 ms (1.45×)**, no prefix ever re-posted/re-evaluated |
+
+Honest findings, first-class:
+
+1. The HTTP arm's round 2 got WORSE (84→180 ms): the interleaved
+   ground-truth/propose/verify request patterns thrash the server's single
+   slot cache — an independent loopback reproduction of the 9.6 pass-1
+   structural finding (per-round prefix re-post) without any injected delay.
+2. Graph re-reservation churn: in-process decodes that ALTERNATE batch
+   shapes (1 token/1 output vs 3 tokens/0 outputs vs 9/9) each pay a
+   ~10–13 ms `graph_reserve`-class cost in b11407 — it ate the growing-
+   prefix win (12–14 ms vs http's 13–15 ms). Productionization must keep
+   batch shapes stable (uniform output counts; that is exactly what
+   llama-server's pipeline does). The verify round (uniform 9/9) and
+   stream/propose steps (uniform 1/1) are already shape-stable and show the
+   true wins.
+3. Tree verification: NOT implemented and NOT expressible through the
+   public C API without forks — the tree attention-mask construction lives
+   inside `llama_speculative` (C++). The primitives exist (`seq_cp`,
+   multi-sequence batches), so branch-per-sequence trees are plausible
+   follow-up research, but linear verify (implemented, measured) is the
+   documented fallback.
+
+## Build story (question 1 of the spike)
+
+No prebuilt-DLL-from-elsewhere, no compiled artifact, no new engine
+version: the adapter `LoadLibrary`s the SAME `llama.dll` that ships in the
+pinned per-OS engine bundle the node already stages and hash-verifies.
+`ggml_backend_load_all_from_path(<bundle dir>)` registers the bundle's
+ggml-cpu backends (required by b11407; discovered and fixed during the
+spike). Per-OS: `llama.dll` (windows-x64, both CPU and Vulkan variants,
+identical sha), `libllama.so` (linux-x64), `libllama.dylib` (macos) — all
+already pinned in `runtime-pins.json`, so the build story is uniform across
+OSes with zero pin changes. The `windows.h`-free loading path
+(libloading + canonicalized path + altered search order) is the only
+Windows-specific bit and it is 12 lines behind a cfg.
+
+## Identity assessment (question 4; no ADR filed — semantics unchanged)
+
+`canonical_build_hash` continues to anchor runtime identity: the C-API
+adapter consumes the same pinned, sha-verified binaries the HTTP server
+does, and reports the same `EngineIdentity` (name `llama.cpp-capi` for
+telemetry disambiguation, same version tag + canonical_build_hash —
+mirroring how ADR-024 treats the Vulkan variant as a local execution
+detail, not a swarm-visible runtime change). No artifact identity
+assumption changes; profile identity (ADR-022, GGUF-anchored) is untouched.
+Governance note: ADR-019 §3 says the Phase-D research adapter "requires its
+own ADR before implementation" — this spike is the evidence base for that
+ADR, not its bypass; ANY productionization (bench/speculation consumption,
+trait integration of `verify_drafts`, enabling outside research feature
+flags) requires the ADR first. Recommendation recorded for that ADR: keep
+the runtime descriptor's build_hash identical across HTTP/C-API variants,
+add the adapter name to run-manifest `runtime.name` so experiment records
+stay environment-labeled (ADR-019 honesty rules).
+
+## Test evidence (commands + outcomes)
+
+- `cargo test -p modelswarm-runtime --features capi-adapter` — 29/29 (6 new
+  unit: batch/params/model-params layout pins, common-prefix, config
+  defaults, missing-dir fail-closed).
+- Env-gated real-engine loopback (executed twice, second run recorded):
+  `MSP_LLAMA_SERVER=…engine/llama-server.exe MSP_REAL_GGUF=…SmolLM2…
+  cargo test -p modelswarm-runtime --features capi-adapter --test
+  capi_loopback -- --ignored --nocapture` — 1/1 PASS with all exactness
+  pins; raw log at `target/spike-p16/run7.log`; no llama-server process
+  remains (ServerGuard).
+- Gates: `cargo fmt --all --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean; + libp2p-backend config clean;
+  + `cargo clippy -p modelswarm-bench --all-targets --features quic-runner
+  -- -D warnings` clean; + `TAURI_CONFIG='{"bundle":{"resources":[]}}'
+  cargo clippy -p modelswarm-desktop --all-targets --features tauri-shell
+  -- -D warnings` clean; `cargo clippy -p modelswarm-runtime --features
+  capi-adapter --all-targets -- -D warnings` clean (feature-on gate, not in
+  CI); `cargo test --workspace` 347/0; `--features
+  modelswarm-node/libp2p-backend` 367/0; desktop tauri-shell 7/0;
+  bench quic-runner 44/0.
+
+## Assumptions
+
+- The struct mirrors are derived from the pinned tag's public header
+  (`b11407/include/llama.h`, fetched read-only from the ggml-org repo —
+  reference material, no remote code executed); layout tests + runtime ABI
+  canaries (default-params shape, n_ctx read-back) fail closed on drift.
+- One model per adapter (construction-time GGUF path); `load()` creates
+  contexts, never frees them (no handle-eviction API in the trait — same
+  class as the HTTP adapter's stateless handles; documented spike limit).
+- Decode steps block the async executor for ~one token of compute
+  (~7.5 ms here) with a yield between stream steps — acceptable for the
+  research/bench posture, must move to `spawn_blocking`-driven channels
+  before any concurrent use.
+- Non-greedy sampling narrows the u64 seed to llama.cpp's u32; `cancel()`
+  is a cooperative flag without task-id discrimination (deadline-class,
+  documented on the method).
+- Loopback numbers are single-run on a loaded dev machine; the 9.6 pass-2
+  harness (Scheduler Scientist) owns the repeat/P50 protocol.
+
+## Unresolved risks
+
+- Batch-shape instability cost (finding 2) is real but unquantified beyond
+  the observed ~10–13 ms per shape change; the production fix (stable
+  output counts / pre-reserved graphs) needs its own measurement.
+- Multiple contexts share one model — VRAM/RAM per extra handle is the
+  KV cache (~90 MiB at ctx 4096 for SmolLM2-135M; scales with model).
+- `ggml_backend_load_all_from_path` registers process-global backends; a
+  second adapter construction with a DIFFERENT bundle dir would silently
+  keep the first registration (OnceLock) — fine while there is exactly one
+  pinned engine per process (today's invariant), worth a check in the ADR.
+- Vulkan variant in-process is untested (same llama.dll + backend-DLL
+  registration path should work; ADR-024 auto-fit semantics live in the
+  engine's device selection).
+
+## Suggested next task for the integrator
+
+Approve the P16 ADR (ADR-019 amendment): adopt the in-process C-API adapter
+as the cooperative-mode research runtime (name `llama.cpp-capi`, identical
+canonical_build_hash, run-manifest `runtime.name` disclosure), then hand
+the adapter to the Scheduler Scientist for 9.6 pass 2 (loopback, then LAN)
+with `verify_drafts` consumed by the speculation harness — the measured
+1.45× 2-round loopback win over the HTTP path is the number pass 2 must
+beat the fastest single host with, environment-labeled.

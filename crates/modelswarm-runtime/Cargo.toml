@@ -11,6 +11,11 @@ rust-version.workspace = true
 # TEST-ONLY deterministic toy decoder (ADR-019): off by default; the node
 # binary never enables it. `modelswarm-bench` enables it via its path dep.
 mock-runtime = []
+# P16 research spike: IN-PROCESS runtime over the pinned llama.cpp C API
+# (loads the hash-verified `llama.dll` from the engine bundle). OFF by
+# default — production serving stays on the HTTP adapter (ADR-021); the
+# node binary never enables it. Research/bench-only.
+capi-adapter = ["dep:libloading"]
 
 [dependencies]
 async-trait = "0.1"
@@ -28,9 +33,22 @@ tokio = { version = "1", features = ["sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 sha2 = "0.10"
 modelswarm-types = { path = "../modelswarm-types" }
+# Runtime-loading of the pinned C-API library (capi-adapter only).
+libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 
-[lints]
-workspace = true
+# NOTE (lint scope): the workspace sets `unsafe_code = "forbid"`. This crate
+# defines its own lint table instead of inheriting, with `unsafe_code`
+# DENIED rather than forbidden, so the feature-gated `capi-adapter` FFI
+# module (`src/capi/ffi.rs`) can carry a module-scoped
+# `#![allow(unsafe_code)]`. Every other file in this crate — and every other
+# crate, which still inherits the workspace table — rejects unsafe code
+# exactly as before. `deny` + one scoped allow is the minimal relaxation the
+# in-process spike requires; removing the feature removes the allow too.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

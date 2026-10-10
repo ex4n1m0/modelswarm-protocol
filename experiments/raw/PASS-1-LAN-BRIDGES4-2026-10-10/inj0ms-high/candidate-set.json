@@ -1,0 +1,81 @@
+{
+  "candidates": [
+    {
+      "effective_queue_ms": 13.749,
+      "measured": {
+        "decode_tokens_per_ms_ewma": 0.3076923076923077,
+        "failure_count": 0,
+        "prefill_tokens_per_ms_ewma": 1.4999999999999998,
+        "rtt_ewma_ms": 3.1503099999999993,
+        "ttft_ewma_ms": 36.232549999999996
+      },
+      "peer_id": "12D3KooWM2jaZWXPYwsswGeiQsV8rf5gjhH4X8kCxhcLciBMMF9L",
+      "predicted_single_ms": 244.233,
+      "roster": {
+        "advertised_queue_ms": 0,
+        "capacity_class": "gpu_mid",
+        "free_slots": 1
+      }
+    },
+    {
+      "effective_queue_ms": 20.26,
+      "measured": {
+        "decode_tokens_per_ms_ewma": 0.19999999999999998,
+        "failure_count": 0,
+        "prefill_tokens_per_ms_ewma": 1.0,
+        "rtt_ewma_ms": 4.7699,
+        "ttft_ewma_ms": 54.029579999999996
+      },
+      "peer_id": "12D3KooWCpd7N85W6AnN9sksT1dZUSwp2PfeHeoAy2Qki5jemeJt",
+      "predicted_single_ms": 374.03,
+      "roster": {
+        "advertised_queue_ms": 0,
+        "capacity_class": "gpu_mid",
+        "free_slots": 1
+      }
+    },
+    {
+      "effective_queue_ms": 300.0,
+      "measured": {
+        "decode_tokens_per_ms_ewma": 2.0,
+        "failure_count": 0,
+        "prefill_tokens_per_ms_ewma": 4.285714285714285,
+        "rtt_ewma_ms": 2.1058,
+        "ttft_ewma_ms": 12.49887
+      },
+      "peer_id": "12D3KooWEJ3SxKfojrDdFQewtF1jSgtr1iSbnGHNZvgxpzxA5DJZ",
+      "predicted_single_ms": 340.872,
+      "roster": {
+        "advertised_queue_ms": 300,
+        "capacity_class": "gpu_high",
+        "free_slots": 1
+      }
+    },
+    {
+      "effective_queue_ms": 13.988,
+      "measured": {
+        "decode_tokens_per_ms_ewma": 0.3076923076923077,
+        "failure_count": 0,
+        "prefill_tokens_per_ms_ewma": 1.4999999999999998,
+        "rtt_ewma_ms": 2.4539,
+        "ttft_ewma_ms": 35.775180000000006
+      },
+      "peer_id": "12D3KooWHNi22gmYvv8j2s7FXETR7dYKWpBSNHj12hozGu4vBXXa",
+      "predicted_single_ms": 243.775,
+      "roster": {
+        "advertised_queue_ms": 0,
+        "capacity_class": "gpu_mid",
+        "free_slots": 1
+      }
+    }
+  ],
+  "label": "lan-2machine-quic",
+  "output_tokens_basis": 64,
+  "prompt_tokens_basis": 29,
+  "ranking": [
+    "12D3KooWHNi22gmYvv8j2s7FXETR7dYKWpBSNHj12hozGu4vBXXa",
+    "12D3KooWM2jaZWXPYwsswGeiQsV8rf5gjhH4X8kCxhcLciBMMF9L",
+    "12D3KooWCpd7N85W6AnN9sksT1dZUSwp2PfeHeoAy2Qki5jemeJt",
+    "12D3KooWEJ3SxKfojrDdFQewtF1jSgtr1iSbnGHNZvgxpzxA5DJZ"
+  ]
+}

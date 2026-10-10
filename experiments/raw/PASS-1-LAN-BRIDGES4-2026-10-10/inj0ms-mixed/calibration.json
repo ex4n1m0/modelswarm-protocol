@@ -1,0 +1,11 @@
+{
+  "label": "lan-2machine-quic",
+  "method": "skipped-lan-real-rtt",
+  "nominal_injected_ms": 0,
+  "measured_injected_ms_p50": 0.0,
+  "calibration_valid": null,
+  "baseline_p50_ms": 0.0,
+  "cell_p50_ms": 0.0,
+  "probes": 0,
+  "transport_note": "quinn connection stats (loss, smoothed RTT) are not exposed by libp2p-quic 0.14"
+}

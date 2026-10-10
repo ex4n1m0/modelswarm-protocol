@@ -331,6 +331,13 @@ async fn pass1_lan_run() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
+    // Cohort cap (max k arm): default 3 matches the committed pass-1
+    // evidence; raise via env for k-sizing runs against >= 4 serve
+    // bridges (k arms are also bounded by the measured candidate count).
+    let cohort_cap: u32 = std::env::var("MSP_BENCH_COHORT_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -386,7 +393,7 @@ async fn pass1_lan_run() {
         let params = Pass1Params {
             proposal_window: window,
             output_tokens_target: 16,
-            cohort_cap: 3,
+            cohort_cap,
             runs_per_arm: runs,
             warmup_completions: 2,
             ..Pass1Params::default()

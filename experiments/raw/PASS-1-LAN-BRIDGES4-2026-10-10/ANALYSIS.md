@@ -1,5 +1,15 @@
 # PASS-1 LAN k-sizing — 2026-10-10 — 4 bridges (follow-up to PASS-1-LAN-2026-10-10)
 
+> **CORRECTION (2026-10-10, pass-2, commit 4faa6c0):** the pass-1
+> record's causal story "per-bridge synthetic seeds → drafts never
+> match" is wrong — the executor folds the request seed only, so
+> non-divergent bridges produce identical continuations (pinned by
+> test). Pass-1's ~100% fallback was the ENGAGE GATE declining to
+> speculate; the two engaged k4 runs matched drafts through exactly
+> this shared-continuation property. All k-flatness numbers and the
+> prediction-divergence finding stand. See
+> `PASS-2-ENGAGE-*-2026-10-10/ANALYSIS.md`.
+
 Label: `lan-2machine-quic`. Same two machines, same method as
 `PASS-1-LAN-2026-10-10` (see its ANALYSIS.md for environment + ops
 record). Differences: serve side runs `--bridges 4`; the LAN test's

@@ -1,5 +1,15 @@
 # PASS-1 LAN — 2026-10-10 — first two-machine QUIC pass-1 evidence
 
+> **CORRECTION (2026-10-10, pass-2, commit 4faa6c0):** finding 1's
+> mechanism below is wrong. The synthetic executor folds the REQUEST
+> seed only — different bridge seeds produce identical continuations
+> (pinned by test `non_divergent_peers_agree_per_request_seed`), so
+> "per-bridge seeds never match" was never the cause. Pass-1's
+> all-fallback was the ENGAGE GATE refusing to speculate (the run
+> records' reason strings say so). The numbers and every other
+> finding stand; only this causal explanation is superseded. See
+> `PASS-2-ENGAGE-*-2026-10-10/ANALYSIS.md`.
+
 Label: `lan-2machine-quic` (every `decision-join.jsonl` row and every
 `summary.json`). Never a WAN claim.
 

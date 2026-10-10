@@ -1,0 +1,60 @@
+{
+  "cell": "inj0ms-high",
+  "label": "lan-2machine-quic",
+  "regime": "High",
+  "injected_delay_ms": 0,
+  "arms": [
+    {
+      "arm": "fastest-single",
+      "k": null,
+      "n": 120,
+      "completion_ms": {
+        "median": 131.10750000000002,
+        "p10": 77.6474,
+        "p90": 159.97170000000003,
+        "iqr": 21.935249999999996,
+        "n": 120
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.0,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "fixed-k2",
+      "k": 2,
+      "n": 120,
+      "completion_ms": {
+        "median": 130.871,
+        "p10": 77.21010000000001,
+        "p90": 160.1326,
+        "iqr": 57.618750000000006,
+        "n": 120
+      },
+      "fallbacks": 120,
+      "failures": 0,
+      "median_vs_fastest_single": 0.998,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "planner-k",
+      "k": 2,
+      "n": 120,
+      "completion_ms": {
+        "median": 130.49599999999998,
+        "p10": 100.6229,
+        "p90": 159.6552,
+        "iqr": 56.364750000000015,
+        "n": 120
+      },
+      "fallbacks": 120,
+      "failures": 0,
+      "median_vs_fastest_single": 0.995,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    }
+  ],
+  "fastest_single_median_ms": 131.108
+}

@@ -263,8 +263,12 @@ impl Pass1Harness {
 
     /// Re-arms LAN bridges for the next cell (cells consume the pool;
     /// reconnect per cell for fresh warm-up, matching the dry run's
-    /// per-cell bridge lifetimes).
+    /// per-cell bridge lifetimes). Also (re)asserts the LAN label: the
+    /// first cell must be labeled LAN too, not the loopback default —
+    /// the join/summary rows carry this and must never claim loopback
+    /// for a real two-machine run.
     pub fn set_lan_bridges(&mut self, bridges: Vec<LiveBridge>) {
+        self.env_label = crate::runner::ENV_LABEL_LAN;
         self.lan_bridges = Some(bridges);
     }
 
@@ -1520,6 +1524,30 @@ mod tests {
         assert_eq!(leading_match(&p, &v), 2);
         assert_eq!(leading_match(&p, &p), 3);
         assert_eq!(leading_match(&[], &v), 0);
+    }
+
+    #[test]
+    fn set_lan_bridges_labels_cells_lan_not_loopback() {
+        // The LAN run re-arms bridges per cell; if the re-arm doesn't
+        // flip the label, every join/summary row ships as
+        // loopback+injected-delay for a real two-machine run (found on
+        // the 2026-10-10 LAN pass: console said lan-2machine-quic from a
+        // hardcoded constant while all 1,080 rows said loopback).
+        let dir = std::env::temp_dir().join(format!("msp-lan-label-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let acceptance = crate::acceptance::AcceptanceStore::open(dir.join("acceptance.sqlite"))
+            .expect("open acceptance store");
+        let mut harness = Pass1Harness::new(
+            "msp1:aa",
+            InstallationIdentity::from_bytes(&[0xB1; 32]),
+            acceptance,
+            "label-test",
+            dir.clone(),
+        );
+        assert_eq!(harness.env_label, ENV_LABEL_LOOPBACK_INJECTED);
+        harness.set_lan_bridges(Vec::new());
+        assert_eq!(harness.env_label, crate::runner::ENV_LABEL_LAN);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

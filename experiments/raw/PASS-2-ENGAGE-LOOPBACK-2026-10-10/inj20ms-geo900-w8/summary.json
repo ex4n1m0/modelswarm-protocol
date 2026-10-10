@@ -1,0 +1,94 @@
+{
+  "cell": "inj20ms-geo900-w8",
+  "label": "loopback+injected-delay",
+  "regime": "geo900",
+  "injected_delay_ms": 20,
+  "arms": [
+    {
+      "arm": "fastest-single",
+      "k": null,
+      "n": 32,
+      "completion_ms": {
+        "median": 247.1395,
+        "p10": 233.393,
+        "p90": 274.8308,
+        "iqr": 26.84050000000002,
+        "n": 32
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.0,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "fixed-k2",
+      "k": 2,
+      "n": 32,
+      "completion_ms": {
+        "median": 405.47450000000003,
+        "p10": 313.4863,
+        "p90": 566.9853,
+        "iqr": 133.103,
+        "n": 32
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.641,
+      "accepted_tokens_per_round_median": 15.0,
+      "acceptance_rate_mean": 0.763
+    },
+    {
+      "arm": "fixed-k3",
+      "k": 3,
+      "n": 32,
+      "completion_ms": {
+        "median": 407.502,
+        "p10": 321.81600000000003,
+        "p90": 652.4674000000001,
+        "iqr": 155.43824999999998,
+        "n": 32
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.649,
+      "accepted_tokens_per_round_median": 15.0,
+      "acceptance_rate_mean": 0.763
+    },
+    {
+      "arm": "fixed-k4",
+      "k": 4,
+      "n": 32,
+      "completion_ms": {
+        "median": 452.5795,
+        "p10": 353.4972,
+        "p90": 743.6049,
+        "iqr": 174.18875000000003,
+        "n": 32
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.831,
+      "accepted_tokens_per_round_median": 15.0,
+      "acceptance_rate_mean": 0.763
+    },
+    {
+      "arm": "planner-k",
+      "k": 4,
+      "n": 32,
+      "completion_ms": {
+        "median": 420.509,
+        "p10": 314.5103,
+        "p90": 660.6863,
+        "iqr": 216.12525,
+        "n": 32
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.702,
+      "accepted_tokens_per_round_median": 15.0,
+      "acceptance_rate_mean": 0.763
+    }
+  ],
+  "fastest_single_median_ms": 247.14
+}

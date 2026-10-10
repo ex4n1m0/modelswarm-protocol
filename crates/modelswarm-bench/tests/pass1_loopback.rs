@@ -355,9 +355,9 @@ fn pass2_env() -> (Vec<AcceptanceRegime>, u32, Option<u32>, u32, Option<f64>) {
 /// through the geometric prefix-match family (real propose → transport →
 /// verify → accept/reject on the wire; never a store-fed regime) over
 /// the engagement pool. At window 8 the implied per-round acceptance
-/// rates are ~1.0 (high), ~0.85 (geo900), ~0.50 (geo800), ~0.27 (geo700
-/// — expected blocked at the engage gate; the honest never-worse
-/// behavior). Env: `MSP_BENCH_PROFILES` (default
+/// rates are ~1.0 (high), ~0.64 (geo900), ~0.42 (geo800), ~0.27 (geo700
+/// — expected blocked at the engage gate once the EWMA warms; the honest
+/// never-worse behavior). Env: `MSP_BENCH_PROFILES` (default
 /// `high,geo900,geo800,geo700`), `MSP_BENCH_DELAYS` (default `5,20`),
 /// `MSP_BENCH_WINDOW` (+ optional `MSP_BENCH_WINDOW2` second pass),
 /// `MSP_BENCH_RUNS` (default 30; loopback runs typically override to
@@ -460,7 +460,7 @@ async fn pass2_engagement_loopback() {
 /// continuation behavior; a v4-era serve would emit non-matching drafts
 /// for the family seeds). Driver env: `MSP_BENCH_PEER_0..9` (B's lines),
 /// `MSP_BENCH_PROFILES` (default `high,geo900,geo800,geo700` — implied
-/// window-8 acceptance rates ~1.0/~0.85/~0.50/~0.27), `MSP_BENCH_RUNS`
+/// window-8 acceptance rates ~1.0/~0.64/~0.42/~0.27), `MSP_BENCH_RUNS`
 /// (default 30), `MSP_BENCH_WINDOW` (+ optional `MSP_BENCH_WINDOW2`),
 /// `MSP_BENCH_COHORT_CAP` (default 4), `MSP_BENCH_LOSS_MULTIPLIER`
 /// (default `off`), `MSP_BENCH_OUT` (absolute). Labels:

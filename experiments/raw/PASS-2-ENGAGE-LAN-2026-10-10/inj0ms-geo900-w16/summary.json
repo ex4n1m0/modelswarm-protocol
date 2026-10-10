@@ -1,0 +1,94 @@
+{
+  "cell": "inj0ms-geo900-w16",
+  "label": "lan-2machine-quic",
+  "regime": "geo900",
+  "injected_delay_ms": 0,
+  "arms": [
+    {
+      "arm": "fastest-single",
+      "k": null,
+      "n": 120,
+      "completion_ms": {
+        "median": 225.389,
+        "p10": 205.3039,
+        "p90": 251.8453,
+        "iqr": 34.960499999999996,
+        "n": 120
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.0,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "fixed-k2",
+      "k": 2,
+      "n": 120,
+      "completion_ms": {
+        "median": 401.206,
+        "p10": 247.61169999999998,
+        "p90": 689.5452000000002,
+        "iqr": 198.83724999999998,
+        "n": 120
+      },
+      "fallbacks": 4,
+      "failures": 0,
+      "median_vs_fastest_single": 1.78,
+      "accepted_tokens_per_round_median": 15.0,
+      "acceptance_rate_mean": 0.549
+    },
+    {
+      "arm": "fixed-k3",
+      "k": 3,
+      "n": 120,
+      "completion_ms": {
+        "median": 395.2605,
+        "p10": 224.6308,
+        "p90": 642.5814000000001,
+        "iqr": 241.11849999999998,
+        "n": 120
+      },
+      "fallbacks": 4,
+      "failures": 0,
+      "median_vs_fastest_single": 1.754,
+      "accepted_tokens_per_round_median": 15.0,
+      "acceptance_rate_mean": 0.549
+    },
+    {
+      "arm": "fixed-k4",
+      "k": 4,
+      "n": 120,
+      "completion_ms": {
+        "median": 436.8045,
+        "p10": 249.33829999999998,
+        "p90": 684.8073,
+        "iqr": 263.37775,
+        "n": 120
+      },
+      "fallbacks": 4,
+      "failures": 0,
+      "median_vs_fastest_single": 1.938,
+      "accepted_tokens_per_round_median": 15.0,
+      "acceptance_rate_mean": 0.549
+    },
+    {
+      "arm": "planner-k",
+      "k": 2,
+      "n": 120,
+      "completion_ms": {
+        "median": 326.3425,
+        "p10": 243.13,
+        "p90": 642.1129000000001,
+        "iqr": 231.06650000000002,
+        "n": 120
+      },
+      "fallbacks": 30,
+      "failures": 0,
+      "median_vs_fastest_single": 1.448,
+      "accepted_tokens_per_round_median": 15.0,
+      "acceptance_rate_mean": 0.561
+    }
+  ],
+  "fastest_single_median_ms": 225.389
+}

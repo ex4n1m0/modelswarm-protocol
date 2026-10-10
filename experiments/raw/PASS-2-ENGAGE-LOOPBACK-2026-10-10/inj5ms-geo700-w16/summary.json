@@ -1,0 +1,94 @@
+{
+  "cell": "inj5ms-geo700-w16",
+  "label": "loopback+injected-delay",
+  "regime": "geo700",
+  "injected_delay_ms": 5,
+  "arms": [
+    {
+      "arm": "fastest-single",
+      "k": null,
+      "n": 32,
+      "completion_ms": {
+        "median": 232.622,
+        "p10": 217.7764,
+        "p90": 259.87989999999996,
+        "iqr": 32.675749999999994,
+        "n": 32
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.0,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "fixed-k2",
+      "k": 2,
+      "n": 32,
+      "completion_ms": {
+        "median": 619.023,
+        "p10": 259.75559999999996,
+        "p90": 858.3860000000001,
+        "iqr": 462.84425,
+        "n": 32
+      },
+      "fallbacks": 9,
+      "failures": 0,
+      "median_vs_fastest_single": 2.661,
+      "accepted_tokens_per_round_median": 12.0,
+      "acceptance_rate_mean": 0.285
+    },
+    {
+      "arm": "fixed-k3",
+      "k": 3,
+      "n": 32,
+      "completion_ms": {
+        "median": 640.7925,
+        "p10": 260.1444,
+        "p90": 1046.7410000000002,
+        "iqr": 522.8690000000001,
+        "n": 32
+      },
+      "fallbacks": 9,
+      "failures": 0,
+      "median_vs_fastest_single": 2.755,
+      "accepted_tokens_per_round_median": 12.0,
+      "acceptance_rate_mean": 0.285
+    },
+    {
+      "arm": "fixed-k4",
+      "k": 4,
+      "n": 32,
+      "completion_ms": {
+        "median": 296.177,
+        "p10": 245.90359999999998,
+        "p90": 865.2887000000002,
+        "iqr": 448.1075,
+        "n": 32
+      },
+      "fallbacks": 16,
+      "failures": 0,
+      "median_vs_fastest_single": 1.273,
+      "accepted_tokens_per_round_median": 12.0,
+      "acceptance_rate_mean": 0.279
+    },
+    {
+      "arm": "planner-k",
+      "k": 2,
+      "n": 32,
+      "completion_ms": {
+        "median": 295.89599999999996,
+        "p10": 246.28619999999998,
+        "p90": 794.2388000000001,
+        "iqr": 446.53975,
+        "n": 32
+      },
+      "fallbacks": 16,
+      "failures": 0,
+      "median_vs_fastest_single": 1.272,
+      "accepted_tokens_per_round_median": 12.0,
+      "acceptance_rate_mean": 0.279
+    }
+  ],
+  "fastest_single_median_ms": 232.622
+}

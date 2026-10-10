@@ -1,0 +1,94 @@
+{
+  "cell": "inj20ms-geo800-w8",
+  "label": "loopback+injected-delay",
+  "regime": "geo800",
+  "injected_delay_ms": 20,
+  "arms": [
+    {
+      "arm": "fastest-single",
+      "k": null,
+      "n": 32,
+      "completion_ms": {
+        "median": 256.07349999999997,
+        "p10": 235.16279999999998,
+        "p90": 274.9013,
+        "iqr": 22.919250000000005,
+        "n": 32
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.0,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "fixed-k2",
+      "k": 2,
+      "n": 32,
+      "completion_ms": {
+        "median": 261.72,
+        "p10": 244.8073,
+        "p90": 352.7064000000002,
+        "iqr": 27.56899999999999,
+        "n": 32
+      },
+      "fallbacks": 27,
+      "failures": 0,
+      "median_vs_fastest_single": 1.022,
+      "accepted_tokens_per_round_median": 14.0,
+      "acceptance_rate_mean": 0.609
+    },
+    {
+      "arm": "fixed-k3",
+      "k": 3,
+      "n": 32,
+      "completion_ms": {
+        "median": 261.6065,
+        "p10": 244.69729999999998,
+        "p90": 353.7610000000002,
+        "iqr": 28.464249999999993,
+        "n": 32
+      },
+      "fallbacks": 27,
+      "failures": 0,
+      "median_vs_fastest_single": 1.022,
+      "accepted_tokens_per_round_median": 14.0,
+      "acceptance_rate_mean": 0.609
+    },
+    {
+      "arm": "fixed-k4",
+      "k": 4,
+      "n": 32,
+      "completion_ms": {
+        "median": 261.45799999999997,
+        "p10": 244.9292,
+        "p90": 354.12030000000016,
+        "iqr": 26.94425000000001,
+        "n": 32
+      },
+      "fallbacks": 27,
+      "failures": 0,
+      "median_vs_fastest_single": 1.021,
+      "accepted_tokens_per_round_median": 14.0,
+      "acceptance_rate_mean": 0.609
+    },
+    {
+      "arm": "planner-k",
+      "k": 2,
+      "n": 32,
+      "completion_ms": {
+        "median": 254.7905,
+        "p10": 234.17510000000001,
+        "p90": 274.9756,
+        "iqr": 22.418499999999995,
+        "n": 32
+      },
+      "fallbacks": 32,
+      "failures": 0,
+      "median_vs_fastest_single": 0.995,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    }
+  ],
+  "fastest_single_median_ms": 256.073
+}

@@ -657,11 +657,11 @@ pub enum AcceptanceRegime {
     /// drawn by successive `p = p_permille/1000` coin flips (capped at
     /// the window) — the classic speculative-decoding acceptance model
     /// (per-token acceptance p ⇒ expected accepted per round
-    /// `p(1-p^w)/(1-p)`, so the per-round acceptance RATE at window 8 is
-    /// ~0.85 at p=0.9, ~0.50 at p=0.8, ~0.27 at p=0.7, ~0.12 at p=0.5 —
-    /// NOT p itself; the ANALYSIS tables state implied rates). Draws are
-    /// keyed by `(round, draw_key)` — reproducible for a fixed driver
-    /// seed.
+    /// `p(1-p^w)/(1-p)`, so the per-round acceptance RATE is NOT p:
+    /// ~0.64 at p=0.9 w8, ~0.42 at p=0.8 w8, ~0.27 at p=0.7 w8; larger
+    /// windows LOWER the rate for the same p (~0.46 at p=0.9 w16) — the
+    /// ANALYSIS tables state implied rates). Draws are keyed by
+    /// `(round, draw_key)` — reproducible for a fixed driver seed.
     Geometric { p_permille: u32 },
 }
 

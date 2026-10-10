@@ -1,0 +1,29 @@
+[
+  {
+    "acceptance_ewma": 0.287,
+    "accepted_count": 4653,
+    "lifetime_rate": 0.567,
+    "peer_id": "12D3KooWEtC4EueSnTboLbXmR3d72PYDXJ6GnD8yLS97h1hdDwoc",
+    "profile_id": "msp1:1111111111111111111111111111111111111111111111111111111111111111",
+    "proposed_count": 8202,
+    "rounds": 723
+  },
+  {
+    "acceptance_ewma": 0.287,
+    "accepted_count": 6408,
+    "lifetime_rate": 0.567,
+    "peer_id": "12D3KooWKgugh3Hy5yGnDDyChCgmtZjXFtHecvnBgqC1sQY251qi",
+    "profile_id": "msp1:1111111111111111111111111111111111111111111111111111111111111111",
+    "proposed_count": 11301,
+    "rounds": 996
+  },
+  {
+    "acceptance_ewma": 0.287,
+    "accepted_count": 2957,
+    "lifetime_rate": 0.569,
+    "peer_id": "12D3KooWMMTLmKTgoqimd8TVHVucQraQNmKmSGpbxPcwrPUYTXeH",
+    "profile_id": "msp1:1111111111111111111111111111111111111111111111111111111111111111",
+    "proposed_count": 5200,
+    "rounds": 459
+  }
+]

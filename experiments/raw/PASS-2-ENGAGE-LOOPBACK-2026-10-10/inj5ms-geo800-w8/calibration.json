@@ -1,0 +1,11 @@
+{
+  "label": "loopback+injected-delay",
+  "method": "executor-seam 1-token round-trip p50, baseline-subtracted (zero-delay calibration bridge)",
+  "nominal_injected_ms": 5,
+  "measured_injected_ms_p50": 5.244,
+  "calibration_valid": true,
+  "baseline_p50_ms": 53.824,
+  "cell_p50_ms": 59.068,
+  "probes": 24,
+  "transport_note": "quinn connection stats (loss, smoothed RTT) are not exposed by libp2p-quic 0.14"
+}

@@ -462,6 +462,10 @@ async fn hand_built_invalid_metric_types_are_caught() {
 // DEFAULT guard WOULD have done, and that counterfactual must be
 // re-derivable from the row's own numbers — a relaxed engaged-curve run
 // can never masquerade as guard-passing.
+// Feature-gated: LossGuardRecord lives in the quic-runner-gated
+// harness module — ungated, this breaks `cargo test --workspace`
+// (default) and default clippy --all-targets in CI.
+#[cfg(feature = "quic-runner")]
 #[test]
 fn loss_guard_counterfactual_matches_default_arithmetic() {
     // inj0ms-geo700-w16 row: round1_wall/predicted_round ≈ 74.0× — the

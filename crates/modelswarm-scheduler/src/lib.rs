@@ -245,6 +245,85 @@ pub fn should_engage_cooperative(
     Ok(predicted_swarm_ms * (1.0 + margin) < predicted_fastest_single_ms)
 }
 
+/// How a cooperative cohort's verification cost must be charged — the
+/// ADR-032 §4 companion correction ("required regardless of this ADR's
+/// fate"): engine-true and capability-aware, with the wire-true
+/// sequential term as the default for every cohort whose verifier has
+/// not declared the capability. This selection and the decision logic
+/// below it live here (default features) so the engage-gate tests are
+/// per-push CI-runnable (ADR-032 rev 2 execution-venue matrix, item 4a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyTerm {
+    /// The verifier DECLARED batch-verify capability
+    /// ([`Candidate::batch_verify`]): one batched engine pass per draft
+    /// window, charged with the caller's batch coefficient (ADR-013's
+    /// ENGINE constant `VERIFY_BATCH_STEPS = 1.5` lives with the
+    /// cost-model coefficients in the bench crate). No production
+    /// adapter can declare the capability today (ADR-032 §4).
+    Batch,
+    /// No batch-verify declaration — every production cohort today. The
+    /// msp-v1 whole-request wire verifies a draft window in **window+1
+    /// sequential verifier tokens** plus a per-round re-post of the
+    /// committed prefix; pass 2 measured that reality at
+    /// realized/predicted 2.8–8.3× against the 1.5-step batch term
+    /// (`experiments/raw/PASS-2-ENGAGE-LAN-2026-10-10/ANALYSIS.md`,
+    /// finding 4). With this term the engage gate blocks engagement on
+    /// HTTP-only cohorts — the pass-2 never-engage conclusion enforced,
+    /// not advised.
+    SequentialWire,
+}
+
+impl VerifyTerm {
+    /// The term one verifier is charged, from its declared capability.
+    #[must_use]
+    pub fn of_verifier(verifier: &Candidate) -> Self {
+        if verifier.batch_verify {
+            Self::Batch
+        } else {
+            Self::SequentialWire
+        }
+    }
+
+    /// The term a cohort is charged: the VERIFIER decides — the
+    /// fastest-ranked peer (`cohort[0]`) is the role that executes
+    /// verification. An HTTP peer may still act as proposer (a
+    /// first-class single, never a batch verifier — ADR-032 §4), so a
+    /// mixed cohort whose verifier has not declared the capability is
+    /// charged the sequential wire term. An empty cohort is charged the
+    /// conservative wire term.
+    #[must_use]
+    pub fn of_cohort(cohort: &[Candidate]) -> Self {
+        cohort
+            .first()
+            .map_or(Self::SequentialWire, Self::of_verifier)
+    }
+
+    /// Decode steps charged per verify round under this term: the
+    /// caller's batch coefficient (ADR-013's 1.5) for a declared
+    /// verifier, or `window + 1` sequential steps on the msp-v1 wire.
+    #[must_use]
+    pub fn decode_steps_per_round(self, window: u32, batch_steps: f64) -> f64 {
+        match self {
+            Self::Batch => batch_steps,
+            Self::SequentialWire => f64::from(window + 1),
+        }
+    }
+
+    /// Stable, grep-able label for run artifacts and fallback reasons.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Batch => {
+                "batch-verify engine term (verifier declared the capability)"
+            }
+            Self::SequentialWire => {
+                "wire-true sequential verify (window+1 verifier tokens/round + per-round prefix re-post; no batch-verify declaration)"
+            }
+        }
+    }
+}
+
 /// Selects a micro-swarm: filter to exact-profile peers with a free slot,
 /// non-stale advertisements, and at least [`MIN_CAPACITY_CLASS`] hardware;
 /// order by [`predicted_single_ms`] (fastest first) with a deterministic
@@ -628,5 +707,98 @@ mod tests {
         assert!(CapacityClass::Cpu < CapacityClass::GpuEntry);
         assert!(CapacityClass::GpuEntry < CapacityClass::GpuMid);
         assert!(CapacityClass::GpuMid < CapacityClass::GpuHigh);
+    }
+
+    /// ADR-032 §4 companion correction (option A): the verification term
+    /// is capability-aware, ABSENT by default, and charges window+1
+    /// sequential steps when the verifier has not declared the
+    /// capability. Runs under DEFAULT features (execution-venue matrix
+    /// item 4a: per-push, `modelswarm-scheduler`).
+    #[test]
+    fn verify_term_is_absent_by_default_and_charges_window_plus_one() {
+        let verifier = candidate("v", 5.0, 0.0, 3.0, 0.10);
+        assert!(!verifier.batch_verify, "capability defaults to ABSENT");
+        assert_eq!(
+            VerifyTerm::of_verifier(&verifier),
+            VerifyTerm::SequentialWire
+        );
+        assert_eq!(
+            VerifyTerm::of_verifier(&Candidate {
+                batch_verify: true,
+                ..verifier.clone()
+            }),
+            VerifyTerm::Batch
+        );
+        // The cohort term follows the VERIFIER (cohort[0]); proposers
+        // never upgrade it, an empty cohort stays conservative.
+        assert_eq!(
+            VerifyTerm::of_cohort(std::slice::from_ref(&verifier)),
+            VerifyTerm::SequentialWire
+        );
+        assert_eq!(VerifyTerm::of_cohort(&[]), VerifyTerm::SequentialWire);
+        // Steps per round: window+1 sequential vs the caller's batch
+        // coefficient — the (window+1)/1.5 ≈ 6× (w8) to 11× (w16) gap
+        // pass 2 measured on the wire.
+        assert!((VerifyTerm::SequentialWire.decode_steps_per_round(8, 1.5) - 9.0).abs() < 1e-12);
+        assert!((VerifyTerm::SequentialWire.decode_steps_per_round(16, 1.5) - 17.0).abs() < 1e-12);
+        assert!((VerifyTerm::Batch.decode_steps_per_round(8, 1.5) - 1.5).abs() < 1e-12);
+        assert!((VerifyTerm::Batch.decode_steps_per_round(16, 1.5) - 1.5).abs() < 1e-12);
+    }
+
+    /// ADR-032 §4 companion correction, the decision logic (item 4a):
+    /// an HTTP-only cohort NEVER engages — with the verifier of a cohort
+    /// being the fastest eligible single's own peer class, the wire-true
+    /// verification term alone already exceeds the single's whole decode
+    /// budget — while a batch-DECLARED cohort engages exactly when
+    /// `predicted × (1 + margin)` still beats that single.
+    #[test]
+    fn http_never_engages_and_batch_engages_only_beating_the_fastest_single() {
+        // Pass-2 engagement-pool arithmetic (window 8, target 16,
+        // acceptance 1.0 ⇒ 2 rounds; rtt 5 ms; prompt 153 tokens; V
+        // decode 0.10 / prefill 3.0 = the cohort verifier AND the
+        // fastest single; drafter decode 4.0).
+        let verifier = candidate("v", 5.0, 0.0, 3.0, 0.10);
+        let fastest_single = predicted_single_ms(&verifier, 153, 16);
+        assert!((fastest_single - 216.0).abs() < 1e-9, "{fastest_single}");
+
+        // Wire-true verification alone: 2 rounds × (8+1) / 0.10 = 180 ms,
+        // already more than the single's ENTIRE decode term (160 ms) —
+        // before any prefill/proposal/sync/rollback overhead.
+        let wire_verify = 2.0 * VerifyTerm::SequentialWire.decode_steps_per_round(8, 1.5)
+            / verifier.decode_tokens_per_ms;
+        let single_decode = 16.0 / verifier.decode_tokens_per_ms;
+        assert!(
+            wire_verify > single_decode,
+            "sequential verification alone must exceed the single's decode budget"
+        );
+        let wire_prediction = 2.0 * (153.0 + 4.0) / 3.0 /* prefix re-post */
+            + 2.0 * 8.0 / 4.0 /* proposal */
+            + wire_verify
+            + 2.0 * 5.0 /* sync */
+            + 0.0 /* rollback at acceptance 1.0 */
+            + 5.0; /* failure risk (bench coefficient) */
+        assert!(!should_engage_cooperative(wire_prediction, fastest_single, 0.15).unwrap());
+        assert!(
+            wire_prediction > fastest_single,
+            "the wire-true prediction loses outright, before any margin"
+        );
+
+        // Batch-declared twin: 2 × 1.5 / 0.10 = 30 ms verification, one
+        // prompt prefill per round — engages at the default margin, and
+        // stops the moment the fastest single wins instead.
+        let batch_verify =
+            2.0 * VerifyTerm::Batch.decode_steps_per_round(8, 1.5) / verifier.decode_tokens_per_ms;
+        assert!((batch_verify - 30.0).abs() < 1e-9);
+        let batch_prediction = 2.0 * 153.0 / 3.0 + 2.0 * 8.0 / 4.0 + batch_verify + 10.0 + 5.0;
+        assert!(should_engage_cooperative(batch_prediction, fastest_single, 0.15).unwrap());
+        let faster_single = predicted_single_ms(
+            &Candidate {
+                decode_tokens_per_ms: 0.25,
+                ..verifier.clone()
+            },
+            153,
+            16,
+        );
+        assert!(!should_engage_cooperative(batch_prediction, faster_single, 0.15).unwrap());
     }
 }

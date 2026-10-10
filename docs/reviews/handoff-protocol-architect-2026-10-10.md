@@ -75,3 +75,54 @@ After reviews, bring the accept/reject decision to the owner with the
 three-line recommendation: adopt B (VerifyDrafts family in the additive
 cooperative namespace), land A's engine-true scheduler term first as the
 standing guard, keep msp-v1 byte-identical.
+
+---
+
+## Addendum — revision 2 (2026-10-11): both reviews folded into ADR-032
+
+Reviews: `docs/reviews/review-adr-032-testrelease-2026-10-11.md` (commit
+`10de665`: B1–B4, R1–R3, A1–A4) and
+`docs/reviews/review-adr-032-security-2026-10-11.md` (commit `5ad5215`:
+RC-1..RC-8, A-1..A-5). All blockers, required changes, and advisories are
+folded into ADR-032 revision 2 (still Proposed; the owner decision follows).
+
+Reconciliation decisions where the reviews diverged or text was not adopted
+literally:
+
+1. **B2 mechanism (the one substantive divergence).** T/R offered (a) map to
+   existing §6.5 codes or (b) a new code via the ADR-028 §5 amendment
+   process; Security A-5 recommended neither — cooperative-namespace
+   `CancelRound` reasons (`parent_mismatch | round_mismatch |
+   commit_mismatch`) with NO registry change. **Adopted Security's**: fewer
+   frozen surfaces touched, and T/R's actual requirement (exact, decided,
+   testable strings) is fully satisfied — the strings are decided, as
+   CancelRound reasons. Session-stage failure branches (unknown session →
+   `bad_frame`; torn-down → `cancelled_by_peer`; lease-expired →
+   `expired_token`; budget → `overloaded`) are pinned in the §2 partition
+   table.
+2. **Field name for the integer verify duration.** Security's literal delta
+   said `verify_ms_ms`; the task delegated the name. **Chose
+   `verify_pass_ms`** (u32 whole ms): a distinct name from revision 1's
+   float `verify_ms` so a stale float-bearing implementation fails
+   deserialization instead of silently coexisting. All other RC-2 content
+   (integer-only rationale via canonical-JSON float rejection, measured
+   cross-check + 25 ms, `verify_ms_lie` telemetry, per-verifier EWMA,
+   under-report bound) adopted as written.
+3. **T/R A4 vs Security RC-2 on value assertions — complementary, not
+   conflicting:** fixture/gate pins assert `verify_pass_ms ≥ 0` only; the
+   cross-check bound is coordinator behavior, asserted via telemetry in the
+   default-feature test row, never against measured wall times.
+4. **Internal fix surfaced by RC-5(c):** revision 1's I3 said "gap-free"
+   while allowing abandoned rounds; revision 2 splits hash-chain
+   gap-freeness (required) from round-number contiguity (NOT required; the
+   shipped `round == state.round()+1` check is explicitly not inherited).
+
+Housekeeping for the Integrator: the §1 cross-reference paragraph in
+`protocol/msp-cooperative-v1.md` needs a one-line refresh to match revision
+2 — replace "additive `verifier_backend` (SessionOffer) and
+`engine {backend, batch_verify}` (SessionAccept) disclosures" with
+"additive `verifier_backend` (SessionOffer), `engine {backend,
+batch_verify, batch_window_max}` (SessionAccept), and the
+`SessionReject {session_id, protocol_version, reason}` shape". Status
+unchanged: Proposed; no code, no wire bytes, no gates run (docs-only; this
+session is read-only).

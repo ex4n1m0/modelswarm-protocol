@@ -103,6 +103,20 @@ pub struct Candidate {
     pub capacity_class: CapacityClass,
     /// Network path type to this peer.
     pub nat_path: NatPath,
+    /// Whether this peer's serving adapter DECLARED batch-verify
+    /// capability: it can verify a speculative draft window in ONE
+    /// batched engine pass (ADR-032 §4 — the in-process C-API adapter
+    /// class; the pinned llama.cpp HTTP adapter, today's only production
+    /// adapter, cannot, so **no production peer may declare it yet**).
+    /// The flag defaults to ABSENT at every construction site here:
+    /// cost models must charge cohorts whose verifier has not declared
+    /// the capability the wire-true sequential verification term
+    /// (window+1 sequential verifier tokens per round plus the per-round
+    /// prefix re-post — pass 2 measured the msp-v1 whole-request wire at
+    /// 2.8–8.3× the 1.5-step batch term's prediction). A peer
+    /// misreporting the capability degrades its acceptance economics,
+    /// never output correctness (ADR-032 §3).
+    pub batch_verify: bool,
 }
 
 /// Scheduler-rule violations (frozen rules, not heuristics).
@@ -330,6 +344,7 @@ mod tests {
             slots: 2,
             capacity_class: CapacityClass::GpuMid,
             nat_path: NatPath::Direct,
+            batch_verify: false,
         }
     }
 

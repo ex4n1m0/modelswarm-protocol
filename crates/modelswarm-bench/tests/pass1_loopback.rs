@@ -4,8 +4,10 @@
 //! - [`runner_smoke_over_real_quic`] — the fast CI proof: three real
 //!   serving bridges over real QUIC with a 5 ms executor-seam injection,
 //!   all arms, frozen-schema records, request-id-level joins, calibration
-//!   within a timer-tolerant band, acceptance recorded from real wire
-//!   rounds.
+//!   within a timer-tolerant band, and (since the ADR-032 §4 companion
+//!   correction) the never-engage contract: every cooperative row falls
+//!   back at the engage gate under the wire-true sequential verification
+//!   term, and no speculative round runs.
 //! - [`pass1_loopback_dryrun`] — `#[ignore}]`d owner-invoked dry run of
 //!   the full sweep; writes the artifacts committed under
 //!   `experiments/raw/PASS-1-LOOPBACK-DRYRUN/` (see the report at
@@ -173,29 +175,44 @@ async fn runner_smoke_over_real_quic() {
         calibration.measured_injected_ms_p50
     );
 
-    // The round machinery executed on the real wire: the k=3 cohort with
-    // the fast drafter passes the engage gate (model prediction beats the
-    // slow verifier-class single), runs wire rounds (acceptance recorded
-    // per proposer), and the honest outcome here is the observed-loss
-    // rule-6 abort or a completed run — either way, visible.
+    // ADR-032 §4 companion correction (2026-10-11): the acting planner's
+    // verification term is wire-true for any cohort whose verifier has
+    // not declared batch-verify — every cohort today. The verifier of a
+    // cohort here IS the fastest-single peer (ordered[0]), so charging
+    // window+1 sequential verifier tokens per round makes an engaged run
+    // structurally unable to beat the single: the pass-2 never-engage
+    // conclusion, ENFORCED. No speculative round may run on this
+    // HTTP-only loopback cell — the acceptance store stays empty and
+    // every cooperative row is an engage-gate fallback whose reason
+    // names the wire-true term. (The engaged wire-round machinery itself
+    // stays pinned by the runner unit tests and the committed pass-2
+    // owner-gated runs; it is unreachable in CI by design now.)
     assert!(
-        !harness.acceptance().snapshot().is_empty(),
-        "acceptance store filled from real wire rounds"
+        harness.acceptance().snapshot().is_empty(),
+        "HTTP-only loopback cohort must never run a speculative round"
     );
-    let round_evidence: Vec<_> = artifacts
+    let cooperative: Vec<_> = artifacts
         .join_rows
         .iter()
-        .filter(|r| {
-            r.rounds > 1
-                || r.reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("observed loss"))
-        })
+        .filter(|r| r.arm != "fastest-single")
         .collect();
     assert!(
-        !round_evidence.is_empty(),
-        "expected wire-round evidence (completed rounds or an observed-loss abort)"
+        !cooperative.is_empty(),
+        "cooperative arms recorded (as fallbacks)"
     );
+    for row in &cooperative {
+        assert_eq!(
+            row.status, "FellBackToSingle",
+            "row {} must fall back at the engage gate",
+            row.request_root
+        );
+        assert_eq!(row.rounds, 1, "no speculative round ran");
+        let reason = row.reason.as_deref().expect("visible fallback reason");
+        assert!(
+            reason.contains("wire-true sequential verify"),
+            "the fallback reason must name the verification term in force: {reason}"
+        );
+    }
     let planner_rows: Vec<_> = artifacts
         .join_rows
         .iter()

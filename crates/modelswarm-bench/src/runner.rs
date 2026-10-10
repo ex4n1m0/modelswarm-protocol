@@ -857,18 +857,87 @@ fn cohort_acceptance(
     }
 }
 
+/// How a cohort's verification cost is charged — the ADR-032 §4
+/// companion correction ("required regardless of this ADR's fate"):
+/// the acting planner's verification term must be ENGINE-TRUE, i.e.
+/// capability-aware, with the wire-true sequential term as the default
+/// for every cohort that has not declared the capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyMode {
+    /// The cohort's verifier DECLARED batch-verify capability
+    /// ([`Candidate::batch_verify`]): one batched engine pass per draft
+    /// window, charged as the frozen ADR-013 ENGINE term
+    /// ([`crate::VERIFY_BATCH_STEPS`] decode steps per round). No
+    /// production adapter can declare this today (ADR-032 §4: the
+    /// in-process C-API adapter is not productionized; the pinned
+    /// llama.cpp HTTP adapter cannot batch).
+    Batch,
+    /// No batch-verify declaration — every production cohort today.
+    /// The msp-v1 whole-request wire verifies a draft window in
+    /// **window+1 sequential verifier tokens** plus a **per-round
+    /// re-post of the committed prefix**; pass 2 measured that reality
+    /// at realized/predicted 2.8–8.3× against the 1.5-step batch term
+    /// (`experiments/raw/PASS-2-ENGAGE-LAN-2026-10-10/ANALYSIS.md`,
+    /// finding 4). Charging it is the pass-2 never-engage conclusion
+    /// ENFORCED, not advised: on this wire the engage gate must block.
+    SequentialWire,
+}
+
+impl VerifyMode {
+    /// Stable, grep-able label for run artifacts and fallback reasons.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            VerifyMode::Batch => {
+                "batch-verify engine term (verifier declared the capability)"
+            }
+            VerifyMode::SequentialWire => {
+                "wire-true sequential verify (window+1 verifier tokens/round + per-round prefix re-post; no batch-verify declaration)"
+            }
+        }
+    }
+}
+
+/// The verification cost mode of a cohort. The VERIFIER decides —
+/// `cohort[0]`, the fastest-ranked peer, is the role that executes
+/// verification. An HTTP peer may still act as proposer (ADR-032 §4:
+/// first-class single, never a batch verifier), so only the verifier's
+/// declaration selects the term; a mixed cohort whose verifier has not
+/// declared the capability is charged the sequential wire term.
+#[must_use]
+pub fn verify_mode(cohort: &[Candidate]) -> VerifyMode {
+    match cohort.first().is_some_and(|verifier| verifier.batch_verify) {
+        true => VerifyMode::Batch,
+        false => VerifyMode::SequentialWire,
+    }
+}
+
 /// Frozen `SwarmInputs` derivation from measured candidates (audit S2:
 /// "no function derives them from candidates/measurements"), with the
-/// PASS-1 WIRE adjustment recorded openly: over the request/reply wire a
-/// speculative round RE-POSTS the whole prefix (there is no propose/
-/// verify protocol — msp-v1 carries whole requests), so the prefill term
-/// is charged PER ROUND, not once (the S3 structural cost the pass-1
-/// experiment exists to measure). Parallel proposers draft concurrently
-/// (wall time = fastest proposer); verification is charged as
-/// `VERIFY_BATCH_STEPS` forwards on the verifier — the batch-verify
-/// ENGINE model (ADR-013). The wire's sequential reality then shows up
-/// as realized-vs-predicted divergence in the join rows, which is
-/// exactly the pass-1 evidence.
+/// PASS-1 WIRE adjustments recorded openly:
+///
+/// - **Per-round prefix re-post (S3):** over the request/reply wire a
+///   speculative round RE-POSTS the whole conversation (there is no
+///   propose/verify protocol — msp-v1 carries whole requests), so the
+///   prefill term is charged PER ROUND, not once (the S3 structural cost
+///   the pass-1 experiment exists to measure).
+/// - **Capability-aware verification term (ADR-032 §4 companion
+///   correction):** verification is charged as
+///   [`crate::VERIFY_BATCH_STEPS`] forwards on the verifier ONLY when
+///   the verifier declared batch-verify ([`verify_mode`] =
+///   [`VerifyMode::Batch`]) — the batch-verify ENGINE model (ADR-013).
+///   Every other cohort (the default; no production adapter can declare
+///   the capability) is charged the WIRE-TRUE sequential term:
+///   `window+1` sequential verifier tokens per round, plus the per-round
+///   re-post of the GROWING committed prefix (the committed prefix grows
+///   by `window × acceptance` per round, so the per-round average over
+///   `rounds_expected` rounds is `output × (R−1)/(2R)` tokens on top of
+///   the prompt). Pass 2 measured this reality at 2.8–8.3× the batch
+///   term's prediction — with this term the pass-2 never-engage
+///   conclusion is enforced by the engage gate, not merely advised.
+/// - Parallel proposers draft concurrently (wall time = fastest
+///   proposer).
 #[must_use]
 pub fn swarm_inputs(
     cohort: &[Candidate],
@@ -886,14 +955,36 @@ pub fn swarm_inputs(
         .fold(0.0_f64, f64::max)
         .max(1e-6);
     let rounds_expected = (f64::from(output_tokens) / (f64::from(window) * acceptance)).max(1.0);
+    let mode = verify_mode(cohort);
+    // Wire-true sequential term: the committed prefix the verifier
+    // re-prefills grows by window × acceptance per round — average
+    // output × (R−1)/(2R) committed tokens per round on top of the
+    // prompt. The batch cohort keeps the ADR-013 ENGINE model
+    // unchanged (a VerifyDrafts-class wire — ADR-032 §1, Proposed —
+    // would carry token ids + hashes and drop the re-post entirely;
+    // until that wire exists the engine term is the declared-
+    // capability model).
+    let committed_avg_tokens = match mode {
+        VerifyMode::Batch => 0.0,
+        VerifyMode::SequentialWire => {
+            f64::from(output_tokens) * (rounds_expected - 1.0) / (2.0 * rounds_expected)
+        }
+    };
+    let verification_cost_ms = match mode {
+        VerifyMode::Batch => {
+            rounds_expected * VERIFY_BATCH_STEPS / verifier.decode_tokens_per_ms.max(1e-6)
+        }
+        VerifyMode::SequentialWire => {
+            rounds_expected * f64::from(window + 1) / verifier.decode_tokens_per_ms.max(1e-6)
+        }
+    };
     SwarmInputs {
         // Wire rounds re-post the prefix every round (S3): per-round
         // prefill charged into the aggregate term.
-        prefill_cost_ms: rounds_expected * f64::from(prompt_tokens)
+        prefill_cost_ms: rounds_expected * (f64::from(prompt_tokens) + committed_avg_tokens)
             / verifier.prefill_tokens_per_ms.max(1e-6),
         proposal_cost_ms: rounds_expected * f64::from(window) / best_proposer_rate,
-        verification_cost_ms: rounds_expected * VERIFY_BATCH_STEPS
-            / verifier.decode_tokens_per_ms.max(1e-6),
+        verification_cost_ms,
         synchronization_cost_ms: rounds_expected * rtt_ms.max(0.0),
         expected_rollback_cost_ms: rounds_expected * (1.0 - acceptance)
             / verifier.decode_tokens_per_ms.max(1e-6),
@@ -1242,13 +1333,25 @@ mod tests {
     }
 
     fn candidate(peer: &str, decode: f64, prefill: f64) -> Candidate {
+        wire_candidate(peer, decode, prefill, 0.0, false)
+    }
+
+    /// Candidate with an explicit advertised queue and verify capability
+    /// (the two fields the ADR-032 §4 tests vary).
+    fn wire_candidate(
+        peer: &str,
+        decode: f64,
+        prefill: f64,
+        queue: f64,
+        batch_verify: bool,
+    ) -> Candidate {
         use modelswarm_scheduler::{CapacityClass, NatPath};
         use modelswarm_types::ModelProfileId;
         Candidate {
             peer_id: peer.to_string(),
             profile_id: ModelProfileId::new("msp:pass1:q4_k_m:v1").unwrap(),
             measured_rtt_ms: 5.0,
-            advertised_queue_ms: 0.0,
+            advertised_queue_ms: queue,
             prefill_tokens_per_ms: prefill,
             decode_tokens_per_ms: decode,
             failure_penalty_ms: 0.0,
@@ -1256,6 +1359,186 @@ mod tests {
             slots: 1,
             capacity_class: CapacityClass::Cpu,
             nat_path: NatPath::Direct,
+            batch_verify,
         }
+    }
+
+    /// The pass-2 ENGAGEMENT pool shape (`pass2_pool()` in
+    /// `tests/pass1_loopback.rs` and `pass1_serve --pool pass2`): V =
+    /// fastest single (prefill 3.0, decode 0.10, free), D = 40×-decode
+    /// drafter (queue 300 — drafted from, never the comparator), M/M2 =
+    /// busy mids. `verifier_batch`/`proposer_batch` set the ADR-032 §4
+    /// capability declaration per role.
+    fn pass2_shaped_pool(verifier_batch: bool, proposer_batch: bool) -> Vec<Candidate> {
+        vec![
+            wire_candidate("v", 0.10, 3.0, 0.0, verifier_batch),
+            wire_candidate("d", 4.00, 6.0, 300.0, proposer_batch),
+            wire_candidate("m", 0.25, 1.2, 400.0, proposer_batch),
+            wire_candidate("m2", 0.20, 1.0, 500.0, proposer_batch),
+        ]
+    }
+
+    fn pass2_params(window: u32) -> Pass1Params {
+        Pass1Params {
+            proposal_window: window,
+            output_tokens_target: 16,
+            cohort_cap: 4,
+            tau_ms: 0.0,
+            ..Pass1Params::default()
+        }
+    }
+
+    /// ADR-032 §4 companion correction, test (a): an HTTP-only cohort
+    /// (NO batch-verify declaration — every production cohort today)
+    /// NEVER engages, even at acceptance 1.0 in the pool shape that the
+    /// frozen 1.5-step batch term engaged on. The wire-true term does
+    /// not merely miss the (1+margin) bar: the cooperative prediction
+    /// loses OUTRIGHT to the fastest eligible single — the pass-2
+    /// never-engage conclusion enforced, not advised.
+    #[test]
+    fn http_only_cohorts_never_engage_on_the_wire_true_term() {
+        let pool = pass2_shaped_pool(false, false);
+        assert_eq!(verify_mode(&pool), VerifyMode::SequentialWire);
+        let perfect = |_: &str| Some(1.0_f64);
+        for window in [8, 16] {
+            let plan = plan_cohort(&pool, &pass2_params(window), perfect, 5.0, 153);
+            assert!(
+                !plan.engaged,
+                "window {window}: HTTP-only cohort must never engage"
+            );
+            let prediction = plan.prediction_ms.expect("finite wire-true prediction");
+            let fastest = plan
+                .fastest_single_prediction_ms
+                .expect("measured fastest single");
+            assert!(
+                prediction > fastest,
+                "window {window}: wire-true prediction {prediction:.1}ms must exceed \
+                 the fastest single {fastest:.1}ms outright"
+            );
+        }
+    }
+
+    /// ADR-032 §4 companion correction, test (b): a batch-DECLARED cohort
+    /// uses the 1.5-step engine term and engages exactly when
+    /// `predicted × (1+margin)` beats the fastest eligible single — it
+    /// engages in the pass-2 corners, and falls back the moment the
+    /// fastest single wins or the margin refuses.
+    #[test]
+    fn batch_declared_cohorts_engage_only_when_margin_beats_the_fastest_single() {
+        let pool = pass2_shaped_pool(true, true);
+        assert_eq!(verify_mode(&pool), VerifyMode::Batch);
+        let perfect = |_: &str| Some(1.0_f64);
+        for window in [8, 16] {
+            let plan = plan_cohort(&pool, &pass2_params(window), perfect, 5.0, 153);
+            assert!(
+                plan.engaged,
+                "window {window}: the declared-capability cohort engages in the \
+                 pass-2 corner (the engine term is legitimately cheaper there)"
+            );
+            let prediction = plan.prediction_ms.unwrap();
+            let fastest = plan.fastest_single_prediction_ms.unwrap();
+            assert!(prediction * (1.0 + plan_margin()) < fastest);
+        }
+        // A faster fastest-single flips it off: V at decode 0.25 completes
+        // in ~120ms; the w8 batch prediction 151ms × 1.15 ≈ 174 loses.
+        let faster_v = {
+            let mut pool = pass2_shaped_pool(true, true);
+            pool[0] = wire_candidate("v", 0.25, 3.0, 0.0, true);
+            pool
+        };
+        let plan = plan_cohort(&faster_v, &pass2_params(8), perfect, 5.0, 153);
+        assert!(
+            !plan.engaged,
+            "the fastest single winning must force fallback"
+        );
+
+        // And a refusing margin must block even a cheap prediction.
+        let refusing = Pass1Params {
+            margin: 10.0,
+            ..pass2_params(8)
+        };
+        let plan = plan_cohort(&pool, &refusing, perfect, 5.0, 153);
+        assert!(!plan.engaged, "margin rule still governs batch cohorts");
+    }
+
+    /// ADR-032 §4 companion correction, test (c): MIXED cohorts. The
+    /// VERIFIER decides the term — an HTTP verifier is charged the
+    /// sequential wire term regardless of the proposers' declarations,
+    /// and a batch verifier with HTTP proposers still falls back when
+    /// the fastest eligible single (either class) wins.
+    #[test]
+    fn mixed_cohorts_fall_back_when_the_fastest_single_wins() {
+        let perfect = |_: &str| Some(1.0_f64);
+        // HTTP verifier + batch-declared proposers: sequential term, the
+        // never-engage conclusion applies (w8 AND the w16 parity corner).
+        let http_verifier = pass2_shaped_pool(false, true);
+        assert_eq!(verify_mode(&http_verifier), VerifyMode::SequentialWire);
+        for window in [8, 16] {
+            let plan = plan_cohort(&http_verifier, &pass2_params(window), perfect, 5.0, 153);
+            assert!(
+                !plan.engaged,
+                "window {window}: an HTTP verifier can never batch-verify"
+            );
+        }
+        // Batch verifier + HTTP proposers: the proposer class is
+        // irrelevant to the verify term, so this engages on the pass-2
+        // pool shape — but falls back when the fastest single wins.
+        let batch_verifier = pass2_shaped_pool(true, false);
+        assert_eq!(verify_mode(&batch_verifier), VerifyMode::Batch);
+        let plan = plan_cohort(&batch_verifier, &pass2_params(8), perfect, 5.0, 153);
+        assert!(plan.engaged, "batch verifier + HTTP proposers engages");
+        let faster_single_wins = {
+            let mut pool = pass2_shaped_pool(true, false);
+            pool[0] = wire_candidate("v", 0.25, 3.0, 0.0, true);
+            pool
+        };
+        let plan = plan_cohort(&faster_single_wins, &pass2_params(8), perfect, 5.0, 153);
+        assert!(
+            !plan.engaged,
+            "mixed cohort falls back when the fastest single (either class) wins"
+        );
+    }
+
+    /// Exact arithmetic pin of the capability-aware `swarm_inputs` terms
+    /// (window 8, target 16, acceptance 1.0 ⇒ 2 expected rounds; prompt
+    /// 128 tokens; verifier decode 0.10 / prefill 3.0; drafter 4.0;
+    /// rtt 5 ms).
+    #[test]
+    fn swarm_inputs_charges_the_exact_capability_aware_terms() {
+        let http = vec![
+            wire_candidate("v", 0.10, 3.0, 0.0, false),
+            wire_candidate("d", 4.00, 6.0, 300.0, false),
+        ];
+        let s = swarm_inputs(&http, 5.0, 1.0, 8, 16, 128);
+        // Sequential wire term: 2 rounds × (window+1 = 9) verifier tokens
+        // at 0.10 tok/ms = 180 ms — vs 30 ms under the 1.5-step engine
+        // term, exactly the (window+1)/VERIFY_BATCH_STEPS = 6× pass-2 gap.
+        assert!((s.verification_cost_ms - 180.0).abs() < 1e-9);
+        // Per-round prefix re-post, wire-true: committed grows 0→16 over
+        // 2 rounds, average 4 extra tokens per round ⇒ 2×(128+4)/3.0.
+        assert!((s.prefill_cost_ms - 88.0).abs() < 1e-9);
+        assert!((s.proposal_cost_ms - 4.0).abs() < 1e-9);
+        assert!((s.synchronization_cost_ms - 10.0).abs() < 1e-9);
+        assert!((s.expected_rollback_cost_ms - 0.0).abs() < 1e-9);
+        assert_eq!(s.failure_risk_penalty_ms, FAILURE_RISK_PENALTY_MS);
+
+        let batch: Vec<Candidate> = http
+            .iter()
+            .map(|c| Candidate {
+                batch_verify: true,
+                ..c.clone()
+            })
+            .collect();
+        let b = swarm_inputs(&batch, 5.0, 1.0, 8, 16, 128);
+        assert!((b.verification_cost_ms - 30.0).abs() < 1e-9);
+        assert!((b.prefill_cost_ms - 2.0 * 128.0 / 3.0).abs() < 1e-9);
+        assert!(
+            (s.verification_cost_ms / b.verification_cost_ms - (8.0 + 1.0) / 1.5).abs() < 1e-9,
+            "sequential/batch verify ratio is exactly (window+1)/VERIFY_BATCH_STEPS"
+        );
+    }
+
+    fn plan_margin() -> f64 {
+        modelswarm_scheduler::DEFAULT_CONFIDENCE_MARGIN
     }
 }

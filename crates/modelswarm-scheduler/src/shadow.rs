@@ -383,6 +383,14 @@ pub fn candidate_from_observations(
             slots: input.roster.free_slots,
             capacity_class: parse_capacity_class(input.roster.capacity_class.as_deref()),
             nat_path: NatPath::Direct,
+            // ADR-032 §4 companion correction: the batch-verify capability
+            // is ABSENT until a peer actually declares it. The roster
+            // carries no such disclosure today (a production declaration
+            // surface would be the cooperative negotiation — ADR-032 §3's
+            // `SessionAccept.engine.batch_verify`, not the tracker roster),
+            // so every mapped candidate is charged the wire-true
+            // sequential verification term by its consumers.
+            batch_verify: false,
         },
         discount,
         measured,
@@ -707,6 +715,10 @@ mod tests {
         assert!((m.candidate.advertised_queue_ms - 120.0).abs() < 1e-9);
         // Direct QUIC roster → no NAT penalty charged.
         assert_eq!(m.candidate.nat_path, NatPath::Direct);
+        // ADR-032 §4: the batch-verify capability is ABSENT — the roster
+        // has no declaration surface, so mapped candidates must never
+        // claim it.
+        assert!(!m.candidate.batch_verify);
     }
 
     #[test]

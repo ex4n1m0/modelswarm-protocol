@@ -74,7 +74,16 @@ pub const SYNTHETIC_PEERS: usize = 4;
 pub const ESTIMATED_ACCEPTANCE: f64 = 0.8;
 /// Synthetic coefficient: batch verification of one proposal window costs
 /// this many sequential decode steps on the verifier (one forward pass over
-/// the window plus overhead). TEST-ONLY model constant.
+/// the window plus overhead). TEST-ONLY model constant — the ADR-013
+/// ENGINE term. Per the ADR-032 §4 companion correction this term is
+/// charged ONLY for cohorts whose verifier declared batch-verify
+/// ([`modelswarm_scheduler::Candidate::batch_verify`]); every other
+/// cohort is charged the wire-true sequential term (window+1 verifier
+/// tokens per round plus the per-round prefix re-post — see
+/// `runner::swarm_inputs` / `runner::VerifyMode` behind the `quic-runner`
+/// feature). The Phase C mock engine below models the batch-verify
+/// engine directly, so its synthetic candidates declare the capability
+/// and its inline `SwarmInputs` derivations keep this constant.
 pub const VERIFY_BATCH_STEPS: f64 = 1.5;
 /// Synthetic pool asymmetry (bench-harness-spec "asymmetric hardware"):
 /// one fast-but-busy host (drafts for slower verifiers).
@@ -1197,6 +1206,13 @@ fn synthetic_candidates(rng: &mut Xorshift, cell: &NetworkCell) -> Vec<Candidate
                 slots: 1,
                 capacity_class: CapacityClass::Cpu,
                 nat_path: NatPath::Direct,
+                // The mock runtime models the BATCH-VERIFY ENGINE (that is
+                // exactly what VERIFY_BATCH_STEPS charges — the ADR-013
+                // engine term, ADR-032 §4). The Phase C simulation is not
+                // the msp-v1 request/reply wire; the wire-true sequential
+                // term governs the pass-1/2 harness path, whose candidates
+                // never declare the capability.
+                batch_verify: true,
             }
         })
         .collect()

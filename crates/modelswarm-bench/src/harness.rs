@@ -43,7 +43,7 @@ use crate::records::{
 };
 use crate::runner::{
     execute_on, plan_cohort, spawn_bridge, swarm_inputs, synthetic_executor_build_hash,
-    AcceptanceRegime, Arm, BridgeConfig, LiveBridge, WireCompletion, WireRequest,
+    verify_mode, AcceptanceRegime, Arm, BridgeConfig, LiveBridge, WireCompletion, WireRequest,
     ENV_LABEL_LOOPBACK_INJECTED, RTT_WAIT_BOUND, SYNTHETIC_EXECUTOR_NAME, VERIFIER_SEED,
 };
 use crate::stats;
@@ -864,7 +864,10 @@ impl Pass1Harness {
 
         // Honest negative: the engage gate blocks the cooperative mode —
         // record the fallback AND still execute the single path so the
-        // row carries realized numbers.
+        // row carries realized numbers. The reason names the verification
+        // term in force (ADR-032 §4 companion correction: wire-true
+        // sequential for any cohort whose verifier has not declared
+        // batch-verify — the pass-2 never-engage conclusion, enforced).
         if !engaged {
             let mut single = self
                 .run_single(
@@ -882,8 +885,9 @@ impl Pass1Harness {
             };
             single.k = Some(k_effective);
             single.status = RunStatus::FellBackToSingle;
+            let verify_label = verify_mode(&ordered[..k_effective as usize]).label();
             single.reason = Some(format!(
-                "cost model v2: cooperative {} × (1+{:.2}) did not beat fastest single {} (engage gate)",
+                "cost model v2 [{verify_label}]: cooperative {} × (1+{:.2}) did not beat fastest single {} (engage gate)",
                 prediction_ms.map(|p| format!("{:.1}ms", p)).unwrap_or_else(|| "∞".into()),
                 params.margin,
                 format_fastest(fastest_single_prediction),

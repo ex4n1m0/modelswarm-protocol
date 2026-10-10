@@ -1,0 +1,94 @@
+{
+  "cell": "inj20ms-geo800-w8",
+  "label": "loopback+injected-delay",
+  "regime": "geo800",
+  "injected_delay_ms": 20,
+  "arms": [
+    {
+      "arm": "fastest-single",
+      "k": null,
+      "n": 32,
+      "completion_ms": {
+        "median": 252.4345,
+        "p10": 232.5063,
+        "p90": 274.3716,
+        "iqr": 25.04650000000001,
+        "n": 32
+      },
+      "fallbacks": 0,
+      "failures": 0,
+      "median_vs_fastest_single": 1.0,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "fixed-k2",
+      "k": 2,
+      "n": 32,
+      "completion_ms": {
+        "median": 254.25549999999998,
+        "p10": 233.9574,
+        "p90": 273.9783,
+        "iqr": 21.48524999999998,
+        "n": 32
+      },
+      "fallbacks": 32,
+      "failures": 0,
+      "median_vs_fastest_single": 1.007,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "fixed-k3",
+      "k": 3,
+      "n": 32,
+      "completion_ms": {
+        "median": 251.83300000000003,
+        "p10": 232.9701,
+        "p90": 273.65700000000004,
+        "iqr": 25.694249999999982,
+        "n": 32
+      },
+      "fallbacks": 32,
+      "failures": 0,
+      "median_vs_fastest_single": 0.998,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "fixed-k4",
+      "k": 4,
+      "n": 32,
+      "completion_ms": {
+        "median": 253.35500000000002,
+        "p10": 232.64989999999997,
+        "p90": 273.6626,
+        "iqr": 23.678750000000036,
+        "n": 32
+      },
+      "fallbacks": 32,
+      "failures": 0,
+      "median_vs_fastest_single": 1.004,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    },
+    {
+      "arm": "planner-k",
+      "k": 2,
+      "n": 32,
+      "completion_ms": {
+        "median": 258.2155,
+        "p10": 232.9547,
+        "p90": 274.1499,
+        "iqr": 28.62850000000003,
+        "n": 32
+      },
+      "fallbacks": 32,
+      "failures": 0,
+      "median_vs_fastest_single": 1.023,
+      "accepted_tokens_per_round_median": null,
+      "acceptance_rate_mean": null
+    }
+  ],
+  "fastest_single_median_ms": 252.435
+}

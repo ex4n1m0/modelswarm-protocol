@@ -1,0 +1,27 @@
+{
+  "record_type": "run-manifest/v1",
+  "run_manifest_id": "run-4393f1010949c30b",
+  "created_at": "2026-10-10T18:30:52Z",
+  "harness_version": "9.6-pass2-lan+arm=planner-k+env=lan-2machine-quic",
+  "profile_id": "msp1:1111111111111111111111111111111111111111111111111111111111111111",
+  "runtime": {
+    "name": "synthetic-token-executor",
+    "version": "v1 (TEST-ONLY, behind the real serving bridge)",
+    "build_hash": "e9e9379f3f59158d08a6c97b7f7fb8504e0c587a27fbf3a69cc40fcf7aaef700"
+  },
+  "hardware_class_peers": [],
+  "os": "windows",
+  "network_cell": {
+    "nominal_rtt_ms": 0,
+    "jitter": "none",
+    "loss_ratio": 0.0,
+    "path": "direct"
+  },
+  "prompt_corpus_id": "synthetic-pass1-v1",
+  "warmup_runs": 0,
+  "recorded_runs": 120,
+  "seeds": [
+    2084227009276016440
+  ],
+  "confidence_margin": 0.15
+}

@@ -1,0 +1,32 @@
+{
+  "record_type": "run-manifest/v1",
+  "run_manifest_id": "run-6c6d1c95985aad53",
+  "created_at": "2026-10-10T18:18:07Z",
+  "harness_version": "9.6-pass2+arm=fixed-k3+env=loopback+injected-delay",
+  "profile_id": "msp1:1111111111111111111111111111111111111111111111111111111111111111",
+  "runtime": {
+    "name": "synthetic-token-executor",
+    "version": "v1 (TEST-ONLY, behind the real serving bridge)",
+    "build_hash": "e9e9379f3f59158d08a6c97b7f7fb8504e0c587a27fbf3a69cc40fcf7aaef700"
+  },
+  "hardware_class_peers": [
+    "gpu_mid",
+    "gpu_high",
+    "gpu_mid",
+    "gpu_mid"
+  ],
+  "os": "windows",
+  "network_cell": {
+    "nominal_rtt_ms": 20,
+    "jitter": "none",
+    "loss_ratio": 0.0,
+    "path": "direct"
+  },
+  "prompt_corpus_id": "synthetic-pass1-v1",
+  "warmup_runs": 8,
+  "recorded_runs": 32,
+  "seeds": [
+    13299808510462148202
+  ],
+  "confidence_margin": 0.15
+}

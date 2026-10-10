@@ -125,18 +125,18 @@ def main() -> int:
     fallback_total = sum(
         1 for rows in joins.values() for r in rows if r["status"] == "FellBackToSingle"
     )
-    worst_ratio = max(
+    # Gated re-runs can legitimately have ZERO engaged rows (the wire-true
+    # verification term blocks every engagement on HTTP-only cohorts —
+    # ADR-032 §5 option A): the best/worst engaged ratios are then None,
+    # published as the honest result instead of crashing the aggregate.
+    ratios = [
         (a["engaged_median_vs_prompt_best_single"], c["cell"], a["arm"])
         for c in per_cell
         for a in c["arms"]
         if a["engaged_median_vs_prompt_best_single"] is not None
-    )
-    best_ratio = min(
-        (a["engaged_median_vs_prompt_best_single"], c["cell"], a["arm"])
-        for c in per_cell
-        for a in c["arms"]
-        if a["engaged_median_vs_prompt_best_single"] is not None
-    )
+    ]
+    worst_ratio = max(ratios) if ratios else None
+    best_ratio = min(ratios) if ratios else None
     document = {
         "experiment": "9.6-pass2-engagement",
         "environment_labels": labels,

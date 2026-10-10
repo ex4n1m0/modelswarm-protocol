@@ -323,9 +323,13 @@ fn regime_discriminant(regime: AcceptanceRegime) -> u64 {
 /// The pass-2 ENGAGEMENT pool (mirror of `pass1_serve --pool pass2`):
 /// V = fastest single (fast prefill 3.0, slow decode 0.10, free), D =
 /// drafter (decode 4.0 = 40x V, queue 300 so it is drafted from, never
-/// the comparator), M/M2 = busy mids. This is the shape that lets the
-/// frozen engage rule legitimately pass so engaged speculative win/loss
-/// is measurable on the wire.
+/// the comparator), M/M2 = busy mids. Pass 2 used this shape to let the
+/// frozen 1.5-step batch-term engage rule legitimately pass so engaged
+/// speculative win/loss was measurable on the wire. Since the ADR-032
+/// §4 companion correction the wire-true sequential verification term
+/// blocks engagement on this pool (HTTP-only cohort) — the pool stays
+/// PINNED so gated re-runs stay directly comparable with the committed
+/// pass-2 cells, and the honest all-fallback outcome is the result.
 fn pass2_pool() -> Vec<BridgeConfig> {
     let verifier = BridgeConfig::new(0x51, 0.10, 3.0);
     let mut drafter = BridgeConfig::new(0x66, 4.00, 6.0);
@@ -372,14 +376,17 @@ fn pass2_env() -> (Vec<AcceptanceRegime>, u32, Option<u32>, u32, Option<f64>) {
 /// through the geometric prefix-match family (real propose → transport →
 /// verify → accept/reject on the wire; never a store-fed regime) over
 /// the engagement pool. At window 8 the implied per-round acceptance
-/// rates are ~1.0 (high), ~0.64 (geo900), ~0.42 (geo800), ~0.27 (geo700
-/// — expected blocked at the engage gate once the EWMA warms; the honest
-/// never-worse behavior). Env: `MSP_BENCH_PROFILES` (default
-/// `high,geo900,geo800,geo700`), `MSP_BENCH_DELAYS` (default `5,20`),
-/// `MSP_BENCH_WINDOW` (+ optional `MSP_BENCH_WINDOW2` second pass),
-/// `MSP_BENCH_RUNS` (default 30; loopback runs typically override to
-/// 8-12), `MSP_BENCH_LOSS_MULTIPLIER` (default `off`), `MSP_BENCH_OUT`.
-/// Labels: loopback+injected-delay — never LAN claims.
+/// rates are ~1.0 (high), ~0.64 (geo900), ~0.42 (geo800), ~0.27
+/// (geo700). Since the ADR-032 §4 wire-true verification term + the
+/// per-profile engaged-loss EWMA gate, this driver's honest outcome on
+/// the HTTP-only pool is ALL-FALLBACK (every cooperative row falls back
+/// at the engage gate with a wire-true reason; the acceptance stores
+/// stay empty) — the gated re-run evidence. Env: `MSP_BENCH_PROFILES`
+/// (default `high,geo900,geo800,geo700`), `MSP_BENCH_DELAYS` (default
+/// `5,20`), `MSP_BENCH_WINDOW` (+ optional `MSP_BENCH_WINDOW2` second
+/// pass), `MSP_BENCH_RUNS` (default 30; loopback runs typically
+/// override to 8-12), `MSP_BENCH_LOSS_MULTIPLIER` (default `off`),
+/// `MSP_BENCH_OUT`. Labels: loopback+injected-delay — never LAN claims.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "owner-invoked pass-2 loopback run (writes committed experiment artifacts)"]
 async fn pass2_engagement_loopback() {
@@ -473,15 +480,19 @@ async fn pass2_engagement_loopback() {
 
 /// Owner-gated 9.6 PASS-2 LAN run (machines A + B). Serve side:
 /// `pass1_serve --pool pass2 --bridges 4` on machine B — a FRESH exe
-/// built from this commit (the prefix-match family changes serve-side
-/// continuation behavior; a v4-era serve would emit non-matching drafts
-/// for the family seeds). Driver env: `MSP_BENCH_PEER_0..9` (B's lines),
+/// built from a ≥4faa6c0-era commit (the prefix-match family changes
+/// serve-side continuation behavior; a v4-era serve would emit
+/// non-matching drafts for the family seeds — see the pass-2 ANALYSIS
+/// ops records). Driver env: `MSP_BENCH_PEER_0..9` (B's lines),
 /// `MSP_BENCH_PROFILES` (default `high,geo900,geo800,geo700` — implied
 /// window-8 acceptance rates ~1.0/~0.64/~0.42/~0.27), `MSP_BENCH_RUNS`
 /// (default 30), `MSP_BENCH_WINDOW` (+ optional `MSP_BENCH_WINDOW2`),
 /// `MSP_BENCH_COHORT_CAP` (default 4), `MSP_BENCH_LOSS_MULTIPLIER`
 /// (default `off`), `MSP_BENCH_OUT` (absolute). Labels:
-/// lan-2machine-quic — never WAN claims.
+/// lan-2machine-quic — never WAN claims. With the ADR-032 §4 wire-true
+/// term + the engaged-loss EWMA gate live, the honest outcome on the
+/// HTTP-only pool is ALL-FALLBACK (gate-blocked at every cell; the
+/// regime dimension becomes moot because no proposer round ever runs).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "owner-invoked LAN pass-2 run (needs pass1_serve --pool pass2 on machine B)"]
 async fn pass2_lan_run() {

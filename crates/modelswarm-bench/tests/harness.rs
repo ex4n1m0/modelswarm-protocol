@@ -452,6 +452,153 @@ async fn hand_built_invalid_metric_types_are_caught() {
     assert!(!errors.is_empty() || json["metrics"]["prompt_tokens"] == 0);
 }
 
+// REVIEW PIN (scheduler 2026-10-11, guard-calibration review
+// recommendation iii — the engaged-loss EWMA engage gate): replay the
+// COMMITTED pass-2 LAN decision-join rows through the REAL
+// `EngagedLossGate` and pin the exact verdicts. The committed artifacts
+// are immutable evidence, so exact numbers are stable; they re-derive
+// the review's §2 claim ("an EWMA on realized/fastest_single_prediction
+// blocking at ≥ 1.0 blocks 8/8 engaged cells") with the shipped
+// implementation: per cell, every cell that ever reached four engaged
+// attempts is blocked from at latest the 5th (the one cell that did not
+// — geo700-w8 — had only 2 engaged attempts because the pass-2 margin
+// rule already blocked the other 118/120; it never warmed, and its two
+// samples' EWMA is 3.018). Whole-run (one per-profile gate, actual sweep
+// order): the 3 warm-up attempts run, then 1,979/1,982 are refused
+// pre-round.
+#[cfg(feature = "quic-runner")]
+#[test]
+fn engage_loss_gate_replay_of_committed_pass2_lan_rows() {
+    use modelswarm_bench::engage_gate::{
+        EngagedLossGate, ENGAGE_LOSS_BLOCK_THRESHOLD, ENGAGE_LOSS_EWMA_ALPHA, ENGAGE_LOSS_WARMUP_N,
+    };
+    use modelswarm_bench::harness::JoinRow;
+
+    // Frozen specification (the review asked for it to be explicit).
+    assert!((ENGAGE_LOSS_EWMA_ALPHA - 0.3).abs() < 1e-12);
+    assert_eq!(ENGAGE_LOSS_EWMA_ALPHA, modelswarm_scheduler::EWMA_ALPHA);
+    assert_eq!(ENGAGE_LOSS_WARMUP_N, 3);
+    assert!((ENGAGE_LOSS_BLOCK_THRESHOLD - 1.0).abs() < 1e-12);
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../experiments/raw/PASS-2-ENGAGE-LAN-2026-10-10");
+    let read_cell = |cell: &str| -> Vec<JoinRow> {
+        let path = root.join(cell).join("decision-join.jsonl");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("committed artifact {} unreadable: {e}", path.display()));
+        text.lines()
+            .map(|line| serde_json::from_str(line).expect("join row parses"))
+            .collect()
+    };
+    // Production replay semantics: an engaged attempt whose gate decision
+    // is BLOCKED is suppressed (never runs, never feeds); an allowed
+    // attempt runs and feeds realized/predicted into the gate.
+    let replay = |gate: &mut EngagedLossGate, rows: &[JoinRow]| -> (usize, usize, Option<usize>) {
+        let mut fed = 0usize;
+        let mut suppressed = 0usize;
+        let mut first_block: Option<usize> = None;
+        for (index, row) in rows.iter().enumerate() {
+            if row.loss_guard.is_none() || row.status != "Completed" {
+                continue; // not an engaged attempt
+            }
+            if gate.decision("msp1:lan").blocked {
+                suppressed += 1;
+                first_block.get_or_insert(index);
+            } else {
+                let prediction = row
+                    .fastest_single_prediction_ms
+                    .expect("engaged rows carry it");
+                gate.record_engaged("msp1:lan", row.realized_total_ms / prediction);
+                fed += 1;
+            }
+        }
+        (fed, suppressed, first_block)
+    };
+
+    // Per-cell (fresh gate per cell — the pass-2 drivers' per-cell
+    // isolation): every cell with ≥ 4 engaged attempts blocks, from
+    // attempt 4 (5 for the parity-corner cell high-w16, whose EWMA
+    // crossed 1.0 at 1.0069 only after the 4th sample).
+    let mut cells_blocked = 0usize;
+    for (cell, attempts, fed, suppressed) in [
+        ("inj0ms-geo700-w16", 180, 3, 177),
+        ("inj0ms-geo800-w16", 15, 3, 12),
+        ("inj0ms-geo800-w8", 15, 3, 12),
+        ("inj0ms-geo900-w16", 438, 3, 435),
+        ("inj0ms-geo900-w8", 372, 3, 369),
+        ("inj0ms-high-w16", 480, 4, 476),
+        ("inj0ms-high-w8", 480, 3, 477),
+    ] {
+        let rows = read_cell(cell);
+        let attempts_seen: usize = rows
+            .iter()
+            .filter(|r| r.loss_guard.is_some() && r.status == "Completed")
+            .count();
+        assert_eq!(attempts_seen, attempts, "{cell}: engaged attempts");
+        let mut gate = EngagedLossGate::new();
+        let (fed_seen, suppressed_seen, first_block) = replay(&mut gate, &rows);
+        assert_eq!(fed_seen, fed, "{cell}: attempts allowed (warm-up)");
+        assert_eq!(
+            suppressed_seen, suppressed,
+            "{cell}: attempts refused pre-round"
+        );
+        let first_block_index = first_block.expect("{cell}: must end blocked");
+        let blocked_from_attempt = rows[..=first_block_index]
+            .iter()
+            .filter(|r| r.loss_guard.is_some() && r.status == "Completed")
+            .count();
+        assert!(
+            blocked_from_attempt <= ENGAGE_LOSS_WARMUP_N as usize + 2,
+            "{cell}: first block at engaged attempt {blocked_from_attempt}"
+        );
+        assert!(gate.decision("msp1:lan").blocked, "{cell}: ends blocked");
+        cells_blocked += 1;
+    }
+    assert_eq!(cells_blocked, 7, "every warmed cell blocks");
+
+    // The never-warmed cell: only 2 engaged attempts existed (the pass-2
+    // margin rule blocked the rest); the EWMA (3.018 over both) is far
+    // above threshold but the warm-up never completed — cold start
+    // honestly allows, and the margin rule covers it.
+    let rows = read_cell("inj0ms-geo700-w8");
+    let mut gate = EngagedLossGate::new();
+    let (fed, suppressed, first_block) = replay(&mut gate, &rows);
+    assert_eq!((fed, suppressed), (2, 0));
+    assert!(first_block.is_none());
+    assert!(!gate.decision("msp1:lan").blocked);
+    assert!(gate.decision("msp1:lan").ewma.unwrap() > 3.0);
+
+    // Whole-run, actual sweep order (high,geo900,geo800,geo700 × w8,w16 —
+    // the recorded ops command), ONE per-profile gate: the 3 warm-up
+    // attempts run, then every further engaged attempt is refused.
+    let order = [
+        "inj0ms-high-w8",
+        "inj0ms-geo900-w8",
+        "inj0ms-geo800-w8",
+        "inj0ms-geo700-w8",
+        "inj0ms-high-w16",
+        "inj0ms-geo900-w16",
+        "inj0ms-geo800-w16",
+        "inj0ms-geo700-w16",
+    ];
+    let mut whole: Vec<JoinRow> = Vec::new();
+    for cell in order {
+        whole.extend(read_cell(cell));
+    }
+    let mut gate = EngagedLossGate::new();
+    let (fed, suppressed, first_block) = replay(&mut gate, &whole);
+    assert_eq!(
+        fed, ENGAGE_LOSS_WARMUP_N as usize,
+        "exactly the warm-up runs"
+    );
+    assert_eq!(
+        suppressed, 1979,
+        "1,979/1,982 engaged attempts refused pre-round"
+    );
+    assert!(first_block.is_some());
+    assert!(gate.decision("msp1:lan").blocked);
+}
+
 // REVIEW PIN (test-release 2026-10-10, guard-calibration review
 // docs/reviews/review-guard-calibration-2026-10-10.md): the pass-2
 // counterfactual honesty contract of `LossGuardRecord`. Rows below are

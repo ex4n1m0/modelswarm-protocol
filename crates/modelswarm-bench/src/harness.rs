@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::acceptance::AcceptanceStore;
 use crate::corpus::{Pass1Prompt, PASS1_CORPUS, PASS1_CORPUS_ID};
+use crate::engage_gate::{EngagedLossGate, GateDecision};
 use crate::params::Pass1Params;
 use crate::records::{
     CellPath, Exactness, JitterClass, ManifestNetworkCell, ManifestRuntime, ModeMetrics,
@@ -115,6 +116,13 @@ pub struct JoinRow {
     /// Observed-loss rule-6 guard telemetry for engaged runs (round 1);
     /// `None` for fallback rows (no round ran) and single rows.
     pub loss_guard: Option<LossGuardRecord>,
+    /// Per-profile engaged-loss EWMA gate state at DECISION time (present
+    /// on cooperative rows whose finite prediction made the gate
+    /// consultable; `None` on single rows, degenerate-planner rows, and
+    /// pre-gate pass-1/pass-2 artifacts — `#[serde(default)]` keeps
+    /// committed join rows parsing).
+    #[serde(default)]
+    pub loss_gate: Option<GateDecision>,
 }
 
 /// The rule-6 observed-loss guard's verdict for one engaged run's first
@@ -217,6 +225,7 @@ struct RunJoined {
     fastest_single_prediction_ms: Option<f64>,
     planner_sweep: Option<Vec<(u32, f64)>>,
     loss_guard: Option<LossGuardRecord>,
+    loss_gate: Option<GateDecision>,
 }
 
 /// What one cooperative arm run targets: the corpus prompt, the unique
@@ -234,12 +243,16 @@ struct CoopSpec {
     k: u32,
     /// Frozen cooperative prediction at that k (None = no finite one).
     prediction_ms: Option<f64>,
-    /// The engage-gate verdict.
+    /// The engage-gate verdict (margin rule AND the engaged-loss EWMA
+    /// gate — see `run_loopback_cell`).
     engaged: bool,
     /// Planner sweep telemetry.
     sweep: Option<Vec<(u32, f64)>>,
     /// Whether this is the planner arm (affects record attribution).
     is_planner: bool,
+    /// The engaged-loss EWMA gate state at decision time (`Some` whenever
+    /// a finite cooperative prediction made the gate consultable).
+    loss_gate: Option<GateDecision>,
 }
 
 /// The pass-1 harness: shared measurement state across cells.
@@ -249,6 +262,13 @@ pub struct Pass1Harness {
     telemetry: Arc<modelswarm_telemetry::Telemetry>,
     metrics: Arc<PeerMetrics>,
     acceptance: AcceptanceStore,
+    /// Per-profile engaged-loss EWMA engage gate (review recommendation
+    /// iii; see [`crate::engage_gate`] for the specification). Fed from
+    /// COMPLETED engaged attempts; consulted by every cooperative arm
+    /// alongside the frozen margin rule. Scoped per profile within this
+    /// harness's lifetime (the pass-2 drivers create one harness per
+    /// cell, which scopes it per cell — the recorded isolation choice).
+    engage_loss_gate: EngagedLossGate,
     /// Harness version recorded in manifests (e.g. "9.6-pass1").
     harness_version: String,
     /// Artifact root directory.
@@ -277,6 +297,7 @@ impl Pass1Harness {
             telemetry: Arc::clone(&telemetry),
             metrics: Arc::new(PeerMetrics::memory(Arc::clone(&telemetry))),
             acceptance,
+            engage_loss_gate: EngagedLossGate::new(),
             harness_version: harness_version.into(),
             out_root: out_root.into(),
             env_label: ENV_LABEL_LOOPBACK_INJECTED,
@@ -485,13 +506,19 @@ impl Pass1Harness {
                                 prompt.documented_prompt_tokens,
                                 params.output_tokens_target,
                             );
+                            // Engage = frozen margin rule AND the per-profile
+                            // engaged-loss EWMA gate (cold start allows — the
+                            // margin rule alone governs until warm).
+                            let margin_engaged = prediction_ms.is_finite()
+                                && should_engage(prediction_ms, fastest_single, params.margin);
+                            let gate = self.engage_loss_gate.decision(&self.profile_id);
                             let coop_spec = CoopSpec {
                                 k: *k,
                                 prediction_ms: prediction_ms.is_finite().then_some(prediction_ms),
-                                engaged: prediction_ms.is_finite()
-                                    && should_engage(prediction_ms, fastest_single, params.margin),
+                                engaged: margin_engaged && !gate.blocked,
                                 sweep: None,
                                 is_planner: false,
+                                loss_gate: prediction_ms.is_finite().then_some(gate),
                             };
                             self.run_cooperative(
                                 &ordered,
@@ -517,12 +544,14 @@ impl Pass1Harness {
                                 rtt_ms,
                                 prompt.documented_prompt_tokens,
                             );
+                            let gate = self.engage_loss_gate.decision(&self.profile_id);
                             let coop_spec = CoopSpec {
                                 k: plan.k.unwrap_or(1),
                                 prediction_ms: plan.prediction_ms,
-                                engaged: plan.engaged,
+                                engaged: plan.engaged && !gate.blocked,
                                 sweep: Some(plan.sweep),
                                 is_planner: true,
+                                loss_gate: plan.prediction_ms.is_some().then_some(gate),
                             };
                             self.run_cooperative(
                                 &ordered,
@@ -543,6 +572,21 @@ impl Pass1Harness {
                             .entry(prompt.id)
                             .or_default()
                             .push(run.total_ms);
+                    }
+                    // Feed the per-profile engaged-loss EWMA from COMPLETED
+                    // engaged attempts only (`loss_guard` presence == a
+                    // cooperative round ran; fallback and aborted rows carry
+                    // no clean realized-vs-prediction ratio). The key is
+                    // exactly the review's: realized_total_ms /
+                    // fastest_single_prediction_ms.
+                    if run.status == RunStatus::Completed && run.loss_guard.is_some() {
+                        if let Some(prediction) = run
+                            .fastest_single_prediction_ms
+                            .filter(|p| p.is_finite() && *p > 0.0)
+                        {
+                            self.engage_loss_gate
+                                .record_engaged(&self.profile_id, run.total_ms / prediction);
+                        }
                     }
                     joined.push(run);
                 }
@@ -807,6 +851,7 @@ impl Pass1Harness {
             fastest_single_prediction_ms: prediction.is_finite().then_some(prediction),
             planner_sweep: None,
             loss_guard: None,
+            loss_gate: None,
         })
     }
 
@@ -832,6 +877,7 @@ impl Pass1Harness {
             engaged,
             sweep: planner_sweep,
             is_planner,
+            loss_gate,
         } = spec;
         let k_effective = k;
         let fastest_single_prediction = modelswarm_scheduler::predicted_single_ms(
@@ -885,16 +931,30 @@ impl Pass1Harness {
             };
             single.k = Some(k_effective);
             single.status = RunStatus::FellBackToSingle;
+            // Which gate blocked: engaged == margin_engaged && !gate.blocked,
+            // so a blocking loss-gate record here means the margin rule
+            // PASSED and the per-profile engaged-loss EWMA refused.
             let verify_label = verify_mode(&ordered[..k_effective as usize]).label();
-            single.reason = Some(format!(
+            let cost_model_reason = format!(
                 "cost model v2 [{verify_label}]: cooperative {} × (1+{:.2}) did not beat fastest single {} (engage gate)",
                 prediction_ms.map(|p| format!("{:.1}ms", p)).unwrap_or_else(|| "∞".into()),
                 params.margin,
                 format_fastest(fastest_single_prediction),
-            ));
+            );
+            single.reason = Some(match loss_gate.filter(|gate| gate.blocked) {
+                Some(gate) => format!(
+                    "engaged-loss EWMA {} ≥ {:.1} over {} engaged attempts (α={:.2}, per-profile engage gate) — the margin rule passed but the profile's engaged history loses; falling back to single",
+                    gate.ewma.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}")),
+                    gate.threshold,
+                    gate.samples,
+                    gate.alpha
+                ),
+                None => cost_model_reason,
+            });
             single.predicted_ms = prediction_ms;
             single.planner_sweep = planner_sweep;
             single.rollbacks = 0;
+            single.loss_gate = loss_gate;
             return Ok(single);
         }
 
@@ -1088,6 +1148,7 @@ impl Pass1Harness {
                         single.predicted_ms = prediction_ms;
                         single.planner_sweep = planner_sweep;
                         single.loss_guard = loss_guard;
+                        single.loss_gate = loss_gate;
                         return Ok(single);
                     }
                 }
@@ -1130,6 +1191,7 @@ impl Pass1Harness {
                     .then_some(fastest_single_prediction),
                 planner_sweep,
                 loss_guard,
+                loss_gate,
             });
         }
         let coordinator_ms = (completion_total - proposer_ms.max(verifier_ms)).max(0.0);
@@ -1163,6 +1225,7 @@ impl Pass1Harness {
                 .then_some(fastest_single_prediction),
             planner_sweep,
             loss_guard,
+            loss_gate,
         })
     }
 
@@ -1412,6 +1475,7 @@ fn build_join_row(
         planner_sweep: run.planner_sweep.clone(),
         label: env_label.to_string(),
         loss_guard: run.loss_guard.clone(),
+        loss_gate: run.loss_gate,
     }
 }
 
@@ -1660,6 +1724,7 @@ mod tests {
                 planner_sweep: None,
                 label: ENV_LABEL_LOOPBACK_INJECTED.into(),
                 loss_guard: None,
+                loss_gate: None,
             },
             JoinRow {
                 request_root: "r2".into(),
@@ -1680,6 +1745,7 @@ mod tests {
                 planner_sweep: Some(vec![(2, 80.0)]),
                 label: ENV_LABEL_LOOPBACK_INJECTED.into(),
                 loss_guard: None,
+                loss_gate: None,
             },
         ];
         let summary = build_summary(&spec, &rows, ENV_LABEL_LOOPBACK_INJECTED);

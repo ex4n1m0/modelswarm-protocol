@@ -47,6 +47,19 @@ pub const ENV_RUNS: &str = "MSP_BENCH_RUNS";
 /// Env var: warm-up completions per peer before the candidate set is
 /// measured. Default 2.
 pub const ENV_WARMUP: &str = "MSP_BENCH_WARMUP";
+/// Env var: rule-6 observed-loss guard multiplier. Default
+/// [`DEFAULT_LOSS_MULTIPLIER`] (the production value); a float ≥ 2.0
+/// relaxes it; the literal `off` disables the abort (pass-2 engaged-curve
+/// instrument — every relaxed run records the multiplier AND the
+/// default-production counterfactual per row).
+pub const ENV_LOSS_MULTIPLIER: &str = "MSP_BENCH_LOSS_MULTIPLIER";
+/// Production rule-6 guard multiplier (round-1 wall beyond
+/// `multiplier × (1 + margin) × predicted-per-round` aborts to single).
+pub const DEFAULT_LOSS_MULTIPLIER: f64 = 2.0;
+/// Relaxation floor: values below the production default are refused
+/// (kept at the default with a warning) — the guard may only be loosened
+/// for measurement, never quietly tightened below production.
+pub const LOSS_MULTIPLIER_MIN: f64 = DEFAULT_LOSS_MULTIPLIER;
 
 /// Hard bounds for every parameter (clamped with a visible warning).
 pub mod bounds {
@@ -87,6 +100,11 @@ pub struct Pass1Params {
     pub warmup_completions: u32,
     /// Guard: maximum speculative rounds per run.
     pub max_rounds: u32,
+    /// Rule-6 observed-loss guard multiplier. `None` = disabled (the
+    /// pass-2 engaged-curve instrument); default
+    /// [`DEFAULT_LOSS_MULTIPLIER`]. Relaxations are recorded per row with
+    /// the default-production counterfactual.
+    pub loss_multiplier: Option<f64>,
 }
 
 impl Default for Pass1Params {
@@ -101,6 +119,7 @@ impl Default for Pass1Params {
             runs_per_arm: 30,
             warmup_completions: 2,
             max_rounds: MAX_SPECULATIVE_ROUNDS,
+            loss_multiplier: Some(DEFAULT_LOSS_MULTIPLIER),
         }
     }
 }
@@ -200,6 +219,33 @@ impl Pass1Params {
         );
         apply_f64(ENV_TAU_MS, &mut params.tau_ms, 0.0, bounds::TAU_MS_MAX);
         apply_f64(ENV_MARGIN, &mut params.margin, MIN_CONFIDENCE_MARGIN, 10.0);
+        // Loss-guard multiplier: float ≥ the production default, or the
+        // literal "off" (recorded per row; never silently below default).
+        if let Some(raw) = lookup(ENV_LOSS_MULTIPLIER) {
+            let trimmed = raw.trim();
+            if trimmed.eq_ignore_ascii_case("off") {
+                params.loss_multiplier = None;
+                env_overrides += 1;
+            } else {
+                match trimmed.parse::<f64>() {
+                    Ok(value) if value.is_finite() => {
+                        if value < LOSS_MULTIPLIER_MIN {
+                            warnings.push(format!(
+                                "{ENV_LOSS_MULTIPLIER}={value} below production default \
+                                 {LOSS_MULTIPLIER_MIN} — kept at default"
+                            ));
+                            params.loss_multiplier = Some(DEFAULT_LOSS_MULTIPLIER);
+                        } else {
+                            params.loss_multiplier = Some(value);
+                        }
+                        env_overrides += 1;
+                    }
+                    Ok(_) | Err(_) => warnings.push(format!(
+                        "{ENV_LOSS_MULTIPLIER}={raw:?} is neither a number nor 'off' — default kept"
+                    )),
+                }
+            }
+        }
 
         EnvParams {
             params,
@@ -232,6 +278,40 @@ mod tests {
         assert_eq!(p.cohort_cap, 3, "default cohort cap must be 3 (D4 gate)");
         assert_eq!(p.tau_ms, 0.0, "tau placeholder until measured");
         assert_eq!(p.runs_per_arm, 30, "9.6 design: >=30 reps/cell");
+        assert_eq!(
+            p.loss_multiplier,
+            Some(DEFAULT_LOSS_MULTIPLIER),
+            "production rule-6 guard default"
+        );
+    }
+
+    #[test]
+    fn loss_multiplier_relaxes_or_disables_but_never_tightens() {
+        // "off" disables the guard abort.
+        let env = Pass1Params::from_lookup(|name| {
+            (name == ENV_LOSS_MULTIPLIER).then(|| "off".to_string())
+        });
+        assert_eq!(env.params.loss_multiplier, None);
+        assert_eq!(env.env_overrides, 1);
+        assert!(env.warnings.is_empty());
+        // A float ≥ 2.0 relaxes it.
+        let env = Pass1Params::from_lookup(|name| {
+            (name == ENV_LOSS_MULTIPLIER).then(|| "12.5".to_string())
+        });
+        assert_eq!(env.params.loss_multiplier, Some(12.5));
+        // Below the production default is refused (kept at default,
+        // visibly) — the guard may only be loosened for measurement.
+        let env = Pass1Params::from_lookup(|name| {
+            (name == ENV_LOSS_MULTIPLIER).then(|| "1.0".to_string())
+        });
+        assert_eq!(env.params.loss_multiplier, Some(DEFAULT_LOSS_MULTIPLIER));
+        assert_eq!(env.warnings.len(), 1);
+        // Garbage keeps the default with a warning.
+        let env = Pass1Params::from_lookup(|name| {
+            (name == ENV_LOSS_MULTIPLIER).then(|| "sometimes".to_string())
+        });
+        assert_eq!(env.params.loss_multiplier, Some(DEFAULT_LOSS_MULTIPLIER));
+        assert_eq!(env.warnings.len(), 1);
     }
 
     #[test]

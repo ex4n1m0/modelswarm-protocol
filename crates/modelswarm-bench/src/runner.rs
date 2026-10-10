@@ -39,6 +39,36 @@ pub const RTT_WAIT_BOUND: Duration = Duration::from_secs(10);
 /// Deterministic verifier sampling seed. Acceptance regimes derive from
 /// per-round proposer seeds relative to this (see [`AcceptanceRegime`]).
 pub const VERIFIER_SEED: u64 = 0x5EED_0F1C;
+/// 9.6 PASS-2 prefix-match seed family base: a proposer request whose
+/// sampling seed lies in `[PREFIX_MATCH_SEED_BASE,
+/// PREFIX_MATCH_SEED_BASE + PREFIX_MATCH_MAX_MATCH]` encodes a MATCH
+/// LENGTH `m = seed - base` — a non-divergent synthetic executor emits the
+/// reference continuation (the [`VERIFIER_SEED`] stream over the SAME
+/// re-posted conversation) for its first `m` tokens, then its own
+/// deterministically different stream. The driver picks `m`; acceptance
+/// stays MEASURED on the wire (real propose request → real verifier
+/// request → client-side leading-match). TEST-ONLY synthetic machinery,
+/// honestly labeled in every artifact it feeds.
+pub const PREFIX_MATCH_SEED_BASE: u64 = 0x5EED_A000_0000_0000;
+/// Maximum encodable prefix-match length (tokens; far above the window
+/// bound of 16 — the family must cover any sweepable window).
+pub const PREFIX_MATCH_MAX_MATCH: u64 = 4095;
+
+/// Encodes a prefix-match request seed for match length `m`.
+#[must_use]
+pub fn prefix_match_seed(match_len: u32) -> u64 {
+    PREFIX_MATCH_SEED_BASE
+        + u64::from(match_len.min(u32::try_from(PREFIX_MATCH_MAX_MATCH).unwrap_or(u32::MAX)))
+}
+
+/// Decodes a seed into a prefix-match length, `None` outside the family.
+#[must_use]
+pub fn prefix_match_len(seed: u64) -> Option<u32> {
+    (PREFIX_MATCH_SEED_BASE..=PREFIX_MATCH_SEED_BASE + PREFIX_MATCH_MAX_MATCH)
+        .contains(&seed)
+        .then(|| u32::try_from(seed - PREFIX_MATCH_SEED_BASE).ok())
+        .flatten()
+}
 /// Build hash for the synthetic executor manifest block (64-hex digest
 /// of the executor name — stable, honest about being synthetic).
 pub fn synthetic_executor_build_hash() -> String {
@@ -211,6 +241,17 @@ impl InferenceExecutor for SyntheticTokenExecutor {
         }
         let folded =
             (u64::from(u32::from(self.divergent)) * self.seed) ^ request.sampling.seed.unwrap_or(0);
+        // PASS-2 prefix-match family: a non-divergent executor asked (via
+        // its request seed) for an m-token match emits the REFERENCE
+        // stream (the verifier's) for its first m tokens, then its own
+        // stream. Divergent executors (the determinism-failure model)
+        // never match — their streams fold their private seed, family or
+        // not.
+        let match_len = if self.divergent {
+            0
+        } else {
+            prefix_match_len(request.sampling.seed.unwrap_or(0)).unwrap_or(0)
+        };
         let max_tokens = request.max_tokens;
         let per_token = Duration::from_secs_f64(1.0 / self.decode_tokens_per_ms / 1000.0);
         let prefill = Duration::from_secs_f64(
@@ -244,8 +285,17 @@ impl InferenceExecutor for SyntheticTokenExecutor {
                             precise_delay(prefill).await;
                         }
                         precise_delay(per_token).await;
+                        let stream_seed = if step < match_len {
+                            // Prefix-match position: the reference
+                            // (verifier) continuation over this exact
+                            // conversation — both sides re-post the same
+                            // text, so positions align token-for-token.
+                            VERIFIER_SEED
+                        } else {
+                            folded
+                        };
                         let event = ExecutorEvent::TokenDelta {
-                            delta: SyntheticTokenExecutor::token_text(folded, &prompt, step),
+                            delta: SyntheticTokenExecutor::token_text(stream_seed, &prompt, step),
                             index: step,
                         };
                         Some((event, (step + 1, false)))
@@ -584,36 +634,116 @@ impl Arm {
     }
 }
 
-/// Client-side acceptance regime: how proposer request seeds relate to
-/// the verifier's. Acceptance is still MEASURED from real wire rounds;
-/// the regime only decides which proposals the proposers actually
-/// produce (the dry run's ground-truth knob).
+/// Client-side acceptance profile: how proposer drafts relate to the
+/// verifier continuation. Acceptance is still MEASURED from real wire
+/// rounds (leading token match over the wire); the profile only decides
+/// which drafts the proposers actually produce (the ground-truth knob).
+/// Pass-1's High/Zero/Mixed full-window profiles are preserved with
+/// identical acceptance outcomes; pass-2 adds the geometric
+/// per-token-match model so acceptance becomes a DIALABLE curve
+/// (window trade-offs, k-vs-acceptance, engaged win/loss vs acceptance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcceptanceRegime {
-    /// Proposer seed equals the verifier's every round (expected ~1.0).
+    /// Every draft matches the whole window (expected ~1.0).
     High,
-    /// Proposer seed differs every round (expected ~0.0).
+    /// No draft ever matches (expected ~0.0).
     Zero,
-    /// Differs on rounds ≡ 2 (mod 3) (expected ~2/3).
+    /// No match on rounds ≡ 2 (mod 3), full match otherwise (~2/3 at the
+    /// acceptance-rate level).
     Mixed,
+    /// Deterministic geometric per-token match: each round's draft
+    /// matches the reference continuation for `m` tokens where `m` is
+    /// drawn by successive `p = p_permille/1000` coin flips (capped at
+    /// the window) — the classic speculative-decoding acceptance model
+    /// (per-token acceptance p ⇒ expected accepted per round
+    /// `p(1-p^w)/(1-p)`, so the per-round acceptance RATE at window 8 is
+    /// ~0.85 at p=0.9, ~0.50 at p=0.8, ~0.27 at p=0.7, ~0.12 at p=0.5 —
+    /// NOT p itself; the ANALYSIS tables state implied rates). Draws are
+    /// keyed by `(round, draw_key)` — reproducible for a fixed driver
+    /// seed.
+    Geometric { p_permille: u32 },
 }
 
 impl AcceptanceRegime {
-    /// The proposer request seed for one round.
+    /// Stable cell-name fragment (`high`/`zero`/`mixed`/`geo70`...).
     #[must_use]
-    pub fn proposer_seed(self, round: u32) -> u64 {
+    pub fn tag(self) -> &'static str {
         match self {
-            AcceptanceRegime::High => VERIFIER_SEED,
-            AcceptanceRegime::Zero => VERIFIER_SEED ^ 0xDEAD_BEEF,
+            AcceptanceRegime::High => "high",
+            AcceptanceRegime::Zero => "zero",
+            AcceptanceRegime::Mixed => "mixed",
+            AcceptanceRegime::Geometric { .. } => "geo",
+        }
+    }
+
+    /// The cell-name spelling of this regime (`geo` carries its permille).
+    #[must_use]
+    pub fn cell_tag(self) -> String {
+        match self {
+            AcceptanceRegime::Geometric { p_permille } => format!("geo{p_permille}"),
+            other => other.tag().to_string(),
+        }
+    }
+
+    /// The proposer request seed for one round: a prefix-match family
+    /// seed encoding the intended match length. `window` is the
+    /// effective window for the round; `draw_key` mixes rep + prompt so
+    /// geometric draws vary per recorded run while staying reproducible.
+    #[must_use]
+    pub fn proposer_seed(self, round: u32, window: u32, draw_key: u64) -> u64 {
+        let match_len = match self {
+            AcceptanceRegime::High => window,
+            AcceptanceRegime::Zero => 0,
             AcceptanceRegime::Mixed => {
                 if round % 3 == 2 {
-                    VERIFIER_SEED ^ 0xDEAD_BEEF
+                    0
                 } else {
-                    VERIFIER_SEED
+                    window
                 }
             }
+            AcceptanceRegime::Geometric { p_permille } => {
+                geometric_match_len(p_permille, window, round, draw_key)
+            }
+        };
+        prefix_match_seed(match_len.min(window))
+    }
+}
+
+/// Deterministic geometric match-length draw: successive p-coin flips
+/// from an LCG seeded by `(round, draw_key, p)`; stops at the first
+/// failure or the window bound. Distribution check pinned by test.
+fn geometric_match_len(p_permille: u32, window: u32, round: u32, draw_key: u64) -> u32 {
+    let mut state =
+        splitmix_finalize(draw_key ^ (u64::from(round) << 32) ^ (u64::from(p_permille) << 48));
+    let mut matched = 0u32;
+    while matched < window {
+        state = state
+            .wrapping_mul(0x5851_F42D_4C95_7F2D)
+            .wrapping_add(0x1405_7B7E_F767_814F);
+        let coin = (state >> 33) % 1000;
+        if coin < u64::from(p_permille) {
+            matched += 1;
+        } else {
+            break;
         }
+    }
+    matched
+}
+
+/// Parses a driver-side profile spelling: `high`/`zero`/`mixed` or
+/// `geo<permilles>` (`geo700` = p=0.7). The pass-2 sweep vocabulary.
+pub fn parse_regime(tag: &str) -> Result<AcceptanceRegime, String> {
+    match tag.trim() {
+        "high" => Ok(AcceptanceRegime::High),
+        "zero" => Ok(AcceptanceRegime::Zero),
+        "mixed" => Ok(AcceptanceRegime::Mixed),
+        other => other
+            .strip_prefix("geo")
+            .and_then(|p| p.parse::<u32>().ok())
+            .filter(|p| (1..=999).contains(p))
+            .map(|p_permille| AcceptanceRegime::Geometric { p_permille })
+            .ok_or_else(|| format!("profile {tag:?} is not high|zero|mixed|geo<1..999 permilles>")),
     }
 }
 
@@ -910,25 +1040,168 @@ mod tests {
     }
 
     #[test]
-    fn regimes_map_rounds_to_proposer_seeds() {
+    fn regimes_map_rounds_to_match_lengths() {
+        // High: full-window match every round.
         assert_eq!(
-            AcceptanceRegime::High.proposer_seed(5),
-            VERIFIER_SEED,
-            "high: always matches"
+            AcceptanceRegime::High.proposer_seed(5, 8, 0),
+            prefix_match_seed(8),
+            "high: always a full-window match"
         );
-        assert_ne!(
-            AcceptanceRegime::Zero.proposer_seed(5),
-            VERIFIER_SEED,
+        // Zero: never matches (match length 0 still yields a draft — it
+        // just agrees on nothing).
+        assert_eq!(
+            AcceptanceRegime::Zero.proposer_seed(5, 8, 0),
+            prefix_match_seed(0),
             "zero: never matches"
         );
+        // Mixed: no match on rounds ≡ 2 mod 3, full match otherwise —
+        // the pass-1 outcome shape preserved through the family encoding.
         let mixed: Vec<bool> = (0..6)
-            .map(|r| AcceptanceRegime::Mixed.proposer_seed(r) == VERIFIER_SEED)
+            .map(|r| AcceptanceRegime::Mixed.proposer_seed(r, 8, 0) == prefix_match_seed(8))
             .collect();
         assert_eq!(
             mixed,
             vec![true, true, false, true, true, false],
             "mixed: diverges on rounds ≡ 2 mod 3"
         );
+        // Geometric degenerate ends: p=1000 always matches, p=0 never.
+        assert_eq!(
+            AcceptanceRegime::Geometric { p_permille: 1000 }.proposer_seed(3, 8, 77),
+            prefix_match_seed(8)
+        );
+        assert_eq!(
+            AcceptanceRegime::Geometric { p_permille: 0 }.proposer_seed(3, 8, 77),
+            prefix_match_seed(0)
+        );
+    }
+
+    /// The geometric draw must be deterministic, key-sensitive, and
+    /// statistically sane: over many draws the mean match fraction must
+    /// sit near the CLASSIC-model expectation `p(1-p^w)/((1-p)w)` — at
+    /// p=0.7, w=8 that is ~0.275, NOT 0.7 (per-token acceptance p means
+    /// the run stops at the first mismatched token).
+    #[test]
+    fn geometric_draws_are_deterministic_and_centered() {
+        let draw = |round: u32, key: u64| {
+            prefix_match_len(
+                AcceptanceRegime::Geometric { p_permille: 700 }.proposer_seed(round, 8, key),
+            )
+            .unwrap_or(0)
+        };
+        assert_eq!(draw(4, 99), draw(4, 99), "deterministic");
+        let mut differing_keys = 0;
+        for key in 0..50u64 {
+            if draw(4, key) != draw(4, key.wrapping_add(1)) {
+                differing_keys += 1;
+            }
+        }
+        assert!(differing_keys > 10, "draw key varies the draw");
+        let mean: f64 = (0..400u64)
+            .map(|i| f64::from(draw(u32::try_from(i % 7).unwrap_or(0), i * 31 + 5)))
+            .sum::<f64>()
+            / (400.0 * 8.0);
+        let p = 0.7_f64;
+        let expected = p * (1.0 - p.powi(8)) / ((1.0 - p) * 8.0);
+        assert!(
+            (mean - expected).abs() < 0.05,
+            "p=700 permille: mean match fraction {mean} near classic-model {expected:.3}"
+        );
+    }
+
+    /// Family encode/decode round-trip and non-collision with the
+    /// verifier seed.
+    #[test]
+    fn prefix_match_family_round_trips() {
+        for m in [0u32, 1, 8, 16, 64, 4095] {
+            assert_eq!(prefix_match_len(prefix_match_seed(m)), Some(m));
+        }
+        assert_eq!(prefix_match_len(VERIFIER_SEED), None);
+        assert_eq!(prefix_match_len(0), None);
+        // The family's own stream must differ from the reference stream
+        // at every position (else "own" tokens could accidentally match).
+        for m in [0u32, 1, 8] {
+            assert_ne!(
+                SyntheticTokenExecutor::token_text(prefix_match_seed(m), "p", 0),
+                SyntheticTokenExecutor::token_text(VERIFIER_SEED, "p", 0),
+                "family seed {m}: own stream differs at position 0"
+            );
+        }
+    }
+
+    /// PASS-1 RECORD CORRECTION, pinned: non-divergent synthetic peers
+    /// with DIFFERENT bridge seeds produce IDENTICAL continuations for
+    /// the same request seed (the executor fold keys on the request seed
+    /// only; the bridge seed keys identity + speeds). Drafts match
+    /// whenever the driver's seeds match — the pass-1 LAN all-fallback
+    /// was the ENGAGE GATE (its reason strings say so), not per-bridge
+    /// seed divergence, and the two engaged 4-bridge runs matched drafts
+    /// through exactly this property.
+    #[tokio::test]
+    async fn non_divergent_peers_agree_per_request_seed() {
+        use futures_util::StreamExt;
+        use modelswarm_gateway::{NormalizedMessage, NormalizedRequest, Sampling};
+        async fn deltas(executor_seed: u64, request_seed: u64) -> Vec<String> {
+            let executor = SyntheticTokenExecutor::new(executor_seed, 1000.0, 1000.0);
+            let request = NormalizedRequest {
+                request_id: format!("t-{executor_seed}-{request_seed}"),
+                profile_id: "msp1:aa".into(),
+                capability_token: None,
+                messages: vec![NormalizedMessage {
+                    role: "user".into(),
+                    content: "same conversation".into(),
+                }],
+                sampling: Sampling {
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: 40,
+                    seed: Some(request_seed),
+                },
+                max_tokens: 4,
+                deadline_ms: 1000,
+                stream: true,
+            };
+            let mut stream = executor.execute(request).await.expect("stream");
+            let mut out = Vec::new();
+            while let Some(event) = stream.next().await {
+                if let ExecutorEvent::TokenDelta { delta, .. } = event {
+                    out.push(delta);
+                }
+            }
+            out
+        }
+        let a = deltas(0x11, VERIFIER_SEED).await;
+        let b = deltas(0x33, VERIFIER_SEED).await;
+        assert_eq!(a, b, "different bridge seeds, same request seed: identical");
+        let c = deltas(0x11, VERIFIER_SEED ^ 1).await;
+        assert_ne!(a, c, "different request seeds diverge");
+        // And the pass-2 family: a partial-match draft agrees on exactly
+        // the encoded prefix of the verifier stream, then diverges.
+        let reference = deltas(0x11, VERIFIER_SEED).await;
+        let draft = deltas(0x33, prefix_match_seed(2)).await;
+        assert_eq!(&draft[..2], &reference[..2], "first 2 tokens match");
+        assert_ne!(draft[2], reference[2], "then the draft diverges");
+    }
+
+    #[test]
+    fn regime_tags_round_trip_through_the_parser() {
+        for regime in [
+            AcceptanceRegime::High,
+            AcceptanceRegime::Zero,
+            AcceptanceRegime::Mixed,
+            AcceptanceRegime::Geometric { p_permille: 700 },
+        ] {
+            assert_eq!(parse_regime(&regime.cell_tag()).unwrap(), regime);
+        }
+        assert_eq!(
+            parse_regime("geo500").unwrap(),
+            AcceptanceRegime::Geometric { p_permille: 500 }
+        );
+        // The degenerate geometric ends are spelled high/zero, not
+        // geo1000/geo0 — the parser refuses them so cell names stay
+        // canonical.
+        assert!(parse_regime("geo1000").is_err());
+        assert!(parse_regime("geo0").is_err());
+        assert!(parse_regime("fast").is_err());
     }
 
     #[test]

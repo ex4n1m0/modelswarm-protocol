@@ -64,22 +64,27 @@ pub struct LoopbackCellSpec {
     /// (5/10/20 for meaningful 10% calibration; 0 records no
     /// `calibration_valid` because 10% of 0 is undefined).
     pub injected_delay_ms: u32,
-    /// Client-side acceptance regime (ground-truth knob).
+    /// Client-side acceptance profile (ground-truth knob).
     pub regime: AcceptanceRegime,
     /// Bridge configurations (the candidate pool).
     pub bridges: Vec<BridgeConfig>,
+    /// Optional window note for the cell name (`Some(16)` → `...-w16`).
+    /// Pass-1 cells predate window sweeps and leave `None` (their
+    /// committed artifact names stay reproducible); pass-2 sweeps, where
+    /// two cells can differ only by window, must set it.
+    pub window_tag: Option<u32>,
 }
 
 impl LoopbackCellSpec {
     /// Directory name for artifacts.
     #[must_use]
     pub fn name(&self) -> String {
-        let regime = match self.regime {
-            AcceptanceRegime::High => "high",
-            AcceptanceRegime::Zero => "zero",
-            AcceptanceRegime::Mixed => "mixed",
-        };
-        format!("inj{}ms-{}", self.injected_delay_ms, regime)
+        let window = self.window_tag.map_or(String::new(), |w| format!("-w{w}"));
+        format!(
+            "inj{}ms-{}{window}",
+            self.injected_delay_ms,
+            self.regime.cell_tag()
+        )
     }
 }
 
@@ -107,6 +112,32 @@ pub struct JoinRow {
     pub planner_sweep: Option<Vec<(u32, f64)>>,
     /// Environment label (loopback+injected-delay / lan).
     pub label: String,
+    /// Observed-loss rule-6 guard telemetry for engaged runs (round 1);
+    /// `None` for fallback rows (no round ran) and single rows.
+    pub loss_guard: Option<LossGuardRecord>,
+}
+
+/// The rule-6 observed-loss guard's verdict for one engaged run's first
+/// round: what the wire realized vs what the frozen model predicted per
+/// round, whether the guard fired, and the counterfactual at the default
+/// production multiplier (pass 2 relaxes the multiplier via a RECORDED
+/// env override to measure full engaged curves; the default-production
+/// verdict stays visible per row).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LossGuardRecord {
+    /// Guard multiplier in effect (the production default is
+    /// [`DEFAULT_LOSS_MULTIPLIER`]; `"off"` disables the abort — recorded,
+    /// never silent).
+    pub multiplier: String,
+    /// Realized round-1 wall (ms).
+    pub round1_wall_ms: f64,
+    /// Predicted per-round budget (ms).
+    pub predicted_round_ms: f64,
+    /// Whether the guard aborted this run pre-first-token.
+    pub fired: bool,
+    /// Whether the DEFAULT production guard would have aborted (the
+    /// counterfactual that keeps pass-2 relaxed runs honest).
+    pub would_fire_at_default: bool,
 }
 
 /// Per-cell injected-delay calibration record (loopback honesty).
@@ -185,6 +216,7 @@ struct RunJoined {
     predicted_ms: Option<f64>,
     fastest_single_prediction_ms: Option<f64>,
     planner_sweep: Option<Vec<(u32, f64)>>,
+    loss_guard: Option<LossGuardRecord>,
 }
 
 /// What one cooperative arm run targets: the corpus prompt, the unique
@@ -774,6 +806,7 @@ impl Pass1Harness {
             predicted_ms: prediction.is_finite().then_some(prediction),
             fastest_single_prediction_ms: prediction.is_finite().then_some(prediction),
             planner_sweep: None,
+            loss_guard: None,
         })
     }
 
@@ -884,12 +917,17 @@ impl Pass1Harness {
         let mut ttft_ms: f64 = 0.0;
         let mut status = RunStatus::Completed;
         let mut reason: Option<String> = None;
+        let mut loss_guard: Option<LossGuardRecord> = None;
 
         while committed_tokens < target && rounds < params.max_rounds {
             let remaining = target - committed_tokens;
             let window_eff = window.min(remaining.max(1));
             let round_index = rounds + 1;
-            let proposer_seed = regime.proposer_seed(round_index);
+            // Draw key mixes rep + prompt so acceptance-profile draws vary
+            // per recorded run yet stay reproducible from the artifacts
+            // (rep and prompt id are both embedded in the request root).
+            let draw_key = mix(u64::from(rep_of(root)), prompt_discriminant(prompt.id));
+            let proposer_seed = regime.proposer_seed(round_index, window_eff, draw_key);
             let round_started = Instant::now();
             let mut request_ids = Vec::with_capacity(proposers.len() + 1);
             for index in 0..proposers.len() {
@@ -986,8 +1024,14 @@ impl Pass1Harness {
             }
 
             // Observed-loss guard (round 1 only — pre-first-committed-
-            // token, honoring AGENTS rule 6): a first round twice over
-            // the predicted per-round budget aborts to single.
+            // token, honoring AGENTS rule 6): a first round beyond
+            // `multiplier × (1 + margin)` the predicted per-round budget
+            // aborts to single. The multiplier defaults to the production
+            // value 2.0; pass 2 relaxes or disables it via a RECORDED env
+            // override to measure full engaged curves — every row then
+            // carries the guard record with the default-production
+            // counterfactual (`would_fire_at_default`), so a relaxed run
+            // can never masquerade as guard-passing.
             if rounds == 1 {
                 if let Some(prediction) = prediction_ms {
                     let acceptance = cohort_acceptance(
@@ -998,7 +1042,25 @@ impl Pass1Harness {
                     let rounds_expected =
                         (f64::from(target) / (f64::from(window) * acceptance)).max(1.0);
                     let predicted_round = prediction / rounds_expected;
-                    if round_wall > 2.0 * (1.0 + params.margin) * predicted_round {
+                    let threshold_at =
+                        |multiplier: f64| multiplier * (1.0 + params.margin) * predicted_round;
+                    let would_fire_at_default =
+                        round_wall > threshold_at(crate::params::DEFAULT_LOSS_MULTIPLIER);
+                    let (fired, multiplier_label) = match params.loss_multiplier {
+                        Some(multiplier) => (
+                            round_wall > threshold_at(multiplier),
+                            format!("{multiplier:.2}"),
+                        ),
+                        None => (false, "off".to_string()),
+                    };
+                    loss_guard = Some(LossGuardRecord {
+                        multiplier: multiplier_label.clone(),
+                        round1_wall_ms: round_wall,
+                        predicted_round_ms: predicted_round,
+                        fired,
+                        would_fire_at_default,
+                    });
+                    if fired {
                         let mut single = self
                             .run_single(
                                 ordered,
@@ -1016,11 +1078,12 @@ impl Pass1Harness {
                         single.k = Some(k_effective);
                         single.status = RunStatus::FellBackToSingle;
                         single.reason = Some(format!(
-                            "observed loss: round-1 wall {:.1}ms > 2×(1+{:.2})×predicted-per-round {:.1}ms (abort pre-first-token, rule 6)",
-                            round_wall, params.margin, predicted_round
+                            "observed loss: round-1 wall {:.1}ms > {}×(1+{:.2})×predicted-per-round {:.1}ms (abort pre-first-token, rule 6)",
+                            round_wall, multiplier_label, params.margin, predicted_round
                         ));
                         single.predicted_ms = prediction_ms;
                         single.planner_sweep = planner_sweep;
+                        single.loss_guard = loss_guard;
                         return Ok(single);
                     }
                 }
@@ -1062,6 +1125,7 @@ impl Pass1Harness {
                 fastest_single_prediction_ms: fastest_single_prediction.is_finite()
                     .then_some(fastest_single_prediction),
                 planner_sweep,
+                loss_guard,
             });
         }
         let coordinator_ms = (completion_total - proposer_ms.max(verifier_ms)).max(0.0);
@@ -1094,6 +1158,7 @@ impl Pass1Harness {
                 .is_finite()
                 .then_some(fastest_single_prediction),
             planner_sweep,
+            loss_guard,
         })
     }
 
@@ -1305,6 +1370,17 @@ fn rep_of(root: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// Stable per-prompt discriminator for acceptance-profile draw keys (the
+/// prompt id is part of the request root, so draws are reproducible from
+/// the artifacts alone).
+fn prompt_discriminant(prompt_id: &str) -> u64 {
+    prompt_id
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+        })
+}
+
 fn build_join_row(
     run: &RunJoined,
     manifest_id_for: &impl Fn(Arm) -> String,
@@ -1331,6 +1407,7 @@ fn build_join_row(
         run_manifest_id: manifest_id_for(run.arm),
         planner_sweep: run.planner_sweep.clone(),
         label: env_label.to_string(),
+        loss_guard: run.loss_guard.clone(),
     }
 }
 
@@ -1389,7 +1466,7 @@ fn build_summary(
     CellArtifactsSummary {
         cell: spec.name(),
         label: env_label.to_string(),
-        regime: format!("{:?}", spec.regime),
+        regime: spec.regime.cell_tag(),
         injected_delay_ms: spec.injected_delay_ms,
         arms,
         fastest_single_median_ms: single_median,
@@ -1513,6 +1590,7 @@ mod tests {
             injected_delay_ms: 20,
             regime: AcceptanceRegime::Mixed,
             bridges: vec![],
+            window_tag: None,
         };
         assert_eq!(spec.name(), "inj20ms-mixed");
     }
@@ -1556,6 +1634,7 @@ mod tests {
             injected_delay_ms: 10,
             regime: AcceptanceRegime::High,
             bridges: vec![],
+            window_tag: None,
         };
         let rows = vec![
             JoinRow {
@@ -1576,6 +1655,7 @@ mod tests {
                 run_manifest_id: "run-aaaaaaaaaaaaaaaa".into(),
                 planner_sweep: None,
                 label: ENV_LABEL_LOOPBACK_INJECTED.into(),
+                loss_guard: None,
             },
             JoinRow {
                 request_root: "r2".into(),
@@ -1595,6 +1675,7 @@ mod tests {
                 run_manifest_id: "run-bbbbbbbbbbbbbbbb".into(),
                 planner_sweep: Some(vec![(2, 80.0)]),
                 label: ENV_LABEL_LOOPBACK_INJECTED.into(),
+                loss_guard: None,
             },
         ];
         let summary = build_summary(&spec, &rows, ENV_LABEL_LOOPBACK_INJECTED);

@@ -40,6 +40,7 @@ async fn main() {
     let mut bridges: u64 = 2;
     let mut inject_ms: u64 = 0;
     let mut bind_ip = "0.0.0.0".to_string();
+    let mut pool = "pass1".to_string();
     let mut print_driver_peer = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -50,6 +51,7 @@ async fn main() {
             "--bridges" => bridges = value().parse().expect("--bridges <n>"),
             "--inject-rtt-ms" => inject_ms = value().parse().expect("--inject-rtt-ms <n>"),
             "--bind-ip" => bind_ip = value(),
+            "--pool" => pool = value(),
             "--print-driver-peer" => print_driver_peer = true,
             other => panic!("unknown flag {other:?}"),
         }
@@ -108,8 +110,14 @@ async fn main() {
     };
     std::env::set_var("MSP_LISTENER", "1");
 
-    println!("# pass1-serve: {bridges} bridges, inject {inject_ms} ms, profile {profile}, advertise {advertised_ip}");
+    println!(
+        "# pass1-serve: {bridges} bridges (pool {pool}), inject {inject_ms} ms, profile {profile}, advertise {advertised_ip}"
+    );
     println!("MSP_BENCH_POLICY_NOTE=leases are throwaway-hub-signed (experiment-only)");
+    assert!(
+        pool == "pass1" || pool == "pass2",
+        "--pool must be pass1 or pass2 (got {pool:?})"
+    );
     // HOLD every bridge handle for the process lifetime (the 2026-10-09
     // LAN bug): each LiveBridge owns its serving task's shutdown watch
     // sender; dropping the handle at the end of a loop iteration dropped
@@ -119,16 +127,38 @@ async fn main() {
     // handshake". The in-process harness holds bridges the same way.
     let mut live = Vec::with_capacity(usize::try_from(bridges).unwrap_or(0));
     for index in 0..bridges {
-        // Asymmetric pool per the dry run (mid, slow, fast-drafter cycle).
-        let mut config = match index % 3 {
-            0 => BridgeConfig::new(0x11 + index, 0.30, 1.5),
-            1 => BridgeConfig::new(0x22 + index, 0.20, 1.0),
-            _ => {
-                let mut drafter = BridgeConfig::new(0x33 + index, 2.00, 4.0);
+        // pass1: the pass-1 speed cycle (mid, slow, fast-drafter).
+        // pass2: the engagement pool — V (fastest single: fast prefill,
+        //   slow decode), D (drafter: decode 40x V, busy), M/M2 (busy
+        //   mids). Indexes beyond 4 repeat the cycle.
+        let mut config = match (pool.as_str(), index % 4) {
+            ("pass2", 0) => BridgeConfig::new(0x51 + index, 0.10, 3.0),
+            ("pass2", 1) => {
+                let mut drafter = BridgeConfig::new(0x66 + index, 4.00, 6.0);
                 drafter.advertised_queue_ms = 300;
                 drafter.capacity_class = "gpu_high";
                 drafter
             }
+            ("pass2", 2) => {
+                let mut mid = BridgeConfig::new(0x77 + index, 0.25, 1.2);
+                mid.advertised_queue_ms = 400;
+                mid
+            }
+            ("pass2", 3) => {
+                let mut mid = BridgeConfig::new(0x88 + index, 0.20, 1.0);
+                mid.advertised_queue_ms = 500;
+                mid
+            }
+            _ => match index % 3 {
+                0 => BridgeConfig::new(0x11 + index, 0.30, 1.5),
+                1 => BridgeConfig::new(0x22 + index, 0.20, 1.0),
+                _ => {
+                    let mut drafter = BridgeConfig::new(0x33 + index, 2.00, 4.0);
+                    drafter.advertised_queue_ms = 300;
+                    drafter.capacity_class = "gpu_high";
+                    drafter
+                }
+            },
         };
         config.bind_addr = bind_ip.clone();
         let bridge = spawn_bridge(

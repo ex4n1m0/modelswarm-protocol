@@ -92,10 +92,12 @@ jobs:
             exit 1
           fi
           echo "workspace version: $VERSION"
-          # The site's download filenames must match the product version
-          # (a drift here 404s every download button).
-          if ! grep -q "ModelSwarm-Setup-$VERSION-windows-x64.exe" apps/tracker/app/page.tsx; then
-            echo "::error::apps/tracker/app/page.tsx download filenames do not match version $VERSION"
+          # The staged download manifest must match the product version
+          # (a drift here 404s every /api/download link). Retargeted from
+          # page.tsx at 89f6b83: the landing no longer lists downloads —
+          # SHA256SUMS.txt is the canonical filename surface now.
+          if ! grep -q "ModelSwarm-Setup-$VERSION-windows-x64.exe" apps/tracker/public/downloads/SHA256SUMS.txt; then
+            echo "::error::apps/tracker/public/downloads/SHA256SUMS.txt does not match version $VERSION (stale or missing windows installer entry)"
             exit 1
           fi
       # The check job's tauri-shell test strips bundle.resources via the

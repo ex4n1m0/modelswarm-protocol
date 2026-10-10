@@ -26,6 +26,7 @@ pub mod params;
 pub mod records;
 #[cfg(feature = "quic-runner")]
 pub mod runner;
+pub mod shadow_join;
 pub mod stats;
 
 pub use corpus::{Pass1Prompt, PASS1_CORPUS, PASS1_CORPUS_ID};

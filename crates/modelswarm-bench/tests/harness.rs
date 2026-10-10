@@ -451,3 +451,51 @@ async fn hand_built_invalid_metric_types_are_caught() {
     // discrimination is separately covered in common's own tests.
     assert!(!errors.is_empty() || json["metrics"]["prompt_tokens"] == 0);
 }
+
+// REVIEW PIN (test-release 2026-10-10, guard-calibration review
+// docs/reviews/review-guard-calibration-2026-10-10.md): the pass-2
+// counterfactual honesty contract of `LossGuardRecord`. Rows below are
+// lifted VERBATIM from committed pass-2 LAN decision-join artifacts
+// (experiments/raw/PASS-2-ENGAGE-LAN-2026-10-10 — one row the default
+// production guard would have aborted, one it would have passed). A run
+// recorded under a relaxed/off multiplier must still report what the
+// DEFAULT guard WOULD have done, and that counterfactual must be
+// re-derivable from the row's own numbers — a relaxed engaged-curve run
+// can never masquerade as guard-passing.
+#[test]
+fn loss_guard_counterfactual_matches_default_arithmetic() {
+    // inj0ms-geo700-w16 row: round1_wall/predicted_round ≈ 74.0× — the
+    // in-effect guard is OFF (did not abort), yet the record says the
+    // default production guard WOULD have fired.
+    let fired = r#"{"multiplier": "off", "round1_wall_ms": 219.44910000000002,
+        "predicted_round_ms": 2.9645614583333333, "fired": false,
+        "would_fire_at_default": true}"#;
+    // inj0ms-high-w8 planner row at the pass/fail boundary:
+    // round1_wall/predicted_round ≈ 2.2995 ≤ 2.0×(1+0.15) — the default
+    // guard would NOT have fired (one of the 125 leak rows the
+    // calibration review characterizes).
+    let passed = r#"{"multiplier": "off", "round1_wall_ms": 172.0826,
+        "predicted_round_ms": 74.83229000000001, "fired": false,
+        "would_fire_at_default": false}"#;
+    for (raw, expect_default_fires) in [(fired, true), (passed, false)] {
+        let record: modelswarm_bench::harness::LossGuardRecord =
+            serde_json::from_str(raw).expect("verbatim artifact rows must deserialize");
+        // Relaxations are recorded per row — never silent.
+        assert_eq!(record.multiplier, "off");
+        assert!(!record.fired, "the in-effect 'off' guard never aborts");
+        // The counterfactual is exactly the default-production threshold:
+        // round1_wall > DEFAULT_LOSS_MULTIPLIER × (1 + margin) × predicted.
+        let default_threshold = modelswarm_bench::params::DEFAULT_LOSS_MULTIPLIER
+            * (1.0 + modelswarm_scheduler::DEFAULT_CONFIDENCE_MARGIN)
+            * record.predicted_round_ms;
+        assert_eq!(
+            record.would_fire_at_default,
+            record.round1_wall_ms > default_threshold,
+            "would_fire_at_default must equal the default-multiplier arithmetic"
+        );
+        assert_eq!(
+            record.would_fire_at_default, expect_default_fires,
+            "the recorded counterfactual must match the committed artifact row"
+        );
+    }
+}

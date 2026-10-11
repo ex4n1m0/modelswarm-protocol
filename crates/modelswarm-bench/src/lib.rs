@@ -20,6 +20,7 @@
 
 pub mod acceptance;
 pub mod corpus;
+pub mod divergence;
 pub mod engage_gate;
 #[cfg(feature = "quic-runner")]
 pub mod harness;

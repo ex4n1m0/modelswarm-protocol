@@ -41,6 +41,7 @@ async fn main() {
     let mut inject_ms: u64 = 0;
     let mut bind_ip = "0.0.0.0".to_string();
     let mut pool = "pass1".to_string();
+    let mut divergent: Vec<usize> = Vec::new();
     let mut print_driver_peer = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -52,6 +53,12 @@ async fn main() {
             "--inject-rtt-ms" => inject_ms = value().parse().expect("--inject-rtt-ms <n>"),
             "--bind-ip" => bind_ip = value(),
             "--pool" => pool = value(),
+            "--divergent" => {
+                divergent = value()
+                    .split(',')
+                    .map(|v| v.parse().expect("--divergent <comma-separated indexes>"))
+                    .collect();
+            }
             "--print-driver-peer" => print_driver_peer = true,
             other => panic!("unknown flag {other:?}"),
         }
@@ -115,8 +122,12 @@ async fn main() {
     );
     println!("MSP_BENCH_POLICY_NOTE=leases are throwaway-hub-signed (experiment-only)");
     assert!(
-        pool == "pass1" || pool == "pass2",
-        "--pool must be pass1 or pass2 (got {pool:?})"
+        pool == "pass1" || pool == "pass2" || pool == "accuracy",
+        "--pool must be pass1, pass2, or accuracy (got {pool:?})"
+    );
+    assert!(
+        pool != "accuracy" || divergent.is_empty() || !divergent.contains(&0),
+        "--divergent must not include index 0 (the verifier-class reference peer)"
     );
     // HOLD every bridge handle for the process lifetime (the 2026-10-09
     // LAN bug): each LiveBridge owns its serving task's shutdown watch
@@ -131,6 +142,40 @@ async fn main() {
         // pass2: the engagement pool — V (fastest single: fast prefill,
         //   slow decode), D (drafter: decode 40x V, busy), M/M2 (busy
         //   mids). Indexes beyond 4 repeat the cycle.
+        // accuracy: the 2026-10-11 accuracy-divergence pool (same shape,
+        //   fixed seeds so the driver can cross-check peer ids), with
+        //   --divergent injecting the divergence fault model.
+        if pool == "accuracy" {
+            let config = modelswarm_bench::runner::accuracy_pool(&divergent)
+                [usize::try_from(index).expect("index")]
+            .clone();
+            let config = BridgeConfig {
+                bind_addr: bind_ip.clone(),
+                ..config
+            };
+            let bridge = spawn_bridge(
+                &profile,
+                &driver_identity,
+                &config,
+                Duration::from_millis(inject_ms),
+                Arc::clone(&telemetry),
+                Arc::clone(&metrics),
+            )
+            .await
+            .expect("bridge spawns");
+            println!(
+                "MSP_BENCH_PEER_{index}={}|{}|{}|{}|{}",
+                bridge
+                    .addr
+                    .replace("/ip4/0.0.0.0/", &format!("/ip4/{advertised_ip}/")),
+                bridge.peer_id,
+                bridge.token,
+                bridge.roster.advertised_queue_ms.unwrap_or(0),
+                bridge.roster.capacity_class.as_deref().unwrap_or("cpu"),
+            );
+            live.push(bridge);
+            continue;
+        }
         let mut config = match (pool.as_str(), index % 4) {
             ("pass2", 0) => BridgeConfig::new(0x51 + index, 0.10, 3.0),
             ("pass2", 1) => {

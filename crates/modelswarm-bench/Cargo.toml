@@ -68,6 +68,10 @@ required-features = ["quic-runner"]
 name = "pass1_loopback"
 required-features = ["quic-runner"]
 
+[[test]]
+name = "accuracy"
+required-features = ["quic-runner"]
+
 
 
 [lints]

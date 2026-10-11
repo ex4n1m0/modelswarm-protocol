@@ -519,6 +519,19 @@ fn bridge_identity_seed(config_seed: u64) -> [u8; 32] {
     bytes
 }
 
+/// The deterministic peer id a bridge spawned from `config_seed` will
+/// advertise (identity derivation is pure — the accuracy driver
+/// cross-checks every dialed LAN peer id against the pinned pool's
+/// expectation, so a mislabeled serve cannot masquerade as a pool member).
+pub fn bridge_peer_id(config_seed: u64) -> String {
+    Libp2pTransport::new(&InstallationIdentity::from_bytes(&bridge_identity_seed(
+        config_seed,
+    )))
+    .expect("transport for identity")
+    .peer_id()
+    .to_string()
+}
+
 /// Spawns one REAL serving bridge on loopback and returns the dialable
 /// handle. `injected_request_delay` is the shim's pre-first-event delay.
 pub async fn spawn_bridge(
@@ -594,6 +607,56 @@ pub async fn spawn_bridge(
         executor,
         shutdown,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Accuracy-divergence pool (2026-10-11 study): the pinned 4-bridge pool
+// ---------------------------------------------------------------------------
+
+/// The accuracy-divergence experiment's environment label for the
+/// two-machine LAN cells (same vocabulary family as [`ENV_LABEL_LAN`]).
+pub const ENV_LABEL_ACCURACY_LAN: &str = "lan-2machine-quic";
+/// Loopback label for the accuracy-divergence cells (no injected delay —
+/// the structural instrument does not calibrate network cells).
+pub const ENV_LABEL_ACCURACY_LOOPBACK: &str = "loopback-quic";
+/// Pool size of the pinned accuracy pool (V, D, M, M2 — pass-2 shape).
+pub const ACCURACY_POOL_SIZE: usize = 4;
+
+/// The pinned accuracy-divergence pool: the pass-2 engagement shape
+/// (V = verifier-class fastest single, D = drafter, M/M2 = busy mids) so
+/// roster ranking and de-ranking behave on a known pool. `divergent`
+/// lists pool indexes whose executor folds its private seed — the
+/// INJECTED divergence fault model (determinism failure / hostile peer /
+/// hardware fault). Both the serve side (`pass1_serve --pool accuracy`)
+/// and the driver derive bridge identities from these seeds, so the
+/// driver can cross-check every dialed peer id against expectation.
+#[must_use]
+pub fn accuracy_pool(divergent: &[usize]) -> Vec<BridgeConfig> {
+    let mut pool = Vec::with_capacity(ACCURACY_POOL_SIZE);
+    for index in 0..ACCURACY_POOL_SIZE {
+        let mut config = match index {
+            0 => BridgeConfig::new(0x51, 0.10, 3.0),
+            1 => {
+                let mut drafter = BridgeConfig::new(0x66, 4.00, 6.0);
+                drafter.advertised_queue_ms = 300;
+                drafter.capacity_class = "gpu_high";
+                drafter
+            }
+            2 => {
+                let mut mid = BridgeConfig::new(0x77, 0.25, 1.2);
+                mid.advertised_queue_ms = 400;
+                mid
+            }
+            _ => {
+                let mut mid = BridgeConfig::new(0x88, 0.20, 1.0);
+                mid.advertised_queue_ms = 500;
+                mid
+            }
+        };
+        config.divergent = divergent.contains(&index);
+        pool.push(config);
+    }
+    pool
 }
 
 // ---------------------------------------------------------------------------

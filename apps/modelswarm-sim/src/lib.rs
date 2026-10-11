@@ -1,10 +1,11 @@
 //! `modelswarm-sim` — deterministic loopback scenario runner for the Phase C
 //! transport gate (ADR-018) and the Phase D/E speculative gates.
 //!
-//! Every scenario runs against real TCP sockets on `127.0.0.1:0` and prints
-//! exactly one JSON object per line (machine-readable; timings vary, the
-//! schema does not). Identities are derived from fixed seeds so peer ids and
-//! request ids are stable across runs.
+//! Every NETWORK scenario runs against real TCP sockets on `127.0.0.1:0`
+//! and prints exactly one JSON object per line (machine-readable; timings
+//! vary, the schema does not); the ADR-032 `mixed` scenario is a pure
+//! decision-level simulation (no sockets, no engine). Identities are derived
+//! from fixed seeds so peer ids and request ids are stable across runs.
 //!
 //! Scenarios (see `main.rs` for the CLI):
 //!
@@ -31,12 +32,24 @@
 //!   B↔C through the relay; the session must stay token-exact vs plain
 //!   single decoding (F13; the local stand-in for libp2p Circuit-Relay-v2).
 //!
+//! - [`mixed_swarm`]: ADR-032 §7 item 4b — decision-level mixed-swarm
+//!   fallback scenarios over the landed session-negotiation and scheduler
+//!   decision surfaces (HTTP-only never engage; adapter cohorts engage only
+//!   beating the fastest eligible single; class-blind mixed fallback;
+//!   backend-mismatch honesty edge). No sockets, no engine: the pinned
+//!   verdicts are decision outcomes, not measurements.
+//!
 //! [`pair`]: run_pair
 //! [`mesh`]: run_mesh
 //! [`kill`]: run_kill
 //! [`spec`]: run_spec
 //! [`spec_multi`]: run_spec_multi
 //! [`relay`]: run_relay
+
+// ADR-032 §7 item 4b: the mixed-swarm fallback scenarios (decision-level;
+// per-push, default features — the execution-venue matrix assigns them to
+// this app, not to bench quic-runner-only modules).
+pub mod mixed_swarm;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

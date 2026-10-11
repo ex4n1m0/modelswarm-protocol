@@ -10,6 +10,7 @@
 //! modelswarm-sim spec <prompt_seed> [window] [draft_accuracy]
 //! modelswarm-sim spec_multi <prompt_seed> [proposers] [draft_accuracy]
 //! modelswarm-sim relay <prompt_seed>
+//! modelswarm-sim mixed
 //! ```
 //!
 //! Each run prints exactly one JSON object on stdout and exits. Exit code 0
@@ -24,7 +25,7 @@ use std::process::ExitCode;
 
 use serde_json::json;
 
-const USAGE: &str = "usage: modelswarm-sim <scenario>\n  scenarios: pair | mesh <n> | kill <at_ms> | spec <prompt_seed> [window] [draft_accuracy] | spec_multi <prompt_seed> [proposers] [draft_accuracy] | relay <prompt_seed>";
+const USAGE: &str = "usage: modelswarm-sim <scenario>\n  scenarios: pair | mesh <n> | kill <at_ms> | spec <prompt_seed> [window] [draft_accuracy] | spec_multi <prompt_seed> [proposers] [draft_accuracy] | relay <prompt_seed> | mixed";
 const DEFAULT_RTT_SAMPLES: usize = 8;
 const DEFAULT_SPEC_WINDOW: u32 = 4;
 const DEFAULT_SPEC_ACCURACY: f32 = 0.5;
@@ -155,6 +156,9 @@ async fn run(scenario: (&str, &[String])) -> anyhow::Result<serde_json::Value> {
                 .map_err(|_| anyhow::anyhow!("relay: <prompt_seed> must be a u64"))?;
             modelswarm_sim::run_relay(seed).await
         }
+        // ADR-032 §7 item 4b: the pinned mixed-swarm fallback matrix
+        // (decision-level; `ok` reports whether every pinned verdict held).
+        ("mixed", []) => modelswarm_sim::mixed_swarm::run_mixed().await,
         (cmd, _) => anyhow::bail!("unknown scenario or arguments: {cmd}\n{USAGE}"),
     }
 }

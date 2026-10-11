@@ -11,12 +11,20 @@ rust-version.workspace = true
 async-trait = "0.1"
 modelswarm-identity = { path = "../../crates/modelswarm-identity" }
 modelswarm-transport = { path = "../../crates/modelswarm-transport" }
+# ADR-032 §7 item 4b (mixed-swarm fallback scenarios): the decision
+# surface (VerifyTerm / engage rule / frozen selector / single formula) is
+# REUSED from the landed scheduler crate — the sim imports the option-A
+# wire-true term rather than re-implementing it, so it cannot drift from
+# the term that guards production.
+modelswarm-scheduler = { path = "../../crates/modelswarm-scheduler" }
 # TEST-ONLY mock backend (ADR-019): the sim harness is exactly the sanctioned
 # non-product consumer of `mock-runtime`.
 modelswarm-runtime = { path = "../../crates/modelswarm-runtime", features = ["mock-runtime"] }
 modelswarm-session = { path = "../../crates/modelswarm-session" }
 modelswarm-speculation = { path = "../../crates/modelswarm-speculation" }
+modelswarm-types = { path = "../../crates/modelswarm-types" }
 tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 

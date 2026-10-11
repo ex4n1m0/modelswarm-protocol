@@ -175,6 +175,15 @@ pub struct RuntimeMetrics {
     pub decode_tokens_per_ms: f64,
     /// Number of admitted-but-unfinished tasks.
     pub queue_depth: u32,
+    /// Adapter-wide engine KV RAM estimate in bytes across live handles
+    /// (ADR-031 §5.3 per-handle KV accounting; 0 for adapters without
+    /// accounting — the HTTP sidecar's memory is process-level, not
+    /// per-handle). Capacity-based estimate, cross-checkable against the
+    /// engine-reported used-state bytes via the capi adapter's `kv_usage`.
+    pub kv_bytes_estimate: u64,
+    /// Total engine decode calls observed by the adapter (ADR-032 I4
+    /// telemetry input; 0 for adapters that do not count).
+    pub engine_decode_calls: u64,
 }
 
 /// Sampling parameters carried by decode calls (msp-v1 §6.2 `sampling`).

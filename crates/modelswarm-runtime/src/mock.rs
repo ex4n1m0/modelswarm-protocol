@@ -266,6 +266,11 @@ impl crate::InferenceRuntime for MockRuntime {
         RuntimeMetrics {
             prefill_tokens_per_ms: MOCK_PREFILL_TOKENS_PER_MS,
             decode_tokens_per_ms: MOCK_DECODE_TOKENS_PER_MS,
+            // The mock has no engine KV; the ADR-031 §5.3 accounting fields
+            // stay 0 (documented additive defaults for adapters without
+            // accounting).
+            kv_bytes_estimate: 0,
+            engine_decode_calls: 0,
             queue_depth: self
                 .state
                 .lock()

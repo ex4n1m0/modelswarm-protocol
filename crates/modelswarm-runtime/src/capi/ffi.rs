@@ -196,6 +196,11 @@ type FnSamplerInitTopP = unsafe extern "C" fn(f32, usize) -> *mut LlamaSampler;
 type FnSamplerInitDist = unsafe extern "C" fn(u32) -> *mut LlamaSampler;
 type FnSamplerSample =
     unsafe extern "C" fn(*mut LlamaSampler, *mut LlamaContext, i32) -> LlamaToken;
+type FnStateGetSize = unsafe extern "C" fn(*mut LlamaContext) -> usize;
+type FnModelNLayer = unsafe extern "C" fn(*const LlamaModel) -> i32;
+type FnModelNEmbd = unsafe extern "C" fn(*const LlamaModel) -> i32;
+type FnModelNHead = unsafe extern "C" fn(*const LlamaModel) -> i32;
+type FnModelNHeadKv = unsafe extern "C" fn(*const LlamaModel) -> i32;
 
 /// Which batch rows request logits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +211,21 @@ pub enum Logits {
     Last,
     /// Every token of the batch (draft verification needs each position).
     All,
+}
+
+impl Logits {
+    /// ADR-031 §5.1 uniform-output promotion: `None` becomes `Last` so the
+    /// engine never switches away from its ≥1-output graph slot (b11407
+    /// caches two graph results, `gf_res_prev[n_outputs > 0]`, and only
+    /// reuses the slot the PREVIOUS decode used — switching pays a
+    /// scheduler reset + re-allocation). `Last`/`All` are unchanged.
+    #[must_use]
+    pub fn promote(self) -> Self {
+        match self {
+            Logits::None => Logits::Last,
+            other => other,
+        }
+    }
 }
 
 // ---- owned pointer wrappers ------------------------------------------------
@@ -252,6 +272,29 @@ impl Drop for ContextPtr {
         if !self.ptr.is_null() {
             unsafe { (self.lib.free)(self.ptr) };
         }
+    }
+}
+
+/// Owned per-handle pooled batch (freed by `llama_batch_free` on drop).
+/// ADR-031 §5.1 shape-stable batching: allocated ONCE per handle at the
+/// adapter's full batch capacity and reused for every decode, so
+/// steady-state decodes perform no per-call `llama_batch_init`/`free`.
+pub struct PooledBatch {
+    lib: Arc<LlamaLib>,
+    raw: LlamaBatch,
+    capacity: i32,
+}
+
+// Safety: raw engine pointers, but every dereference happens inside
+// `LlamaLib::decode_pooled` while the adapter holds the owning handle's
+// mutex (same serialization discipline as the context wrappers).
+unsafe impl Send for PooledBatch {}
+// Safety: see module note.
+unsafe impl Sync for PooledBatch {}
+
+impl Drop for PooledBatch {
+    fn drop(&mut self) {
+        unsafe { (self.lib.batch_free)(self.raw) };
     }
 }
 
@@ -318,6 +361,11 @@ pub struct LlamaLib {
     sampler_init_top_p: FnSamplerInitTopP,
     sampler_init_dist: FnSamplerInitDist,
     sampler_sample: FnSamplerSample,
+    state_get_size: FnStateGetSize,
+    model_n_layer: FnModelNLayer,
+    model_n_embd: FnModelNEmbd,
+    model_n_head: FnModelNHead,
+    model_n_head_kv: FnModelNHeadKv,
     /// Vocabulary size cached at adapter construction (logits rows).
     vocab_size: AtomicU32,
 }
@@ -399,6 +447,11 @@ impl LlamaLib {
             sampler_init_top_p: require!("llama_sampler_init_top_p", FnSamplerInitTopP),
             sampler_init_dist: require!("llama_sampler_init_dist", FnSamplerInitDist),
             sampler_sample: require!("llama_sampler_sample", FnSamplerSample),
+            state_get_size: require!("llama_state_get_size", FnStateGetSize),
+            model_n_layer: require!("llama_model_n_layer", FnModelNLayer),
+            model_n_embd: require!("llama_model_n_embd", FnModelNEmbd),
+            model_n_head: require!("llama_model_n_head", FnModelNHead),
+            model_n_head_kv: require!("llama_model_n_head_kv", FnModelNHeadKv),
             lib,
             // The ggml library ships next to the llama library in every
             // pinned bundle; resolving the backend registry loader from it
@@ -661,48 +714,107 @@ impl LlamaLib {
         unsafe { (self.memory_seq_rm)(ctx.mem, 0, p0, -1) }
     }
 
-    /// Decodes `tokens` into the context's KV (sequence 0). `logits`
-    /// selects which rows request logits. Returns the KV position the FIRST
-    /// token landed on. Errors carry the engine's `llama_decode` return
-    /// code.
+    /// Removes the WHOLE of sequence 0 from the KV (documented b11407
+    /// semantics: removing a whole sequence never fails). Used by the
+    /// load-time warmup to leave zero KV behind.
+    pub fn memory_seq_rm_all(&self, ctx: &ContextPtr) -> bool {
+        unsafe { (self.memory_seq_rm)(ctx.mem, 0, -1, -1) }
+    }
+
+    /// Decodes `tokens` into the context's KV (sequence 0) through the
+    /// handle's POOLED batch (ADR-031 §5.1: shape-stable batching — the
+    /// batch buffer is allocated once per handle and reused, so steady-state
+    /// decodes perform no engine-side batch allocation). `logits` selects
+    /// which rows request logits; returns the KV position the FIRST token
+    /// landed on; errors carry the engine's `llama_decode` return code.
     ///
     /// Batch construction follows the engine's own examples:
     /// `llama_batch_init` returns allocated-but-PARTIALLY-UNINITIALIZED
     /// arrays (`pos` is raw malloc, `n_seq_id`/`seq_id`/`logits` are
     /// zeroed), so EVERY field is written explicitly here — sequence 0,
     /// consecutive positions starting at the KV tail.
-    pub fn decode(&self, ctx: &mut ContextPtr, tokens: &[u32], logits: Logits) -> Result<u32, i32> {
+    pub fn decode_pooled(
+        &self,
+        ctx: &mut ContextPtr,
+        batch: &mut PooledBatch,
+        tokens: &[u32],
+        logits: Logits,
+    ) -> Result<u32, i32> {
         if tokens.is_empty() {
             return Err(-1);
         }
         let n = i32::try_from(tokens.len()).map_err(|_| -1)?;
+        if n > batch.capacity {
+            // Caller bug, never a runtime shape: the pool is sized for the
+            // adapter's full context at load time.
+            return Err(-1);
+        }
         let start = unsafe { (self.memory_seq_pos_max)(ctx.mem, 0) } + 1;
-        let mut batch = unsafe { (self.batch_init)(n, 0, 1) };
-        batch.n_tokens = n;
+        let raw = &mut batch.raw;
+        raw.n_tokens = n;
         for (i, token) in tokens.iter().enumerate() {
             if *token > i32::MAX as u32 {
-                unsafe { (self.batch_free)(batch) };
                 return Err(-1);
             }
             unsafe {
-                *batch.token.add(i) = *token as LlamaToken;
-                *batch.pos.add(i) = start + i as LlamaPos;
-                *batch.n_seq_id.add(i) = 1;
-                *(*batch.seq_id.add(i)) = 0;
+                *raw.token.add(i) = *token as LlamaToken;
+                *raw.pos.add(i) = start + i as LlamaPos;
+                *raw.n_seq_id.add(i) = 1;
+                *(*raw.seq_id.add(i)) = 0;
                 let want = match logits {
                     Logits::None => 0,
                     Logits::All => 1,
                     Logits::Last => i8::from(i + 1 == tokens.len()),
                 };
-                *batch.logits.add(i) = want;
+                *raw.logits.add(i) = want;
             }
         }
-        let rc = unsafe { (self.decode)(ctx.ptr, batch) };
-        unsafe { (self.batch_free)(batch) };
+        let rc = unsafe { (self.decode)(ctx.ptr, *raw) };
         if rc != 0 {
             return Err(rc);
         }
         Ok(start.max(0) as u32)
+    }
+
+    /// Allocates the per-handle pooled batch (`llama_batch_init` once,
+    /// `llama_batch_free` on drop) with room for `capacity` tokens.
+    pub fn pooled_batch(self: &Arc<Self>, capacity: u32) -> Result<PooledBatch, String> {
+        let n = i32::try_from(capacity).map_err(|_| "batch capacity out of range".to_string())?;
+        let raw = unsafe { (self.batch_init)(n, 0, 1) };
+        Ok(PooledBatch {
+            lib: Arc::clone(self),
+            raw,
+            capacity: n,
+        })
+    }
+
+    /// `llama_state_get_size` — the engine-reported size in bytes of the
+    /// context's serializable state (KV cache contents + output buffers).
+    /// Used for per-handle KV RAM accounting (an upper-bound proxy: the
+    /// physical KV allocation exists from load, this measures the used
+    /// state).
+    pub fn state_get_size(&self, ctx: &ContextPtr) -> u64 {
+        unsafe { (self.state_get_size)(ctx.ptr) as u64 }
+    }
+
+    /// Model layer count (KV accounting input).
+    pub fn model_n_layer(&self, model: &ModelPtr) -> u32 {
+        unsafe { (self.model_n_layer)(model.ptr) }.max(0) as u32
+    }
+
+    /// Model embedding width (head size derivation for KV accounting).
+    pub fn model_n_embd(&self, model: &ModelPtr) -> u32 {
+        unsafe { (self.model_n_embd)(model.ptr) }.max(0) as u32
+    }
+
+    /// Model attention head count.
+    pub fn model_n_head(&self, model: &ModelPtr) -> u32 {
+        unsafe { (self.model_n_head)(model.ptr) }.max(0) as u32
+    }
+
+    /// Model KV head count (GQA-aware).
+    pub fn model_n_head_kv(&self, model: &ModelPtr) -> u32 {
+        unsafe { (self.model_n_head_kv)(model.ptr) }.max(0) as u32
     }
 
     /// The logits row for output index `row` (negative indexes from the
@@ -793,13 +905,14 @@ fn load_library(path: &Path) -> Result<libloading::Library, libloading::Error> {
     libloading::Library::new(path)
 }
 
-/// `Send`/`Sync` for the adapter type declared in `super`: its only raw
-/// pointer is `vocab` (derived from the owned `ModelPtr`, freed together),
-/// and every engine call is serialized by the adapter's per-handle mutex.
+/// `Send`/`Sync` for the engine core declared in `super`: its only raw
+/// pointer beyond the owned wrappers is `EngineInner::vocab` (derived from
+/// the owned `ModelPtr`, freed together), and every engine call is
+/// serialized by the owning handle's mutex.
 // Safety: see comment; mirrors the wrapper impls above.
-unsafe impl Send for super::LlamaCppCapi {}
+unsafe impl Send for super::EngineInner {}
 // Safety: see comment.
-unsafe impl Sync for super::LlamaCppCapi {}
+unsafe impl Sync for super::EngineInner {}
 
 #[cfg(test)]
 mod tests {

@@ -550,16 +550,21 @@ async fn capi_vs_http_loopback_measurements() {
         .propose(&capi_handle, &spec_prefix, window)
         .await
         .unwrap();
-    let mut corrupted = draft[1..].to_vec();
-    corrupted.push(draft[0]);
+    // Corrupt position 0 EXPLICITLY: a shift-by-one is prompt-dependent (a
+    // continuation beginning with a repeated token would legitimately
+    // accept — the Vulkan test hit exactly that).
+    let mut corrupted = draft.clone();
+    let wrong = (ground_truth[0] + 1) % capi.vocab_size();
+    assert_ne!(wrong, ground_truth[0]);
+    corrupted[0] = wrong;
     let outcome = capi
         .verify_drafts(&capi_handle, &spec_prefix, &corrupted, &sampling)
         .await
         .unwrap();
-    // corrupted[0] = draft[1] != ground_truth[0] => rejection at position 0.
+    // corrupted[0] != ground_truth[0] => rejection at position 0.
     assert!(
         outcome.accepted.is_empty(),
-        "shift-by-one draft must reject at the first token (got {:?})",
+        "explicitly-wrong first token must reject at position 0 (got {:?})",
         outcome.accepted
     );
     assert_eq!(
@@ -586,16 +591,184 @@ async fn capi_vs_http_loopback_measurements() {
     );
     println!("OK: rejected at position 0; replacement + continuation token-exact");
 
+    // ---- 8. mid-window reject at position k, continue single-mode ---------
+    label("MID-WINDOW REJECT AT k=4 (shape-stable batching): rollback + single-mode continuation, token-for-token");
+    // Ground truth continuation of spec_prefix (64 tokens; covers both arms).
+    let truth_cont: Vec<u32> = {
+        let mut t = Vec::new();
+        let mut p = spec_prefix.clone();
+        for _ in 0..64 {
+            let tok = http.decode_step(&http_handle, &p, &sampling).await.unwrap();
+            t.push(tok);
+            p.push(tok);
+        }
+        t
+    };
+    // Corrupt ONLY position 4: positions 0..4 are the true greedy tokens
+    // (accepted), position 4 is wrong (rejected, replaced by truth[4]).
+    let clean_draft: Vec<u32> = truth_cont[..8].to_vec();
+    let mut mid_corrupted = clean_draft.clone();
+    mid_corrupted[4] = {
+        // A token that is NOT truth[4] (vocab is far larger than 1; pick a
+        // deterministic id different from it).
+        let wrong = (truth_cont[4] + 1) % capi.vocab_size();
+        assert_ne!(wrong, truth_cont[4]);
+        wrong
+    };
+    let outcome = capi
+        .verify_drafts(&capi_handle, &spec_prefix, &mid_corrupted, &sampling)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.accepted.as_slice(),
+        &truth_cont[..4],
+        "accepted prefix must be exactly the 4 true tokens"
+    );
+    assert_eq!(
+        outcome.bonus,
+        Some(truth_cont[4]),
+        "replacement at k=4 must be the ground-truth token"
+    );
+    // Continue SINGLE-MODE from (prefix + accepted + replacement) and assert
+    // token-for-token equality with the HTTP ground truth — the KV-rollback
+    // path under shape-stable batching must land exactly on the true line.
+    let mut cont_prefix = spec_prefix.clone();
+    cont_prefix.extend_from_slice(&truth_cont[..5]);
+    let mut single_mode: Vec<u32> = Vec::new();
+    for _ in 0..12 {
+        let tok = capi
+            .decode_step(&capi_handle, &cont_prefix, &sampling)
+            .await
+            .unwrap();
+        single_mode.push(tok);
+        cont_prefix.push(tok);
+    }
+    assert_eq!(
+        single_mode.as_slice(),
+        &truth_cont[5..17],
+        "single-mode continuation after mid-window reject must be token-for-token equal"
+    );
+    println!("OK: rejected at position 4; 12 single-mode tokens identical to HTTP ground truth");
+
+    // ---- 9. one-engine-pass (I4) + window cap + KV accounting -------------
+    label("ONE ENGINE PASS PER VERIFY (I4) + WINDOW CAP + KV ACCOUNTING");
+    // Warm the handle so the verify's sync needs no delta decode, then count.
+    let _ = capi
+        .verify_drafts(&capi_handle, &spec_prefix, &clean_draft, &sampling)
+        .await
+        .unwrap();
+    let before = capi.kv_usage().await.unwrap();
+    let _ = capi
+        .verify_drafts(&capi_handle, &spec_prefix, &clean_draft, &sampling)
+        .await
+        .unwrap();
+    let after = capi.kv_usage().await.unwrap();
+    let warm = after
+        .handles
+        .iter()
+        .find(|h| h.handle_id == capi_handle.handle_id())
+        .expect("kv_usage lists the capi handle");
+    let before_h = before
+        .handles
+        .iter()
+        .find(|h| h.handle_id == capi_handle.handle_id())
+        .expect("kv_usage lists the capi handle (before)");
+    assert_eq!(
+        warm.decode_calls - before_h.decode_calls,
+        1,
+        "a warm-KV verify_drafts must be exactly ONE engine decode call (ADR-032 I4)"
+    );
+    println!(
+        "OK: warm verify = 1 engine decode call ({} -> {}); kv tokens {} / cap {}, estimate {} MiB, engine state {} MiB",
+        before_h.decode_calls,
+        warm.decode_calls,
+        warm.kv_tokens,
+        warm.kv_token_cap,
+        warm.kv_bytes_estimate / (1024 * 1024),
+        warm.state_bytes / (1024 * 1024),
+    );
+    assert!(
+        warm.kv_bytes_estimate >= warm.state_bytes,
+        "capacity estimate must upper-bound the engine-reported used state"
+    );
+
+    // A window longer than the pinned verify window is refused BEFORE any
+    // engine work (ADR-032 §1/RC-8) — decode_calls must not move.
+    let mut oversized = truth_cont[..(capi.verify_window_max() as usize + 2)].to_vec();
+    oversized.resize(capi.verify_window_max() as usize + 2, 0);
+    let before_calls = warm.decode_calls;
+    match capi
+        .verify_drafts(&capi_handle, &spec_prefix, &oversized, &sampling)
+        .await
+    {
+        Err(modelswarm_runtime::RuntimeError::Api { status, code, .. }) => {
+            assert_eq!(status, 413);
+            assert_eq!(code, "payload_too_large");
+        }
+        other => panic!("oversized window must fail closed, got {other:?}"),
+    }
+    let cap_check = capi.kv_usage().await.unwrap();
+    let cap_h = cap_check
+        .handles
+        .iter()
+        .find(|h| h.handle_id == capi_handle.handle_id())
+        .unwrap();
+    assert_eq!(
+        cap_h.decode_calls, before_calls,
+        "the window-cap reject must do zero engine work"
+    );
+    println!(
+        "OK: window {} + 2 -> payload_too_large before any engine work",
+        capi.verify_window_max()
+    );
+
+    // ---- 10. per-handle KV cap: honest error, second adapter --------------
+    label("KV TOKEN CAP (honest kv_budget_exceeded error, no engine work)");
+    {
+        let capped = LlamaCppCapi::new(
+            CapiConfig::new(&engine_dir, &model)
+                .with_engine(EngineIdentity {
+                    version: pins.tag.clone(),
+                    build_hash: pins.canonical_build_hash.clone(),
+                })
+                .with_kv_token_cap(64),
+        )
+        .expect("second adapter (same bundle) constructs");
+        let capped_handle = capped.load("msp1:capped").await.expect("capped load");
+        let short: Vec<u32> = ids_long[..32.min(ids_long.len())].to_vec();
+        capped.prefill(&capped_handle, &short).await.unwrap();
+        match capped.prefill(&capped_handle, &ids_long).await {
+            Err(modelswarm_runtime::RuntimeError::Api { status, code, .. }) => {
+                assert_eq!(status, 429);
+                assert_eq!(code, "kv_budget_exceeded");
+            }
+            other => panic!("over-cap prefill must fail honestly, got {other:?}"),
+        }
+        // The refused call must not have grown the KV: usage still 32.
+        let usage = capped.kv_usage().await.unwrap();
+        let h = usage
+            .handles
+            .iter()
+            .find(|h| h.handle_id == capped_handle.handle_id())
+            .unwrap();
+        assert_eq!(h.kv_tokens, 32, "the refused sync must leave the KV at 32");
+        assert_eq!(h.kv_token_cap, 64, "the report carries the configured cap");
+        println!("OK: cap 64 honored (32 kept, 1217 refused with kv_budget_exceeded)");
+        drop(capped);
+    }
+
     // ---- metrics + teardown ----------------------------------------------
     label("ADAPTER METRICS (as reported through the trait)");
     let http_metrics = http.metrics();
     let capi_metrics = capi.metrics();
     println!(
-        "http: prefill {:.1} tok/ms, decode {:.3} tok/ms | capi: prefill {:.1} tok/ms, decode {:.3} tok/ms",
+        "http: prefill {:.1} tok/ms, decode {:.3} tok/ms | capi: prefill {:.1} tok/ms, decode {:.3} tok/ms, kv est {} MiB, engine decode calls {}",
         http_metrics.prefill_tokens_per_ms,
         http_metrics.decode_tokens_per_ms,
         capi_metrics.prefill_tokens_per_ms,
         capi_metrics.decode_tokens_per_ms,
+        capi_metrics.kv_bytes_estimate / (1024 * 1024),
+        capi_metrics.engine_decode_calls,
     );
 
     drop(capi);

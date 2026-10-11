@@ -4,9 +4,8 @@ import type { ReactNode } from "react";
 const SITE_URL = "https://modelswarm.deepflux.space";
 const TITLE = "ModelSwarm — Decentralized Cooperative Inference";
 const DESCRIPTION =
-  "Network-aware micro-swarms of peers hosting the same immutable model profile. " +
-  "Lossless cooperative inference with fastest-host fallback. " +
-  "Client for Windows, Linux, and macOS — all platforms released together.";
+  "Pool computers that each host the exact same verified model build into swarms — " +
+  "host to participate, no credits or payments. Live desktop client for Windows, Linux, and macOS.";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),

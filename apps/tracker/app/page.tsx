@@ -1,13 +1,18 @@
-// Landing page copy contract (2026-10-09 simplification, owner directive:
-// "simple with what is coming; keep what is needed to continue development"):
-// - forward-looking: presets + roadmap; no downloads, no chat, no changelog
-//   (installers remain available at their direct /api/download/<file> URLs)
-// - every status label must stay honest: only FAST is live today
+// Landing page copy contract (2026-10-11 revision, owner directive:
+// "as simple as possible; keep the technical features needed for
+// development; much less public text"):
+// - one honest lede + the one project rule + a short live-now list;
+//   presets table and one-line roadmap; the dev-facing API table stays
+// - every status label stays honest: only FAST is live today; cooperative
+//   contracts are LANDED (dev, not research); accuracy benefits are the
+//   accepted parallel direction (ADR-032 decision record, 2026-10-11 —
+//   benefits in any form, accuracy welcome even when slower)
 // - no payments/credits surface (AGENTS.md constraint 8)
 // - copy never names the inference engine or model-file format — the H2 meta
 //   test's source scan covers app/ marketing copy too
+// - installers remain available at their direct /api/download/<file> URLs
 
-// Protocol-level execution presets (master prompt §3 / gap-engineering study §2).
+// Protocol-level execution presets (ADR-029 §1; master prompt §3).
 const PRESETS: Array<{ name: string; status: "live" | "design"; allows: string; correctness: string }> = [
   { name: "FAST", status: "live", allows: "single host", correctness: "lossless — the baseline" },
   { name: "BALANCED", status: "design", allows: "single + hedged (≤3 raced peers)", correctness: "lossless" },
@@ -18,11 +23,19 @@ const PRESETS: Array<{ name: string; status: "live" | "design"; allows: string; 
 
 // Roadmap rows: status must reflect plan-of-record state, never aspiration.
 const ROADMAP: Array<{ item: string; status: "dev" | "research" | "gated"; detail: string }> = [
-  { item: "NAT traversal + circuit relay", status: "dev", detail: "Relay implementation verified on a real LAN; production relay hosting and honest direct-vs-relay measurements are next." },
-  { item: "Hostile-network hardening", status: "dev", detail: "Lease-gated serving is live — every serving session carries a hub-signed lease. Adversarial verification and audit epochs extend it." },
-  { item: "Cooperative inference", status: "research", detail: "Exact speculative decoding and verified token trees, engaged only when predicted to beat the measured fastest single host — otherwise automatic fallback." },
-  { item: "Verified-work accounting + fair queueing", status: "research", detail: "Contribution made visible without becoming a currency; a minimal reputation chassis with measured detection math. No credits, no payments." },
-  { item: "Deliberation + multi-model federation", status: "gated", detail: "Solvers, skeptics, and judges across different model swarms — gated behind its own correctness contracts so exact-profile guarantees never weaken." },
+  { item: "Cooperative inference", status: "dev", detail: "Batch-verification contracts are landed and tested on the wire; swarm modes engage only when predicted to beat the fastest measured single host — otherwise automatic fallback." },
+  { item: "Accuracy benefits", status: "research", detail: "Using many peers to improve answers, not just speed — welcome even when slower. Anything that changes a model's output stays gated behind its own contract and preset disclosure." },
+  { item: "Relay + NAT traversal", status: "dev", detail: "Circuit relay verified on a real LAN; production relay hosting and honest direct-vs-relay measurements are next." },
+  { item: "Verified-work accounting", status: "research", detail: "Signed receipts make contribution visible — granted, never claimed. No credits, no payments." },
+  { item: "Deliberation + multi-model federation", status: "gated", detail: "Different models working as solvers, skeptics, and judges — only behind its own correctness contracts." },
+];
+
+const LIVE_NOW: Array<{ title: string; note: string }> = [
+  { title: "Single-host inference (FAST)", note: "desktop client for Windows, Linux, and macOS" },
+  { title: "Verified identity", note: "signed catalog of immutable, hash-pinned model builds" },
+  { title: "Lease-gated serving", note: "every serving session carries a hub-signed lease" },
+  { title: "Content-blind hub", note: "prompts and completions never touch this site" },
+  { title: "Direct peer-to-peer connections", note: "LAN-tested; relay verified" },
 ];
 
 const ENDPOINTS: Array<{ method: string; path: string; note: string }> = [
@@ -62,15 +75,12 @@ const css = `
   nav .spacer { flex: 1; }
   .badge { border: 1px solid #2fd4ff55; color: #2fd4ff; border-radius: 999px; padding: 0.1rem 0.65rem; font-size: 0.72rem; letter-spacing: 0.1em; }
   .hero { width: 75%; height: auto; display: block; margin: 0 auto; }
-  .tagline { text-align: center; color: #9fb8d8; padding: 1.4rem 1rem 0.2rem; font-size: 0.95rem; }
-  .tagline b { color: #e8f4ff; font-weight: 600; }
   .lede { text-align: center; color: #b6cbe8; padding: 1.6rem 1rem 0; font-size: 0.92rem; line-height: 1.7; max-width: 62rem; margin: 0 auto; }
+  .lede b { color: #e8f4ff; font-weight: 600; }
   section { padding: 2.2rem 0 0.6rem; }
   h2 { font-size: 0.85rem; letter-spacing: 0.22em; text-transform: uppercase; color: #2fd4ff; margin-bottom: 1.1rem; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1rem; }
-  .feat { border: 1px solid #1c2b52; background: #0a1030; border-radius: 12px; padding: 1rem 1.1rem; font-size: 0.85rem; color: #c7d8ef; }
-  .feat b { display: block; color: #e8f4ff; margin-bottom: 0.35rem; font-size: 0.9rem; }
   .rule { border-left: 3px solid #2fd4ff; background: #0a1030; padding: 0.9rem 1.1rem; border-radius: 0 10px 10px 0; color: #c7d8ef; font-size: 0.88rem; margin-bottom: 1.2rem; }
+  .rule b { color: #e8f4ff; }
   code { color: #a855f7; font-size: 0.85em; }
   table { width: 100%; border-collapse: collapse; font-size: 0.8rem; color: #9fb8d8; }
   td, th { padding: 0.28rem 0.6rem 0.28rem 0; border-bottom: 1px solid #101a38; text-align: left; }
@@ -80,10 +90,14 @@ const css = `
   .pill.live { border: 1px solid #43c78f66; color: #7fe0b8; }
   .pill.dev { border: 1px solid #43c78f66; color: #7fe0b8; }
   .pill.design, .pill.research, .pill.gated { border: 1px solid #7d95b855; color: #9fb8d8; }
-  .road-row { border: 1px solid #1c2b52; background: #0a1030; border-radius: 12px; padding: 1rem 1.2rem; margin-bottom: 0.9rem; }
+  .today { list-style: none; padding: 0; margin: 0 0 0.6rem; font-size: 0.88rem; color: #c7d8ef; }
+  .today li { padding: 0.4rem 0; border-bottom: 1px solid #101a38; }
+  .today li:last-child { border-bottom: 0; }
+  .today b { color: #e8f4ff; font-weight: 600; margin-right: 0.4rem; }
+  .road-row { border: 1px solid #1c2b52; background: #0a1030; border-radius: 12px; padding: 0.8rem 1.2rem; margin-bottom: 0.7rem; }
   .road-row .rhead { display: flex; align-items: baseline; gap: 0.8rem; flex-wrap: wrap; }
-  .road-row .rname { color: #e8f4ff; font-weight: 600; font-size: 0.95rem; }
-  .road-row .rdetail { color: #c7d8ef; font-size: 0.85rem; margin-top: 0.4rem; }
+  .road-row .rname { color: #e8f4ff; font-weight: 600; font-size: 0.92rem; }
+  .road-row .rdetail { color: #c7d8ef; font-size: 0.84rem; margin-top: 0.3rem; }
   .note { font-size: 0.78rem; color: #7d95b8; margin: 0 0 1rem; }
   @media (max-width: 720px) { table { font-size: 0.72rem; } td:first-child { white-space: normal; } }
   footer { color: #7d95b8; font-size: 0.75rem; padding: 2.4rem 0 2rem; text-align: center; }
@@ -123,76 +137,44 @@ export default function Home() {
       />
 
       <p className="lede">
-        ModelSwarm is a decentralized inference protocol that groups peers hosting identical,
-        cryptographically verified model profiles into latency-aware micro-swarms. It uses direct
-        P2P communication, exact speculative decoding, parallel candidate search, and adversarial
-        verification to improve inference performance, while automatically falling back to the
-        fastest individual peer when distributed execution offers no advantage.
-      </p>
-
-      <p className="tagline">
-        Network-aware <b>micro-swarms</b> of peers hosting the same immutable model profile —<br />
-        lossless cooperative inference with automatic <b>fastest-host fallback</b>.
+        ModelSwarm pools computers that each host the <b>exact same verified
+        model build</b> into small swarms. You earn swarm access by hosting
+        the model you use — no credits, no payments. Today every request is
+        served by the fastest eligible single host; cooperative swarm modes
+        are in development and will engage only when measured to help,
+        falling back to the fastest single host whenever they don&rsquo;t.
       </p>
 
       <div className="wrap">
-        <section aria-labelledby="what-heading">
-          <h2 id="what-heading">What it is</h2>
+        <section aria-labelledby="rule-heading">
+          <h2 id="rule-heading">The one rule</h2>
           <div className="rule">
-            A peer may consume swarm inference for a model profile only while it is
-            actively and verifiably <b>hosting the exact same profile</b> — same
-            artifact hash, revision, quantization, and runtime. Enforced at the
-            tracker, at the requester, and at every serving peer.
+            A peer may consume swarm inference for a model only while it is
+            actively and verifiably <b>hosting that exact same model</b> —
+            same artifact hash, revision, quantization, and runtime.
+            Enforced at the tracker, at the requester, and at every serving
+            peer.
           </div>
-          <div className="grid">
-            <div className="feat">
-              <b>Exact-profile swarms</b>
-              Identity is a manifest-derived <code>msp1:</code> id — tokenizer, prompt
-              template, runtime build and artifact digest all pinned. Different hash,
-              different swarm.
-            </div>
-            <div className="feat">
-              <b>Lossless cooperation</b>
-              Speculative decoding and verified token trees reproduce the target
-              model&rsquo;s output exactly — proven token-for-token, including under
-              adversarial peers.
-            </div>
-            <div className="feat">
-              <b>Honest routing</b>
-              Cooperative modes engage only when predicted to beat the measured
-              fastest eligible single host — and fall back automatically when they
-              don&rsquo;t.
-            </div>
-            <div className="feat">
-              <b>Reciprocity, not currency</b>
-              You earn swarm access by hosting the same profile you consume —
-              challenges, leases and receipts make contribution verifiable. No
-              credits, tokens, or payments.
-            </div>
-            <div className="feat">
-              <b>Content-blind hub</b>
-              This site&rsquo;s tracker handles metadata, leases and rendezvous only.
-              Prompts and completions never touch it — asserted against the
-              production database.
-            </div>
-            <div className="feat">
-              <b>Adversarial resistance</b>
-              Every serving session carries a hub-signed lease bound to the
-              QUIC-authenticated peer identity; stale or foreign leases are refused
-              before the first token.
-            </div>
-          </div>
+        </section>
+
+        <section aria-labelledby="today-heading">
+          <h2 id="today-heading">Live now</h2>
+          <ul className="today">
+            {LIVE_NOW.map((l) => (
+              <li key={l.title}>
+                <b>{l.title}</b> {l.note}
+              </li>
+            ))}
+          </ul>
         </section>
 
         <section aria-labelledby="coming-heading">
           <h2 id="coming-heading">What&rsquo;s coming</h2>
           <p className="note">
-            The direction, in one table and five rows. A preset is a protocol-level
-            contract, not a UI preference: it fixes which execution modes may run, the
-            cohort cap, and the correctness label the swarm must honor — with the
-            compute budget declared on the wire. FAST is the default and live today;
-            the others activate exactly when their component modes pass their
-            correctness gates.
+            A preset is a protocol-level contract: it fixes which execution
+            modes may run and the correctness label the swarm must honor.
+            FAST is live today; each other preset activates exactly when its
+            component modes pass their correctness gates.
           </p>
           <table>
             <caption className="visually-hidden" style={{ position: "absolute", left: "-9999px" }}>

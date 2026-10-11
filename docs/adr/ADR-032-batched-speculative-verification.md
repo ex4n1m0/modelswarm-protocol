@@ -1,11 +1,14 @@
 # ADR-032: Batched speculative verification (one engine pass per draft window)
 
-Status: **Accepted (2026-10-11, owner decision — option B, with option A
-already live in code).** Both required reviews returned approve-with-
-required-changes and every required change is folded into revision 2 (see
-the amendment note). Implementation is authorized under the §7 gates; the
-ADR-031 productionization gate remains the hard dependency for anything
-runnable. Owner: Protocol Architect.
+Status: **Accepted (revision 3, 2026-10-11; originally accepted 2026-10-11 —
+option B, with option A already live in code).** Both required reviews
+returned approve-with-required-changes and every required change is folded
+into revision 2; revision 3 folds the landed implementation sessions'
+resolved contract confirmations and corrections (see the revision-3
+amendment note). The wire-contract tier is implemented and green (§7
+implementation status); the ADR-031 productionization gate — revision 2's
+hard dependency for the real-engine path — has PASSED. Owner: Protocol
+Architect.
 
 **Decision record (2026-10-11).** The owner accepted option B with the
 directive: the main goal is benefits from a swarm regardless of the
@@ -45,6 +48,38 @@ shape + offer/accept vector extension, P16 single-run label, `≥ 0`-only
 value pins). Two reviews' points of divergence and their resolutions are
 recorded in the handoff addendum
 (`docs/reviews/handoff-protocol-architect-2026-10-10.md`, revision 2).
+
+**Amendment note (revision 3, 2026-10-11).** Sessions 1–4 of
+`docs/implementation/adr-032-verifydrafts-plan.md` are landed and green
+(`fddb972`, `4f277cc`, `f9d0806`, `6730974`; workspace 447/0; handoffs
+`docs/reviews/handoff-verifydrafts-session{1..4}-2026-10-11.md`). This
+revision confirms the plan's flagged follow-up amendments as accepted
+contract text and records the implementation-driven corrections; nothing
+else changes. (1) F-1: §1 rule 3 pins the integral-only
+`generation_params_hash` rendering and the full-integer (u64-width) seed.
+(2) F-2: §1 pins `correction` as field-always-present, value-null exactly
+at EOG, prefix-only commit. (3) F-6: §3 states that the extended canonical
+form makes `verifier_backend`/`engine` REQUIRED (new canonical form; no
+deployed fleet reads the base form). (4) The session-3 fixture defect
+(over-constrained `deadline-past` context) is recorded as resolved — the
+ADR stage order won, the fixture was repaired at the generator source (§7
+correction note). (5) The two session-4 ADR-internal reconciliations are
+folded into §2 RC-3: the result `seq` check is the strict-monotone RC-7
+mirror (literal equality was unsatisfiable against RC-7's own worked
+example), and `profile_id`/`parent_prefix_hash` are enforced transitively
+(both absent from the result wire shape). (6) F-3: the venue
+interpretation is confirmed (per-push rows gated only on acceptance; the
+ADR-031 gate binds the real-engine path), and ADR-031's productionization
+has PASSED (`docs/verification/adr-031-productionization-2026-10-11.md`,
+commits `48536d2`/`30258fe`) — §7 records the satisfied dependency and the
+honest churn correction. (7) §3 gains the REQUIRED cache-cold audit rule
+(measured llama-server greedy flips on cache-warm repeats,
+`docs/reviews/accuracy-benefits-study-2026-10-11.md`). (8) §7 gains the
+acceptance-checklist progress note (wire-tier items 1–5 and 7 green;
+remaining: session 5 sim, scheduler 4a sign-off recording, the
+post-implementation Security + Test and Release review pass). The
+implementation plan is NOT amended — it remains the historical contract of
+record for sessions 1–4.
 
 Evidence base (all committed): `experiments/raw/PASS-2-ENGAGE-LAN-2026-10-10/ANALYSIS.md`
 · `experiments/raw/PASS-2-ENGAGE-LOOPBACK-2026-10-10/ANALYSIS.md` (the 9.6
@@ -163,9 +198,15 @@ Semantics (normative):
   `divergence_point == accepted_prefix_len`. The result returns the LENGTH
   and the divergence point, not the accepted tokens — both sides already
   hold the window; the actual ids travel in the subsequent `PrefixCommit`.
-- `correction` is always present for a non-empty window (replacement or
-  bonus). An empty `window_tokens` is malformed (there is nothing to verify;
-  the one-lookahead-token case is a window of the proposer's last greedy
+- `correction` (F-2, confirmed as implemented): the FIELD is always present
+  for a non-empty window (replacement or bonus); its VALUE is `null`
+  exactly at end-of-generation (EOG) — the one engine outcome with no
+  correction token — mirroring the `divergence_point` present-as-null
+  discipline of rule 4. At EOG the commit covers the accepted prefix only
+  (`committed = window_tokens[..accepted_prefix_len]`; no correction token
+  in the hash preimage). Byte-pinned by `verifydrafts-4-eos.json`. An
+  empty `window_tokens` is malformed (there is nothing to verify; the
+  one-lookahead-token case is a window of the proposer's last greedy
   token).
 - `verify_pass_ms` (RC-2, replacing revision 1's float `verify_ms`) is the
   verifier's measured engine-pass wall time in WHOLE milliseconds (u32,
@@ -210,15 +251,29 @@ golden-vector rule exists to prevent:
    Genesis = hex(sha256 of the empty string) =
    `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
 3. **`generation_params_hash` preimage (new canonical encoding, defined
-   here):** sha256 over the canonical JSON (msp-v1 §2.2) of the pinned
-   sampling-parameter object `{"seed":<u32|null>,"temperature":<num>,
-   "top_k":<u32>,"top_p":<num>}` with `seed` null when unset. The shipped
+   here; rendering pinned by revision 3 / plan flag F-1):** sha256 over the
+   canonical JSON (msp-v1 §2.2) of the pinned sampling-parameter object
+   `{"seed":<null|integer>,"temperature":<integer>,"top_k":<integer>,
+   "top_p":<integer>}` with `seed` null when unset. **Integral-only
+   rendering:** every numeric value renders as a bare JSON integer — a
+   mathematically integral value (e.g. `temperature 1.0`) renders as `1`;
+   a non-integral value fails closed at the sender
+   (`ParamsHashError::NonIntegral`) and cannot be signed. This is forced,
+   not chosen: the frozen canonicalizer rejects floats outright
+   (`FloatRejected`), so fractional sampling parameters are unsignable in
+   this family by construction. **Seed width:** revision 2's `<u32|null>`
+   sketch was narrower than the runtime type (`Option<u64>`); the accepted
+   encoding renders the FULL integer in decimal (u64 width), so any seed
+   the runtime can carry hashes identically everywhere. The
+   default-parameters preimage is byte-pinned by the fixtures:
+   `{"seed":null,"temperature":1,"top_k":40,"top_p":1}`. The shipped
    `default_sampling_params_hash` hashes a Rust `Debug` string —
    implementation-specific; it remains the OLD vocabulary's internal value
    and is NOT this family's wire preimage.
 4. **Signature preimage:** canonical JSON of the message with the
    `signature` field OMITTED ENTIRELY (not null, not empty string). All
-   other declared fields — including a null-valued `divergence_point` — are
+   other declared fields — including a null-valued `divergence_point`
+   and a null-valued EOG `correction` (F-2) — are
    PRESENT in the canonical form. Floats are forbidden in signed payloads.
 5. **Sender binding:** `sender` MUST equal the installation id derived from
    the verifying key AND the QUIC-authenticated remote PeerId of the
@@ -293,22 +348,33 @@ codes are needed" claim was false as written; the corrected claim is: no
 §6.5 registry amendment is needed, and the exact reject strings are the
 table above plus this vocabulary — decided, testable.
 
-**Result admission at the coordinator (RC-3, normative).** A
-`VerifyDraftsResult` is applied only when ALL hold: (a) the signature
-verifies under the session's pinned verifier key, `sender` derives from that
-key AND equals the QUIC-authenticated remote PeerId (msp-v1 §6.6); (b)
-`nonce_echo` EQUALS the outstanding request's `nonce` (equality check —
-pinned here); (c) `session_id`, `round`, `seq`, `profile_id`, and
-`parent_prefix_hash` equal the outstanding request's; (d)
-`accepted_prefix_len ≤ len(window_tokens)`, and on rejection
-`divergence_point == accepted_prefix_len`; (e) `new_prefix_hash` equals the
-locally recomputed hash of `(parent ‖ accepted prefix ‖ [correction])` under
-the §1 byte rule. The first valid result consumes the request's nonce; any
-later result carrying a consumed nonce, and any result with no outstanding
-request, is dropped with no state change (a replayed genuine signed result
-is thereby undetectable-to-harmless). A second protocol violation by the
-same peer within one session tears the session down with an honest reason
-(the threshold is two).
+**Result admission at the coordinator (RC-3, normative; clause (c) amended
+by revision 3).** A `VerifyDraftsResult` is applied only when ALL hold:
+(a) the signature verifies under the session's pinned verifier key,
+`sender` derives from that key AND equals the QUIC-authenticated remote
+PeerId (msp-v1 §6.6); (b) `nonce_echo` EQUALS the outstanding request's
+`nonce` (equality check — pinned here); (c) `session_id`,
+`protocol_version`, and `round` equal the outstanding request's — and, as
+amended: the result's `seq` is NOT an equality check against the request's
+(the revision-2 letter was unsatisfiable against RC-7's own worked
+example, request `seq: 12` / result `seq: 4`); the coordinator enforces
+the RC-7 mirror — the result's `seq` must be STRICTLY GREATER than the
+last `seq` seen from this verifier (`seq ≤ last` is a violation; the
+first valid result establishes the baseline, because the counter's start
+is not disclosed on the wire). `profile_id` and `parent_prefix_hash` are
+absent from the result wire shape (§1) and are enforced TRANSITIVELY: the
+parent through (e)'s recomputation under the outstanding request's parent
+(a hash computed under any other parent cannot recompute), the profile
+through (a)'s session-pinned verifier key plus the tracked request's
+profile binding; (d) `accepted_prefix_len ≤ len(window_tokens)`, and on
+rejection `divergence_point == accepted_prefix_len`; (e) `new_prefix_hash`
+equals the locally recomputed hash of `(parent ‖ accepted prefix ‖
+[correction])` under the §1 byte rule. The first valid result consumes the
+request's nonce; any later result carrying a consumed nonce, and any
+result with no outstanding request, is dropped with no state change (a
+replayed genuine signed result is thereby undetectable-to-harmless). A
+second protocol violation by the same peer within one session tears the
+session down with an honest reason (the threshold is two).
 
 **Backward compatibility with v0.1 rule 6 (ADR-007) — unchanged and
 outermost.** Draft tokens are never emitted to the local client; the
@@ -345,9 +411,18 @@ Inside a cooperative session, the fallback primitive is the existing
   cooperative negotiation, which is the layer where ADR-024's "backend MUST
   become part of verifier-class eligibility" is enforceable without a
   frozen-field edit. Because these additive fields change the canonical
-  forms of two frozen shapes, the `protocol/vectors/` golden vectors for
-  `SessionOffer`/`SessionAccept` MUST be extended (and `SessionReject`
-  vectors created) in the same gate as the family fixtures (A-4, §7 item 1).
+  forms of two frozen shapes, the extended canonical form makes
+  `verifier_backend` (SessionOffer) and `engine` (SessionAccept) REQUIRED
+  fields (revision 3 / plan flag F-6, decided): absence fails schema. There
+  is no deployed fleet reading the base form (no second implementation
+  exists, and this ADR's fixture set discharges the msp-cooperative-v1 §7
+  vector obligation), so "additive" means additive to the NAMESPACE, not
+  optional per message. The base ADR-029 shapes are preserved as DATA, not
+  accepted inputs: `session-offer-1.json` / `session-accept-1.json` pin the
+  base forms as raw JSON that FAILS deserialization into the extended
+  structs, and the extended-form vectors were created in the same gate as
+  the family fixtures (A-4, §7 item 1: `session-offer-2.json` /
+  `session-accept-2.json` / `session-reject-1.json`).
   A tracker-side backend column for cohort pre-filtering is a possible
   future ADR, not this one.
 - **What misreporting can and cannot do (A-1 wording).** The committed
@@ -376,8 +451,18 @@ Inside a cooperative session, the fallback primitive is the existing
   outcome. The audit path is sound within a backend family (E0 finding:
   re-execution spot-checks are sound within a backend family, not across);
   CPU cross-machine audit is gated on the same open E0 sub-question that
-  already gates real-draft pass 3. Exactness pins remain engine-side tests;
-  the audit path is the wire-side check the lossless label requires.
+  already gates real-draft pass 3. **Audits run cache-cold (revision 3; a
+  REQUIRED property of any `WindowAuditor` implementation):** the
+  accuracy-benefits study measured llama-server flipping a greedy
+  continuation between two attractors on cache-warm repeats of the same
+  prompt (request-state/prompt cache; first decode of a fresh state vs every
+  repeat diverged, reproduced 3/3 —
+  `docs/reviews/accuracy-benefits-study-2026-10-11.md` §3.3), so a cache-warm
+  audit can flip its OWN answer and return a false verdict in either
+  direction; every audit re-execution therefore runs with fresh engine
+  state, never against a warm request cache. Exactness pins remain
+  engine-side tests; the audit path is the wire-side check the lossless
+  label requires.
   **Receipt honesty:** counters granted from this family are
   verifier-claimed numbers inside counter-signed receipts — the ADR-030
   grant rules govern WHO may increment counters; they do not independently
@@ -496,6 +581,24 @@ language must reproduce identical canonical bytes, signatures, and outcomes
 from the same files. If the owner wants a live second consumer,
 `apps/modelswarm-sim` (T/R-owned) is the natural one.
 
+**Fixture-set correction (resolved, revision 3).** The committed
+`verifydrafts-malformed.json` (session 2, `4f277cc`) shipped its
+`deadline-past` case over-constrained: the shared context template carried
+an at-ceiling budget (`committed_output_tokens == max_output_tokens`), so
+this ADR's own first-failure-wins order (budget stage precedes deadline
+stage) classifies a literally-seeded replay as `overloaded`, not the
+recorded `deadline_exceeded`. Resolution (session 4, `6730974`, authorized
+per the plan's ADR-wins rule): **the ADR stage order won; the fixture was
+over-constrained** — repaired at the generator source, so the
+`deadline-past` context now carries a fresh budget ledger (zero committed
+tokens, coherent with RC-5(c) gap semantics: round 1 was admitted and
+abandoned before any commit) plus a recorded `budget_ledger` note; the
+file was regenerated with the diff confined to that case (3 insertions /
+2 deletions). The session-3 compensating golden-test workaround was
+removed; contexts now seed literally and the case replays directly to
+`deadline_exceeded`. The budget-before-deadline conjunction itself remains
+pinned where it belongs — in the first-failure-wins property sweep.
+
 **Execution-venue matrix (B4 — which job can ever run each item):**
 
 | Test | Venue | Features/config | Gated on |
@@ -522,6 +625,42 @@ obligation applies (`crates/modelswarm-node/tests/live_tracker.rs`
 precedent). Invariant coverage: I3/I5/I6/I7 + I2 + the I4 disclosure half
 are wire tests (per-push); I1 and the I4 one-pass half are engine-side-only
 (item 2 venue).
+
+**Venue status (revision 3; plan flag F-3 confirmed).** The per-push rows'
+gate ("this ADR's acceptance") is the binding interpretation: the
+wire-contract tier — types, fixtures, admission state machine, coordinator,
+and every mock-verifier property suite — is landed and green in per-push
+CI (implementation status below). The ADR-031 gate binds the real-engine
+path, and it has PASSED
+(`docs/verification/adr-031-productionization-2026-10-11.md`; commits
+`48536d2`/`30258fe`): all five gate items, including the I4
+one-decode-call warm-verify pin, Vulkan in-process, and the honest churn
+correction — the P16 "graph_reserve shape churn" framing was corrected by
+measurement (verify-width alternation was never the cost; the real residual
+is a +24–26 ms anti-pattern for small delta decodes immediately after KV
+rollback + tail re-eval, which the verify loop's own call order does not
+hit). The `capi-adapter` feature STAYS OFF by default — productionization
+means safe-to-turn-on; the flag flips only when this family lights up in
+serving, at which point item 2's family-specific exactness-pin reruns
+follow this matrix's `real-model-e2e.yml` extension.
+
+**Implementation status (revision 3, 2026-10-11; plan §5.3 wire-contract
+checklist).** Items 1–5 and 7 GREEN: (1–5) sessions 1–4 landed and green —
+`fddb972` types + serialization (25 unit tests), `4f277cc` committed
+fixtures + golden test (10 golden tests; generator byte-idempotent),
+`f9d0806` verifier gate + admission/divergence property suites (15 + 3
+tests; every fixture replays through the real gate), `6730974`
+coordinator admission/EWMA/audit + the deadline-past fixture repair (15
+coordinator property tests + 4 unit tests); workspace `cargo test
+--workspace` **447 passed / 0 failed / 6 ignored** at `6730974`, fmt and
+clippy clean each session; (7) the reject-frame privacy assertion is green
+inside the admission suite. REMAINING for the wire tier: item 6 (scheduler
+4a decision-logic tests green with the Scheduler + Protocol sign-off
+recorded in the ADR log — the wire-true term itself is landed,
+`crates/modelswarm-scheduler/src/shadow.rs`), session 5 (T/R-owned
+mixed-swarm fallback scenarios in `apps/modelswarm-sim`, in flight), and
+item 8 (the post-implementation Security + Test and Release review pass
+over sessions 1–4).
 
 ### 8. Verifier round state machine (per session; reviewer-facing)
 
@@ -598,9 +737,14 @@ binding; **(I8)** session-budget enforcement at the verifier (§8e).
   comparator all survive unchanged; capability discovery is honest
   (`batch_verify: false` peers are first-class singles, never fake
   verifiers); verifier authority is auditable, not assumed.
-− Depends on ADR-031's productionization gate; until it passes, this ADR
-  authorizes nothing runnable, and the wire-true term (option A) is the only
-  production-visible change.
+− (Revision 3 update — dependency satisfied.) ADR-031's productionization
+  gate has PASSED (§7 venue status) and the wire-contract tier is landed
+  and green; the remaining pre-light-up obligations are the §7
+  implementation-status items (scheduler 4a sign-off recording, session 5
+  sim scenarios, the post-implementation Security + T/R review) plus the
+  serve-loop wiring and the family's own item-2 exactness-pin reruns at
+  light-up. The wire-true term (option A) remains the only
+  production-visible change until then.
 − Linear verify only: no tree acceptance; multi-proposer diversity gains
   wait on a future tree ADR (pass-2 finding: extra proposers cost traffic
   without raising acceptance in a linear world).

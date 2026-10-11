@@ -1,41 +1,22 @@
-// Landing page copy contract (2026-10-11 revision, owner directive:
-// "as simple as possible; keep the technical features needed for
-// development; much less public text"):
-// - one honest lede + the one project rule + a short live-now list;
-//   presets table and one-line roadmap; the dev-facing API table stays
-// - every status label stays honest: only FAST is live today; cooperative
-//   contracts are LANDED (dev, not research); accuracy benefits are the
-//   accepted parallel direction (ADR-032 decision record, 2026-10-11 —
-//   benefits in any form, accuracy welcome even when slower)
+// Landing page copy contract (2026-10-11 second revision, owner directive:
+// "no one uses today's solution, the client is not hosted on the website —
+// remove old-plan references, focus on the future plan, 10x less text"):
+// - future-focused copy only: swarms, cooperation, accuracy, mixed models
+// - no live/status labels, no client/download references, no "today" hedges
+//   (honesty rides on tense + the engage/fallback note, not status pills)
+// - dev-facing surfaces stay: API table, status/catalog links, online badge
 // - no payments/credits surface (AGENTS.md constraint 8)
 // - copy never names the inference engine or model-file format — the H2 meta
 //   test's source scan covers app/ marketing copy too
 // - installers remain available at their direct /api/download/<file> URLs
 
 // Protocol-level execution presets (ADR-029 §1; master prompt §3).
-const PRESETS: Array<{ name: string; status: "live" | "design"; allows: string; correctness: string }> = [
-  { name: "FAST", status: "live", allows: "single host", correctness: "lossless — the baseline" },
-  { name: "BALANCED", status: "design", allows: "single + hedged (≤3 raced peers)", correctness: "lossless" },
-  { name: "DEEP", status: "design", allows: "BALANCED + best-of-n + deliberation roles", correctness: "approximate — never lossless" },
-  { name: "VERIFIED", status: "design", allows: "BALANCED + audited chain", correctness: "detection-oriented, carries audit proofs" },
-  { name: "MAXIMUM", status: "design", allows: "sanctioned composition of gated modes", correctness: "union of component labels" },
-];
-
-// Roadmap rows: status must reflect plan-of-record state, never aspiration.
-const ROADMAP: Array<{ item: string; status: "dev" | "research" | "gated"; detail: string }> = [
-  { item: "Cooperative inference", status: "dev", detail: "Batch-verification contracts are landed and tested on the wire; swarm modes engage only when predicted to beat the fastest measured single host — otherwise automatic fallback." },
-  { item: "Accuracy benefits", status: "research", detail: "Using many peers to improve answers, not just speed — welcome even when slower. Anything that changes a model's output stays gated behind its own contract and preset disclosure." },
-  { item: "Relay + NAT traversal", status: "dev", detail: "Circuit relay verified on a real LAN; production relay hosting and honest direct-vs-relay measurements are next." },
-  { item: "Verified-work accounting", status: "research", detail: "Signed receipts make contribution visible — granted, never claimed. No credits, no payments." },
-  { item: "Deliberation + multi-model federation", status: "gated", detail: "Mixing models — different models working as solvers, skeptics, and judges — only behind its own correctness contracts." },
-];
-
-const LIVE_NOW: Array<{ title: string; note: string }> = [
-  { title: "Single-host inference (FAST)", note: "desktop client for Windows, Linux, and macOS" },
-  { title: "Verified identity", note: "signed catalog of immutable, hash-pinned model builds" },
-  { title: "Lease-gated serving", note: "every serving session carries a hub-signed lease" },
-  { title: "Content-blind hub", note: "prompts and completions never touch this site" },
-  { title: "Direct peer-to-peer connections", note: "LAN-tested; relay verified" },
+const PRESETS: Array<{ name: string; allows: string; correctness: string }> = [
+  { name: "FAST", allows: "single host", correctness: "lossless — the baseline" },
+  { name: "BALANCED", allows: "single + hedged (≤3 raced peers)", correctness: "lossless" },
+  { name: "DEEP", allows: "best-of-n + deliberation roles", correctness: "approximate — never lossless" },
+  { name: "VERIFIED", allows: "BALANCED + audited chain", correctness: "carries audit proofs" },
+  { name: "MAXIMUM", allows: "sanctioned composition of gated modes", correctness: "union of component labels" },
 ];
 
 const ENDPOINTS: Array<{ method: string; path: string; note: string }> = [
@@ -75,41 +56,21 @@ const css = `
   nav .spacer { flex: 1; }
   .badge { border: 1px solid #2fd4ff55; color: #2fd4ff; border-radius: 999px; padding: 0.1rem 0.65rem; font-size: 0.72rem; letter-spacing: 0.1em; }
   .hero { width: 75%; height: auto; display: block; margin: 0 auto; }
-  .lede { text-align: center; color: #b6cbe8; padding: 1.6rem 1rem 0; font-size: 0.92rem; line-height: 1.7; max-width: 62rem; margin: 0 auto; }
+  .lede { text-align: center; color: #b6cbe8; padding: 1.6rem 1rem 0; font-size: 0.95rem; line-height: 1.7; max-width: 56rem; margin: 0 auto; }
   .lede b { color: #e8f4ff; font-weight: 600; }
   section { padding: 2.2rem 0 0.6rem; }
   h2 { font-size: 0.85rem; letter-spacing: 0.22em; text-transform: uppercase; color: #2fd4ff; margin-bottom: 1.1rem; }
-  .rule { border-left: 3px solid #2fd4ff; background: #0a1030; padding: 0.9rem 1.1rem; border-radius: 0 10px 10px 0; color: #c7d8ef; font-size: 0.88rem; margin-bottom: 1.2rem; }
+  .rule { border-left: 3px solid #2fd4ff; background: #0a1030; padding: 0.9rem 1.1rem; border-radius: 0 10px 10px 0; color: #c7d8ef; font-size: 0.9rem; margin-bottom: 1.2rem; }
   .rule b { color: #e8f4ff; }
   code { color: #a855f7; font-size: 0.85em; }
   table { width: 100%; border-collapse: collapse; font-size: 0.8rem; color: #9fb8d8; }
   td, th { padding: 0.28rem 0.6rem 0.28rem 0; border-bottom: 1px solid #101a38; text-align: left; }
   td:first-child { color: #2fd4ff; white-space: nowrap; }
   th { color: #7d95b8; font-size: 0.7rem; letter-spacing: 0.12em; text-transform: uppercase; }
-  .pill { display: inline-block; border-radius: 999px; padding: 0.05rem 0.6rem; font-size: 0.68rem; letter-spacing: 0.1em; white-space: nowrap; }
-  .pill.live { border: 1px solid #43c78f66; color: #7fe0b8; }
-  .pill.dev { border: 1px solid #43c78f66; color: #7fe0b8; }
-  .pill.design, .pill.research, .pill.gated { border: 1px solid #7d95b855; color: #9fb8d8; }
-  .today { list-style: none; padding: 0; margin: 0 0 0.6rem; font-size: 0.88rem; color: #c7d8ef; }
-  .today li { padding: 0.4rem 0; border-bottom: 1px solid #101a38; }
-  .today li:last-child { border-bottom: 0; }
-  .today b { color: #e8f4ff; font-weight: 600; margin-right: 0.4rem; }
-  .road-row { border: 1px solid #1c2b52; background: #0a1030; border-radius: 12px; padding: 0.8rem 1.2rem; margin-bottom: 0.7rem; }
-  .road-row .rhead { display: flex; align-items: baseline; gap: 0.8rem; flex-wrap: wrap; }
-  .road-row .rname { color: #e8f4ff; font-weight: 600; font-size: 0.92rem; }
-  .road-row .rdetail { color: #c7d8ef; font-size: 0.84rem; margin-top: 0.3rem; }
-  .note { font-size: 0.78rem; color: #7d95b8; margin: 0 0 1rem; }
+  .note { font-size: 0.78rem; color: #7d95b8; margin: 1rem 0 0; max-width: 46rem; }
   @media (max-width: 720px) { table { font-size: 0.72rem; } td:first-child { white-space: normal; } }
   footer { color: #7d95b8; font-size: 0.75rem; padding: 2.4rem 0 2rem; text-align: center; }
 `;
-
-const STATUS_LABEL: Record<string, string> = {
-  live: "LIVE",
-  dev: "IN DEVELOPMENT",
-  research: "RESEARCH",
-  gated: "GATED",
-  design: "DESIGN",
-};
 
 export default function Home() {
   return (
@@ -137,82 +98,52 @@ export default function Home() {
       />
 
       <p className="lede">
-        ModelSwarm pools computers that host verified model builds into small
-        swarms — today, peers running the <b>exact same pinned model</b>;
-        next, cooperative inference on those swarms; and later, behind its
-        own correctness gates, swarms that <b>mix different models</b> as
-        solvers, skeptics, and judges. You earn access by hosting the model
-        you use — no credits, no payments. Today every request is served by
-        the fastest eligible single host; cooperative modes will engage only
-        when measured to help, falling back to the fastest single host
-        whenever they don&rsquo;t.
+        ModelSwarm pools computers hosting verified models into <b>swarms</b> —
+        same-model swarms cooperate for <b>faster or better</b> answers; later,
+        mixed models work together as <b>solvers, skeptics, and judges</b>.
+        Host to participate.
       </p>
 
       <div className="wrap">
         <section aria-labelledby="rule-heading">
           <h2 id="rule-heading">The one rule</h2>
           <div className="rule">
-            A peer may consume swarm inference for a model only while it is
-            actively and verifiably <b>hosting that exact same model</b> —
-            same artifact hash, revision, quantization, and runtime.
-            Enforced at the tracker, at the requester, and at every serving
-            peer.
+            <b>Host to consume.</b> A peer earns swarm access only by
+            verifiably hosting the models it uses — contribution is checked,
+            not paid for. No credits, no payments. Prompts and completions
+            never touch this site.
           </div>
         </section>
 
-        <section aria-labelledby="today-heading">
-          <h2 id="today-heading">Live now</h2>
-          <ul className="today">
-            {LIVE_NOW.map((l) => (
-              <li key={l.title}>
-                <b>{l.title}</b> {l.note}
-              </li>
-            ))}
-          </ul>
-        </section>
-
-        <section aria-labelledby="coming-heading">
-          <h2 id="coming-heading">What&rsquo;s coming</h2>
-          <p className="note">
-            A preset is a protocol-level contract: it fixes which execution
-            modes may run and the correctness label the swarm must honor.
-            FAST is live today; each other preset activates exactly when its
-            component modes pass their correctness gates.
-          </p>
+        <section aria-labelledby="presets-heading">
+          <h2 id="presets-heading">Presets</h2>
           <table>
             <caption className="visually-hidden" style={{ position: "absolute", left: "-9999px" }}>
-              Execution presets and their status
+              Execution presets
             </caption>
             <thead>
               <tr>
                 <th scope="col">Preset</th>
-                <th scope="col">Status</th>
-                <th scope="col">Modes allowed</th>
-                <th scope="col">Correctness label</th>
+                <th scope="col">What runs</th>
+                <th scope="col">Correctness</th>
               </tr>
             </thead>
             <tbody>
               {PRESETS.map((p) => (
                 <tr key={p.name}>
                   <td>{p.name}</td>
-                  <td><span className={"pill " + p.status}>{STATUS_LABEL[p.status]}</span></td>
                   <td>{p.allows}</td>
                   <td>{p.correctness}</td>
                 </tr>
               ))}
             </tbody>
           </table>
-          <div style={{ marginTop: "1.4rem" }}>
-            {ROADMAP.map((r) => (
-              <div key={r.item} className="road-row">
-                <div className="rhead">
-                  <span className="rname">{r.item}</span>
-                  <span className={"pill " + r.status}>{STATUS_LABEL[r.status]}</span>
-                </div>
-                <p className="rdetail">{r.detail}</p>
-              </div>
-            ))}
-          </div>
+          <p className="note">
+            Swarm modes engage only when measured to beat the fastest eligible
+            single host — otherwise automatic fallback. Accuracy benefits
+            (better answers, even when slower) and mixed-model work stay
+            behind their own correctness gates.
+          </p>
         </section>
 
         <section aria-labelledby="api-heading">

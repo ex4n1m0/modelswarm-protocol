@@ -818,6 +818,10 @@ pub struct VerifyDraftsGate {
     profile_id: String,
     generation_params_hash: String,
     coordinator_key: VerifyingKey,
+    /// `peer_id_for(coordinator_key)` — the PeerId the serve loop's
+    /// `remote_peer_id` argument must equal on every request (ADR-032
+    /// §1 rule 5's second half; security review RC-1, 2026-10-11).
+    coordinator_peer_id: String,
     verifier_installation_id: String,
     engine: EngineDisclosure,
     // Chain state — committed hash and last HANDLED round diverge under
@@ -871,6 +875,7 @@ impl VerifyDraftsGate {
             profile_id: config.profile_id,
             generation_params_hash: config.generation_params_hash,
             coordinator_key: config.coordinator_key,
+            coordinator_peer_id: peer_id_for(&config.coordinator_key.to_bytes()),
             verifier_installation_id: config.verifier_installation_id,
             engine: config.engine,
             committed_prefix_hash: config.committed_prefix_hash,
@@ -1018,14 +1023,26 @@ impl VerifyDraftsGate {
     /// the ONE outstanding request (state `Verify`), the nonce is
     /// consumed, the sender's `seq` advances, and `last_handled_round`
     /// moves to the admitted round.
+    ///
+    /// `remote_peer_id` is the QUIC-authenticated remote PeerId of the
+    /// stream the frame arrived on (serve-loop supplied). Per ADR-032
+    /// §1 rule 5 it must equal the PeerId derived from the pinned
+    /// coordinator key; a mismatch fails closed as `bad_frame` (the
+    /// authentication-family reject — unauthenticated = malformed)
+    /// BEFORE any stage state is touched (security review RC-1,
+    /// 2026-10-11; the coordinator-side mirror is `admit_result`).
     pub fn admit_verify_drafts(
         &mut self,
         frame: &Value,
         arrival_ms: u64,
         now_ms: u64,
+        remote_peer_id: &str,
     ) -> AdmissionDecision {
         // Housekeeping first: settle COMMITTED, expire WAIT_COMMIT (RC-5(b)).
         self.settle(now_ms);
+        if remote_peer_id != self.coordinator_peer_id {
+            return self.reject(FrameRejectReason::BadFrame, None);
+        }
         let prior_state = self.state;
         self.state = GateState::Validating;
         let decision = self.run_admission_stages(frame, arrival_ms, now_ms);

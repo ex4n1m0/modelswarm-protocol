@@ -17,7 +17,7 @@
 //! codes / CancelRound reasons / state transitions (the session-2
 //! `TODO(session 3)` hooks, now live).
 
-use modelswarm_identity::{installation_id_for, InstallationIdentity};
+use modelswarm_identity::{installation_id_for, peer_id_for, InstallationIdentity};
 use modelswarm_runtime::SamplingParams;
 use modelswarm_session::negotiation::FrameRejectReason;
 use modelswarm_session::negotiation::{
@@ -334,7 +334,9 @@ fn replay_family_fixture(f: &Value, req: &VerifyDrafts, res: &VerifyDraftsResult
         MockVerifyEngine::new(engine_disclosure, (res.accepted_prefix_len, res.correction));
 
     let fields = f["request"]["fields"].clone();
-    match gate.admit_verify_drafts(&fields, anchor, anchor) {
+    let coord_peer =
+        peer_id_for(&verifying_key(f["coordinator_public_key_hex"].as_str().unwrap()).to_bytes());
+    match gate.admit_verify_drafts(&fields, anchor, anchor, &coord_peer) {
         AdmissionDecision::Admitted { round, .. } => {
             assert_eq!(round, req.round, "admitted round");
         }
@@ -624,7 +626,9 @@ fn golden_verifydrafts_3_boundary_cap_edge() {
     })
     .unwrap();
     let engine = MockVerifyEngine::new(engine_disclosure, (32, None));
-    match gate.admit_verify_drafts(&over["wire"]["fields"], anchor, anchor) {
+    let coord_peer =
+        peer_id_for(&verifying_key(f["coordinator_public_key_hex"].as_str().unwrap()).to_bytes());
+    match gate.admit_verify_drafts(&over["wire"]["fields"], anchor, anchor, &coord_peer) {
         AdmissionDecision::FrameRejected(reject) => {
             assert_eq!(reject.code, FrameRejectReason::PayloadTooLarge);
         }
@@ -983,7 +987,10 @@ fn replay_malformed_case(case: &Value) -> (VerifyDraftsGate, AdmissionDecision) 
         lease_expires_at_ms: None,
     });
 
-    let decision = gate.admit_verify_drafts(&case["wire"], arrival, anchor);
+    let coord_peer = peer_id_for(
+        &verifying_key(case["coordinator_public_key_hex"].as_str().unwrap()).to_bytes(),
+    );
+    let decision = gate.admit_verify_drafts(&case["wire"], arrival, anchor, &coord_peer);
     (gate, decision)
 }
 

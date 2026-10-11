@@ -28,9 +28,15 @@
 //!    review for the owning session/architect to confirm or amend.
 
 use modelswarm_identity::InstallationIdentity;
+
+/// The QUIC remote PeerId a serve loop would supply for this
+/// coordinator identity (RC-1: admitted requests must carry it).
+fn peer_of(c: &InstallationIdentity) -> String {
+    modelswarm_identity::peer_id_for(&c.verifying_key().to_bytes())
+}
 use modelswarm_runtime::SamplingParams;
 use modelswarm_session::negotiation::{
-    Backend, CancelRoundReason, EngineDisclosure, SessionBudget,
+    Backend, CancelRoundReason, EngineDisclosure, FrameRejectReason, SessionBudget,
 };
 use modelswarm_session::verifydrafts::{
     batch_generation_params_hash, sign_verify_drafts, sign_verify_drafts_result, AdmissionDecision,
@@ -284,7 +290,12 @@ async fn pin_verifier_late_commit_after_expiry_is_commit_mismatch() {
     let AdmissionDecision::Admitted {
         deadline_expires_at_ms,
         ..
-    } = gate.admit_verify_drafts(&serde_json::to_value(&frame).unwrap(), NOW, NOW)
+    } = gate.admit_verify_drafts(
+        &serde_json::to_value(&frame).unwrap(),
+        NOW,
+        NOW,
+        &peer_of(&coordinator),
+    )
     else {
         panic!("round must admit");
     };
@@ -339,4 +350,40 @@ async fn pin_verifier_late_commit_after_expiry_is_commit_mismatch() {
     );
     assert!(gate.is_torn_down());
     assert_eq!(gate.teardown_reason(), Some("commit_mismatch"));
+}
+
+/// RC-1 (security review 2026-10-11, required change): a request
+/// arriving on a stream whose QUIC-authenticated remote PeerId differs
+/// from the pinned coordinator's fails closed as `bad_frame` BEFORE any
+/// admission stage touches state — and the nonce is not consumed, so a
+/// retry on the correct stream still admits.
+#[test]
+fn remote_peer_mismatch_fails_closed_before_stages() {
+    let coordinator = fixture_id(0x33);
+    let mut gate = gate(&coordinator);
+    let frame = build_request(&coordinator, 12, 1, "peer-mismatch-nonce");
+    let decision = gate.admit_verify_drafts(
+        &serde_json::to_value(&frame).unwrap(),
+        NOW,
+        NOW,
+        "12D3KooWWrongStreamPeerIdFailsClosedBeforeStages",
+    );
+    match decision {
+        AdmissionDecision::FrameRejected(reject) => {
+            assert_eq!(reject.code, FrameRejectReason::BadFrame);
+        }
+        other => panic!("expected bad_frame on remote-peer mismatch, got {other:?}"),
+    }
+    assert_eq!(gate.state().as_str(), "prefilled");
+    // Nothing was consumed: the same frame on the correct stream admits.
+    let ok = gate.admit_verify_drafts(
+        &serde_json::to_value(&frame).unwrap(),
+        NOW,
+        NOW,
+        &peer_of(&coordinator),
+    );
+    assert!(
+        matches!(ok, AdmissionDecision::Admitted { .. }),
+        "correct-stream retry must admit after a mismatch reject"
+    );
 }

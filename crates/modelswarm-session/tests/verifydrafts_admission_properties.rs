@@ -14,6 +14,12 @@
 //! `protocol/vectors/*` record as `verify_at`.
 
 use modelswarm_identity::InstallationIdentity;
+
+/// The QUIC remote PeerId a serve loop would supply for this
+/// coordinator identity (RC-1: admitted requests must carry it).
+fn peer_of(c: &InstallationIdentity) -> String {
+    modelswarm_identity::peer_id_for(&c.verifying_key().to_bytes())
+}
 use modelswarm_runtime::SamplingParams;
 use modelswarm_session::negotiation::{
     Backend, CancelRoundReason, EngineDisclosure, FrameRejectReason, SessionBudget,
@@ -284,7 +290,7 @@ fn run_case(conds: &[Cond]) -> (VerifyDraftsGate, AdmissionDecision) {
         );
         assert!(
             matches!(
-                gate.admit_verify_drafts(&prior, NOW, NOW),
+                gate.admit_verify_drafts(&prior, NOW, NOW, &peer_of(&coordinator)),
                 AdmissionDecision::Admitted { .. }
             ),
             "the busy-setup prior round must be admitted"
@@ -376,7 +382,7 @@ fn run_case(conds: &[Cond]) -> (VerifyDraftsGate, AdmissionDecision) {
     } else {
         NOW
     };
-    let decision = gate.admit_verify_drafts(&frame, arrival, NOW);
+    let decision = gate.admit_verify_drafts(&frame, arrival, NOW, &peer_of(&coordinator));
     (gate, decision)
 }
 
@@ -449,7 +455,7 @@ fn admission_table_rows_singly() {
             last_handled_round: Some(1),
             ..GatePreStateSeed::default()
         });
-        let decision = gate.admit_verify_drafts(&frame, NOW, NOW);
+        let decision = gate.admit_verify_drafts(&frame, NOW, NOW, &peer_of(&coordinator));
         (gate, decision)
     };
     assert_decision(
@@ -476,10 +482,10 @@ fn admission_table_rows_singly() {
         &BASE_WINDOW,
     );
     assert!(matches!(
-        gate.admit_verify_drafts(&first, NOW, NOW),
+        gate.admit_verify_drafts(&first, NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { .. }
     ));
-    match gate.admit_verify_drafts(&first, NOW, NOW) {
+    match gate.admit_verify_drafts(&first, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::ReplayedRequest);
         }
@@ -496,7 +502,7 @@ fn admission_table_rows_singly() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&decreased, NOW, NOW) {
+    match gate.admit_verify_drafts(&decreased, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::ReplayedRequest);
         }
@@ -562,7 +568,7 @@ fn replays_reject_without_state_change() {
     );
     // Same nonce, ANY seq (fresh seq 13 > 12).
     let nonce_replay = build_request(&coordinator, 13, 6, "n0", GENESIS_PREFIX_HASH, &BASE_WINDOW);
-    match gate.admit_verify_drafts(&nonce_replay, NOW, NOW) {
+    match gate.admit_verify_drafts(&nonce_replay, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::ReplayedRequest)
         }
@@ -570,7 +576,7 @@ fn replays_reject_without_state_change() {
     }
     // Duplicate seq (== last seen), fresh nonce.
     let seq_replay = build_request(&coordinator, 12, 6, "n1", GENESIS_PREFIX_HASH, &BASE_WINDOW);
-    match gate.admit_verify_drafts(&seq_replay, NOW, NOW) {
+    match gate.admit_verify_drafts(&seq_replay, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::ReplayedRequest)
         }
@@ -585,7 +591,7 @@ fn replays_reject_without_state_change() {
         m.signature = sign_verify_drafts(&m, &coordinator).unwrap();
         decreased = serde_json::to_value(&m).unwrap();
     }
-    match gate.admit_verify_drafts(&decreased, NOW, NOW) {
+    match gate.admit_verify_drafts(&decreased, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::ReplayedRequest)
         }
@@ -623,7 +629,7 @@ fn stale_and_reordered_rounds_cancel_without_state_change() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&stale, NOW, NOW) {
+    match gate.admit_verify_drafts(&stale, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::CancelRound(c) => {
             assert_eq!(c.reason, CancelRoundReason::RoundMismatch);
             assert_eq!(c.round, 7);
@@ -638,7 +644,7 @@ fn stale_and_reordered_rounds_cancel_without_state_change() {
         &other_hash(),
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&wrong_parent, NOW, NOW) {
+    match gate.admit_verify_drafts(&wrong_parent, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::CancelRound(c) => {
             assert_eq!(c.reason, CancelRoundReason::ParentMismatch);
             assert_eq!(c.round, 8);
@@ -681,7 +687,7 @@ fn cross_profile_tears_down_and_later_frames_are_cancelled() {
     foreign.signature = sign_verify_drafts(&foreign, &coordinator).unwrap();
     let frame = serde_json::to_value(&foreign).unwrap();
 
-    match gate.admit_verify_drafts(&frame, NOW, NOW) {
+    match gate.admit_verify_drafts(&frame, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::ProfileMismatch)
         }
@@ -699,7 +705,7 @@ fn cross_profile_tears_down_and_later_frames_are_cancelled() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&next, NOW, NOW) {
+    match gate.admit_verify_drafts(&next, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::CancelledByPeer)
         }
@@ -730,7 +736,7 @@ fn window_cap_rejects_before_engine_work() {
         GENESIS_PREFIX_HASH,
         &[9_000_401; 33],
     );
-    match gate.admit_verify_drafts(&over_global, NOW, NOW) {
+    match gate.admit_verify_drafts(&over_global, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::PayloadTooLarge)
         }
@@ -746,7 +752,7 @@ fn window_cap_rejects_before_engine_work() {
         GENESIS_PREFIX_HASH,
         &[9_000_501; 9],
     );
-    match gate.admit_verify_drafts(&over_batch, NOW, NOW) {
+    match gate.admit_verify_drafts(&over_batch, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::PayloadTooLarge)
         }
@@ -781,7 +787,7 @@ async fn one_outstanding_never_queued() {
         &BASE_WINDOW,
     );
     assert!(matches!(
-        gate.admit_verify_drafts(&first.clone(), NOW, NOW),
+        gate.admit_verify_drafts(&first.clone(), NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { .. }
     ));
     assert_eq!(gate.state().as_str(), "verify");
@@ -795,12 +801,12 @@ async fn one_outstanding_never_queued() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&fresh, NOW, NOW) {
+    match gate.admit_verify_drafts(&fresh, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => assert_eq!(f.code, FrameRejectReason::BadFrame),
         other => panic!("{other:?}"),
     }
     // Repeated nonce → replayed_request (stage 6 path).
-    match gate.admit_verify_drafts(&first, NOW, NOW) {
+    match gate.admit_verify_drafts(&first, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::ReplayedRequest)
         }
@@ -827,7 +833,7 @@ async fn one_outstanding_never_queued() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&fresh2, NOW, NOW) {
+    match gate.admit_verify_drafts(&fresh2, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => assert_eq!(f.code, FrameRejectReason::BadFrame),
         other => panic!("{other:?}"),
     }
@@ -864,7 +870,7 @@ async fn wait_commit_timeout_abandons_and_gaps_are_tolerated() {
     let AdmissionDecision::Admitted {
         deadline_expires_at_ms,
         ..
-    } = gate.admit_verify_drafts(&frame, NOW, NOW)
+    } = gate.admit_verify_drafts(&frame, NOW, NOW, &peer_of(&coordinator))
     else {
         panic!("baseline must admit");
     };
@@ -902,7 +908,7 @@ async fn wait_commit_timeout_abandons_and_gaps_are_tolerated() {
         &BASE_WINDOW,
     );
     assert!(matches!(
-        gate.admit_verify_drafts(&next, NOW, NOW),
+        gate.admit_verify_drafts(&next, NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { round: 4, .. }
     ));
 }
@@ -931,7 +937,7 @@ async fn rc4_commit_mismatch_abandons_and_reproducing_commits_advance() {
         &window,
     );
     assert!(matches!(
-        gate.admit_verify_drafts(&frame, NOW, NOW),
+        gate.admit_verify_drafts(&frame, NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { .. }
     ));
     let modelswarm_session::verifydrafts::DispatchOutcome::Dispatched(result) =
@@ -971,7 +977,7 @@ async fn rc4_commit_mismatch_abandons_and_reproducing_commits_advance() {
         &window,
     );
     assert!(matches!(
-        gate.admit_verify_drafts(&frame3, NOW, NOW),
+        gate.admit_verify_drafts(&frame3, NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { .. }
     ));
     let modelswarm_session::verifydrafts::DispatchOutcome::Dispatched(result3) =
@@ -1020,7 +1026,7 @@ async fn rc4_commit_mismatch_abandons_and_reproducing_commits_advance() {
         &window,
     );
     assert!(matches!(
-        gate.admit_verify_drafts(&frame4, NOW, NOW),
+        gate.admit_verify_drafts(&frame4, NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { .. }
     ));
     gate.dispatch_outstanding(&engine, NOW, NOW + 35).await;
@@ -1059,7 +1065,7 @@ fn budget_exhaustion_refuses_with_overloaded() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&frame, NOW, NOW) {
+    match gate.admit_verify_drafts(&frame, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => assert_eq!(f.code, FrameRejectReason::Overloaded),
         other => panic!("{other:?}"),
     }
@@ -1069,7 +1075,7 @@ fn budget_exhaustion_refuses_with_overloaded() {
         ..GatePreStateSeed::default()
     });
     assert!(matches!(
-        gate.admit_verify_drafts(&frame, NOW, NOW),
+        gate.admit_verify_drafts(&frame, NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { .. }
     ));
     // Abandon the outstanding round so the seconds case starts clean.
@@ -1086,7 +1092,7 @@ fn budget_exhaustion_refuses_with_overloaded() {
         &BASE_WINDOW,
     );
     assert!(matches!(
-        gate.admit_verify_drafts(&frame2, NOW, NOW),
+        gate.admit_verify_drafts(&frame2, NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { .. }
     ));
     // At the seconds ceiling (120 s served), the next request is refused.
@@ -1100,7 +1106,7 @@ fn budget_exhaustion_refuses_with_overloaded() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&frame3, NOW, NOW) {
+    match gate.admit_verify_drafts(&frame3, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => assert_eq!(f.code, FrameRejectReason::Overloaded),
         other => panic!("seconds ceiling must refuse: {other:?}"),
     }
@@ -1128,7 +1134,7 @@ fn deadline_past_at_admission_and_clamping_boundaries() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&past, NOW - 10_000, NOW) {
+    match gate.admit_verify_drafts(&past, NOW - 10_000, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => {
             assert_eq!(f.code, FrameRejectReason::DeadlineExceeded)
         }
@@ -1150,7 +1156,7 @@ fn deadline_past_at_admission_and_clamping_boundaries() {
         msg.signature = sign_verify_drafts(&msg, &coordinator).unwrap();
         serde_json::to_value(&msg).unwrap()
     };
-    match gate.admit_verify_drafts(&clamp_low, NOW, NOW) {
+    match gate.admit_verify_drafts(&clamp_low, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::Admitted {
             deadline_expires_at_ms,
             ..
@@ -1177,7 +1183,7 @@ fn deadline_past_at_admission_and_clamping_boundaries() {
         msg.signature = sign_verify_drafts(&msg, &coordinator).unwrap();
         serde_json::to_value(&msg).unwrap()
     };
-    match gate.admit_verify_drafts(&clamp_high, NOW, NOW) {
+    match gate.admit_verify_drafts(&clamp_high, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::Admitted {
             deadline_expires_at_ms,
             ..
@@ -1210,7 +1216,7 @@ async fn deadline_rechecked_at_dispatch_after_queue_wait() {
     let AdmissionDecision::Admitted {
         deadline_expires_at_ms,
         ..
-    } = gate.admit_verify_drafts(&frame, NOW, NOW)
+    } = gate.admit_verify_drafts(&frame, NOW, NOW, &peer_of(&coordinator))
     else {
         panic!("must admit");
     };
@@ -1236,7 +1242,7 @@ async fn deadline_rechecked_at_dispatch_after_queue_wait() {
         &BASE_WINDOW,
     );
     assert!(matches!(
-        gate.admit_verify_drafts(&frame2, NOW, NOW),
+        gate.admit_verify_drafts(&frame2, NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { .. }
     ));
     let outcome = gate
@@ -1325,7 +1331,7 @@ fn lease_expiry_mid_session_refuses_with_expired_token() {
         &BASE_WINDOW,
     );
     assert!(matches!(
-        gate.admit_verify_drafts(&live, NOW, NOW),
+        gate.admit_verify_drafts(&live, NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { .. }
     ));
     assert!(gate.expire_wait_commit_if_due(NOW + 500_000));
@@ -1343,7 +1349,7 @@ fn lease_expiry_mid_session_refuses_with_expired_token() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&after, NOW, NOW) {
+    match gate.admit_verify_drafts(&after, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => assert_eq!(f.code, FrameRejectReason::ExpiredToken),
         other => panic!("{other:?}"),
     }
@@ -1356,7 +1362,7 @@ fn lease_expiry_mid_session_refuses_with_expired_token() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&later, NOW, NOW) {
+    match gate.admit_verify_drafts(&later, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => assert_eq!(f.code, FrameRejectReason::ExpiredToken),
         other => panic!("{other:?}"),
     }

@@ -12,6 +12,12 @@
 //! (ADR-032 §7 fixture row 3 generalized).
 
 use modelswarm_identity::InstallationIdentity;
+
+/// The QUIC remote PeerId a serve loop would supply for this
+/// coordinator identity (RC-1: admitted requests must carry it).
+fn peer_of(c: &InstallationIdentity) -> String {
+    modelswarm_identity::peer_id_for(&c.verifying_key().to_bytes())
+}
 use modelswarm_runtime::SamplingParams;
 use modelswarm_session::negotiation::{
     Backend, EngineDisclosure, FrameRejectReason, SessionBudget,
@@ -165,7 +171,7 @@ proptest! {
             &window,
         );
         assert!(matches!(
-            g.admit_verify_drafts(&frame, NOW, NOW),
+            g.admit_verify_drafts(&frame, NOW, NOW, &peer_of(&coordinator)),
             AdmissionDecision::Admitted { .. }
         ));
 
@@ -247,7 +253,7 @@ proptest! {
             &window,
         );
         let effective = WINDOW_CAP.min(batch_window_max) as usize;
-        let decision = g.admit_verify_drafts(&frame, NOW, NOW);
+        let decision = g.admit_verify_drafts(&frame, NOW, NOW, &peer_of(&coordinator));
         if len > effective {
             let rejected = matches!(
                 decision,
@@ -287,7 +293,7 @@ fn deterministic_boundary_sweep_len_x_batch_window_max() {
                 GENESIS_PREFIX_HASH,
                 &window,
             );
-            let decision = g.admit_verify_drafts(&frame, NOW, NOW);
+            let decision = g.admit_verify_drafts(&frame, NOW, NOW, &peer_of(&coordinator));
             if !admitted {
                 assert!(
                     matches!(
@@ -350,7 +356,7 @@ fn deterministic_boundary_sweep_len_x_batch_window_max() {
                 &next_window,
             );
             assert!(matches!(
-                g.admit_verify_drafts(&next, NOW, NOW),
+                g.admit_verify_drafts(&next, NOW, NOW, &peer_of(&coordinator)),
                 AdmissionDecision::Admitted { round: 7, .. }
             ));
         }

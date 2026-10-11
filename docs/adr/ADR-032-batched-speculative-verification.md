@@ -645,29 +645,44 @@ serving, at which point item 2's family-specific exactness-pin reruns
 follow this matrix's `real-model-e2e.yml` extension.
 
 **Implementation status (revision 3, 2026-10-11; plan §5.3 wire-contract
-checklist).** Items 1–7 GREEN: (1–5) sessions 1–4 landed and green —
+checklist).** ALL EIGHT ITEMS GREEN — the wire-contract tier is
+implemented, reviewed, and closed. (1–5) sessions 1–4 landed and green —
 `fddb972` types + serialization (25 unit tests), `4f277cc` committed
 fixtures + golden test (10 golden tests; generator byte-idempotent),
 `f9d0806` verifier gate + admission/divergence property suites (15 + 3
 tests; every fixture replays through the real gate), `6730974`
 coordinator admission/EWMA/audit + the deadline-past fixture repair (15
-coordinator property tests + 4 unit tests); workspace `cargo test
---workspace` **447 passed / 0 failed / 6 ignored** at `6730974`, fmt and
-clippy clean each session; (6) scheduler 4a sign-off RECORDED — the
-wire-true term landed at `e85e869`/`bea1749` (Scheduler handoff
-`docs/reviews/handoff-scheduler-scientist-2026-10-11.md`), the Protocol
-seat's venue confirmation is revision 3, and session 5's
+coordinator property tests + 4 unit tests); (6) scheduler 4a sign-off
+RECORDED — the wire-true term landed at `e85e869`/`bea1749` (Scheduler
+handoff `docs/reviews/handoff-scheduler-scientist-2026-10-11.md`), the
+Protocol seat's venue confirmation is revision 3, and session 5's
 `mirror_matches_the_landed_scheduler_test_numbers` pins the engagement
 arithmetic against the landed scheduler constants; (7) the reject-frame
-privacy assertion is green inside the admission suite. Session 5 LANDED
+privacy assertion is green inside the admission suite; session 5 LANDED
 (`f09a50c`): the item-4b mixed-swarm scenarios in `apps/modelswarm-sim`
 under default features, per-push — all four scenario families green
 (HTTP-only never engages; adapter cohorts engage only on predicted ×(1+
 margin) wins, honest window caps degrade never inflate; mixed swarms are
 class-blind with the fastest single of either class winning; capability
-mismatch rejects honestly with no silent drops), 456/0 workspace. The one
-REMAINING wire-tier item is (8): the post-implementation Security + Test
-and Release review pass over sessions 1–5.
+mismatch rejects honestly with no silent drops). **Item 8 CLOSED**: T/R
+sign-off APPROVE 0/0/5
+(`docs/reviews/review-verifydrafts-implementation-testrelease-2026-10-11.md`,
+`c40d09b`); Security sign-off APPROVE WITH REQUIRED CHANGES 0/2/7
+(`docs/reviews/review-verifydrafts-implementation-security-2026-10-11.md`,
+`7ca964d`) — required change RC-1 RESOLVED at `28be9a8` (remote PeerId
+now required on the request path, fail-closed `bad_frame`, pinned by
+test); RC-2 (serve-loop obligations: seconds-ledger deltas, WAIT_COMMIT
+polling, draft signing, PeerId supply) is pinned to the light-up
+serve-loop checklist — nothing exploitable while no serve loop exists.
+Advisories routed: A-1 Scheduler (expose `predicted_swarm_ms`, delete
+the sim mirror), A-2 Protocol (budget-check would-exceed vs already-at-
+cap asymmetry — pin or amend before light-up), A-3/A-4 test hardening,
+A-5 sim eligibility-skip case, plus the Security advisories A1–A7
+(late-commit policy ruling to the architect, bounded sets, frame-size
+source, `+250` overflow guard, F-4 de-rank value, `GatePreStateSeed`
+visibility). Remaining beyond the wire tier: the light-up tier
+(serve-loop wiring + `capi-adapter` flag flip + item-2 exactness-pin
+reruns), owner-gated.
 
 ### 8. Verifier round state machine (per session; reviewer-facing)
 

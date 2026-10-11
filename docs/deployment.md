@@ -50,6 +50,31 @@ modelswarm.deepflux.space you can create it").
 Set env vars with: `cd apps/tracker && vercel env add NAME production` +
 redeploy (`vercel deploy --prod`).
 
+## Deploy authentication (permanent, 2026-10-11)
+
+Deploys are non-interactive: a Vercel personal access token is stored in
+this machine's user-scope `VERCEL_TOKEN` environment variable (account
+`igorcarlier-4674`, team `timedivision`; the token value itself lives only
+in the Windows user environment — never in this repo). Any shell running
+`vercel deploy --prod --yes` from `apps/tracker/` picks it up
+automatically; shells opened before the variable was set can read it via
+PowerShell: `[Environment]::GetEnvironmentVariable('VERCEL_TOKEN','User')`.
+
+Two gotchas pinned by experience:
+
+1. **The CLI must be ≥ 63** — the token uses the `vcp_…` format, which
+   CLI 59.x rejects as "not valid" (this exact failure happened
+   2026-10-11). The global install is upgraded via
+   `npm i -g vercel@latest`; keep it current.
+2. **Interactive `vercel login` is dead as a mechanism here** — the
+   machine-wide login expired between 2026-10-05 and 2026-10-11 (all
+   local Vercel projects shared it), which blocked deploys until the
+   token existed. Do not regress to login-based deploys.
+
+Rotation: revoke/create at vercel.com/account/settings/tokens, then
+re-set the user env var. The current token value appeared in a chat
+transcript once (2026-10-11) — rotating it at owner discretion is cheap.
+
 ## Boundaries that still hold
 
 - The tracker is and remains **content-blind** (ADR-001): no prompts,

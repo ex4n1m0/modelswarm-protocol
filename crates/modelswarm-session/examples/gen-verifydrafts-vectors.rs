@@ -712,7 +712,14 @@ fn fixture_eos(coordinator: &Actor, verifier: &Actor, params_hash: &str) -> Valu
 /// case entry so each is self-contained). A prior round-1 request from
 /// the coordinator (seq 12, nonce 5a6b…) was admitted and committed 16
 /// output tokens — the budget ceiling — under a batch_window_max = 8
-/// engine.
+/// engine. The `committed_output_tokens: 16 == max_output_tokens: 16`
+/// template is the injected condition of the `budget-exhausted` case;
+/// the `deadline-past` case OVERRIDES it with a fresh ledger (see its
+/// `context_extra`) so the ADR-032 §2 first-failure-wins stage order —
+/// budget (stage 11) precedes deadline (stage 12) — lets its own
+/// condition decide (fixture repair, session 4; the session-3 handoff
+/// §5.1 finding, ruled on per the plan's ADR-wins rule: the ADR's stage
+/// order wins, the fixture was over-constrained).
 fn malformed_session_context() -> Value {
     json!({
         "admitted_session_id": "sess-vd-malformed-0001",
@@ -887,18 +894,26 @@ fn fixture_malformed(coordinator: &Actor, verifier: &Actor, params_hash: &str) -
     //    verify_at (00:00:00Z) — 60 s of queue wait exhausted the
     //    deadline long before admission. Signed with deadline_ms 1000 in
     //    the preimage (schema- and signature-valid; the reject is
-    //    temporal).
+    //    temporal). Context carries a FRESH budget ledger (fixture
+    //    repair, session 4): the template's at-ceiling 16/16 ledger is
+    //    the budget-exhausted case's injected condition and would fire
+    //    `overloaded` at stage 11 before the deadline stage could decide
+    //    — here the round-1 request was admitted but ABANDONED before
+    //    any commit (RC-5(c) gap semantics), so zero tokens are
+    //    committed and the deadline stage classifies.
     let mut deadline_spec = valid(13, "bb00000000000004");
     deadline_spec.deadline_ms = 1_000;
     cases.push(malformed_case(
         "deadline-past",
-        "ADR-032 §2 admission table, deadline-past-at-admission row: arrival 2026-10-11T23:59:00Z + deadline_ms 1000 (the DEADLINE_CLAMP_MIN_MS floor) = 23:59:01Z, one minute before the verify_at admission clock — deadline_exceeded at admission (stage 12; re-checked again before dispatch per A-2).",
+        "ADR-032 §2 admission table, deadline-past-at-admission row: arrival 2026-10-11T23:59:00Z + deadline_ms 1000 (the DEADLINE_CLAMP_MIN_MS floor) = 23:59:01Z, one minute before the verify_at admission clock — deadline_exceeded at admission (stage 12; re-checked again before dispatch per A-2). The context's budget ledger is FRESH (0 tokens committed; the round-1 request was admitted but abandoned before commit, RC-5(c)), so the earlier budget stage passes and the deadline stage decides.",
         &signed(deadline_spec),
         json!({
             "request_arrival": REQUEST_ARRIVAL,
             "request_arrival_unix_ms": REQUEST_ARRIVAL_UNIX_MS,
             "deadline_ms_effective": 1_000,
             "deadline_expires_at_unix_ms": REQUEST_ARRIVAL_UNIX_MS + 1_000,
+            "committed_output_tokens": 0,
+            "budget_ledger": "fresh (0 tokens committed; round 1 was admitted but abandoned before commit, RC-5(c)) — stage 11 passes so stage 12 decides",
         }),
         "deadline_exceeded",
         &keys,

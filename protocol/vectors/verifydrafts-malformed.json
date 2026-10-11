@@ -386,7 +386,8 @@
         "max_endpoints": 1,
         "max_output_tokens": 16
       },
-      "committed_output_tokens": 16,
+      "budget_ledger": "fresh (0 tokens committed; round 1 was admitted but abandoned before commit, RC-5(c)) — stage 11 passes so stage 12 decides",
+      "committed_output_tokens": 0,
       "committed_prefix_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "consumed_nonces": [
         "5a6b7c8d9e0f1c3d"
@@ -411,7 +412,7 @@
     "coordinator_peer_id": "12D3KooWPqT2nMDSiXUSx5D7fasaxhxKigVhcqfkKqrLghCq9jxz",
     "coordinator_public_key_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
     "coordinator_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
-    "description": "ADR-032 §2 admission table, deadline-past-at-admission row: arrival 2026-10-11T23:59:00Z + deadline_ms 1000 (the DEADLINE_CLAMP_MIN_MS floor) = 23:59:01Z, one minute before the verify_at admission clock — deadline_exceeded at admission (stage 12; re-checked again before dispatch per A-2).",
+    "description": "ADR-032 §2 admission table, deadline-past-at-admission row: arrival 2026-10-11T23:59:00Z + deadline_ms 1000 (the DEADLINE_CLAMP_MIN_MS floor) = 23:59:01Z, one minute before the verify_at admission clock — deadline_exceeded at admission (stage 12; re-checked again before dispatch per A-2). The context's budget ledger is FRESH (0 tokens committed; the round-1 request was admitted but abandoned before commit, RC-5(c)), so the earlier budget stage passes and the deadline stage decides.",
     "expected_reject": "deadline_exceeded",
     "name": "deadline-past",
     "signature": "ItyeJu2MF0S3bAgpYW3SkeluNzZtt8guWvFNyG0EFXupTs0gbuX9Bsd27LcKYzgq/TW+o4JZaMxSVLuk425XDA==",

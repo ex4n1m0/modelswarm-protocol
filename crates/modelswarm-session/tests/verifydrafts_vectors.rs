@@ -818,6 +818,17 @@ fn golden_verifydrafts_malformed_admission_cases() {
                     context["request_arrival"].as_str().unwrap(),
                     "2026-10-11T23:59:00Z"
                 );
+                // Fixture repair (session 4, session-3 handoff §5.1
+                // finding): the context carries a FRESH budget ledger
+                // (0 committed tokens), so the earlier budget stage
+                // (stage 11) passes and the deadline stage (12) decides —
+                // a literally-seeded gate replays deadline_exceeded.
+                assert_eq!(
+                    context["committed_output_tokens"].as_u64().unwrap(),
+                    0,
+                    "deadline-past context must carry a fresh budget ledger"
+                );
+                assert!(context["budget_ledger"].is_string());
             }
             "unknown-session" => {
                 let msg = VerifyDrafts::parse(wire).unwrap();
@@ -887,7 +898,7 @@ fn golden_verifydrafts_malformed_admission_cases() {
         // admission gate against the recorded context pre-state (clock
         // fixed at verify_at, mock engine) and assert the EXACT emitted
         // code equals `expected_reject`.
-        let (gate, decision) = replay_malformed_case(case, name);
+        let (gate, decision) = replay_malformed_case(case);
         let expected_code: FrameRejectReason =
             serde_json::from_value(json!(code)).expect("expected code is a family code");
         match decision {
@@ -912,15 +923,17 @@ fn golden_verifydrafts_malformed_admission_cases() {
 }
 
 /// Builds the gate recorded in one malformed case's `context` pre-state
-/// and replays the case's wire through it. Budget-ledger seeding note:
-/// the recorded `committed_output_tokens: 16` == `max_output_tokens` is
-/// the injected condition of the `budget-exhausted` case; it is seeded
-/// for every case EXCEPT `deadline-past`, whose shared-template context
-/// would otherwise mask the case's own (later-stage) condition — under
-/// first-failure-wins a literally-seeded `deadline-past` context
-/// classifies as `overloaded` (stage 11 < stage 12), which is asserted
-/// below and flagged for fixture regeneration in the session-3 handoff.
-fn replay_malformed_case(case: &Value, name: &str) -> (VerifyDraftsGate, AdmissionDecision) {
+/// and replays the case's wire through it. Budget-ledger seeding is
+/// LITERAL from the recorded context for every case: the shared
+/// template's at-ceiling `committed_output_tokens: 16 ==
+/// max_output_tokens: 16` is the injected condition of the
+/// `budget-exhausted` case, while `deadline-past` records a FRESH
+/// ledger (0 tokens committed; fixture repair, session 4 — the
+/// session-3 handoff §5.1 finding, ruled per the plan's ADR-wins rule:
+/// the ADR-032 §2 first-failure-wins stage order wins, the fixture was
+/// over-constrained), so every case now replays directly to its
+/// recorded `expected_reject` with no compensating seeding.
+fn replay_malformed_case(case: &Value) -> (VerifyDraftsGate, AdmissionDecision) {
     let ctx = &case["context"];
     let anchor = unix_ms(case["verify_at"].as_str().unwrap());
     let arrival = ctx
@@ -964,63 +977,13 @@ fn replay_malformed_case(case: &Value, name: &str) -> (VerifyDraftsGate, Admissi
             .iter()
             .filter_map(|n| n.as_str().map(str::to_string))
             .collect(),
-        committed_output_tokens: if name == "budget-exhausted" {
-            Some(ctx["committed_output_tokens"].as_u64().unwrap())
-        } else {
-            None
-        },
+        committed_output_tokens: Some(ctx["committed_output_tokens"].as_u64().unwrap()),
         last_handled_round: Some(ctx["last_handled_round"].as_u64().unwrap()),
         served_ms: None,
         lease_expires_at_ms: None,
     });
 
     let decision = gate.admit_verify_drafts(&case["wire"], arrival, anchor);
-
-    // The recorded template's at-ceiling budget seeded LITERALLY makes
-    // deadline-past classify as overloaded (budget stage precedes the
-    // deadline stage; the property suite pins this conjunction). This
-    // pins the fixture defect in code until the fixture is regenerated.
-    if name == "deadline-past" {
-        let mut literal = VerifyDraftsGate::new(VerifyDraftsGateConfig {
-            session_id: ctx["admitted_session_id"].as_str().unwrap().to_string(),
-            profile_id: ctx["pinned_profile_id"].as_str().unwrap().to_string(),
-            generation_params_hash: batch_generation_params_hash(&SamplingParams::default())
-                .unwrap(),
-            committed_prefix_hash: ctx["committed_prefix_hash"].as_str().unwrap().to_string(),
-            coordinator_key: verifying_key(case["coordinator_public_key_hex"].as_str().unwrap()),
-            verifier_installation_id: case["verifier_installation_id"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-            engine: engine_disclosure.clone(),
-            budget: serde_json::from_value(ctx["budget"].clone()).unwrap(),
-            lease_expires_at_ms: unix_ms(ctx["lease_expires_at"].as_str().unwrap()),
-            sampling_params: SamplingParams::default(),
-            verifier_next_seq: 4,
-        })
-        .unwrap();
-        literal.seed_pre_state(GatePreStateSeed {
-            last_seq: vec![(
-                case["coordinator_installation_id"]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-                ctx["last_seq_from_coordinator"].as_u64().unwrap(),
-            )],
-            last_handled_round: Some(ctx["last_handled_round"].as_u64().unwrap()),
-            committed_output_tokens: Some(ctx["committed_output_tokens"].as_u64().unwrap()),
-            ..GatePreStateSeed::default()
-        });
-        match literal.admit_verify_drafts(&case["wire"], arrival, anchor) {
-            AdmissionDecision::FrameRejected(reject) => assert_eq!(
-                reject.code,
-                FrameRejectReason::Overloaded,
-                "literal at-ceiling budget seeding must win over deadline (stage 11 < 12)"
-            ),
-            other => panic!("deadline-past literal seeding must reject: {other:?}"),
-        }
-    }
-
     (gate, decision)
 }
 

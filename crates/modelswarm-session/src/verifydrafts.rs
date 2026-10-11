@@ -3,10 +3,14 @@
 //! two-pass deserialization, and the family's byte-rule helpers.
 //!
 //! This module carries the **type and serialization layer** (implementation
-//! plan §1, step 1 — sessions 1 and 2) and the **verifier-side admission
+//! plan §1, step 1 — sessions 1 and 2), the **verifier-side admission
 //! gate and round state machine** (plan §3 / ADR-032 §8, session 3 — see
-//! [`BatchVerifyEngine`] and [`VerifyDraftsGate`]). The coordinator side
-//! (§4) lands in its own session; nothing here talks to a real engine:
+//! [`BatchVerifyEngine`] and [`VerifyDraftsGate`]), and the
+//! **coordinator side** (plan §4 / ADR-032 §2 RC-3, §1 RC-2, §3 RC-1,
+//! session 4 — see [`VerifyDraftsCoordinator`] for result admission,
+//! [`VerifierTiming`] / [`VerifierTimings`] for the timing-trust rule,
+//! and the [`VerifyTelemetry`] / [`WindowAuditor`] trait surfaces the
+//! node/desktop layers implement). Nothing here talks to a real engine:
 //! engine access is the [`BatchVerifyEngine`] trait, mockable in tests.
 //!
 //! Wire form: both messages serialize as the BARE objects of ADR-032 §1 —
@@ -54,7 +58,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use modelswarm_identity::{installation_id_for, InstallationIdentity};
+use modelswarm_identity::{installation_id_for, peer_id_for, InstallationIdentity};
 use modelswarm_runtime::{RuntimeError, SamplingParams};
 use modelswarm_transport::ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use modelswarm_transport::frame::MAX_FRAME_BYTES;
@@ -65,8 +69,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::negotiation::{CancelRoundReason, EngineDisclosure, FrameRejectReason, SessionBudget};
-use crate::{compute_prefix_hash, CommitPrefix, SpecError, DUPLICATE_MEMORY_ROUNDS};
+use crate::negotiation::{
+    CancelRoundReason, EngineDisclosure, FrameRejectReason, SessionAccept, SessionBudget,
+    SessionOffer, SessionRejectReason,
+};
+use crate::{
+    compute_prefix_hash, CommitPrefix, SpecError, DUPLICATE_MEMORY_ROUNDS, GENESIS_PREFIX_HASH,
+};
 
 /// The cooperative namespace version every family message carries
 /// (must equal `"msp-cooperative-v1"`).
@@ -1414,6 +1423,1007 @@ fn is_profile_id_form(s: &str) -> bool {
     is_bare_hash(hex_part)
 }
 
+// ---------------------------------------------------------------------------
+// §4 — Coordinator side: result admission (RC-3), timing trust (RC-2),
+// telemetry + audit surfaces (RC-1)
+// ---------------------------------------------------------------------------
+
+/// Teardown reason the coordinator records when the same peer commits a
+/// SECOND result-admission protocol violation in one session (RC-3 tail:
+/// threshold exactly [`TEARDOWN_VIOLATION_THRESHOLD`]). An honest label —
+/// it names what happened, nothing more.
+pub const TEARDOWN_REASON_RESULT_VIOLATION: &str = "verify_result_violation";
+
+/// Receipt-honesty label (ADR-032 §3 RC-1 / §6 non-goals): every counter
+/// granted from this family — `verified_tokens` inside counter-signed
+/// ReceiptV2s — is a **verifier-claimed** number. The ADR-030 grant rules
+/// govern WHO may increment counters; they do not independently measure
+/// the claimed values. This label MUST be attached at the receipt intake
+/// (the msp-v1 §5 `verified_capacity` honest-label sense) and it adds NO
+/// wire field: the family's messages are frozen and this is a
+/// documentation-at-intake obligation only.
+pub const RECEIPT_COUNTER_HONESTY_LABEL: &str = "verifier-claimed";
+
+/// The outstanding `VerifyDrafts` request the coordinator has sent and is
+/// awaiting one `VerifyDraftsResult` for (the mirror of the verifier
+/// gate's [`OutstandingRound`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutstandingVerifyRequest {
+    /// The request's round (RC-3 (c)).
+    pub round: u64,
+    /// The COORDINATOR's own request `seq` (RC-7: the result replies with
+    /// the VERIFIER's counter, not this one).
+    pub seq: u64,
+    /// The request's single-use nonce; the first valid result consumes it.
+    pub nonce: String,
+    /// The request's profile id (RC-3 (c)).
+    pub profile_id: String,
+    /// The parent the window chains onto (RC-3 (c)/(e)).
+    pub parent_prefix_hash: String,
+    /// The draft window (RC-3 (d): `accepted_prefix_len <= len`).
+    pub window_tokens: Vec<u32>,
+}
+
+/// Configuration for [`VerifyDraftsCoordinator::new`] — the session
+/// binding the coordinator enforces plus the session's PINNED verifier
+/// key (RC-3 (a): results verify under exactly this key).
+#[derive(Debug, Clone)]
+pub struct VerifyDraftsCoordinatorConfig {
+    /// The admitted session id.
+    pub session_id: String,
+    /// The pinned model profile id.
+    pub profile_id: String,
+    /// This family's canonical generation-params hash.
+    pub generation_params_hash: String,
+    /// The verifier's public key pinned at session open; every
+    /// `VerifyDraftsResult` signature is verified under it (RC-3 (a)).
+    pub verifier_key: VerifyingKey,
+}
+
+/// Why a coordinator could not be constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatorConfigError {
+    /// The pinned profile id is not `"msp1:" + 64 hex`.
+    InvalidProfileId,
+    /// The generation-params hash is not bare 64-lowercase-hex.
+    InvalidParamsHash,
+}
+
+impl std::fmt::Display for CoordinatorConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoordinatorConfigError::InvalidProfileId => {
+                write!(f, "profile id must be msp1:<64 hex>")
+            }
+            CoordinatorConfigError::InvalidParamsHash => {
+                write!(f, "generation-params hash must be 64 lowercase hex chars")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CoordinatorConfigError {}
+
+/// Why a [`VerifyDraftsCoordinator::track_request`] call was refused
+/// (requester-side misuse — the coordinator builds its own requests).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackRequestError {
+    /// The session is torn down; no new rounds may be sent.
+    SessionTornDown,
+    /// The request does not bind to the coordinator's session config
+    /// (carries the field name).
+    Binding(&'static str),
+}
+
+impl std::fmt::Display for TrackRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrackRequestError::SessionTornDown => {
+                write!(f, "session is torn down; no new rounds may be sent")
+            }
+            TrackRequestError::Binding(field) => {
+                write!(
+                    f,
+                    "request field {field:?} does not bind to the session config"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TrackRequestError {}
+
+/// A result was DROPPED with no state change at all (not even the
+/// violation counters) — RC-3 tail: "any later result carrying a consumed
+/// nonce, and any result with no outstanding request, is dropped with no
+/// state change (a replayed genuine signed result is thereby
+/// undetectable-to-harmless)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultDrop {
+    /// No `VerifyDrafts` is outstanding (never sent, already answered, or
+    /// abandoned).
+    NoOutstandingRequest,
+    /// The echoed nonce was already consumed by a prior valid result — a
+    /// replayed genuine result; harmless by construction.
+    ConsumedNonce,
+    /// The session is torn down; nothing is admitted anymore.
+    SessionTornDown,
+}
+
+impl std::fmt::Display for ResultDrop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResultDrop::NoOutstandingRequest => write!(f, "no outstanding request"),
+            ResultDrop::ConsumedNonce => write!(f, "consumed nonce (replayed result)"),
+            ResultDrop::SessionTornDown => write!(f, "session torn down"),
+        }
+    }
+}
+
+/// Which RC-3 admission check (a)–(e) failed. Every variant is a protocol
+/// violation by the result's peer and counts toward the
+/// [`TEARDOWN_VIOLATION_THRESHOLD`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultViolation {
+    /// The frame does not strictly parse (schema stage).
+    Schema,
+    /// RC-3 (a): the signature does not verify under the pinned verifier
+    /// key, or `sender` does not derive from it.
+    Signature,
+    /// RC-3 (a): the QUIC-authenticated remote PeerId of the connection
+    /// (msp-v1 §6.6) — supplied by the serve loop, the only place that
+    /// knows the stream's peer id — does not equal the PeerId derived
+    /// from the session's pinned verifier key.
+    RemotePeer,
+    /// RC-3 (b): `nonce_echo` does not equal the outstanding request's
+    /// nonce (and is not a consumed one — that is a drop, not a
+    /// violation).
+    NonceEcho,
+    /// RC-3 (c): an echoed binding field differs from the outstanding
+    /// request's (carries the field name; `seq` is the RC-7 per-verifier
+    /// strict-monotone mirror — see
+    /// [`VerifyDraftsCoordinator::admit_result`]). The `profile_id` and
+    /// `parent_prefix_hash` equalities of RC-3 (c) are enforced
+    /// transitively (the result wire carries neither field): the parent
+    /// through the (e) recomputation, the profile through the pinned
+    /// verifier key of (a).
+    Binding(&'static str),
+    /// RC-3 (d): `accepted_prefix_len > len(window_tokens)`.
+    AcceptedPrefixBounds,
+    /// RC-3 (d): the divergence shape is inconsistent (`divergence_point`
+    /// differs from `Some(accepted_prefix_len)` on a partial acceptance,
+    /// or is non-null on a full acceptance).
+    DivergenceInconsistent,
+    /// RC-3 (e): `new_prefix_hash` does not equal the locally recomputed
+    /// [`crate::compute_prefix_hash`] over
+    /// `(parent ‖ accepted prefix ‖ [correction])`.
+    NewPrefixHash,
+}
+
+impl std::fmt::Display for ResultViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResultViolation::Schema => write!(f, "result frame failed the strict schema parse"),
+            ResultViolation::Signature => write!(f, "RC-3(a) signature/sender-derivation failed"),
+            ResultViolation::RemotePeer => {
+                write!(f, "RC-3(a) sender does not equal the remote peer id")
+            }
+            ResultViolation::NonceEcho => write!(f, "RC-3(b) nonce_echo mismatch"),
+            ResultViolation::Binding(field) => {
+                write!(f, "RC-3(c) binding mismatch on {field:?}")
+            }
+            ResultViolation::AcceptedPrefixBounds => {
+                write!(f, "RC-3(d) accepted_prefix_len exceeds the window")
+            }
+            ResultViolation::DivergenceInconsistent => {
+                write!(
+                    f,
+                    "RC-3(d) divergence shape inconsistent with accepted_prefix_len"
+                )
+            }
+            ResultViolation::NewPrefixHash => {
+                write!(f, "RC-3(e) new_prefix_hash does not recompute")
+            }
+        }
+    }
+}
+
+/// Outcome of [`VerifyDraftsCoordinator::admit_result`] (plan §4.1,
+/// ADR-032 §2 RC-3 (a)–(e) exactly).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultAdmission {
+    /// ALL of (a)–(e) held: the result is admitted, the request's nonce
+    /// is consumed, the outstanding round is answered, and the committed
+    /// ids — `window_tokens[..accepted_prefix_len] ++ [correction]` (the
+    /// correction is absent exactly at EOG, plan flag F-2) — are the
+    /// tokens the gateway may surface. The counters this result grants
+    /// are VERIFIER-CLAIMED numbers ([`RECEIPT_COUNTER_HONESTY_LABEL`]).
+    Accepted { committed: Vec<u32> },
+    /// A protocol violation (the carried check failed). The violation
+    /// counter for the remote peer grew; every OTHER piece of state is
+    /// unchanged. The FIRST violation does not tear the session down.
+    Violation(ResultViolation),
+    /// The SECOND protocol violation by the same peer within this
+    /// session: the session is torn down with the honest reason
+    /// [`TEARDOWN_REASON_RESULT_VIOLATION`] (threshold exactly
+    /// [`TEARDOWN_VIOLATION_THRESHOLD`]).
+    TornDown(ResultViolation),
+    /// Dropped with no state change at all (see [`ResultDrop`]).
+    Dropped(ResultDrop),
+}
+
+/// Receipt-outcome marker for the ADR-032 §3 RC-1 audit path (coordinator
+/// side): the receipt of a session whose audit found a divergence is
+/// MARKED — verifier-claimed counters from a diverging peer are never
+/// presented as clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReceiptOutcome {
+    /// No audit divergence recorded (the default).
+    #[default]
+    Clean,
+    /// The audit path re-executed a committed window and diverged from
+    /// the verifier-claimed committed stream.
+    AuditDivergence,
+}
+
+/// Action the audit path mandates after one audited window (plan §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditAction {
+    /// The audited window matched the verifier-claimed committed stream;
+    /// the session continues as-is.
+    Continue,
+    /// Divergence: `verifier_divergence` telemetry was emitted, the
+    /// session switched to the `SingleDecode` fallback for the REMAINDER
+    /// (the existing, exact-by-construction primitive), and the receipt
+    /// outcome was marked ([`ReceiptOutcome::AuditDivergence`]).
+    SwitchedToSingleDecode,
+}
+
+/// The coordinator side of one batched-verify session (plan §4.1;
+/// ADR-032 §2 RC-3): tracks the ONE outstanding `VerifyDrafts` it sent,
+/// admits at most one valid `VerifyDraftsResult` per request (the first
+/// valid result consumes the nonce), drops replays and unsolicited
+/// results with no state change, and tears the session down on the second
+/// protocol violation by the same peer.
+///
+/// The QUIC-authenticated remote PeerId equality of RC-3 (a) is enforced
+/// through the `remote_peer_id` parameter of [`Self::admit_result`] —
+/// the serve loop supplies it, because the session crate cannot see the
+/// stream's peer id itself (msp-v1 §6.6).
+///
+/// `seq` under RC-3 (c): the ADR's §2 binding list names `seq` equality
+/// with the outstanding request, but §1/RC-7 pin the result's `seq` as
+/// the VERIFIER's own per-(session, sender) counter — the ADR's own
+/// worked example is request `seq: 12`, result `seq: 4`, valid. The
+/// coherent rule implemented here is the RC-7 mirror of the verifier's
+/// stage-6 check: the result's `seq` must be strictly greater than the
+/// last `seq` this coordinator saw from the verifier (the first result
+/// establishes the baseline — its counter start is not disclosed on the
+/// wire); `seq <= last` is a violation. Recorded in the session-4
+/// handoff as an ADR-internal reconciliation.
+#[derive(Debug, Clone)]
+pub struct VerifyDraftsCoordinator {
+    session_id: String,
+    profile_id: String,
+    generation_params_hash: String,
+    /// The pinned verifier key (RC-3 (a)).
+    verifier_key: VerifyingKey,
+    /// `installation_id_for(verifier_key)` — the verifier's wire sender
+    /// identity for telemetry/receipt labeling.
+    verifier_peer: String,
+    /// `peer_id_for(verifier_key)` — the PeerId the serve loop's
+    /// QUIC-authenticated remote PeerId must equal (RC-3 (a), msp-v1
+    /// §6.6; ADR-020: the PeerId is the identity-multihash derivation,
+    /// a different string from the installation id — both derive from
+    /// the SAME pinned key, which is the point of the rule).
+    verifier_peer_id: String,
+    /// The one outstanding request (RC-3 runs against it).
+    outstanding: Option<OutstandingVerifyRequest>,
+    /// Session-scoped consumed nonces: every request's nonce moves here
+    /// when answered (first valid result), replaced, or abandoned — a
+    /// late or replayed genuine result for it is thereby a harmless drop.
+    consumed_nonces: HashSet<String>,
+    /// Last `seq` seen from the VERIFIER sender (the RC-7 mirror above).
+    verifier_last_seq: Option<u64>,
+    /// Per-peer protocol-violation counters (RC-3 tail).
+    violations: HashMap<String, u32>,
+    torn_down: Option<String>,
+    /// The committed prefix hash the NEXT request chains onto.
+    committed_prefix_hash: String,
+    last_accepted_round: Option<u64>,
+    /// RC-1 audit-path state.
+    fallback_single_decode: bool,
+    receipt: ReceiptOutcome,
+}
+
+impl VerifyDraftsCoordinator {
+    /// Constructs the coordinator in the fresh state (genesis chain root).
+    pub fn new(config: VerifyDraftsCoordinatorConfig) -> Result<Self, CoordinatorConfigError> {
+        if !is_profile_id_form(&config.profile_id) {
+            return Err(CoordinatorConfigError::InvalidProfileId);
+        }
+        if !is_bare_hash(&config.generation_params_hash) {
+            return Err(CoordinatorConfigError::InvalidParamsHash);
+        }
+        Ok(Self {
+            verifier_peer: installation_id_for(&config.verifier_key.to_bytes()),
+            verifier_peer_id: peer_id_for(&config.verifier_key.to_bytes()),
+            session_id: config.session_id,
+            profile_id: config.profile_id,
+            generation_params_hash: config.generation_params_hash,
+            verifier_key: config.verifier_key,
+            outstanding: None,
+            consumed_nonces: HashSet::new(),
+            verifier_last_seq: None,
+            violations: HashMap::new(),
+            torn_down: None,
+            committed_prefix_hash: GENESIS_PREFIX_HASH.to_string(),
+            last_accepted_round: None,
+            fallback_single_decode: false,
+            receipt: ReceiptOutcome::Clean,
+        })
+    }
+
+    /// Records the `VerifyDrafts` the coordinator is sending as the ONE
+    /// outstanding request. Any previously outstanding request's nonce is
+    /// consumed (a late genuine result for the replaced round is thereby
+    /// a harmless drop, not a violation).
+    pub fn track_request(&mut self, request: &VerifyDrafts) -> Result<(), TrackRequestError> {
+        if self.torn_down.is_some() {
+            return Err(TrackRequestError::SessionTornDown);
+        }
+        if request.session_id != self.session_id {
+            return Err(TrackRequestError::Binding("session_id"));
+        }
+        if request.profile_id != self.profile_id {
+            return Err(TrackRequestError::Binding("profile_id"));
+        }
+        if request.generation_params_hash != self.generation_params_hash {
+            return Err(TrackRequestError::Binding("generation_params_hash"));
+        }
+        if let Some(previous) = self.outstanding.take() {
+            self.consumed_nonces.insert(previous.nonce);
+        }
+        self.outstanding = Some(OutstandingVerifyRequest {
+            round: request.round,
+            seq: request.seq,
+            nonce: request.nonce.clone(),
+            profile_id: request.profile_id.clone(),
+            parent_prefix_hash: request.parent_prefix_hash.clone(),
+            window_tokens: request.window_tokens.clone(),
+        });
+        Ok(())
+    }
+
+    /// Abandons the outstanding request (round deadline passed, peer
+    /// gone): its nonce is consumed so a late genuine result is a
+    /// harmless drop. Returns whether a request was abandoned.
+    pub fn abandon_outstanding_request(&mut self) -> bool {
+        match self.outstanding.take() {
+            Some(previous) => {
+                self.consumed_nonces.insert(previous.nonce);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Admits one `VerifyDraftsResult` frame under RC-3 (a)–(e) EXACTLY
+    /// (plan §4.1). `remote_peer_id` is the QUIC-authenticated remote
+    /// PeerId of the connection, supplied by the serve loop (msp-v1
+    /// §6.6) — the session crate cannot see it itself.
+    ///
+    /// Check order: torn-down drop → strict schema parse → (a) signature
+    /// under the pinned verifier key + sender derivation + remote-peer
+    /// equality → no-outstanding drop → consumed-nonce drop → (b) nonce
+    /// echo → (c) session/protocol/round/seq binding (profile/parent
+    /// transitively, see [`ResultViolation::Binding`]) → (d)
+    /// accepted-length bounds + divergence consistency → (e)
+    /// `new_prefix_hash` recomputation. The first valid result consumes
+    /// the nonce; replays and unsolicited results drop with no state
+    /// change; every check failure is a protocol violation, and the
+    /// SECOND by the same peer tears the session down.
+    pub fn admit_result(&mut self, frame: &Value, remote_peer_id: &str) -> ResultAdmission {
+        if self.torn_down.is_some() {
+            return ResultAdmission::Dropped(ResultDrop::SessionTornDown);
+        }
+        // Schema (strict two-pass parse).
+        let Ok(msg) = VerifyDraftsResult::parse(frame) else {
+            return self.violation(remote_peer_id, ResultViolation::Schema);
+        };
+        // (a) — sender derivation + Ed25519 under the pinned key …
+        if verify_verify_drafts_result_signature(&msg, &self.verifier_key).is_err() {
+            return self.violation(remote_peer_id, ResultViolation::Signature);
+        }
+        // … and the QUIC-authenticated remote PeerId equality (serve-loop
+        // supplied): the stream's PeerId must equal the PeerId derived
+        // from the SAME pinned key (msp-v1 §6.6).
+        if remote_peer_id != self.verifier_peer_id {
+            return self.violation(remote_peer_id, ResultViolation::RemotePeer);
+        }
+        // Drops (no state change, not violations).
+        if self.consumed_nonces.contains(&msg.nonce_echo) {
+            return ResultAdmission::Dropped(ResultDrop::ConsumedNonce);
+        }
+        let Some(out) = self.outstanding.clone() else {
+            return ResultAdmission::Dropped(ResultDrop::NoOutstandingRequest);
+        };
+        // (b)
+        if msg.nonce_echo != out.nonce {
+            return self.violation(remote_peer_id, ResultViolation::NonceEcho);
+        }
+        // (c)
+        if msg.session_id != self.session_id {
+            return self.violation(remote_peer_id, ResultViolation::Binding("session_id"));
+        }
+        if msg.protocol_version != COOPERATIVE_PROTOCOL_VERSION {
+            return self.violation(remote_peer_id, ResultViolation::Binding("protocol_version"));
+        }
+        if msg.round != out.round {
+            return self.violation(remote_peer_id, ResultViolation::Binding("round"));
+        }
+        if self.verifier_last_seq.is_some_and(|last| msg.seq <= last) {
+            return self.violation(remote_peer_id, ResultViolation::Binding("seq"));
+        }
+        // (c) profile/parent note: the RESULT wire carries neither
+        // `profile_id` nor `parent_prefix_hash` (ADR-032 §1 result shape),
+        // so their RC-3(c) equality with the outstanding request is
+        // enforced TRANSITIVELY: the parent through (e)'s recomputation
+        // under the outstanding request's parent (a hash computed under
+        // any other parent cannot match), and the profile through the
+        // session-pinned verifier key of (a) plus the fact that
+        // [`Self::track_request`] only tracks requests bound to this
+        // session/profile config.
+        // (d)
+        if msg.accepted_prefix_len as usize > out.window_tokens.len() {
+            return self.violation(remote_peer_id, ResultViolation::AcceptedPrefixBounds);
+        }
+        let full_acceptance = msg.accepted_prefix_len as usize == out.window_tokens.len();
+        let expected_divergence = (!full_acceptance).then_some(msg.accepted_prefix_len);
+        if msg.divergence_point != expected_divergence {
+            return self.violation(remote_peer_id, ResultViolation::DivergenceInconsistent);
+        }
+        // (e) — the §1 rule 2 preimage over (parent ‖ accepted ‖ [correction]).
+        let mut committed = out.window_tokens[..msg.accepted_prefix_len as usize].to_vec();
+        if let Some(token) = msg.correction {
+            committed.push(token);
+        }
+        let recomputed =
+            compute_prefix_hash(&out.parent_prefix_hash, &committed).unwrap_or_default();
+        if recomputed != msg.new_prefix_hash {
+            return self.violation(remote_peer_id, ResultViolation::NewPrefixHash);
+        }
+
+        // Admitted: the FIRST valid result consumes the nonce (RC-3).
+        self.consumed_nonces.insert(out.nonce.clone());
+        self.outstanding = None;
+        self.verifier_last_seq = Some(msg.seq);
+        self.committed_prefix_hash = msg.new_prefix_hash.clone();
+        self.last_accepted_round = Some(out.round);
+        ResultAdmission::Accepted { committed }
+    }
+
+    /// Runs the RC-1 audit path over ONE committed window (plan §4.3):
+    /// the auditor re-executes the window with the coordinator's own
+    /// engine (cache-cold — REQUIRED of implementations, see
+    /// [`WindowAuditor`]) and compares token-for-token. On
+    /// [`AuditVerdict::Divergence`] this emits `verifier_divergence`
+    /// through `telemetry`, switches the session to the `SingleDecode`
+    /// fallback for the remainder, and marks the receipt outcome. An
+    /// audit already in fallback is a no-op (the session is single-mode
+    /// from here on).
+    ///
+    /// An auditor error propagates: a FAILED audit is not evidence of
+    /// divergence and marks nothing (the ADR pins no behavior for it;
+    /// the serve loop decides the honest stream outcome).
+    pub async fn audit_committed_window<A: WindowAuditor, T: VerifyTelemetry>(
+        &mut self,
+        auditor: &A,
+        telemetry: &T,
+        prompt_tokens: &[u32],
+        committed_before: &[u32],
+        window_commit: &[u32],
+    ) -> Result<AuditAction, RuntimeError> {
+        if self.fallback_single_decode {
+            return Ok(AuditAction::SwitchedToSingleDecode);
+        }
+        match auditor
+            .audit_window(prompt_tokens, committed_before, window_commit)
+            .await?
+        {
+            AuditVerdict::Match => Ok(AuditAction::Continue),
+            AuditVerdict::Divergence { .. } => {
+                telemetry.verifier_divergence(&self.session_id, &self.verifier_peer);
+                self.fallback_single_decode = true;
+                self.receipt = ReceiptOutcome::AuditDivergence;
+                Ok(AuditAction::SwitchedToSingleDecode)
+            }
+        }
+    }
+
+    /// Counts one protocol violation for `peer`; reaching
+    /// [`TEARDOWN_VIOLATION_THRESHOLD`] tears the session down with the
+    /// honest reason [`TEARDOWN_REASON_RESULT_VIOLATION`] (RC-3 tail).
+    fn violation(&mut self, peer: &str, why: ResultViolation) -> ResultAdmission {
+        let count = self.violations.entry(peer.to_string()).or_insert(0);
+        *count += 1;
+        if *count >= TEARDOWN_VIOLATION_THRESHOLD {
+            self.torn_down = Some(TEARDOWN_REASON_RESULT_VIOLATION.to_string());
+            ResultAdmission::TornDown(why)
+        } else {
+            ResultAdmission::Violation(why)
+        }
+    }
+
+    // -- Inspectors ---------------------------------------------------------
+
+    /// The outstanding request, if any.
+    pub fn outstanding_request(&self) -> Option<&OutstandingVerifyRequest> {
+        self.outstanding.as_ref()
+    }
+
+    /// The committed prefix hash the next request chains onto (genesis at
+    /// session open; advances on each accepted result).
+    pub fn committed_prefix_hash(&self) -> &str {
+        &self.committed_prefix_hash
+    }
+
+    /// The last round whose result was accepted.
+    pub fn last_accepted_round(&self) -> Option<u64> {
+        self.last_accepted_round
+    }
+
+    /// The last `seq` seen from the verifier sender (RC-7 mirror).
+    pub fn verifier_last_seq(&self) -> Option<u64> {
+        self.verifier_last_seq
+    }
+
+    /// Whether `nonce` is in the session-scoped consumed set.
+    pub fn nonce_consumed(&self, nonce: &str) -> bool {
+        self.consumed_nonces.contains(nonce)
+    }
+
+    /// A peer's protocol-violation count.
+    pub fn violations_of(&self, peer: &str) -> u32 {
+        self.violations.get(peer).copied().unwrap_or(0)
+    }
+
+    /// Whether the session is torn down.
+    pub fn is_torn_down(&self) -> bool {
+        self.torn_down.is_some()
+    }
+
+    /// The teardown reason, when torn down.
+    pub fn teardown_reason(&self) -> Option<&str> {
+        self.torn_down.as_deref()
+    }
+
+    /// Whether the RC-1 audit path switched this session to the
+    /// `SingleDecode` fallback.
+    pub fn in_single_decode_fallback(&self) -> bool {
+        self.fallback_single_decode
+    }
+
+    /// The receipt-outcome marker (RC-1 receipt honesty).
+    pub fn receipt_outcome(&self) -> ReceiptOutcome {
+        self.receipt
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4.2 — Timing trust: per-verifier EWMA + the verify_pass_ms cross-check
+// ---------------------------------------------------------------------------
+
+/// Default EWMA alpha (plan §4.2 / Appendix A; NOT ADR-pinned — plan flag
+/// F-4: the scheduler-facing de-rank semantics need a pinned value before
+/// light-up).
+pub const EWMA_ALPHA_DEFAULT: f64 = 0.25;
+
+/// [`VerifierTiming::with_alpha`] rejects alphas outside `(0.0, 1.0]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidAlpha;
+
+impl std::fmt::Display for InvalidAlpha {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EWMA alpha must lie in (0.0, 1.0]")
+    }
+}
+
+impl std::error::Error for InvalidAlpha {}
+
+/// Outcome of the `verify_pass_ms` cross-check (ADR-032 §1, RC-2):
+/// `Ok` — the claim is within the observed round wall time plus
+/// [`VERIFY_PASS_CLOCK_NOISE_MS`] — or `Lie` — the claim is above it and
+/// is recorded as `verify_ms_lie` telemetry, the verifier is de-ranked,
+/// and the engage gate discounts it as unverified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossCheckOutcome {
+    /// Within `observed_wall_ms + VERIFY_PASS_CLOCK_NOISE_MS`.
+    Ok,
+    /// Above it: a `verify_ms_lie` (inflation caught; under-reporting
+    /// cannot be detected from timing alone — RTT/queue dominate — and is
+    /// bounded by the realized-loss guard and acceptance-collapse
+    /// telemetry, ADR-032 §1).
+    Lie,
+}
+
+/// Per-VERIFIER timing trust (plan §4.2; RC-2). The EWMA is fed ONLY by
+/// the round wall time the REQUESTER measures itself (send `VerifyDrafts`
+/// → receive `VerifyDraftsResult`, via [`Self::record_round`]);
+/// `verify_pass_ms` is a lower-bound sanity term only
+/// ([`Self::cross_check`]). The EWMA is strictly per-verifier — a
+/// cohort-wide blend would let one lying peer de-rank honest peers
+/// (FORBIDDEN, ADR-032 §1); see [`VerifierTimings`] for the keyed table.
+#[derive(Debug, Clone)]
+pub struct VerifierTiming {
+    alpha: f64,
+    ewma_ms: Option<f64>,
+    lie_count: u32,
+}
+
+impl Default for VerifierTiming {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VerifierTiming {
+    /// Default alpha ([`EWMA_ALPHA_DEFAULT`] = 0.25).
+    pub fn new() -> Self {
+        Self {
+            alpha: EWMA_ALPHA_DEFAULT,
+            ewma_ms: None,
+            lie_count: 0,
+        }
+    }
+
+    /// Configurable alpha (plan flag F-4), `(0.0, 1.0]`.
+    pub fn with_alpha(alpha: f64) -> Result<Self, InvalidAlpha> {
+        if !alpha.is_finite() || alpha <= 0.0 || alpha > 1.0 {
+            return Err(InvalidAlpha);
+        }
+        Ok(Self {
+            alpha,
+            ewma_ms: None,
+            lie_count: 0,
+        })
+    }
+
+    /// Feeds the REQUESTER-measured round wall time into the EWMA
+    /// (first sample initializes it).
+    pub fn record_round(&mut self, measured_wall_ms: u64) {
+        let sample = measured_wall_ms as f64;
+        self.ewma_ms = Some(match self.ewma_ms {
+            None => sample,
+            Some(previous) => self.alpha * sample + (1.0 - self.alpha) * previous,
+        });
+    }
+
+    /// The per-verifier EWMA in whole milliseconds (rounded to nearest);
+    /// `None` before the first measured round.
+    pub fn ewma_ms(&self) -> Option<u64> {
+        self.ewma_ms.map(|value| value.round() as u64)
+    }
+
+    /// The RC-2 cross-check: `verify_pass_ms <= observed_wall_ms +
+    /// VERIFY_PASS_CLOCK_NOISE_MS` is `Ok`; anything above is a `Lie`
+    /// (recorded — the caller emits `verify_ms_lie` telemetry and
+    /// de-ranks; the lie count is exposed for the de-rank policy). The
+    /// EWMA is NOT fed by claimed values.
+    pub fn cross_check(&mut self, verify_pass_ms: u32, observed_wall_ms: u64) -> CrossCheckOutcome {
+        if u64::from(verify_pass_ms) > observed_wall_ms + VERIFY_PASS_CLOCK_NOISE_MS {
+            self.lie_count += 1;
+            CrossCheckOutcome::Lie
+        } else {
+            CrossCheckOutcome::Ok
+        }
+    }
+
+    /// How many `verify_ms_lie` outcomes this verifier has accumulated
+    /// (de-rank policy input, plan flag F-4).
+    pub fn lie_count(&self) -> u32 {
+        self.lie_count
+    }
+}
+
+/// The per-verifier timing table, keyed by peer id (plan §4.2 sketch:
+/// "per-verifier, keyed by peer id"). Structural per-verifier isolation:
+/// every read and write touches exactly one peer's [`VerifierTiming`];
+/// no method blends across peers, so one lying peer can never de-rank
+/// another (ADR-032 §1, tested by the coordinator property suite).
+#[derive(Debug, Clone, Default)]
+pub struct VerifierTimings {
+    /// Configured per-peer alpha (`None` = the default 0.25).
+    alpha: Option<f64>,
+    per_peer: HashMap<String, VerifierTiming>,
+}
+
+impl VerifierTimings {
+    /// Empty table, default alpha per peer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Empty table with a configurable per-peer alpha (`(0.0, 1.0]`).
+    pub fn with_alpha(alpha: f64) -> Result<Self, InvalidAlpha> {
+        // Validate eagerly so the configuration error surfaces at
+        // construction, not on the first lazy per-peer insert.
+        VerifierTiming::with_alpha(alpha)?;
+        Ok(Self {
+            per_peer: HashMap::new(),
+            alpha: Some(alpha),
+        })
+    }
+
+    /// Feeds one REQUESTER-measured round for `peer`.
+    pub fn record_round(&mut self, peer: &str, measured_wall_ms: u64) {
+        self.tracker(peer).record_round(measured_wall_ms);
+    }
+
+    /// `peer`'s EWMA (`None` before its first measured round).
+    pub fn ewma_ms(&self, peer: &str) -> Option<u64> {
+        self.per_peer.get(peer).and_then(VerifierTiming::ewma_ms)
+    }
+
+    /// The RC-2 cross-check for `peer` (see [`VerifierTiming::cross_check`]).
+    pub fn cross_check(
+        &mut self,
+        peer: &str,
+        verify_pass_ms: u32,
+        observed_wall_ms: u64,
+    ) -> CrossCheckOutcome {
+        self.tracker(peer)
+            .cross_check(verify_pass_ms, observed_wall_ms)
+    }
+
+    /// `peer`'s accumulated `verify_ms_lie` count (0 for unknown peers).
+    pub fn lie_count(&self, peer: &str) -> u32 {
+        self.per_peer.get(peer).map_or(0, VerifierTiming::lie_count)
+    }
+
+    fn tracker(&mut self, peer: &str) -> &mut VerifierTiming {
+        self.per_peer
+            .entry(peer.to_string())
+            .or_insert_with(|| match self.alpha {
+                Some(alpha) => VerifierTiming {
+                    alpha,
+                    ewma_ms: None,
+                    lie_count: 0,
+                },
+                None => VerifierTiming::new(),
+            })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4.3 — Telemetry + audit interfaces (RC-1; node/desktop implement later)
+// ---------------------------------------------------------------------------
+
+/// Telemetry surface for the batched-verify family (plan §4.3). The
+/// session crate takes NO `modelswarm-telemetry` dependency (it is a
+/// dev-dependency today; the graph stays unchanged) — the node/desktop
+/// layers implement this trait.
+pub trait VerifyTelemetry: Send + Sync {
+    /// RC-2: a `verify_pass_ms` claim exceeded the requester-measured
+    /// round wall time + clock noise — the verifier is de-ranked and the
+    /// engage gate discounts it as unverified.
+    fn verify_ms_lie(&self, session_id: &str, peer: &str);
+    /// RC-1: the audit path re-executed a committed window and diverged
+    /// from the verifier-claimed committed stream — the session switches
+    /// to the `SingleDecode` fallback and the receipt is marked.
+    fn verifier_divergence(&self, session_id: &str, peer: &str);
+    /// I8: a session budget refusal was recorded (the effective §6.5
+    /// code, e.g. `overloaded`).
+    fn budget_refused(&self, session_id: &str, code: &str);
+}
+
+/// Verdict of one audited window (plan §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditVerdict {
+    /// The coordinator's own re-execution reproduced the committed
+    /// window token-for-token.
+    Match,
+    /// The re-execution diverged at `at_index` (0-based into
+    /// `window_commit`).
+    Divergence { at_index: usize },
+}
+
+/// The RC-1 audit path (plan §4.3; ADR-032 §3 "Verifier authority is
+/// checkable, not assumed"): the coordinator locally re-executes a
+/// SAMPLED fraction of committed windows with its own engine for the same
+/// profile — at minimum the first committed window of the session and one
+/// window after every acceptance/divergence transition (see
+/// [`AuditSampler`]) — and compares token-for-token against the committed
+/// stream. Audit is sound only within the E0-pinned backend pairing of
+/// the session (re-execution spot-checks are sound within a backend
+/// family, not across).
+///
+/// # REQUIRED property of implementations: cache-cold re-execution
+///
+/// The re-execution MUST run cache-cold (fresh engine/KV state for the
+/// audited window). This is a measured requirement, not a preference:
+/// `docs/reviews/accuracy-benefits-study-2026-10-11.md` caught, live, a
+/// llama.cpp server flipping its greedy continuation between two
+/// attractors on REPEAT requests (prompt-cache state; reproduced 3/3,
+/// minority digest always at request 0) — E0's single-shot design
+/// structurally could not see it. The study's extracted rule:
+/// "divergence checks and audit re-executions MUST run cache-cold, or the
+/// check itself can flip the answer." A cache-warm audit can therefore
+/// report a DIVERGENCE for an honest verifier (or a match for a lying
+/// one) — implementations MUST evict/reset the cache before the audited
+/// pass.
+#[async_trait::async_trait]
+pub trait WindowAuditor: Send + Sync {
+    /// Re-executes one committed window with the coordinator's own
+    /// engine (cache-cold — REQUIRED, see the trait docs) and compares
+    /// token-for-token against `window_commit` (the verifier-claimed
+    /// `window_tokens[..accepted_prefix_len] ++ [correction]`).
+    async fn audit_window(
+        &self,
+        prompt_tokens: &[u32],
+        committed_before: &[u32],
+        window_commit: &[u32],
+    ) -> Result<AuditVerdict, RuntimeError>;
+}
+
+/// The acceptance/divergence class of one round's result — the audit
+/// sampling policy's transition input (plan §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowOutcome {
+    /// Full acceptance (`divergence_point` null).
+    FullAcceptance,
+    /// The window diverged (rejected at some position).
+    Divergence,
+}
+
+impl WindowOutcome {
+    /// Classifies a result's shape.
+    pub fn of(divergence_point: Option<u32>) -> Self {
+        match divergence_point {
+            Some(_) => WindowOutcome::Divergence,
+            None => WindowOutcome::FullAcceptance,
+        }
+    }
+}
+
+/// The RC-1 audit SAMPLING policy (plan §4.3, normative): audit at
+/// minimum the FIRST committed window of the session and one window
+/// after every acceptance/divergence transition. [`Self::sample`] is
+/// called with each committed window's [`WindowOutcome`] BEFORE the
+/// audit decision; it returns whether THAT window must be audited.
+#[derive(Debug, Clone, Default)]
+pub struct AuditSampler {
+    seen_any: bool,
+    last_outcome: Option<WindowOutcome>,
+    audited: usize,
+}
+
+impl AuditSampler {
+    /// Empty sampler (nothing audited yet).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records this window's outcome class and returns whether the
+    /// window MUST be audited: the first window of the session, or the
+    /// first window whose class differs from the previous one (an
+    /// acceptance/divergence transition).
+    pub fn sample(&mut self, outcome: WindowOutcome) -> bool {
+        let first = !self.seen_any;
+        let transition = self.last_outcome != Some(outcome);
+        self.seen_any = true;
+        self.last_outcome = Some(outcome);
+        let audit = first || transition;
+        self.audited += usize::from(audit);
+        audit
+    }
+
+    /// How many windows this sampler has mandated so far.
+    pub fn audited_windows(&self) -> usize {
+        self.audited
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4 — Coordinator-side negotiation decisions (SessionAccept honesty)
+// ---------------------------------------------------------------------------
+
+/// Requester-side `SessionAccept` validation failure (plan §4.4 item 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAcceptError {
+    /// An echoed field (`session_id` / `protocol_version` / `preset`)
+    /// differs from the offer.
+    EchoMismatch(&'static str),
+    /// The engine disclosure is schema-invalid: `batch_verify: true`
+    /// REQUIRES `batch_window_max` in `1..=WINDOW_CAP` (invariant I4).
+    InvalidDisclosure,
+    /// The effective budget exceeds the offered envelope — it is clamped
+    /// DOWN only, never up (carries the field name).
+    BudgetInflated(&'static str),
+}
+
+impl std::fmt::Display for SessionAcceptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionAcceptError::EchoMismatch(field) => {
+                write!(f, "accept does not echo the offer's {field:?}")
+            }
+            SessionAcceptError::InvalidDisclosure => {
+                write!(
+                    f,
+                    "engine disclosure invalid (batch_window_max out of 1..=WINDOW_CAP)"
+                )
+            }
+            SessionAcceptError::BudgetInflated(field) => {
+                write!(f, "effective budget {field:?} exceeds the offered envelope")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionAcceptError {}
+
+/// Requester-side honesty check of one `SessionAccept` against the offer
+/// it answers (ADR-032 §3): echoed `session_id`/`protocol_version`/
+/// `preset`, a schema-valid engine disclosure (`batch_verify: true`
+/// REQUIRES `batch_window_max` in `1..=WINDOW_CAP` — I4), and an
+/// effective budget clamped DOWN only.
+pub fn validate_session_accept(
+    offer: &SessionOffer,
+    accept: &SessionAccept,
+) -> Result<(), SessionAcceptError> {
+    if accept.session_id != offer.session_id {
+        return Err(SessionAcceptError::EchoMismatch("session_id"));
+    }
+    if accept.protocol_version != offer.protocol_version {
+        return Err(SessionAcceptError::EchoMismatch("protocol_version"));
+    }
+    if accept.preset != offer.preset {
+        return Err(SessionAcceptError::EchoMismatch("preset"));
+    }
+    if !accept.engine.is_valid_disclosure() {
+        return Err(SessionAcceptError::InvalidDisclosure);
+    }
+    if accept.budget.max_endpoints > offer.budget.max_endpoints {
+        return Err(SessionAcceptError::BudgetInflated("max_endpoints"));
+    }
+    if accept.budget.max_endpoint_seconds > offer.budget.max_endpoint_seconds {
+        return Err(SessionAcceptError::BudgetInflated("max_endpoint_seconds"));
+    }
+    if accept.budget.max_output_tokens > offer.budget.max_output_tokens {
+        return Err(SessionAcceptError::BudgetInflated("max_output_tokens"));
+    }
+    Ok(())
+}
+
+/// Requester-side batch-verifier eligibility (ADR-032 §3/§4): the accept
+/// must validate AND the peer must actually be able to batch-verify
+/// under the session's backend pairing. A `batch_verify: false` peer is
+/// a first-class single (and may act as proposer) — it is NEVER selected
+/// as this family's batch verifier.
+pub fn eligible_batch_verifier(offer: &SessionOffer, accept: &SessionAccept) -> bool {
+    validate_session_accept(offer, accept).is_ok()
+        && accept.engine.batch_verify
+        && accept.engine.backend == offer.verifier_backend
+}
+
+/// Peer-side honest reject reason for an incoming offer, if any
+/// (ADR-032 §3): a peer whose engine backend differs from the offer's
+/// `verifier_backend` rejects with `backend_mismatch` (E0 pairing:
+/// CPU ≠ Vulkan, never mixed) and the requester falls back to single —
+/// mandatory, never silent. `batch_verify` incapability is NOT a reject
+/// here: such a peer ACCEPTS declaring `batch_verify: false` in its
+/// engine disclosure (ADR-032 §4) and stays a first-class single; the
+/// remaining frozen reasons (`preset_unavailable`,
+/// `batch_verify_unsupported`, `budget_infeasible`) fire on the peer's
+/// own policy judgments of the offer and are left to the serve loop.
+pub fn peer_reject_reason(
+    offer: &SessionOffer,
+    engine: &EngineDisclosure,
+) -> Option<SessionRejectReason> {
+    (engine.backend != offer.verifier_backend).then_some(SessionRejectReason::BackendMismatch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1919,5 +2929,90 @@ mod tests {
             canonical_json(&floaty).unwrap_err(),
             CanonicalError::FloatRejected
         );
+    }
+
+    // -- §4.2/§4.3 unit pins (the coordinator property suite carries the
+    //    RC-3/I2/telemetry coverage) ----------------------------------------
+
+    #[test]
+    fn verifier_timing_ewma_default_alpha_and_configuration() {
+        // None before the first measured round.
+        let mut timing = VerifierTiming::new();
+        assert_eq!(timing.ewma_ms(), None);
+        assert_eq!(timing.alpha, EWMA_ALPHA_DEFAULT);
+
+        // Default alpha 0.25: 100 then 200 -> 0.25*200 + 0.75*100 = 125.
+        timing.record_round(100);
+        assert_eq!(timing.ewma_ms(), Some(100));
+        timing.record_round(200);
+        assert_eq!(timing.ewma_ms(), Some(125));
+
+        // Configurable alpha (plan flag F-4): 0.5 gives 0.5*200+0.5*100.
+        let mut half = VerifierTiming::with_alpha(0.5).unwrap();
+        half.record_round(100);
+        half.record_round(200);
+        assert_eq!(half.ewma_ms(), Some(150));
+
+        // Alpha bounds: (0.0, 1.0] — 0.0, 1.0+epsilon, NaN, infinity fail.
+        assert!(VerifierTiming::with_alpha(0.0).is_err());
+        assert!(VerifierTiming::with_alpha(1.0).is_ok());
+        assert!(VerifierTiming::with_alpha(1.0 + f64::EPSILON).is_err());
+        assert!(VerifierTiming::with_alpha(f64::NAN).is_err());
+        assert!(VerifierTiming::with_alpha(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn verifier_timing_cross_check_pins_the_25ms_bound() {
+        // RC-2: claimed <= observed + 25 ms is Ok; above is a Lie. The
+        // bound is INCLUSIVE at +25 (clock-noise allowance).
+        let mut timing = VerifierTiming::new();
+        assert_eq!(
+            timing.cross_check(35, 10),
+            CrossCheckOutcome::Ok,
+            "35 <= 10 + 25"
+        );
+        assert_eq!(
+            timing.cross_check(36, 10),
+            CrossCheckOutcome::Lie,
+            "36 > 10 + 25"
+        );
+        assert_eq!(timing.lie_count(), 1);
+        assert_eq!(timing.cross_check(0, 0), CrossCheckOutcome::Ok);
+        // Under-reporting is NOT detectable from timing alone (ADR §1) —
+        // the cross-check stays Ok.
+        assert_eq!(timing.cross_check(1, 10_000), CrossCheckOutcome::Ok);
+        assert_eq!(timing.lie_count(), 1);
+        // Lies never feed the EWMA (requester-measured rounds only).
+        assert_eq!(timing.ewma_ms(), None);
+        timing.record_round(50);
+        assert_eq!(timing.ewma_ms(), Some(50));
+    }
+
+    #[test]
+    fn audit_sampler_audits_first_window_and_transitions() {
+        let mut sampler = AuditSampler::new();
+        // First window always; same class again not; class change yes.
+        assert!(sampler.sample(WindowOutcome::FullAcceptance));
+        assert!(!sampler.sample(WindowOutcome::FullAcceptance));
+        assert!(sampler.sample(WindowOutcome::Divergence));
+        assert!(!sampler.sample(WindowOutcome::Divergence));
+        assert!(!sampler.sample(WindowOutcome::Divergence));
+        assert!(sampler.sample(WindowOutcome::FullAcceptance));
+        assert_eq!(sampler.audited_windows(), 3);
+        // WindowOutcome classifies by the divergence shape.
+        assert_eq!(WindowOutcome::of(None), WindowOutcome::FullAcceptance);
+        assert_eq!(WindowOutcome::of(Some(3)), WindowOutcome::Divergence);
+    }
+
+    #[test]
+    fn receipt_honesty_label_is_verifier_claimed_and_adds_no_wire_field() {
+        // RC-1 receipt honesty: counters granted from this family are
+        // verifier-claimed numbers (documented at receipt intake; NO new
+        // wire fields — the label must not leak onto any frozen shape).
+        assert_eq!(RECEIPT_COUNTER_HONESTY_LABEL, "verifier-claimed");
+        let (result, _verifier) = signed_result();
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(!wire.contains(RECEIPT_COUNTER_HONESTY_LABEL));
+        assert!(!VERIFY_DRAFTS_RESULT_FIELDS.contains(&RECEIPT_COUNTER_HONESTY_LABEL));
     }
 }

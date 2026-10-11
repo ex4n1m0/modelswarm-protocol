@@ -21,6 +21,7 @@ modelswarm-identity = { path = "../modelswarm-identity" }
 modelswarm-runtime = { path = "../modelswarm-runtime" }
 modelswarm-speculation = { path = "../modelswarm-speculation" }
 modelswarm-transport = { path = "../modelswarm-transport" }
+modelswarm-types = { path = "../modelswarm-types" }
 
 [dev-dependencies]
 proptest = "1"

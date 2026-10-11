@@ -22,7 +22,9 @@
 //! protocol (verifier/proposer servers, coordinator, signed commits over the
 //! ADR-018 staged transport, fallback, receipts).
 
+pub mod negotiation;
 pub mod spec;
+pub mod verifydrafts;
 
 pub use spec::{
     default_sampling_params_hash, serve_proposer_multi, sign_commit, sign_receipt,

@@ -3578,6 +3578,7 @@ dependencies = [
  "modelswarm-speculation",
  "modelswarm-telemetry",
  "modelswarm-transport",
+ "modelswarm-types",
  "proptest",
  "serde",
  "serde_json",

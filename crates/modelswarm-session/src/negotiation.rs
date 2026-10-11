@@ -1,0 +1,614 @@
+//! Cooperative session negotiation: the msp-cooperative-v1 §2/§3 wire
+//! shapes plus the ADR-032 §3 additive fields, and the frozen reason
+//! vocabularies of the VerifyDrafts family (ADR-032 §2/§3).
+//!
+//! No Rust `SessionOffer` existed before ADR-032 (only scheduler shadow
+//! references), so this module defines all three negotiation messages
+//! fresh, byte-matching the frozen document
+//! (`protocol/msp-cooperative-v1.md` §2/§3) plus the additive fields
+//! ADR-032 §3 pins on top:
+//!
+//! - `SessionOffer.verifier_backend` — the requester's own backend (under
+//!   the project rule the requester hosts exact profile P too). Required
+//!   in the new canonical form (`session-offer-2.json` vectors; plan flag
+//!   F-6: "additive" in the ADR, required here — no deployed fleet to be
+//!   compatible with).
+//! - `SessionAccept.engine` — the `EngineDisclosure`
+//!   `{backend, batch_verify, batch_window_max}` (RC-8): the largest
+//!   window this engine verifies in ONE pass.
+//! - `SessionReject` — the honest reject path with the frozen reason
+//!   vocabulary `preset_unavailable | backend_mismatch |
+//!   batch_verify_unsupported | budget_infeasible` (A-4).
+//!
+//! Negotiation messages carry no signature of their own: they ride the
+//! handshake-authenticated session (msp-cooperative-v1 §1; msp-v1 §6.6
+//! PeerId binding), exactly like today's `SpecMessage` non-commit
+//! variants. The frozen §5 `EligibilityLease` signed shape is NOT touched
+//! (`protocol/vectors/lease-hubkey-1.json` byte-pins it); backend pairing
+//! rides this negotiation layer.
+//!
+//! The reason vocabularies live here (single home for frozen strings):
+//! `SessionRejectReason` (negotiation), `CancelRoundReason` (round-level
+//! abandons of the VerifyDrafts family — cooperative-namespace messages,
+//! NOT §6.5 codes, per ADR-032 §2 decision B2/A-5), and
+//! [`FrameRejectReason`] — the frame/session-level codes this family maps
+//! 1:1 onto the effective msp-v1 §6.5 registry (ADR-028 §5: no registry
+//! change).
+
+use serde::{Deserialize, Serialize};
+
+use crate::verifydrafts::WINDOW_CAP;
+
+/// The cooperative negotiation namespace version every message in this
+/// module carries (msp-cooperative-v1 §2, frozen).
+pub const COOPERATIVE_PROTOCOL_VERSION: &str = "msp-cooperative-v1";
+
+// ---------------------------------------------------------------------------
+// Preset (msp-cooperative-v1 §1/§2: "SessionOffer and the preset enum")
+// ---------------------------------------------------------------------------
+
+/// The negotiated contract tier (ADR-029; msp-cooperative-v1 §2, frozen:
+/// exactly these five values). The ONLY mode-ish field on the wire;
+/// primitive-mode resolution is planner-internal (§4 of the doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Preset {
+    /// The msp-v1 §6 single-stream baseline; lossless; default and live.
+    Fast,
+    /// `single` + honesty-patched `hedged`; lossless.
+    Balanced,
+    /// `balanced` + best-of-n + deliberation roles; approximate — never
+    /// lossless (ADR-gated future work; not in this family).
+    Deep,
+    /// `balanced` + audited chain; detection-oriented.
+    Verified,
+    /// Composition of individually-gated modes only; union of labels.
+    Maximum,
+}
+
+impl Preset {
+    /// Stable wire/record label (the frozen msp-cooperative-v1 §2 strings).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Preset::Fast => "fast",
+            Preset::Balanced => "balanced",
+            Preset::Deep => "deep",
+            Preset::Verified => "verified",
+            Preset::Maximum => "maximum",
+        }
+    }
+}
+
+impl std::fmt::Display for Preset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backend + engine disclosure (ADR-032 §3)
+// ---------------------------------------------------------------------------
+
+/// Engine backend vocabulary (ADR-032 §3, from E0/ADR-024: greedy
+/// determinism is CPU-identical across thread counts and Vulkan-identical
+/// across GPU vendors, with CPU ≠ Vulkan — so pairing is per backend
+/// family, never mixed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// CPU (any thread count): E0-proven identical continuations.
+    Cpu,
+    /// Vulkan (any GPU vendor): E0-proven identical continuations.
+    Vulkan,
+}
+
+impl Backend {
+    /// Stable wire/record label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Cpu => "cpu",
+            Backend::Vulkan => "vulkan",
+        }
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The verifier's engine capability disclosure (ADR-032 §3, RC-8) — the
+/// additive `SessionAccept.engine` object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineDisclosure {
+    /// The backend this peer actually verifies under.
+    pub backend: Backend,
+    /// Whether this engine can verify a draft window in ONE batched pass
+    /// (ADR-031 in-process C-API adapter or an equivalent surface). The
+    /// pinned llama.cpp HTTP server cannot — such peers declare `false`
+    /// and remain first-class singles, never batch verifiers.
+    pub batch_verify: bool,
+    /// The largest window this engine verifies in one pass,
+    /// `1..=WINDOW_CAP`. `batch_verify: true` REQUIRES an honest value
+    /// here (invariant I4); guidance for incapable peers is
+    /// `batch_verify: false, batch_window_max: 1`.
+    pub batch_window_max: u32,
+}
+
+impl EngineDisclosure {
+    /// Schema-validity of the disclosure (ADR-032 §3): `batch_window_max`
+    /// MUST lie in `1..=WINDOW_CAP`. Any in-range value is schema-valid;
+    /// the capability MEANING only attaches to `batch_verify: true` (which
+    /// this range check therefore already satisfies — a peer that cannot
+    /// honor I4 must declare `batch_verify: false`).
+    pub fn is_valid_disclosure(&self) -> bool {
+        (1..=WINDOW_CAP).contains(&self.batch_window_max)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Negotiation messages (msp-cooperative-v1 §2/§3 + ADR-032 §3)
+// ---------------------------------------------------------------------------
+
+/// Session budget envelope (msp-cooperative-v1 §2, frozen field set).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBudget {
+    /// Cohort-size cap inside the preset envelope (`>= 1`); the planner
+    /// still picks the smallest useful cohort.
+    pub max_endpoints: u32,
+    /// Summed wall-seconds the session may spend across peers (`>= 1`).
+    pub max_endpoint_seconds: u64,
+    /// Output-token ceiling for the session (`>= 1`). The VerifyDrafts
+    /// verifier enforces this cumulatively on COMMITTED tokens (ADR-032
+    /// §8e / invariant I8).
+    pub max_output_tokens: u32,
+}
+
+/// Requester → peer at cooperative session open (msp-cooperative-v1 §2)
+/// with the ADR-032 §3 additive `verifier_backend` (the requester's own
+/// backend — under the project rule the requester hosts exact profile P
+/// too; backend pairing is per family, so a differing peer rejects with
+/// `backend_mismatch` and the requester falls back to single, never
+/// silently).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOffer {
+    /// Opaque unique string generated by the requester; echoed by
+    /// `SessionAccept` and carried by the ReceiptV2.
+    pub session_id: String,
+    /// Always `"msp-cooperative-v1"`.
+    pub protocol_version: String,
+    /// The negotiated contract tier (frozen five-value enum).
+    pub preset: Preset,
+    /// The budget envelope; the serving side clamps DOWN only, never up.
+    pub budget: SessionBudget,
+    /// ADDITIVE (ADR-032 §3): the requester's own backend. Required in
+    /// the new canonical form pinned by the `session-offer-2.json`
+    /// golden vectors (plan flag F-6).
+    pub verifier_backend: Backend,
+}
+
+/// Peer → requester reply (msp-cooperative-v1 §3) with the ADR-032 §3
+/// additive `engine` disclosure (RC-8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAccept {
+    /// Echoed from the offer.
+    pub session_id: String,
+    /// Echoed from the offer.
+    pub protocol_version: String,
+    /// Echoed from the offer.
+    pub preset: Preset,
+    /// The EFFECTIVE budget (clamped DOWN only, never up).
+    pub budget: SessionBudget,
+    /// ADDITIVE (ADR-032 §3): the peer's engine capability disclosure —
+    /// `batch_verify: true` REQUIRES an honest `batch_window_max` in
+    /// `1..=WINDOW_CAP`; a peer that cannot honor invariant I4 declares
+    /// `batch_verify: false`.
+    pub engine: EngineDisclosure,
+}
+
+/// Peer → requester honest reject (ADR-032 §3, A-4): the wire shape for
+/// "this peer cannot take the session". A peer whose backend differs, or
+/// that cannot batch-verify, signals it here and the requester falls back
+/// to single — mandatory, never silent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReject {
+    /// Echoed from the offer.
+    pub session_id: String,
+    /// Echoed from the offer.
+    pub protocol_version: String,
+    /// The frozen reject reason.
+    pub reason: SessionRejectReason,
+}
+
+// ---------------------------------------------------------------------------
+// Frozen reason vocabularies
+// ---------------------------------------------------------------------------
+
+/// Why a peer rejected a `SessionOffer` (ADR-032 §3, frozen):
+/// `preset_unavailable | backend_mismatch | batch_verify_unsupported |
+/// budget_infeasible`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRejectReason {
+    /// The peer cannot honor the offered preset tier.
+    PresetUnavailable,
+    /// The peer's engine backend differs from the requester's
+    /// `verifier_backend` (E0 pairing: CPU ≠ Vulkan, never mixed).
+    BackendMismatch,
+    /// The peer's engine cannot verify a window in one batched pass
+    /// (e.g. the pinned llama.cpp HTTP adapter).
+    BatchVerifyUnsupported,
+    /// The offered budget is infeasible for this peer.
+    BudgetInfeasible,
+}
+
+impl SessionRejectReason {
+    /// Stable wire/record label (the frozen ADR-032 §3 strings).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionRejectReason::PresetUnavailable => "preset_unavailable",
+            SessionRejectReason::BackendMismatch => "backend_mismatch",
+            SessionRejectReason::BatchVerifyUnsupported => "batch_verify_unsupported",
+            SessionRejectReason::BudgetInfeasible => "budget_infeasible",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why one ROUND of a VerifyDrafts-family session was abandoned (ADR-032
+/// §2, frozen): round-level abandons are cooperative-namespace
+/// `CancelRound { session_id, round, reason }` messages — NOT §6.5 codes
+/// (decision B2/A-5: the effective §6.5 registry contains no
+/// chain-position code and none is added). The old vocabulary's
+/// `proposal_failed` string belongs to `SpecMessage::CancelRound` and is
+/// deliberately NOT reused here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelRoundReason {
+    /// `parent_prefix_hash` did not equal the current committed hash; no
+    /// state change.
+    ParentMismatch,
+    /// `round` was not greater than the last handled round; no state
+    /// change.
+    RoundMismatch,
+    /// A `PrefixCommit` chained validly from the parent but did not
+    /// reproduce the outstanding `VerifyDraftsResult` (RC-4); the round
+    /// is abandoned.
+    CommitMismatch,
+}
+
+impl CancelRoundReason {
+    /// Stable wire/record label (the frozen ADR-032 §2 strings).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CancelRoundReason::ParentMismatch => "parent_mismatch",
+            CancelRoundReason::RoundMismatch => "round_mismatch",
+            CancelRoundReason::CommitMismatch => "commit_mismatch",
+        }
+    }
+}
+
+impl std::fmt::Display for CancelRoundReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Frame/session-level reject codes the VerifyDrafts family emits
+/// (ADR-032 §2 admission table). These map 1:1 onto the EFFECTIVE msp-v1
+/// §6.5 registry strings (msp-v1 §6.5 + ADR-028 §5) with **no registry
+/// change** — this enum is the family's subset view of the registry, not a
+/// new registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameRejectReason {
+    /// Schema invalid / unknown fields, or an invalid signature
+    /// (unauthenticated = malformed, fail-closed), or an unknown/mismatched
+    /// `session_id`.
+    BadFrame,
+    /// Duplicate or decreased `seq`, nonce reuse, or a repeated
+    /// `VerifyDrafts` while a round is outstanding with a repeated nonce.
+    ReplayedRequest,
+    /// The ADR-026 lease expired mid-session.
+    ExpiredToken,
+    /// The session was torn down (e.g. after `profile_mismatch`); stream
+    /// closed.
+    CancelledByPeer,
+    /// `profile_id` mismatch (also tears the session down).
+    ProfileMismatch,
+    /// Frame over the 256 KiB limit, or a window over
+    /// `min(WINDOW_CAP, batch_window_max)` — before any engine work.
+    PayloadTooLarge,
+    /// The session budget would be exceeded (budget exhausted, I8).
+    Overloaded,
+    /// The deadline was past at admission or at the pre-dispatch re-check.
+    DeadlineExceeded,
+}
+
+impl FrameRejectReason {
+    /// Stable wire/record label — EXACTLY the effective §6.5 registry
+    /// string (ADR-028 §5 folds included; never a new code).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrameRejectReason::BadFrame => "bad_frame",
+            FrameRejectReason::ReplayedRequest => "replayed_request",
+            FrameRejectReason::ExpiredToken => "expired_token",
+            FrameRejectReason::CancelledByPeer => "cancelled_by_peer",
+            FrameRejectReason::ProfileMismatch => "profile_mismatch",
+            FrameRejectReason::PayloadTooLarge => "payload_too_large",
+            FrameRejectReason::Overloaded => "overloaded",
+            FrameRejectReason::DeadlineExceeded => "deadline_exceeded",
+        }
+    }
+}
+
+impl std::fmt::Display for FrameRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The effective msp-v1 §6.5 registry (msp-v1 §6.5 list + the ADR-026
+    /// `invalid_lease` and ADR-028 §5 `bad_frame`/`executor_error` adds
+    /// and renames) — every family code MUST be one of these strings.
+    const EFFECTIVE_REGISTRY: [&str; 16] = [
+        "handshake_failed",
+        "incompatible_protocol",
+        "profile_mismatch",
+        "invalid_token",
+        "invalid_lease",
+        "expired_token",
+        "revoked_token",
+        "replayed_request",
+        "overloaded",
+        "deadline_exceeded",
+        "payload_too_large",
+        "runtime_error",
+        "bad_frame",
+        "executor_error",
+        "cancelled_by_peer",
+        "interrupted",
+    ];
+
+    #[test]
+    fn preset_serializes_exactly_the_five_frozen_values() {
+        let cases = [
+            (Preset::Fast, "fast"),
+            (Preset::Balanced, "balanced"),
+            (Preset::Deep, "deep"),
+            (Preset::Verified, "verified"),
+            (Preset::Maximum, "maximum"),
+        ];
+        for (preset, label) in cases {
+            assert_eq!(serde_json::to_value(preset).unwrap(), json!(label));
+            assert_eq!(preset.as_str(), label);
+            assert_eq!(preset.to_string(), label);
+            assert_eq!(
+                serde_json::from_value::<Preset>(json!(label)).unwrap(),
+                preset
+            );
+        }
+        // Anything else fails deserialization (frozen enum).
+        assert!(serde_json::from_value::<Preset>(json!("turbo")).is_err());
+    }
+
+    #[test]
+    fn backend_serializes_lowercase() {
+        assert_eq!(serde_json::to_value(Backend::Cpu).unwrap(), json!("cpu"));
+        assert_eq!(
+            serde_json::to_value(Backend::Vulkan).unwrap(),
+            json!("vulkan")
+        );
+        assert_eq!(Backend::Cpu.as_str(), "cpu");
+        assert_eq!(Backend::Vulkan.to_string(), "vulkan");
+        assert_eq!(
+            serde_json::from_value::<Backend>(json!("cpu")).unwrap(),
+            Backend::Cpu
+        );
+        assert!(serde_json::from_value::<Backend>(json!("CUDA")).is_err());
+    }
+
+    #[test]
+    fn session_offer_wire_shape_is_frozen_doc_plus_additive_backend() {
+        let offer = SessionOffer {
+            session_id: "sess-1".to_string(),
+            protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
+            preset: Preset::Verified,
+            budget: SessionBudget {
+                max_endpoints: 1,
+                max_endpoint_seconds: 120,
+                max_output_tokens: 2048,
+            },
+            verifier_backend: Backend::Cpu,
+        };
+        let value = serde_json::to_value(&offer).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "session_id": "sess-1",
+                "protocol_version": "msp-cooperative-v1",
+                "preset": "verified",
+                "budget": {
+                    "max_endpoints": 1,
+                    "max_endpoint_seconds": 120,
+                    "max_output_tokens": 2048
+                },
+                "verifier_backend": "cpu"
+            })
+        );
+        // Round-trip and canonicalizability (integer-only: no floats).
+        assert_eq!(
+            serde_json::from_value::<SessionOffer>(value.clone()).unwrap(),
+            offer
+        );
+        assert!(modelswarm_types::canonical_json(&value).is_ok());
+    }
+
+    #[test]
+    fn session_accept_round_trips_engine_disclosure() {
+        let accept = SessionAccept {
+            session_id: "sess-1".to_string(),
+            protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
+            preset: Preset::Balanced,
+            budget: SessionBudget {
+                max_endpoints: 3,
+                max_endpoint_seconds: 60,
+                max_output_tokens: 512,
+            },
+            engine: EngineDisclosure {
+                backend: Backend::Vulkan,
+                batch_verify: true,
+                batch_window_max: 32,
+            },
+        };
+        let value = serde_json::to_value(&accept).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "session_id": "sess-1",
+                "protocol_version": "msp-cooperative-v1",
+                "preset": "balanced",
+                "budget": {
+                    "max_endpoints": 3,
+                    "max_endpoint_seconds": 60,
+                    "max_output_tokens": 512
+                },
+                "engine": { "backend": "vulkan", "batch_verify": true, "batch_window_max": 32 }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionAccept>(value).unwrap(),
+            accept
+        );
+    }
+
+    #[test]
+    fn engine_disclosure_validity_pins_the_window_cap() {
+        // batch_verify: true REQUIRES batch_window_max in 1..=WINDOW_CAP.
+        for window in [1u32, 8, WINDOW_CAP] {
+            assert!(EngineDisclosure {
+                backend: Backend::Cpu,
+                batch_verify: true,
+                batch_window_max: window,
+            }
+            .is_valid_disclosure());
+        }
+        for window in [0u32, WINDOW_CAP + 1, u32::MAX] {
+            assert!(!EngineDisclosure {
+                backend: Backend::Cpu,
+                batch_verify: true,
+                batch_window_max: window,
+            }
+            .is_valid_disclosure());
+        }
+        // Guidance for incapable peers: false + 1. Any in-range value is
+        // schema-valid with batch_verify: false (meaning attaches only to
+        // `true`); out-of-range is never schema-valid.
+        assert!(EngineDisclosure {
+            backend: Backend::Cpu,
+            batch_verify: false,
+            batch_window_max: 1,
+        }
+        .is_valid_disclosure());
+        assert!(!EngineDisclosure {
+            backend: Backend::Cpu,
+            batch_verify: false,
+            batch_window_max: WINDOW_CAP + 1,
+        }
+        .is_valid_disclosure());
+    }
+
+    #[test]
+    fn session_reject_wire_shape_and_frozen_reasons() {
+        for (reason, label) in [
+            (SessionRejectReason::PresetUnavailable, "preset_unavailable"),
+            (SessionRejectReason::BackendMismatch, "backend_mismatch"),
+            (
+                SessionRejectReason::BatchVerifyUnsupported,
+                "batch_verify_unsupported",
+            ),
+            (SessionRejectReason::BudgetInfeasible, "budget_infeasible"),
+        ] {
+            assert_eq!(reason.as_str(), label);
+            assert_eq!(reason.to_string(), label);
+            let reject = SessionReject {
+                session_id: "sess-1".to_string(),
+                protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
+                reason,
+            };
+            assert_eq!(
+                serde_json::to_value(&reject).unwrap(),
+                json!({
+                    "session_id": "sess-1",
+                    "protocol_version": "msp-cooperative-v1",
+                    "reason": label
+                })
+            );
+            assert_eq!(
+                serde_json::from_value::<SessionReject>(serde_json::to_value(&reject).unwrap())
+                    .unwrap()
+                    .reason,
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_round_reasons_are_the_frozen_three() {
+        let cases = [
+            (CancelRoundReason::ParentMismatch, "parent_mismatch"),
+            (CancelRoundReason::RoundMismatch, "round_mismatch"),
+            (CancelRoundReason::CommitMismatch, "commit_mismatch"),
+        ];
+        for (reason, label) in cases {
+            assert_eq!(reason.as_str(), label);
+            assert_eq!(reason.to_string(), label);
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(label));
+            assert_eq!(
+                serde_json::from_value::<CancelRoundReason>(json!(label)).unwrap(),
+                reason
+            );
+        }
+        // The old vocabulary's reason string is not expressible here.
+        assert!(serde_json::from_value::<CancelRoundReason>(json!("proposal_failed")).is_err());
+    }
+
+    #[test]
+    fn frame_reject_reasons_match_the_effective_registry_exactly() {
+        let codes = [
+            FrameRejectReason::BadFrame,
+            FrameRejectReason::ReplayedRequest,
+            FrameRejectReason::ExpiredToken,
+            FrameRejectReason::CancelledByPeer,
+            FrameRejectReason::ProfileMismatch,
+            FrameRejectReason::PayloadTooLarge,
+            FrameRejectReason::Overloaded,
+            FrameRejectReason::DeadlineExceeded,
+        ];
+        for code in codes {
+            let label = code.as_str();
+            assert_eq!(code.to_string(), label);
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(label));
+            assert_eq!(
+                serde_json::from_value::<FrameRejectReason>(json!(label)).unwrap(),
+                code
+            );
+            // 1:1 onto the effective §6.5 registry: no new codes, ever.
+            assert!(
+                EFFECTIVE_REGISTRY.contains(&label),
+                "{label} is not an effective §6.5 registry string"
+            );
+        }
+    }
+}

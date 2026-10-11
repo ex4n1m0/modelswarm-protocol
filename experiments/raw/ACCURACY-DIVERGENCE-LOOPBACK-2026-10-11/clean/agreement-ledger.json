@@ -1,0 +1,26 @@
+[
+  [
+    "12D3KooWKb9exPan38Yk5pVTyT84zYK17ETXn6WVgFzY5qmsGd8c",
+    {
+      "checks": 8,
+      "divergences": 0,
+      "agreement_ewma": 1.0
+    }
+  ],
+  [
+    "12D3KooWKgugh3Hy5yGnDDyChCgmtZjXFtHecvnBgqC1sQY251qi",
+    {
+      "checks": 8,
+      "divergences": 0,
+      "agreement_ewma": 1.0
+    }
+  ],
+  [
+    "12D3KooWMzXDs5uep1eHRyUYrCwrgNjAtEWLYs5rWvPi4E755v2w",
+    {
+      "checks": 8,
+      "divergences": 0,
+      "agreement_ewma": 1.0
+    }
+  ]
+]

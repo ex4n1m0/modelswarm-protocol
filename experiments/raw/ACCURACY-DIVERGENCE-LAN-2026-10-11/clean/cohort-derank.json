@@ -1,0 +1,17 @@
+{
+  "record_type": "cohort-derank/v1",
+  "cell": "clean",
+  "environment": "lan-2machine-quic",
+  "suspended_peers": [],
+  "cohort_before": [
+    "12D3KooWBSrBZLVkyrbF5mzWV3jSbLFvzKtVLXHfVTTsn3BkuTTM",
+    "12D3KooWKgugh3Hy5yGnDDyChCgmtZjXFtHecvnBgqC1sQY251qi",
+    "12D3KooWKb9exPan38Yk5pVTyT84zYK17ETXn6WVgFzY5qmsGd8c"
+  ],
+  "cohort_after": [
+    "12D3KooWBSrBZLVkyrbF5mzWV3jSbLFvzKtVLXHfVTTsn3BkuTTM",
+    "12D3KooWKgugh3Hy5yGnDDyChCgmtZjXFtHecvnBgqC1sQY251qi",
+    "12D3KooWKb9exPan38Yk5pVTyT84zYK17ETXn6WVgFzY5qmsGd8c"
+  ],
+  "selection": "select_microswarm(want=3) over pool-spec candidates (flat rtt 5ms placeholder; ranking demo)"
+}

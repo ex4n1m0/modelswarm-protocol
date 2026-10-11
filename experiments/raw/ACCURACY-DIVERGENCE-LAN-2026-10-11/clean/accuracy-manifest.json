@@ -1,0 +1,59 @@
+{
+  "record_type": "accuracy-manifest/v1",
+  "cell": "clean",
+  "environment": "lan-2machine-quic",
+  "harness_version": "accuracy-2026-10-11",
+  "executor": "synthetic-token-executor",
+  "pool": [
+    {
+      "index": 0,
+      "seed": 81,
+      "decode_tokens_per_ms": 0.1,
+      "prefill_tokens_per_ms": 3.0,
+      "advertised_queue_ms": 0,
+      "capacity_class": "gpu_mid",
+      "divergent": false
+    },
+    {
+      "index": 1,
+      "seed": 102,
+      "decode_tokens_per_ms": 4.0,
+      "prefill_tokens_per_ms": 6.0,
+      "advertised_queue_ms": 300,
+      "capacity_class": "gpu_high",
+      "divergent": false
+    },
+    {
+      "index": 2,
+      "seed": 119,
+      "decode_tokens_per_ms": 0.25,
+      "prefill_tokens_per_ms": 1.2,
+      "advertised_queue_ms": 400,
+      "capacity_class": "gpu_mid",
+      "divergent": false
+    },
+    {
+      "index": 3,
+      "seed": 136,
+      "decode_tokens_per_ms": 0.2,
+      "prefill_tokens_per_ms": 1.0,
+      "advertised_queue_ms": 500,
+      "capacity_class": "gpu_mid",
+      "divergent": false
+    }
+  ],
+  "corpus_id": "synthetic-pass1-v1",
+  "prompt_ids": [
+    "p1-short",
+    "p1-medium",
+    "p1-long",
+    "p1-xl"
+  ],
+  "seeds": [
+    181141505,
+    181141506
+  ],
+  "max_tokens": 16,
+  "reference_policy": "bridge-0 verifier-reference (peer comparisons feed the ledger) + quorum-majority read; suspend after first divergence",
+  "notes": "LAN two-machine run, cell clean, injected indexes []; deterministic request ids mean the serve task must be fresh per cell"
+}

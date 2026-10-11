@@ -1,0 +1,8 @@
+{"round": 1, "instance": "a1", "prompt_id": "p1-short", "sha256_16": "b8d0d0b4867c6407", "chars": 48, "total_ms": 125.07560010999441}
+{"round": 1, "instance": "a1", "prompt_id": "p1-medium", "sha256_16": "dbbce3bd4c9ba6ba", "chars": 83, "total_ms": 139.93459998164326}
+{"round": 1, "instance": "a1", "prompt_id": "p1-long", "sha256_16": "868701fe9a3958d9", "chars": 139, "total_ms": 162.7422000747174}
+{"round": 1, "instance": "a1", "prompt_id": "p1-xl", "sha256_16": "dbbce3bd4c9ba6ba", "chars": 83, "total_ms": 165.33739992883056}
+{"round": 2, "instance": "a2", "prompt_id": "p1-short", "sha256_16": "b8d0d0b4867c6407", "chars": 48, "total_ms": 124.4893999537453}
+{"round": 2, "instance": "a2", "prompt_id": "p1-medium", "sha256_16": "dbbce3bd4c9ba6ba", "chars": 83, "total_ms": 135.9252999536693}
+{"round": 2, "instance": "a2", "prompt_id": "p1-long", "sha256_16": "868701fe9a3958d9", "chars": 139, "total_ms": 151.8198000267148}
+{"round": 2, "instance": "a2", "prompt_id": "p1-xl", "sha256_16": "dbbce3bd4c9ba6ba", "chars": 83, "total_ms": 171.55960004311055}

@@ -645,7 +645,7 @@ serving, at which point item 2's family-specific exactness-pin reruns
 follow this matrix's `real-model-e2e.yml` extension.
 
 **Implementation status (revision 3, 2026-10-11; plan §5.3 wire-contract
-checklist).** Items 1–5 and 7 GREEN: (1–5) sessions 1–4 landed and green —
+checklist).** Items 1–7 GREEN: (1–5) sessions 1–4 landed and green —
 `fddb972` types + serialization (25 unit tests), `4f277cc` committed
 fixtures + golden test (10 golden tests; generator byte-idempotent),
 `f9d0806` verifier gate + admission/divergence property suites (15 + 3
@@ -653,14 +653,21 @@ tests; every fixture replays through the real gate), `6730974`
 coordinator admission/EWMA/audit + the deadline-past fixture repair (15
 coordinator property tests + 4 unit tests); workspace `cargo test
 --workspace` **447 passed / 0 failed / 6 ignored** at `6730974`, fmt and
-clippy clean each session; (7) the reject-frame privacy assertion is green
-inside the admission suite. REMAINING for the wire tier: item 6 (scheduler
-4a decision-logic tests green with the Scheduler + Protocol sign-off
-recorded in the ADR log — the wire-true term itself is landed,
-`crates/modelswarm-scheduler/src/shadow.rs`), session 5 (T/R-owned
-mixed-swarm fallback scenarios in `apps/modelswarm-sim`, in flight), and
-item 8 (the post-implementation Security + Test and Release review pass
-over sessions 1–4).
+clippy clean each session; (6) scheduler 4a sign-off RECORDED — the
+wire-true term landed at `e85e869`/`bea1749` (Scheduler handoff
+`docs/reviews/handoff-scheduler-scientist-2026-10-11.md`), the Protocol
+seat's venue confirmation is revision 3, and session 5's
+`mirror_matches_the_landed_scheduler_test_numbers` pins the engagement
+arithmetic against the landed scheduler constants; (7) the reject-frame
+privacy assertion is green inside the admission suite. Session 5 LANDED
+(`f09a50c`): the item-4b mixed-swarm scenarios in `apps/modelswarm-sim`
+under default features, per-push — all four scenario families green
+(HTTP-only never engages; adapter cohorts engage only on predicted ×(1+
+margin) wins, honest window caps degrade never inflate; mixed swarms are
+class-blind with the fastest single of either class winning; capability
+mismatch rejects honestly with no silent drops), 456/0 workspace. The one
+REMAINING wire-tier item is (8): the post-implementation Security + Test
+and Release review pass over sessions 1–5.
 
 ### 8. Verifier round state machine (per session; reviewer-facing)
 

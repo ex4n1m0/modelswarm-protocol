@@ -27,7 +27,7 @@ const ROADMAP: Array<{ item: string; status: "dev" | "research" | "gated"; detai
   { item: "Accuracy benefits", status: "research", detail: "Using many peers to improve answers, not just speed — welcome even when slower. Anything that changes a model's output stays gated behind its own contract and preset disclosure." },
   { item: "Relay + NAT traversal", status: "dev", detail: "Circuit relay verified on a real LAN; production relay hosting and honest direct-vs-relay measurements are next." },
   { item: "Verified-work accounting", status: "research", detail: "Signed receipts make contribution visible — granted, never claimed. No credits, no payments." },
-  { item: "Deliberation + multi-model federation", status: "gated", detail: "Different models working as solvers, skeptics, and judges — only behind its own correctness contracts." },
+  { item: "Deliberation + multi-model federation", status: "gated", detail: "Mixing models — different models working as solvers, skeptics, and judges — only behind its own correctness contracts." },
 ];
 
 const LIVE_NOW: Array<{ title: string; note: string }> = [
@@ -137,12 +137,15 @@ export default function Home() {
       />
 
       <p className="lede">
-        ModelSwarm pools computers that each host the <b>exact same verified
-        model build</b> into small swarms. You earn swarm access by hosting
-        the model you use — no credits, no payments. Today every request is
-        served by the fastest eligible single host; cooperative swarm modes
-        are in development and will engage only when measured to help,
-        falling back to the fastest single host whenever they don&rsquo;t.
+        ModelSwarm pools computers that host verified model builds into small
+        swarms — today, peers running the <b>exact same pinned model</b>;
+        next, cooperative inference on those swarms; and later, behind its
+        own correctness gates, swarms that <b>mix different models</b> as
+        solvers, skeptics, and judges. You earn access by hosting the model
+        you use — no credits, no payments. Today every request is served by
+        the fastest eligible single host; cooperative modes will engage only
+        when measured to help, falling back to the fastest single host
+        whenever they don&rsquo;t.
       </p>
 
       <div className="wrap">

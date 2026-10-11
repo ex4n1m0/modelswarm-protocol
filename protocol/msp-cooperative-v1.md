@@ -22,15 +22,16 @@ Transport and framing inherit msp-v1 §6 (QUIC + Noise, request-scoped
 streams). This namespace carries no prompt or completion content beyond
 what the §6 stream already carries; the hub never sees any of it.
 
-**ADR-032 cross-reference (Proposed, revision 2, 2026-10-11):** ADR-032
-drafts the batched speculative-verification family (`VerifyDrafts` /
+**ADR-032 cross-reference (Accepted 2026-10-11, revision 2):** ADR-032
+specifies the batched speculative-verification family (`VerifyDrafts` /
 `VerifyDraftsResult` — one engine pass per draft window) that the future
 SpecMessage-freeze ADR anticipated above is expected to include, plus the
 additive `verifier_backend` (SessionOffer), `engine {backend,
 batch_verify, batch_window_max}` (SessionAccept), and the
-`SessionReject {session_id, protocol_version, reason}` shape. Proposed
-only: nothing in it is implementable until accepted, and this note records
-the dependency — it does not extend the frozen §2 field set.
+`SessionReject {session_id, protocol_version, reason}` shape. Accepted by
+owner decision (option B); implementation is authorized under its §7 gates
+and gated on ADR-031 productionization — this note records the dependency
+and does not itself extend the frozen §2 field set.
 
 ## 2. SessionOffer (the only wire addition authorized by ADR-029)
 

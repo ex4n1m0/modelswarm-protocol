@@ -1,13 +1,22 @@
 # ADR-032: Batched speculative verification (one engine pass per draft window)
 
-Status: **Proposed (revision 2, 2026-10-11) — draft for review, NOT accepted.**
-Nothing in this ADR is implementable until it is accepted. Owner: Protocol
-Architect. Required reviewers before any implementation: Security Engineer,
-Test and Release Engineer (both reviews landed and are folded into this
-revision — see the amendment note). Named consultees: Runtime Engineer (§4
-engine boundary, ADR-031 gate), Scheduler Scientist (§4 cost-model
-correction — flagged as a Protocol/Runtime sign-off question in
-`docs/reviews/handoff-scheduler-scientist-2026-10-10.md`).
+Status: **Accepted (2026-10-11, owner decision — option B, with option A
+already live in code).** Both required reviews returned approve-with-
+required-changes and every required change is folded into revision 2 (see
+the amendment note). Implementation is authorized under the §7 gates; the
+ADR-031 productionization gate remains the hard dependency for anything
+runnable. Owner: Protocol Architect.
+
+**Decision record (2026-10-11).** The owner accepted option B with the
+directive: the main goal is benefits from a swarm regardless of the
+engineering path — if benefits cannot be achieved one way, find other
+ways; the engineering exercises themselves may surface other creative
+"many is better than one" benefits, and accuracy benefits are welcome even
+when slower. Scope note: this acceptance commits the batched-verify family
+under the §3 contracts; the accuracy-benefits exploration is a parallel
+research direction, and any mode that CHANGES outputs (rather than
+verifying them) requires its own ADR and preset disclosure — the
+lossless `speculative_exact` contract is not weakened by this acceptance.
 
 **Amendment note (revision 2, 2026-10-11).** Folds
 `docs/reviews/review-adr-032-testrelease-2026-10-11.md` (commit `10de665`:

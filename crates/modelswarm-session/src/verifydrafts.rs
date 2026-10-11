@@ -2,10 +2,12 @@
 //! `VerifyDrafts` / `VerifyDraftsResult` wire types, their strict
 //! two-pass deserialization, and the family's byte-rule helpers.
 //!
-//! This module is the **type + serialization layer only** (implementation
-//! plan §1 / step 1). Verifier-side admission and the state machine
-//! (§3), the coordinator side (§4), and the golden-vector fixtures (§2)
-//! land in their own sessions; nothing here talks to an engine.
+//! This module carries the **type and serialization layer** (implementation
+//! plan §1, step 1 — sessions 1 and 2) and the **verifier-side admission
+//! gate and round state machine** (plan §3 / ADR-032 §8, session 3 — see
+//! [`BatchVerifyEngine`] and [`VerifyDraftsGate`]). The coordinator side
+//! (§4) lands in its own session; nothing here talks to a real engine:
+//! engine access is the [`BatchVerifyEngine`] trait, mockable in tests.
 //!
 //! Wire form: both messages serialize as the BARE objects of ADR-032 §1 —
 //! they are NOT new `SpecMessage` variants (no external tag) — and ride
@@ -53,15 +55,18 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use modelswarm_identity::{installation_id_for, InstallationIdentity};
-use modelswarm_runtime::SamplingParams;
+use modelswarm_runtime::{RuntimeError, SamplingParams};
 use modelswarm_transport::ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use modelswarm_transport::frame::MAX_FRAME_BYTES;
 use modelswarm_types::{canonical_json, CanonicalError};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::SpecError;
+use crate::negotiation::{CancelRoundReason, EngineDisclosure, FrameRejectReason, SessionBudget};
+use crate::{compute_prefix_hash, CommitPrefix, SpecError, DUPLICATE_MEMORY_ROUNDS};
 
 /// The cooperative namespace version every family message carries
 /// (must equal `"msp-cooperative-v1"`).
@@ -510,6 +515,905 @@ pub fn verify_verify_drafts_result_signature(
     )
 }
 
+// ---------------------------------------------------------------------------
+// §3 — Verifier-side admission + round state machine (ADR-032 §8 / plan §3)
+// ---------------------------------------------------------------------------
+
+/// Engine access for the batched-verify family (plan §3.1): ONE batched
+/// engine pass over `[prefix_last, window...]` with logits on every row,
+/// the engine's own sampler chain under the pinned `params` (ADR-032 §1).
+/// A trait so the whole family is testable with a mock verifier (ADR-032
+/// §4 boundary); the production implementation (capi `verify_drafts`
+/// wrapped in `spawn_blocking`) is ADR-031-gated engine work and is OUT
+/// of this crate's scope.
+///
+/// Returns `(accepted_len, correction)`: the number of leading window
+/// tokens the engine itself would have sampled (`accepted_len <=
+/// len(window)`), and the replacement token on rejection / bonus token on
+/// full acceptance (`None` exactly at end-of-generation — plan flag F-2).
+#[async_trait::async_trait]
+pub trait BatchVerifyEngine: Send + Sync {
+    /// Executes the one batched pass for `window` under `params`.
+    async fn verify_window(
+        &self,
+        window: &[u32],
+        params: &SamplingParams,
+    ) -> Result<(u32, Option<u32>), RuntimeError>;
+    /// The engine's own capability disclosure (RC-8); its
+    /// `batch_window_max` bounds admission (stage 10) BEFORE any engine
+    /// work.
+    fn capabilities(&self) -> EngineDisclosure;
+}
+
+/// The verifier round state machine (ADR-032 §8, normative diagram;
+/// plan §3.2). `Validating` is the transient state occupied while the
+/// admission stages run inside one synchronous
+/// [`VerifyDraftsGate::admit_verify_drafts`] call — with a pure gate it is
+/// never observable between calls; the one-outstanding rule (RC-5(a))
+/// structurally covers it (any outstanding round rejects a new
+/// `VerifyDrafts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateState {
+    /// No round outstanding; accepts `VerifyDrafts` (RC-5(d)).
+    Prefilled,
+    /// Admission stages running (transient, inside one admit call).
+    Validating,
+    /// A `VerifyDrafts` was admitted; awaiting the ONE engine pass.
+    Verify,
+    /// The engine pass produced a result; awaiting the reproducing
+    /// `PrefixCommit` (bounded by `deadline_ms + 250 ms`, RC-5(b)).
+    WaitCommit,
+    /// A reproducing commit was applied (chain advanced); settles back to
+    /// `Prefilled` on the next admission/tick.
+    Committed,
+}
+
+impl GateState {
+    /// Stable label (test/diagnostic surface).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GateState::Prefilled => "prefilled",
+            GateState::Validating => "validating",
+            GateState::Verify => "verify",
+            GateState::WaitCommit => "wait_commit",
+            GateState::Committed => "committed",
+        }
+    }
+}
+
+impl std::fmt::Display for GateState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The outstanding round: everything the gate must remember between
+/// admission and commit/abandonment (plan §3.2).
+#[derive(Debug, Clone)]
+struct OutstandingRound {
+    round: u64,
+    nonce: String,
+    /// The request's (already clamped) deadline, anchored at its arrival.
+    deadline_expires_at_ms: u64,
+    parent_prefix_hash: String,
+    window_tokens: Vec<u32>,
+    /// The verifier's own emitted result once the engine pass ran.
+    result: Option<VerifyDraftsResult>,
+}
+
+/// Configuration for [`VerifyDraftsGate::new`] — the session binding the
+/// gate enforces (plan §3.2): session id, profile id, this family's
+/// `generation_params_hash`, the committed prefix-hash root, the pinned
+/// COORDINATOR key (requests are authenticated against it, §1 rule 5),
+/// the verifier's own installation id (the emitted result's `sender`),
+/// the engine disclosure, the effective `SessionAccept` budget (§3.5),
+/// and the ADR-026 lease expiry.
+#[derive(Debug, Clone)]
+pub struct VerifyDraftsGateConfig {
+    /// The stream's admitted session id (binding, stage 4).
+    pub session_id: String,
+    /// The pinned model profile id (stage 7; I7).
+    pub profile_id: String,
+    /// This family's canonical generation-params hash (binding, stage 4).
+    pub generation_params_hash: String,
+    /// The committed prefix-hash root (genesis at session open).
+    pub committed_prefix_hash: String,
+    /// The coordinator's public key; every `VerifyDrafts` signature is
+    /// verified under it (stage 3, sender binding FIRST).
+    pub coordinator_key: VerifyingKey,
+    /// The verifier's installation id — the emitted result's `sender`.
+    pub verifier_installation_id: String,
+    /// The verifier's engine disclosure (its `batch_window_max` is the
+    /// stage-10 cap, RC-8).
+    pub engine: EngineDisclosure,
+    /// The effective `SessionAccept` budget (clamped DOWN only, §3.5).
+    pub budget: SessionBudget,
+    /// ADR-026 lease expiry (unix ms); stage 5.
+    pub lease_expires_at_ms: u64,
+    /// The pinned sampling parameters (engine calls + params-hash binding).
+    pub sampling_params: SamplingParams,
+    /// The verifier's own next per-session `seq` for an emitted
+    /// `VerifyDraftsResult` (RC-7: the VERIFIER's counter, not the
+    /// coordinator's; fixture replay seeds the recorded value).
+    pub verifier_next_seq: u64,
+}
+
+/// Why a gate could not be constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateConfigError {
+    /// The committed prefix-hash root is not bare 64-lowercase-hex.
+    InvalidCommittedHash(String),
+    /// The engine disclosure is schema-invalid (`batch_window_max` out of
+    /// `1..=WINDOW_CAP`).
+    InvalidDisclosure,
+    /// The budget envelope has a zero field (all fields are `>= 1`).
+    InvalidBudget,
+}
+
+impl std::fmt::Display for GateConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GateConfigError::InvalidCommittedHash(v) => {
+                write!(
+                    f,
+                    "committed prefix hash must be 64 lowercase hex chars: {v:?}"
+                )
+            }
+            GateConfigError::InvalidDisclosure => {
+                write!(
+                    f,
+                    "engine disclosure is invalid (batch_window_max out of 1..=WINDOW_CAP)"
+                )
+            }
+            GateConfigError::InvalidBudget => {
+                write!(f, "session budget fields must all be >= 1")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GateConfigError {}
+
+/// A frame/session-level rejection (ADR-032 §2): codes, counts, and
+/// hashes ONLY — `window_tokens`, `correction`, and any token ids NEVER
+/// appear here (privacy rule 5 / A-3; asserted by serialization in the
+/// property suites).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectionFrame {
+    /// The admitted session id.
+    pub session_id: String,
+    /// The effective-§6.5-registry reject code.
+    pub code: FrameRejectReason,
+    /// The round the frame claimed, when known (a COUNT, never a token id).
+    pub round: Option<u64>,
+    /// The current committed prefix hash (a hash; echo is permitted).
+    pub prefix_hash: Option<String>,
+}
+
+/// A round-level abandon (ADR-032 §2 decision B2/A-5): a
+/// cooperative-namespace `CancelRound { session_id, round, reason }`,
+/// NOT a §6.5 code. Same privacy shape: no token ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelRoundFrame {
+    /// The admitted session id.
+    pub session_id: String,
+    /// The abandoned round.
+    pub round: u64,
+    /// The frozen three-value reason vocabulary.
+    pub reason: CancelRoundReason,
+}
+
+/// Outcome of admitting (or rejecting) one `VerifyDrafts` frame
+/// (plan §3.3, stages 1–12; the engine is never touched here).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdmissionDecision {
+    /// All stages passed; the round is outstanding and the ONE engine
+    /// pass is authorized (state `Verify`). `deadline_expires_at_ms`
+    /// carries the CLAMPED deadline anchored at the frame's arrival.
+    Admitted {
+        /// The admitted round number.
+        round: u64,
+        /// arrival + clamp(deadline_ms) — the WAIT_COMMIT bound is this
+        /// plus [`WAIT_COMMIT_GRACE_MS`].
+        deadline_expires_at_ms: u64,
+    },
+    /// Frame/session-level reject (codes, counts, hashes only).
+    FrameRejected(RejectionFrame),
+    /// Round-level abandon (`round_mismatch` / `parent_mismatch`; no
+    /// state change).
+    CancelRound(CancelRoundFrame),
+}
+
+/// Outcome of dispatching the outstanding round to the engine (stage 13 +
+/// the one pass; plan §3.1/§3.3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DispatchOutcome {
+    /// The ONE pass ran; this is the verifier's own (unsigned) result
+    /// draft — the serve loop signs it with the verifier key and sends
+    /// it. State is now `WaitCommit`.
+    Dispatched(VerifyDraftsResult),
+    /// Stage 13: the deadline re-check (after any queue wait, A-2)
+    /// failed. The round is abandoned, the request discarded, state back
+    /// to `Prefilled`.
+    DeadlineExceeded,
+    /// The engine pass failed (or violated its contract); the round is
+    /// abandoned the same way. Not a wire code — the serve loop decides
+    /// the honest stream outcome.
+    EngineFailed(RuntimeError),
+    /// Dispatch called with no admitted, undispatched round (misuse).
+    NoOutstandingRound,
+}
+
+/// Outcome of applying a `PrefixCommit` under RC-4 + the gate's own chain
+/// rules (plan §3.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitApplyOutcome {
+    /// RC-4 satisfied: the commit reproduced the outstanding result's
+    /// accepted ids AND `new_prefix_hash`; the gate's own chain advanced
+    /// (round gaps allowed, I3) and the token budget ledger grew.
+    Advanced { round: u64 },
+    /// A remembered replay of an already-applied commit (bounded per-round
+    /// duplicate memory): a no-op.
+    DuplicateRound,
+    /// Round-level abandon (`parent_mismatch` / `round_mismatch` — no
+    /// state change; `commit_mismatch` — round abandoned, RC-4).
+    CancelRound(CancelRoundFrame),
+    /// Session-level reject of the commit frame itself (wrong session /
+    /// params → `bad_frame`; wrong profile → `profile_mismatch` +
+    /// teardown; torn-down session → `cancelled_by_peer`).
+    FrameRejected(RejectionFrame),
+}
+
+/// Test/fixture-replay seeding of a gate's recorded pre-state (the
+/// `context` block of `protocol/vectors/verifydrafts-malformed.json` and
+/// the property harness's injected conditions). Production code
+/// constructs the gate [`VerifyDraftsGate::new`] and lets the session run.
+#[derive(Debug, Clone, Default)]
+pub struct GatePreStateSeed {
+    /// Tear the session down before replay (stage 5 → `cancelled_by_peer`).
+    pub torn_down: bool,
+    /// Override the lease expiry (unix ms).
+    pub lease_expires_at_ms: Option<u64>,
+    /// Last seen `seq` per sender (stage 6 replay defense).
+    pub last_seq: Vec<(String, u64)>,
+    /// Already-consumed single-use nonces (session-scoped, I6).
+    pub consumed_nonces: Vec<String>,
+    /// Cumulative committed output tokens (the §3.5 ledger).
+    pub committed_output_tokens: Option<u64>,
+    /// Cumulative served session milliseconds (advanced by serve-loop
+    /// deltas; §3.5).
+    pub served_ms: Option<u64>,
+    /// The last handled round (rounds may gap past it, RC-5(c)).
+    pub last_handled_round: Option<u64>,
+}
+
+/// The verifier-side admission gate and round state machine for one
+/// session (plan §3.2–§3.5; ADR-032 §2/§8). A PURE state machine: every
+/// clock read is injected (`arrival_ms`/`now_ms`/`pass_end_ms`
+/// parameters), and engine access is the [`BatchVerifyEngine`] trait.
+///
+/// CRITICAL reuse decision (plan §3.4): commits are applied through the
+/// gate's OWN chain state — NOT [`crate::SessionStateMachine::apply`],
+/// whose `round == current + 1` check forbids gaps
+/// ([`crate::RejectReason::FutureRound`]); ADR-032 §8 RC-5(c) states the
+/// shipped check MUST NOT be inherited by this family. The gate applies
+/// the same checks itself: session/profile/params equality, `round >
+/// last committed round` (strictly monotone, gaps allowed — I3),
+/// parent-hash equality, [`compute_prefix_hash`] verification (reused
+/// unchanged), plus bounded per-round duplicate memory
+/// ([`DUPLICATE_MEMORY_ROUNDS`]) so replays are remembered no-ops.
+#[derive(Debug, Clone)]
+pub struct VerifyDraftsGate {
+    // Session binding (plan §3.2).
+    session_id: String,
+    profile_id: String,
+    generation_params_hash: String,
+    coordinator_key: VerifyingKey,
+    verifier_installation_id: String,
+    engine: EngineDisclosure,
+    // Chain state — committed hash and last HANDLED round diverge under
+    // gaps (RC-5(c)): an abandoned round advances `last_handled_round`
+    // but not the chain.
+    committed_prefix_hash: String,
+    last_committed_round: u64,
+    last_handled_round: u64,
+    /// Bounded duplicate memory: applied round -> its `new_prefix_hash`.
+    applied_hashes: HashMap<u64, String>,
+    applied_order: VecDeque<u64>,
+    // Outstanding request (at most ONE, RC-5(a)).
+    outstanding: Option<OutstandingRound>,
+    // Replay defenses (I6, RC-7).
+    consumed_nonces: HashSet<String>,
+    last_seq: HashMap<String, u64>,
+    // Per-peer protocol-violation counters (RC-3 tail: threshold two).
+    violations: HashMap<String, u32>,
+    // Budget ledger (§3.5, I8).
+    budget: SessionBudget,
+    committed_tokens: u64,
+    served_ms: u64,
+    // Session lifetime.
+    lease_expires_at_ms: u64,
+    torn_down: Option<String>,
+    state: GateState,
+    // The verifier's own emitted-message counter (RC-7).
+    next_result_seq: u64,
+    sampling_params: SamplingParams,
+}
+
+impl VerifyDraftsGate {
+    /// Constructs the gate in `Prefilled` with no round outstanding,
+    /// validating the committed-hash root, the engine disclosure, and the
+    /// budget envelope.
+    pub fn new(config: VerifyDraftsGateConfig) -> Result<Self, GateConfigError> {
+        compute_prefix_hash(&config.committed_prefix_hash, &[]).map_err(|_| {
+            GateConfigError::InvalidCommittedHash(config.committed_prefix_hash.clone())
+        })?;
+        if !config.engine.is_valid_disclosure() {
+            return Err(GateConfigError::InvalidDisclosure);
+        }
+        if config.budget.max_endpoints == 0
+            || config.budget.max_endpoint_seconds == 0
+            || config.budget.max_output_tokens == 0
+        {
+            return Err(GateConfigError::InvalidBudget);
+        }
+        Ok(Self {
+            session_id: config.session_id,
+            profile_id: config.profile_id,
+            generation_params_hash: config.generation_params_hash,
+            coordinator_key: config.coordinator_key,
+            verifier_installation_id: config.verifier_installation_id,
+            engine: config.engine,
+            committed_prefix_hash: config.committed_prefix_hash,
+            last_committed_round: 0,
+            last_handled_round: 0,
+            applied_hashes: HashMap::new(),
+            applied_order: VecDeque::new(),
+            outstanding: None,
+            consumed_nonces: HashSet::new(),
+            last_seq: HashMap::new(),
+            violations: HashMap::new(),
+            budget: config.budget,
+            committed_tokens: 0,
+            served_ms: 0,
+            lease_expires_at_ms: config.lease_expires_at_ms,
+            torn_down: None,
+            state: GateState::Prefilled,
+            next_result_seq: config.verifier_next_seq,
+            sampling_params: config.sampling_params,
+        })
+    }
+
+    /// Seeds recorded pre-state (fixture replay / property harness). See
+    /// [`GatePreStateSeed`].
+    pub fn seed_pre_state(&mut self, seed: GatePreStateSeed) {
+        if seed.torn_down {
+            self.torn_down = Some("profile_mismatch".to_string());
+        }
+        if let Some(lease) = seed.lease_expires_at_ms {
+            self.lease_expires_at_ms = lease;
+        }
+        for (sender, seq) in seed.last_seq {
+            self.last_seq.insert(sender, seq);
+        }
+        for nonce in seed.consumed_nonces {
+            self.consumed_nonces.insert(nonce);
+        }
+        if let Some(tokens) = seed.committed_output_tokens {
+            self.committed_tokens = tokens;
+        }
+        if let Some(served) = seed.served_ms {
+            self.served_ms = served;
+        }
+        if let Some(round) = seed.last_handled_round {
+            self.last_handled_round = round;
+        }
+    }
+
+    /// Advances the seconds ledger by a serve-loop-reported wall-clock
+    /// delta (§3.5: the ledger advances on reported deltas, mock-fixed in
+    /// tests).
+    pub fn advance_session_seconds(&mut self, delta_ms: u64) {
+        self.served_ms = self.served_ms.saturating_add(delta_ms);
+    }
+
+    // -- Inspectors ---------------------------------------------------------
+
+    /// The current round state.
+    pub fn state(&self) -> GateState {
+        self.state
+    }
+
+    /// The current committed prefix hash (the parent every new round must
+    /// chain onto).
+    pub fn committed_prefix_hash(&self) -> &str {
+        &self.committed_prefix_hash
+    }
+
+    /// The last COMMITTED round (0 = the root).
+    pub fn last_committed_round(&self) -> u64 {
+        self.last_committed_round
+    }
+
+    /// The last HANDLED round — diverges from [`Self::last_committed_round`]
+    /// after an abandonment (RC-5(c)); new rounds must exceed it.
+    pub fn last_handled_round(&self) -> u64 {
+        self.last_handled_round
+    }
+
+    /// Cumulative committed output tokens (the §3.5 ledger).
+    pub fn committed_output_tokens(&self) -> u64 {
+        self.committed_tokens
+    }
+
+    /// Cumulative served session milliseconds (the §3.5 seconds ledger).
+    pub fn served_session_ms(&self) -> u64 {
+        self.served_ms
+    }
+
+    /// The outstanding round number, if any.
+    pub fn outstanding_round(&self) -> Option<u64> {
+        self.outstanding.as_ref().map(|out| out.round)
+    }
+
+    /// The outstanding round's clamped deadline expiry (arrival +
+    /// clamp(deadline_ms)).
+    pub fn outstanding_deadline_expires_at_ms(&self) -> Option<u64> {
+        self.outstanding
+            .as_ref()
+            .map(|out| out.deadline_expires_at_ms)
+    }
+
+    /// The pending (emitted but uncommitted) result, if any.
+    pub fn pending_result(&self) -> Option<&VerifyDraftsResult> {
+        self.outstanding
+            .as_ref()
+            .and_then(|out| out.result.as_ref())
+    }
+
+    /// Whether the session is torn down (e.g. after `profile_mismatch`).
+    pub fn is_torn_down(&self) -> bool {
+        self.torn_down.is_some()
+    }
+
+    /// The teardown reason, when torn down.
+    pub fn teardown_reason(&self) -> Option<&str> {
+        self.torn_down.as_deref()
+    }
+
+    /// A peer's protocol-violation count.
+    pub fn violations_of(&self, peer: &str) -> u32 {
+        self.violations.get(peer).copied().unwrap_or(0)
+    }
+
+    /// Whether `nonce` is in the session-scoped consumed set.
+    pub fn nonce_consumed(&self, nonce: &str) -> bool {
+        self.consumed_nonces.contains(nonce)
+    }
+
+    // -- Admission (plan §3.3, stages 1–12; first-failure-wins) -----------
+
+    /// Admits one `VerifyDrafts` frame. `now_ms` is the injected admission
+    /// clock; `arrival_ms` is the frame's arrival anchor for the deadline
+    /// math (equal to `now_ms` in the no-queue case; the ADR-032 §7
+    /// `deadline-past` fixture models a queued frame whose deadline
+    /// expired before admission).
+    ///
+    /// Stage order (ADR-032 §2 — first-failure-wins, asserted by the
+    /// conjunction property sweep): (1) frame size, (2) schema,
+    /// (3) signature, (4) session binding, (5) session alive (torn down,
+    /// then lease), (6) seq/nonce — "dropped as `replayed_request` before
+    /// any other check" applies to this stage, (7) profile,
+    /// (8) round/parent, (9) one-outstanding, (10) window cap, (11) session
+    /// budget, (12) deadline at admission. On success the round becomes
+    /// the ONE outstanding request (state `Verify`), the nonce is
+    /// consumed, the sender's `seq` advances, and `last_handled_round`
+    /// moves to the admitted round.
+    pub fn admit_verify_drafts(
+        &mut self,
+        frame: &Value,
+        arrival_ms: u64,
+        now_ms: u64,
+    ) -> AdmissionDecision {
+        // Housekeeping first: settle COMMITTED, expire WAIT_COMMIT (RC-5(b)).
+        self.settle(now_ms);
+        let prior_state = self.state;
+        self.state = GateState::Validating;
+        let decision = self.run_admission_stages(frame, arrival_ms, now_ms);
+        if matches!(decision, AdmissionDecision::Admitted { .. }) {
+            self.state = GateState::Verify;
+        } else {
+            // No rejection may change round/chain/replay state (I3/I6).
+            self.state = prior_state;
+        }
+        decision
+    }
+
+    fn run_admission_stages(
+        &mut self,
+        frame: &Value,
+        arrival_ms: u64,
+        now_ms: u64,
+    ) -> AdmissionDecision {
+        // Stage 1 — frame size (msp-v1 §6.4, before any parsing).
+        let frame_len = serde_json::to_string(frame).map_or(usize::MAX, |s| s.len());
+        if frame_len > MAX_FRAME_BYTES {
+            return self.reject(FrameRejectReason::PayloadTooLarge, None);
+        }
+        // Stage 2 — schema: strict two-pass parse, protocol version,
+        // wire forms (bare hex, profile form).
+        let Ok(msg) = VerifyDrafts::parse(frame) else {
+            return self.reject(FrameRejectReason::BadFrame, None);
+        };
+        if msg.protocol_version != COOPERATIVE_PROTOCOL_VERSION
+            || !is_bare_hash(&msg.parent_prefix_hash)
+            || !is_bare_hash(&msg.generation_params_hash)
+            || !is_profile_id_form(&msg.profile_id)
+        {
+            return self.reject(FrameRejectReason::BadFrame, Some(msg.round));
+        }
+        // Stage 3 — signature (sender binding FIRST, then Ed25519;
+        // unauthenticated = malformed, fail-closed).
+        if verify_verify_drafts_signature(&msg, &self.coordinator_key).is_err() {
+            return self.reject(FrameRejectReason::BadFrame, Some(msg.round));
+        }
+        // Stage 4 — session binding: session id, and this family's
+        // generation-params hash, must equal the admitted session's.
+        if msg.session_id != self.session_id
+            || msg.generation_params_hash != self.generation_params_hash
+        {
+            return self.reject(FrameRejectReason::BadFrame, Some(msg.round));
+        }
+        // Stage 5 — session alive: torn down (row order: before lease).
+        if self.torn_down.is_some() {
+            return self.reject(FrameRejectReason::CancelledByPeer, Some(msg.round));
+        }
+        if now_ms >= self.lease_expires_at_ms {
+            return self.reject(FrameRejectReason::ExpiredToken, Some(msg.round));
+        }
+        // Stage 6 — seq/nonce: replayed_request before any other check
+        // (RC-7). `seq` is per (session, sender).
+        if let Some(&last) = self.last_seq.get(&msg.sender) {
+            if msg.seq <= last {
+                return self.reject(FrameRejectReason::ReplayedRequest, Some(msg.round));
+            }
+        }
+        if self.consumed_nonces.contains(&msg.nonce) {
+            return self.reject(FrameRejectReason::ReplayedRequest, Some(msg.round));
+        }
+        // Stage 7 — profile (I7): mismatch tears the session down.
+        if msg.profile_id != self.profile_id {
+            *self.violations.entry(msg.sender.clone()).or_insert(0) += 1;
+            self.torn_down = Some("profile_mismatch".to_string());
+            return self.reject(FrameRejectReason::ProfileMismatch, Some(msg.round));
+        }
+        // Stage 8 — round/parent (round-level CancelRound, no state change).
+        if msg.round <= self.last_handled_round {
+            return self.cancel_round(msg.round, CancelRoundReason::RoundMismatch);
+        }
+        if msg.parent_prefix_hash != self.committed_prefix_hash {
+            return self.cancel_round(msg.round, CancelRoundReason::ParentMismatch);
+        }
+        // Stage 9 — one-outstanding (RC-5(a)): never queued. A repeated
+        // nonce is replayed_request (normally already caught at stage 6);
+        // a fresh nonce is bad_frame.
+        if let Some(out) = self.outstanding.as_ref() {
+            let code = if out.nonce == msg.nonce {
+                FrameRejectReason::ReplayedRequest
+            } else {
+                FrameRejectReason::BadFrame
+            };
+            return self.reject(code, Some(msg.round));
+        }
+        // Stage 10 — window cap BEFORE any engine work (RC-8). An empty
+        // window was already a stage-2 schema failure.
+        let effective_cap = WINDOW_CAP.min(self.engine.batch_window_max);
+        if msg.window_tokens.len() as u64 > u64::from(effective_cap) {
+            return self.reject(FrameRejectReason::PayloadTooLarge, Some(msg.round));
+        }
+        // Stage 11 — session budget (I8/§8e): would-exceed on cumulative
+        // committed tokens or cumulative served seconds.
+        if self.committed_tokens + msg.window_tokens.len() as u64
+            > u64::from(self.budget.max_output_tokens)
+            || self.served_ms >= self.budget.max_endpoint_seconds.saturating_mul(1000)
+        {
+            return self.reject(FrameRejectReason::Overloaded, Some(msg.round));
+        }
+        // Stage 12 — deadline at admission. `deadline_ms` is CLAMPED to
+        // [1000, 120000] (clamp, not reject — §2, msp-v1 §6.4); the
+        // deadline expired iff arrival + clamped deadline <= now.
+        let clamped = msg
+            .deadline_ms
+            .clamp(DEADLINE_CLAMP_MIN_MS, DEADLINE_CLAMP_MAX_MS);
+        let deadline_expires_at_ms = arrival_ms.saturating_add(u64::from(clamped));
+        if deadline_expires_at_ms <= now_ms {
+            return self.reject(FrameRejectReason::DeadlineExceeded, Some(msg.round));
+        }
+
+        // Admitted: the round is handled from this point (RC-5(c) gap
+        // semantics), the nonce is consumed, the seq advances.
+        self.last_seq.insert(msg.sender.clone(), msg.seq);
+        self.consumed_nonces.insert(msg.nonce.clone());
+        self.last_handled_round = msg.round;
+        self.outstanding = Some(OutstandingRound {
+            round: msg.round,
+            nonce: msg.nonce.clone(),
+            deadline_expires_at_ms,
+            parent_prefix_hash: msg.parent_prefix_hash.clone(),
+            window_tokens: msg.window_tokens.clone(),
+            result: None,
+        });
+        AdmissionDecision::Admitted {
+            round: msg.round,
+            deadline_expires_at_ms,
+        }
+    }
+
+    /// Stage 13 + the ONE engine pass (plan §3.1/§3.3): the deadline is
+    /// RE-CHECKED immediately before engine work, after any queue wait
+    /// (A-2) — modelled by calling this with the post-queue `now_ms`.
+    /// `pass_end_ms` is the injected clock at pass completion;
+    /// `verify_pass_ms` is its delta from `now_ms` (the plan keeps the
+    /// engine trait clock-free, so the pass duration is caller-supplied
+    /// and mock-fixed in tests).
+    ///
+    /// On success the verifier's own (unsigned) result draft is returned
+    /// with its `seq` taken from the VERIFIER's counter (RC-7); the serve
+    /// loop signs and sends it. On deadline or engine failure the round is
+    /// abandoned (request discarded, state back to `Prefilled`).
+    pub async fn dispatch_outstanding<E: BatchVerifyEngine>(
+        &mut self,
+        engine: &E,
+        now_ms: u64,
+        pass_end_ms: u64,
+    ) -> DispatchOutcome {
+        let Some(out) = self.outstanding.as_ref() else {
+            return DispatchOutcome::NoOutstandingRound;
+        };
+        if self.state != GateState::Verify {
+            return DispatchOutcome::NoOutstandingRound;
+        }
+        // Stage 13 — deadline re-check before engine work.
+        if out.deadline_expires_at_ms <= now_ms {
+            self.abandon_outstanding();
+            return DispatchOutcome::DeadlineExceeded;
+        }
+        let (accepted_len, correction) = match engine
+            .verify_window(&out.window_tokens, &self.sampling_params)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.abandon_outstanding();
+                return DispatchOutcome::EngineFailed(e);
+            }
+        };
+        let window_len = out.window_tokens.len();
+        if accepted_len > window_len as u32 {
+            // Engine contract violation — fail closed, abandon the round.
+            self.abandon_outstanding();
+            return DispatchOutcome::EngineFailed(RuntimeError::MalformedResponse(format!(
+                "engine accepted {accepted_len} of {window_len} window tokens"
+            )));
+        }
+        let mut committed = out.window_tokens[..accepted_len as usize].to_vec();
+        if let Some(token) = correction {
+            committed.push(token);
+        }
+        let new_prefix_hash = compute_prefix_hash(&out.parent_prefix_hash, &committed)
+            .expect("parent hash is validated bare hex at admission");
+        let result = VerifyDraftsResult {
+            session_id: self.session_id.clone(),
+            protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
+            seq: self.next_result_seq,
+            round: out.round,
+            accepted_prefix_len: accepted_len,
+            divergence_point: (accepted_len < out.window_tokens.len() as u32)
+                .then_some(accepted_len),
+            correction,
+            new_prefix_hash,
+            verify_pass_ms: u32::try_from(pass_end_ms.saturating_sub(now_ms)).unwrap_or(u32::MAX),
+            nonce_echo: out.nonce.clone(),
+            sender: self.verifier_installation_id.clone(),
+            // The serve loop signs the draft with the verifier key.
+            signature: String::new(),
+        };
+        self.next_result_seq += 1;
+        let Some(out) = self.outstanding.as_mut() else {
+            return DispatchOutcome::NoOutstandingRound;
+        };
+        out.result = Some(result.clone());
+        self.state = GateState::WaitCommit;
+        DispatchOutcome::Dispatched(result)
+    }
+
+    // -- WAIT_COMMIT admission (RC-4) + the gate's own chain (plan §3.4) --
+
+    /// Applies a `PrefixCommit` (the shipped [`CommitPrefix`] shape rides
+    /// this family; ADR-032 §2 defers old-vocabulary binding to the freeze
+    /// ADR). The commit is applied ONLY if it reproduces the outstanding
+    /// result: `accepted_token_ids == window_tokens[..accepted_prefix_len]
+    /// ++ [correction]` AND `new_prefix_hash == result.new_prefix_hash`
+    /// (RC-4). A commit that chains validly from the parent but does not
+    /// reproduce the result is `CancelRound("commit_mismatch")` and the
+    /// round is abandoned.
+    ///
+    /// Chain rules (the gate's OWN state, NOT
+    /// [`crate::SessionStateMachine::apply`] — gaps are allowed, I3):
+    /// session/profile/params equality, `round > last committed round`
+    /// (strictly monotone; round NUMBERS may gap after abandonment),
+    /// parent-hash equality, [`compute_prefix_hash`] verification, and
+    /// bounded per-round duplicate memory so replays are remembered
+    /// no-ops.
+    pub fn apply_prefix_commit(&mut self, commit: &CommitPrefix) -> CommitApplyOutcome {
+        // Session-level rejects first (the admission-table discipline).
+        if self.torn_down.is_some() {
+            return self.reject_commit(FrameRejectReason::CancelledByPeer, commit.round);
+        }
+        if commit.session_id != self.session_id
+            || commit.generation_params_hash != self.generation_params_hash
+        {
+            return self.reject_commit(FrameRejectReason::BadFrame, commit.round);
+        }
+        if commit.model_profile_id != self.profile_id {
+            *self.violations.entry(commit.sender.clone()).or_insert(0) += 1;
+            self.torn_down = Some("profile_mismatch".to_string());
+            return self.reject_commit(FrameRejectReason::ProfileMismatch, commit.round);
+        }
+        // Duplicates of applied rounds are remembered no-ops; any other
+        // round at or below the committed round is a round_mismatch.
+        if commit.round <= self.last_committed_round {
+            if self
+                .applied_hashes
+                .get(&commit.round)
+                .is_some_and(|remembered| *remembered == commit.new_prefix_hash)
+            {
+                return CommitApplyOutcome::DuplicateRound;
+            }
+            return self.cancel_round_commit(commit.round, CancelRoundReason::RoundMismatch);
+        }
+        // The chain must continue from the committed hash (I3).
+        if commit.previous_prefix_hash != self.committed_prefix_hash {
+            return self.cancel_round_commit(commit.round, CancelRoundReason::ParentMismatch);
+        }
+        // RC-4: the commit must reproduce the outstanding result for THIS
+        // round — token ids and hash, both.
+        let reproduces = self.outstanding.as_ref().is_some_and(|out| {
+            out.round == commit.round
+                && out.result.as_ref().is_some_and(|result| {
+                    let mut expected =
+                        out.window_tokens[..result.accepted_prefix_len as usize].to_vec();
+                    if let Some(token) = result.correction {
+                        expected.push(token);
+                    }
+                    commit.accepted_token_ids == expected
+                        && commit.new_prefix_hash == result.new_prefix_hash
+                })
+        });
+        let hash_valid =
+            compute_prefix_hash(&self.committed_prefix_hash, &commit.accepted_token_ids)
+                .is_ok_and(|recomputed| recomputed == commit.new_prefix_hash);
+        if !reproduces || !hash_valid {
+            // Round abandoned (RC-4); a repeated offender tears the session
+            // down (threshold two, §2 RC-3 tail).
+            *self.violations.entry(commit.sender.clone()).or_insert(0) += 1;
+            if self.violations.get(&commit.sender).copied().unwrap_or(0)
+                >= TEARDOWN_VIOLATION_THRESHOLD
+            {
+                self.torn_down = Some("commit_mismatch".to_string());
+            }
+            self.abandon_outstanding();
+            return self.cancel_round_commit(commit.round, CancelRoundReason::CommitMismatch);
+        }
+        // Advance the gate's own chain + the budget ledger.
+        self.last_committed_round = commit.round;
+        self.committed_prefix_hash = commit.new_prefix_hash.clone();
+        self.committed_tokens += commit.accepted_token_ids.len() as u64;
+        self.remember(commit.round, commit.new_prefix_hash.clone());
+        self.outstanding = None;
+        self.state = GateState::Committed;
+        CommitApplyOutcome::Advanced {
+            round: commit.round,
+        }
+    }
+
+    // -- Expiry (RC-5(b)) ---------------------------------------------------
+
+    /// Expires an outstanding round whose `deadline_ms + 250 ms` grace
+    /// has passed: abandons the round, discards the pending result,
+    /// returns to `Prefilled`. The verifier never holds an uncommitted
+    /// round for a vanished coordinator.
+    ///
+    /// RC-5(b) pins this for WAIT_COMMIT; an admitted-but-undispatched
+    /// round (state `Verify`) past the same bound is equally abandoned —
+    /// its dispatch is already impossible (the stage-13 re-check would
+    /// refuse), so holding it would only block new rounds at stage 9.
+    /// Returns whether an abandonment happened.
+    pub fn expire_wait_commit_if_due(&mut self, now_ms: u64) -> bool {
+        if !matches!(self.state, GateState::Verify | GateState::WaitCommit) {
+            return false;
+        }
+        let expired = self
+            .outstanding
+            .as_ref()
+            .is_some_and(|out| now_ms >= out.deadline_expires_at_ms + WAIT_COMMIT_GRACE_MS);
+        if expired {
+            self.abandon_outstanding();
+        }
+        expired
+    }
+
+    /// Housekeeping: settle COMMITTED → PREFILLED and expire a stale
+    /// WAIT_COMMIT round.
+    fn settle(&mut self, now_ms: u64) {
+        if self.state == GateState::Committed {
+            self.state = GateState::Prefilled;
+        }
+        self.expire_wait_commit_if_due(now_ms);
+    }
+
+    fn abandon_outstanding(&mut self) {
+        self.outstanding = None;
+        self.state = GateState::Prefilled;
+    }
+
+    fn remember(&mut self, round: u64, new_prefix_hash: String) {
+        if self.applied_hashes.insert(round, new_prefix_hash).is_none() {
+            self.applied_order.push_back(round);
+        }
+        while self.applied_hashes.len() > DUPLICATE_MEMORY_ROUNDS {
+            match self.applied_order.pop_front() {
+                Some(evicted) => {
+                    self.applied_hashes.remove(&evicted);
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn reject(&self, code: FrameRejectReason, round: Option<u64>) -> AdmissionDecision {
+        AdmissionDecision::FrameRejected(RejectionFrame {
+            session_id: self.session_id.clone(),
+            code,
+            round,
+            prefix_hash: Some(self.committed_prefix_hash.clone()),
+        })
+    }
+
+    fn reject_commit(&self, code: FrameRejectReason, round: u64) -> CommitApplyOutcome {
+        CommitApplyOutcome::FrameRejected(RejectionFrame {
+            session_id: self.session_id.clone(),
+            code,
+            round: Some(round),
+            prefix_hash: Some(self.committed_prefix_hash.clone()),
+        })
+    }
+
+    fn cancel_round(&self, round: u64, reason: CancelRoundReason) -> AdmissionDecision {
+        AdmissionDecision::CancelRound(self.cancel_round_frame(round, reason))
+    }
+
+    fn cancel_round_commit(&self, round: u64, reason: CancelRoundReason) -> CommitApplyOutcome {
+        CommitApplyOutcome::CancelRound(self.cancel_round_frame(round, reason))
+    }
+
+    fn cancel_round_frame(&self, round: u64, reason: CancelRoundReason) -> CancelRoundFrame {
+        CancelRoundFrame {
+            session_id: self.session_id.clone(),
+            round,
+            reason,
+        }
+    }
+}
+
+/// `profile_id` wire form: `"msp1:"` + bare 64-hex (stage 2 schema).
+fn is_profile_id_form(s: &str) -> bool {
+    let Some(hex_part) = s.strip_prefix("msp1:") else {
+        return false;
+    };
+    is_bare_hash(hex_part)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +1447,15 @@ mod tests {
     }
 
     fn sample_result(sender: &str, signature: &str) -> VerifyDraftsResult {
+        // ADR-032 §1 rule 2: new_prefix_hash covers
+        // (parent ‖ accepted prefix ‖ [correction]) — the FULL accepted
+        // prefix of the sample window, not the correction alone. (Session-3
+        // fix of the session-1 inconsistency the session-2 handoff flagged:
+        // the helper previously hashed [999] only while claiming
+        // accepted_prefix_len 8 over the 8-token sample window.)
+        let window = [101, 102, 103, 104, 105, 106, 107, 108];
+        let mut committed = window.to_vec();
+        committed.push(999);
         VerifyDraftsResult {
             session_id: "sess-1".to_string(),
             protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
@@ -551,7 +1464,7 @@ mod tests {
             accepted_prefix_len: 8,
             divergence_point: None,
             correction: Some(999),
-            new_prefix_hash: compute_prefix_hash(GENESIS_PREFIX_HASH, &[999]).unwrap(),
+            new_prefix_hash: compute_prefix_hash(GENESIS_PREFIX_HASH, &committed).unwrap(),
             verify_pass_ms: 35,
             nonce_echo: "a1b2c3d4e5f60718".to_string(),
             sender: sender.to_string(),
@@ -745,11 +1658,15 @@ mod tests {
         let new_hash = compute_prefix_hash(GENESIS_PREFIX_HASH, &committed).unwrap();
         assert!(is_bare_hash(&new_hash));
         assert_ne!(new_hash, GENESIS_PREFIX_HASH);
-        // The result's new_prefix_hash pins exactly this construction.
+        // The result's new_prefix_hash pins exactly this construction:
+        // full-acceptance (k=8) hashes window[..8] ++ [correction], not
+        // the correction alone (session-3 alignment; ADR-032 §1 rule 2).
         let msg = sample_result("v", "sig");
+        let mut full = window.to_vec();
+        full.push(correction);
         assert_eq!(
             msg.new_prefix_hash,
-            compute_prefix_hash(GENESIS_PREFIX_HASH, &[999]).unwrap()
+            compute_prefix_hash(GENESIS_PREFIX_HASH, &full).unwrap()
         );
     }
 

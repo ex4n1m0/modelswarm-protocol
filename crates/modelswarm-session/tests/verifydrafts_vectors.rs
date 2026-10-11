@@ -10,35 +10,33 @@
 //! canonical bytes, signatures, and outcomes from the same files
 //! (consumer-neutrality rule).
 //!
-//! What is asserted now vs. what waits for session 3: session 1 landed
-//! the types + byte rules (strict two-pass parse, signature preimage,
-//! sender binding, `batch_generation_params_hash`, `compute_prefix_hash`
-//! reuse) and session 2 lands these fixtures — but the §3 verifier-side
-//! admission gate does NOT exist yet. Every admission-rejection case is
-//! therefore asserted at the classification level that is executable
-//! TODAY (parsing, schema classification, signature outcome, and the
-//! recorded reject inputs: seq vs. last-seen, nonce vs. consumed set,
-//! window length vs. `min(WINDOW_CAP, batch_window_max)`, deadline math
-//! against the recorded clock ints, session/profile/lease/budget
-//! pre-state), each carrying a clearly-marked `TODO(session 3)` hook
-//! where the gate itself will replay the fixture.
+//! Session 3 activation: every family fixture (1–4, the len-33 over-cap
+//! case, and all 12 malformed admission-rejection cases) is REPLAYED
+//! through the real §3 [`VerifyDraftsGate`] with a mock engine and the
+//! clock fixed at the recorded `verify_at`, asserting the exact expected
+//! codes / CancelRound reasons / state transitions (the session-2
+//! `TODO(session 3)` hooks, now live).
 
-use modelswarm_identity::installation_id_for;
+use modelswarm_identity::{installation_id_for, InstallationIdentity};
 use modelswarm_runtime::SamplingParams;
 use modelswarm_session::negotiation::FrameRejectReason;
 use modelswarm_session::negotiation::{
-    EngineDisclosure, SessionAccept, SessionOffer, SessionReject, SessionRejectReason,
+    EngineDisclosure, SessionAccept, SessionBudget, SessionOffer, SessionReject,
+    SessionRejectReason,
 };
 use modelswarm_session::verifydrafts::{
-    batch_generation_params_hash, is_bare_hash, signing_preimage,
-    verify_verify_drafts_result_signature, verify_verify_drafts_signature, FrameParseError,
-    VerifyDrafts, VerifyDraftsResult, COOPERATIVE_PROTOCOL_VERSION, WINDOW_CAP,
+    batch_generation_params_hash, is_bare_hash, sign_verify_drafts_result, signing_preimage,
+    verify_verify_drafts_result_signature, verify_verify_drafts_signature, AdmissionDecision,
+    BatchVerifyEngine, CommitApplyOutcome, DispatchOutcome, FrameParseError, GatePreStateSeed,
+    GateState, VerifyDrafts, VerifyDraftsGate, VerifyDraftsGateConfig, VerifyDraftsResult,
+    COOPERATIVE_PROTOCOL_VERSION, WINDOW_CAP,
 };
-use modelswarm_session::{compute_prefix_hash, GENESIS_PREFIX_HASH};
+use modelswarm_session::{compute_prefix_hash, CommitPrefix, GENESIS_PREFIX_HASH};
 use modelswarm_transport::ed25519_dalek::VerifyingKey;
 use modelswarm_types::canonical_json;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const FIXTURE_ACCEPT: &str = include_str!("../../../protocol/vectors/verifydrafts-1-accept.json");
 const FIXTURE_REJECT: &str = include_str!("../../../protocol/vectors/verifydrafts-2-reject.json");
@@ -78,6 +76,81 @@ fn token_ids(value: &Value) -> Vec<u32> {
         .iter()
         .map(|v| v.as_u64().expect("token id is a u32") as u32)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Session-3 replay helpers: injected clock + mock engine + the real gate
+// ---------------------------------------------------------------------------
+
+/// Days-from-civil (Howard Hinnant) — the generator's own conversion, so
+/// the test derives the anchors independently of any stored unix-ms int.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Parses the fixtures' `"YYYY-MM-DDTHH:MM:SSZ"` stamps into unix ms.
+fn unix_ms(iso: &str) -> u64 {
+    let (y, m, d) = (
+        iso[0..4].parse::<i64>().expect("year"),
+        iso[5..7].parse::<i64>().expect("month"),
+        iso[8..10].parse::<i64>().expect("day"),
+    );
+    let (hh, mm, ss) = (
+        iso[11..13].parse::<i64>().expect("hour"),
+        iso[14..16].parse::<i64>().expect("minute"),
+        iso[17..19].parse::<i64>().expect("second"),
+    );
+    (((days_from_civil(y, m, d) * 24 + hh) * 60 + mm) * 60 + ss) as u64 * 1000
+}
+
+#[test]
+fn unix_ms_matches_the_recorded_fixture_anchors() {
+    // Session 2 verified these against `date -u`; the test re-derives them.
+    assert_eq!(unix_ms("2026-10-12T00:00:00Z"), 1_791_763_200_000);
+    assert_eq!(unix_ms("2026-10-11T23:59:00Z"), 1_791_763_140_000);
+    assert_eq!(unix_ms("2026-10-11T23:00:00Z"), 1_791_759_600_000);
+}
+
+/// The counting mock engine (plan §3.5: mock-fixed outcome; the recorded
+/// fixture result IS the outcome).
+struct MockVerifyEngine {
+    disclosure: EngineDisclosure,
+    outcome: (u32, Option<u32>),
+    calls: AtomicUsize,
+}
+
+impl MockVerifyEngine {
+    fn new(disclosure: EngineDisclosure, outcome: (u32, Option<u32>)) -> Self {
+        Self {
+            disclosure,
+            outcome,
+            calls: AtomicUsize::new(0),
+        }
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl BatchVerifyEngine for MockVerifyEngine {
+    async fn verify_window(
+        &self,
+        window: &[u32],
+        _params: &SamplingParams,
+    ) -> Result<(u32, Option<u32>), modelswarm_runtime::RuntimeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok((self.outcome.0.min(window.len() as u32), self.outcome.1))
+    }
+    fn capabilities(&self) -> EngineDisclosure {
+        self.disclosure.clone()
+    }
 }
 
 /// Plan §2.3 check (1)+(2) for one recorded message block: recompute the
@@ -221,11 +294,137 @@ fn check_family_fixture(f: &Value) -> (VerifyDrafts, VerifyDraftsResult) {
     // value assertion) — pinned simply by being a u32 here.
     let _ = res.verify_pass_ms;
 
-    // TODO(session 3 — verifier gate, plan §3): replay this request
-    // through the admission gate with a mock engine and a clock fixed at
-    // `verify_at`; assert the engine sees exactly ONE pass and the
-    // emitted VerifyDraftsResult equals the recorded result.
+    // Session-3 activation: replay through the real §3 admission gate.
+    replay_family_fixture(f, &req, &res);
     (req, res)
+}
+
+/// Session-3 activation: replays one family fixture through the real gate
+/// (mock engine, clock fixed at `verify_at`) — admission (no engine work),
+/// exactly ONE engine pass at dispatch, the emitted result equalling the
+/// recorded one on every signed field, re-signing the draft with the
+/// recorded verifier key reproducing the recorded signature
+/// byte-for-byte, and the RC-4 commit reproduction (advance + duplicate
+/// no-op).
+fn replay_family_fixture(f: &Value, req: &VerifyDrafts, res: &VerifyDraftsResult) {
+    let anchor = unix_ms(f["verify_at"].as_str().unwrap());
+    let engine_disclosure: EngineDisclosure =
+        serde_json::from_value(f["engine"].clone()).expect("engine disclosure parses");
+    let mut gate = VerifyDraftsGate::new(VerifyDraftsGateConfig {
+        session_id: req.session_id.clone(),
+        profile_id: req.profile_id.clone(),
+        generation_params_hash: req.generation_params_hash.clone(),
+        committed_prefix_hash: GENESIS_PREFIX_HASH.to_string(),
+        coordinator_key: verifying_key(f["coordinator_public_key_hex"].as_str().unwrap()),
+        verifier_installation_id: f["verifier_installation_id"].as_str().unwrap().to_string(),
+        engine: engine_disclosure.clone(),
+        budget: SessionBudget {
+            max_endpoints: 1,
+            max_endpoint_seconds: 3600,
+            max_output_tokens: 1_000_000,
+        },
+        lease_expires_at_ms: anchor + 3_600_000,
+        sampling_params: SamplingParams::default(),
+        // The recorded result seq is the RC-7 verifier-own-counter
+        // illustration made normative bytes (request 12 / result 4).
+        verifier_next_seq: res.seq,
+    })
+    .expect("gate config is valid");
+    let engine =
+        MockVerifyEngine::new(engine_disclosure, (res.accepted_prefix_len, res.correction));
+
+    let fields = f["request"]["fields"].clone();
+    match gate.admit_verify_drafts(&fields, anchor, anchor) {
+        AdmissionDecision::Admitted { round, .. } => {
+            assert_eq!(round, req.round, "admitted round");
+        }
+        other => panic!(
+            "fixture {} must admit: {other:?}",
+            f["name"].as_str().unwrap()
+        ),
+    }
+    assert_eq!(
+        engine.calls(),
+        0,
+        "no engine work at admission (stages 1-12)"
+    );
+    assert_eq!(gate.state(), GateState::Verify);
+
+    // Dispatch: exactly ONE pass; the pass clock delta equals the
+    // recorded verify_pass_ms so the emitted draft is byte-comparable.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime");
+    let outcome = rt.block_on(gate.dispatch_outstanding(
+        &engine,
+        anchor,
+        anchor + u64::from(res.verify_pass_ms),
+    ));
+    let DispatchOutcome::Dispatched(draft) = outcome else {
+        panic!(
+            "fixture {} must dispatch: {outcome:?}",
+            f["name"].as_str().unwrap()
+        );
+    };
+    assert_eq!(
+        engine.calls(),
+        1,
+        "exactly ONE engine pass per VerifyDrafts"
+    );
+    assert_eq!(gate.state(), GateState::WaitCommit);
+
+    // The emitted draft equals the recorded result on every signed field;
+    // the gate emits UNSIGNED drafts (the serve loop signs).
+    assert_eq!(draft.session_id, res.session_id);
+    assert_eq!(draft.protocol_version, res.protocol_version);
+    assert_eq!(draft.seq, res.seq);
+    assert_eq!(draft.round, res.round);
+    assert_eq!(draft.accepted_prefix_len, res.accepted_prefix_len);
+    assert_eq!(draft.divergence_point, res.divergence_point);
+    assert_eq!(draft.correction, res.correction);
+    assert_eq!(draft.new_prefix_hash, res.new_prefix_hash);
+    assert_eq!(draft.verify_pass_ms, res.verify_pass_ms);
+    assert_eq!(draft.nonce_echo, res.nonce_echo);
+    assert_eq!(draft.sender, res.sender);
+    assert_eq!(draft.signature, "");
+
+    // Signing the draft with the recorded verifier fixture key
+    // reproduces the recorded signature byte-for-byte.
+    let seed: [u8; 32] = hex::decode(f["verifier_seed_hex"].as_str().unwrap())
+        .expect("verifier seed decodes")
+        .try_into()
+        .expect("verifier seed is 32 bytes");
+    let verifier = InstallationIdentity::from_bytes(&seed);
+    assert_eq!(
+        sign_verify_drafts_result(&draft, &verifier).unwrap(),
+        res.signature
+    );
+
+    // RC-4: the reproducing commit over the recorded committed ids
+    // advances the gate's own chain; a replay is a remembered no-op.
+    let committed = token_ids(&f["expected"]["committed"]);
+    let commit = CommitPrefix {
+        session_id: req.session_id.clone(),
+        round: req.round,
+        previous_prefix_hash: req.parent_prefix_hash.clone(),
+        accepted_token_ids: committed.clone(),
+        new_prefix_hash: res.new_prefix_hash.clone(),
+        model_profile_id: req.profile_id.clone(),
+        generation_params_hash: req.generation_params_hash.clone(),
+        sender: req.sender.clone(),
+    };
+    assert_eq!(
+        gate.apply_prefix_commit(&commit),
+        CommitApplyOutcome::Advanced { round: req.round }
+    );
+    assert_eq!(gate.committed_prefix_hash(), res.new_prefix_hash);
+    assert_eq!(gate.last_committed_round(), req.round);
+    assert_eq!(gate.state(), GateState::Committed);
+    assert_eq!(gate.committed_output_tokens(), committed.len() as u64);
+    assert_eq!(
+        gate.apply_prefix_commit(&commit),
+        CommitApplyOutcome::DuplicateRound
+    );
 }
 
 /// Plan §2.3 check (4): the `expected` block is internally consistent
@@ -340,7 +539,8 @@ fn golden_verifydrafts_1_accept_full_acceptance() {
     );
     // Present-as-null on the wire fields.
     assert!(f["result"]["fields"]["divergence_point"].is_null());
-    // TODO(session 3): gate replay with the mock engine (one pass).
+    // (The gate replay itself — admission, ONE pass, byte-equal result,
+    // RC-4 commit reproduction — runs inside check_family_fixture.)
 }
 
 #[test]
@@ -358,8 +558,8 @@ fn golden_verifydrafts_2_reject_mid_window() {
         token_ids(&f["expected"]["committed"]),
         vec![201, 202, 203, 777]
     );
-    // TODO(session 3): gate replay — KV rolls back to the divergence
-    // point; the emitted result equals the recorded one.
+    // (Gate replay with the mid-window rollback runs in
+    // check_family_fixture: divergence == accepted_prefix_len == 3.)
 }
 
 #[test]
@@ -400,8 +600,37 @@ fn golden_verifydrafts_3_boundary_cap_edge() {
         over["context"]["engine_passes_before_reject"], 0,
         "the cap reject fires before any engine work (RC-8)"
     );
-    // TODO(session 3): gate replay — the mock engine asserts ZERO
-    // verify_window calls for this wire.
+
+    // Session-3 activation: gate replay of the len-33 wire —
+    // payload_too_large at stage 10 with ZERO verify_window calls.
+    let anchor = unix_ms(f["verify_at"].as_str().unwrap());
+    let engine_disclosure: EngineDisclosure = serde_json::from_value(f["engine"].clone()).unwrap();
+    let mut gate = VerifyDraftsGate::new(VerifyDraftsGateConfig {
+        session_id: over_req.session_id.clone(),
+        profile_id: over_req.profile_id.clone(),
+        generation_params_hash: over_req.generation_params_hash.clone(),
+        committed_prefix_hash: GENESIS_PREFIX_HASH.to_string(),
+        coordinator_key: verifying_key(f["coordinator_public_key_hex"].as_str().unwrap()),
+        verifier_installation_id: f["verifier_installation_id"].as_str().unwrap().to_string(),
+        engine: engine_disclosure.clone(),
+        budget: SessionBudget {
+            max_endpoints: 1,
+            max_endpoint_seconds: 3600,
+            max_output_tokens: 1_000_000,
+        },
+        lease_expires_at_ms: anchor + 3_600_000,
+        sampling_params: SamplingParams::default(),
+        verifier_next_seq: 4,
+    })
+    .unwrap();
+    let engine = MockVerifyEngine::new(engine_disclosure, (32, None));
+    match gate.admit_verify_drafts(&over["wire"]["fields"], anchor, anchor) {
+        AdmissionDecision::FrameRejected(reject) => {
+            assert_eq!(reject.code, FrameRejectReason::PayloadTooLarge);
+        }
+        other => panic!("len-33 must be payload_too_large: {other:?}"),
+    }
+    assert_eq!(engine.calls(), 0, "ZERO verify_window calls (RC-8)");
 }
 
 #[test]
@@ -424,8 +653,8 @@ fn golden_verifydrafts_4_eos_correction_null() {
         f["expected"]["committed"],
         "no correction token is chained at EOG"
     );
-    // TODO(session 3): gate replay — the mock engine returns bonus None
-    // (generation end); the emitted result equals the recorded one.
+    // (Gate replay with the EOG outcome — correction None, prefix-only
+    // commit — runs in check_family_fixture.)
 }
 
 // ---------------------------------------------------------------------------
@@ -654,13 +883,145 @@ fn golden_verifydrafts_malformed_admission_cases() {
             other => panic!("unknown malformed case {other}"),
         }
 
-        // TODO(session 3 — verifier gate, plan §3): replay each wire
-        // through the admission gate against the recorded context
-        // pre-state (clock fixed at verify_at, mock engine, session
-        // seeded from the context) and assert the EXACT emitted code
-        // equals `expected_reject` here.
-        let _ = code;
+        // Session-3 activation: replay each wire through the real §3
+        // admission gate against the recorded context pre-state (clock
+        // fixed at verify_at, mock engine) and assert the EXACT emitted
+        // code equals `expected_reject`.
+        let (gate, decision) = replay_malformed_case(case, name);
+        let expected_code: FrameRejectReason =
+            serde_json::from_value(json!(code)).expect("expected code is a family code");
+        match decision {
+            AdmissionDecision::FrameRejected(reject) => {
+                assert_eq!(reject.code, expected_code, "case {name}: gate replay code");
+                // Privacy (A-3): the reject frame carries codes/counts/
+                // hashes only — serialized, no token id can appear.
+                let serialized = serde_json::to_string(&reject).unwrap();
+                assert!(!serialized.contains("701"), "case {name}: token id leak");
+            }
+            other => panic!("case {name}: expected reject {code}, got {other:?}"),
+        }
+        if name == "wrong-profile-id" {
+            // The profile row tears the session down (I7).
+            assert!(
+                gate.is_torn_down(),
+                "case {name}: profile mismatch must tear down"
+            );
+            assert_eq!(gate.teardown_reason(), Some("profile_mismatch"));
+        }
     }
+}
+
+/// Builds the gate recorded in one malformed case's `context` pre-state
+/// and replays the case's wire through it. Budget-ledger seeding note:
+/// the recorded `committed_output_tokens: 16` == `max_output_tokens` is
+/// the injected condition of the `budget-exhausted` case; it is seeded
+/// for every case EXCEPT `deadline-past`, whose shared-template context
+/// would otherwise mask the case's own (later-stage) condition — under
+/// first-failure-wins a literally-seeded `deadline-past` context
+/// classifies as `overloaded` (stage 11 < stage 12), which is asserted
+/// below and flagged for fixture regeneration in the session-3 handoff.
+fn replay_malformed_case(case: &Value, name: &str) -> (VerifyDraftsGate, AdmissionDecision) {
+    let ctx = &case["context"];
+    let anchor = unix_ms(case["verify_at"].as_str().unwrap());
+    let arrival = ctx
+        .get("request_arrival_unix_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(anchor);
+    let budget: SessionBudget = serde_json::from_value(ctx["budget"].clone()).unwrap();
+    let engine_disclosure: EngineDisclosure =
+        serde_json::from_value(ctx["engine"].clone()).unwrap();
+
+    let mut gate = VerifyDraftsGate::new(VerifyDraftsGateConfig {
+        session_id: ctx["admitted_session_id"].as_str().unwrap().to_string(),
+        profile_id: ctx["pinned_profile_id"].as_str().unwrap().to_string(),
+        generation_params_hash: batch_generation_params_hash(&SamplingParams::default())
+            .expect("default params are integral"),
+        committed_prefix_hash: ctx["committed_prefix_hash"].as_str().unwrap().to_string(),
+        coordinator_key: verifying_key(case["coordinator_public_key_hex"].as_str().unwrap()),
+        verifier_installation_id: case["verifier_installation_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        engine: engine_disclosure.clone(),
+        budget,
+        lease_expires_at_ms: unix_ms(ctx["lease_expires_at"].as_str().unwrap()),
+        sampling_params: SamplingParams::default(),
+        verifier_next_seq: 4,
+    })
+    .expect("recorded context builds a valid gate");
+    gate.seed_pre_state(GatePreStateSeed {
+        torn_down: ctx["session_state"].as_str() == Some("torn_down"),
+        last_seq: vec![(
+            case["coordinator_installation_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            ctx["last_seq_from_coordinator"].as_u64().unwrap(),
+        )],
+        consumed_nonces: ctx["consumed_nonces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect(),
+        committed_output_tokens: if name == "budget-exhausted" {
+            Some(ctx["committed_output_tokens"].as_u64().unwrap())
+        } else {
+            None
+        },
+        last_handled_round: Some(ctx["last_handled_round"].as_u64().unwrap()),
+        served_ms: None,
+        lease_expires_at_ms: None,
+    });
+
+    let decision = gate.admit_verify_drafts(&case["wire"], arrival, anchor);
+
+    // The recorded template's at-ceiling budget seeded LITERALLY makes
+    // deadline-past classify as overloaded (budget stage precedes the
+    // deadline stage; the property suite pins this conjunction). This
+    // pins the fixture defect in code until the fixture is regenerated.
+    if name == "deadline-past" {
+        let mut literal = VerifyDraftsGate::new(VerifyDraftsGateConfig {
+            session_id: ctx["admitted_session_id"].as_str().unwrap().to_string(),
+            profile_id: ctx["pinned_profile_id"].as_str().unwrap().to_string(),
+            generation_params_hash: batch_generation_params_hash(&SamplingParams::default())
+                .unwrap(),
+            committed_prefix_hash: ctx["committed_prefix_hash"].as_str().unwrap().to_string(),
+            coordinator_key: verifying_key(case["coordinator_public_key_hex"].as_str().unwrap()),
+            verifier_installation_id: case["verifier_installation_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            engine: engine_disclosure.clone(),
+            budget: serde_json::from_value(ctx["budget"].clone()).unwrap(),
+            lease_expires_at_ms: unix_ms(ctx["lease_expires_at"].as_str().unwrap()),
+            sampling_params: SamplingParams::default(),
+            verifier_next_seq: 4,
+        })
+        .unwrap();
+        literal.seed_pre_state(GatePreStateSeed {
+            last_seq: vec![(
+                case["coordinator_installation_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                ctx["last_seq_from_coordinator"].as_u64().unwrap(),
+            )],
+            last_handled_round: Some(ctx["last_handled_round"].as_u64().unwrap()),
+            committed_output_tokens: Some(ctx["committed_output_tokens"].as_u64().unwrap()),
+            ..GatePreStateSeed::default()
+        });
+        match literal.admit_verify_drafts(&case["wire"], arrival, anchor) {
+            AdmissionDecision::FrameRejected(reject) => assert_eq!(
+                reject.code,
+                FrameRejectReason::Overloaded,
+                "literal at-ceiling budget seeding must win over deadline (stage 11 < 12)"
+            ),
+            other => panic!("deadline-past literal seeding must reject: {other:?}"),
+        }
+    }
+
+    (gate, decision)
 }
 
 // ---------------------------------------------------------------------------

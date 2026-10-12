@@ -76,6 +76,7 @@
 //! feature is off by default and the node never enables it.
 
 mod ffi;
+pub mod verify;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -87,6 +88,7 @@ use async_trait::async_trait;
 
 pub use ffi::LlamaLib;
 use ffi::{ContextPtr, Logits, PooledBatch};
+pub use verify::{BatchVerifyEngineMirror, CapiVerifyEngine, VerifyBackend, VerifyEngineCaps};
 
 use crate::{
     DecodeEvent, DecodeEventStream, Handle, KvCommitment, RuntimeDescriptor, RuntimeError,

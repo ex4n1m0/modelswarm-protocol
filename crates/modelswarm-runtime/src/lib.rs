@@ -43,7 +43,7 @@ pub mod capi;
 pub use llamacpp::LlamaCppAdapter;
 
 #[cfg(feature = "capi-adapter")]
-pub use capi::{CapiConfig, LlamaCppCapi, VerifyOutcome};
+pub use capi::{CapiConfig, CapiVerifyEngine, LlamaCppCapi, VerifyOutcome};
 
 #[cfg(feature = "mock-runtime")]
 pub use mock::{

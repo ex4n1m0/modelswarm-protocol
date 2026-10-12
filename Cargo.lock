@@ -3544,6 +3544,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "libloading",
+ "modelswarm-session",
  "modelswarm-types",
  "reqwest 0.12.28",
  "serde",

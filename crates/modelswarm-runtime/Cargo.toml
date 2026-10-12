@@ -41,6 +41,14 @@ libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# REAL-trait compile-proof for `capi::verify` (ADR-032 §1): the architect's
+# `BatchVerifyEngine` lives in `modelswarm-session`, which already depends
+# on THIS crate — so the impl cannot live in the lib (cyclic package
+# dependency), but a DEV-dependency cycle is legal and lets
+# `tests/capi_verify.rs` implement the real trait for a newtype of
+# `CapiVerifyEngine` and run the engine-exactness pins THROUGH it. The
+# mirror trait in `capi::verify` is the labeled stopgap.
+modelswarm-session = { path = "../modelswarm-session" }
 
 # NOTE (lint scope): the workspace sets `unsafe_code = "forbid"`. This crate
 # defines its own lint table instead of inheriting, with `unsafe_code`

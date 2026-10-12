@@ -250,6 +250,75 @@ async fn send_reject<W: VerifyDraftsWire>(
     let _ = wire.send_json(&value, io_deadline).await;
 }
 
+/// Why [`read_session_open`] could not read the session-open exchange
+/// (labels only — never lease contents).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOpenError {
+    /// The lease carrier arrived but failed its STRICT schema
+    /// (`deny_unknown_fields`/type) — a malformed presented lease, mapped
+    /// by the caller to the `invalid_lease` refusal classification.
+    BadCarrier,
+    /// The carrier arrived but no `SessionOffer` followed within the
+    /// open deadline.
+    OfferTimeout,
+    /// Transport failure reading the offer behind the carrier (label
+    /// only).
+    Wire(&'static str),
+}
+
+impl SessionOpenError {
+    /// Stable telemetry label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BadCarrier => "bad_lease_carrier",
+            Self::OfferTimeout => "offer_timeout",
+            Self::Wire(_) => "wire_failure",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadCarrier => write!(f, "lease carrier failed its strict schema"),
+            Self::OfferTimeout => write!(f, "no session offer behind the lease carrier"),
+            Self::Wire(what) => write!(f, "transport failure: {what}"),
+        }
+    }
+}
+
+/// Reads the family SESSION-OPEN exchange from an already-read FIRST
+/// frame (ADR-032 §2 admission order, wired 2026-10-12): the coordinator
+/// PRESENTS its consume lease in the minimal [`WireSessionLease`] carrier
+/// immediately BEFORE its `SessionOffer` — the family-side equivalent of
+/// msp-v1's per-request `capability_token`, at session open per §2. The
+/// returned offer value is UNPARSED (raw JSON, handed to the serve loop
+/// pre-read through [`super::wire::PrefacedWire`] — never decoded twice);
+/// the caller feeds the presented token into the SAME validation the
+/// roster path runs (`FamilyLeaseSource::lease_for`).
+///
+/// An offer WITHOUT a preceding carrier is equally valid (presented =
+/// `None`): the roster-fed path and offer-only clients keep working —
+/// this reader only routes, never decides.
+pub async fn read_session_open<W: VerifyDraftsWire>(
+    wire: &mut W,
+    first: Value,
+    offer_deadline: Duration,
+) -> Result<(Option<String>, Value), SessionOpenError> {
+    if first.get("lease").is_none() {
+        // Offer-first (roster/classic path): nothing presented.
+        return Ok((None, first));
+    }
+    let carrier: super::WireSessionLease =
+        serde_json::from_value(first).map_err(|_| SessionOpenError::BadCarrier)?;
+    let offer = match wire.recv_json(offer_deadline).await {
+        Ok(value) => value,
+        Err(WireError::Timeout) => return Err(SessionOpenError::OfferTimeout),
+        Err(_) => return Err(SessionOpenError::Wire("recv offer behind carrier")),
+    };
+    Ok((Some(carrier.lease), offer))
+}
+
 /// Serves one VerifyDrafts session to its end and returns the report.
 ///
 /// Never panics on peer input: every malformed frame becomes a serialized

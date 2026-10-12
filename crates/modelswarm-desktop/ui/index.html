@@ -189,6 +189,10 @@
           <span class="chip" role="listitem" id="chip-hosting" data-state="inactive">not hosting</span>
         </div>
         <p class="note" id="family-line" style="margin:6px 0 0;font-size:11.5px">batch-verify family: unknown</p>
+        <div class="row" style="margin-top:6px">
+          <button class="ghost" id="family-probe">test family pairing (presents this machine's lease)</button>
+        </div>
+        <p class="note" id="family-probe-line" style="margin:4px 0 0;font-size:11.5px">family pairing: not tested</p>
       </section>
 
       <section aria-labelledby="priv-h">
@@ -409,7 +413,9 @@
         : "remote serve: off (dev listener flag not set)";
       // ADR-032 family: the daemon's own verdict with its real engine
       // geometry — on (cpu|vulkan, batch window) / off (exact reason) /
-      // null while not hosting. Never a static label.
+      // null while not hosting. Never a static label. Since the
+      // presented-lease activation, admission is by the coordinator's
+      // PRESENTED lease (roster 0 is normal — nothing feeds it yet).
       const fam = s.family;
       if (!s.node.running || !fam) {
         $("family-line").textContent = "batch-verify family: off (hosting off)";
@@ -417,8 +423,8 @@
         const d = fam.disclosure || {};
         $("family-line").textContent =
           "batch-verify family: on — " + (d.backend || "?") + ", batch window " +
-          (d.batch_window_max || "?") + ", lease roster " + (fam.lease_roster_peers ?? 0) +
-          (fam.lease_roster_peers ? "" : " (refusing family sessions until a coordinator lease is seeded)");
+          (d.batch_window_max || "?") + ", coordinator leases: presented at session open (roster " +
+          (fam.lease_roster_peers ?? 0) + ")";
       } else {
         $("family-line").textContent = "batch-verify family: off — " + (fam.reason || "unknown");
       }
@@ -454,6 +460,28 @@
 
     $("save-tracker").onclick = async () => { try { await invoke("set_tracker", { url: $("tracker-url").value }); error(""); } catch (e) { error(String(e)); } };
     $("accept-btn").onclick = async () => { try { await invoke("accept_privacy"); } catch (e) { error(String(e)); } refresh(); };
+    // The two-desktop pairing diagnostic (ADR-032 §2): opens one real
+    // family session presenting this machine's earned lease. The outcome
+    // is the daemon's own truth — opened (peer, real disclosure) or the
+    // exact honest reason; never a lease, key, or token.
+    $("family-probe").onclick = async () => {
+      if (!hostingOn) { $("family-probe-line").textContent = "family pairing: hosting is off"; return; }
+      $("family-probe-line").textContent = "family pairing: opening a session (challenge + lease + dial)…";
+      try {
+        const r = await invoke("family_probe");
+        if (r.opened) {
+          $("family-probe-line").textContent =
+            "family pairing: OPENED with " + (r.peer_id || "?").slice(0, 16) + "… — " +
+            (r.backend || "?") + ", batch window " + (r.batch_window_max || "?") +
+            " (presented lease accepted; session " + (r.session_id || "") + ")";
+        } else {
+          $("family-probe-line").textContent = "family pairing: " + (r.reason || "failed") +
+            (r.detail ? " — " + r.detail : "");
+        }
+      } catch (e) {
+        $("family-probe-line").textContent = "family pairing: error — " + e;
+      }
+    };
     $("enroll-open").onclick = async () => {
       if (!pendingEnroll) return;
       const url = pendingEnroll.verify_url + "?code=" + encodeURIComponent(pendingEnroll.user_code);

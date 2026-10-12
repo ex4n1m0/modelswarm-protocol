@@ -51,7 +51,11 @@
 //!   discipline (the lease seam: [`composed::FamilyLeaseSource`],
 //!   profile-bound and fail-closed at family session open since the
 //!   RC-L1 discharge — the production source is
-//!   [`composed::RosterFamilyLeases`]).
+//!   [`composed::RosterFamilyLeases`], which since the 2026-10-12
+//!   activation accepts the lease the coordinator PRESENTS at session
+//!   open ([`WireSessionLease`] carrier →
+//!   [`serve::read_session_open`]) and still honors tracker-fed roster
+//!   entries — one validation engine, two token sources).
 //! - [`engine_source::FamilyEngineSource`]: the injection seam — a
 //!   mock/stub engine, or the production C-API engine under the
 //!   `verifydrafts-capi` feature ([`engine_bridge`], the G4 bridge that
@@ -81,12 +85,12 @@ pub use composed::{
 pub use engine_bridge::{capi_disclosure, CapiBatchVerifyEngine};
 pub use engine_source::FamilyEngineSource;
 pub use serve::{
-    serve_verifydrafts_quic, serve_verifydrafts_session, ServeEndReason, VerifyDraftsServeConfig,
-    VerifyDraftsServeReport,
+    read_session_open, serve_verifydrafts_quic, serve_verifydrafts_session, ServeEndReason,
+    SessionOpenError, VerifyDraftsServeConfig, VerifyDraftsServeReport,
 };
 pub use wire::{
-    accept_quic, accept_staged, dial_quic, dial_staged, QuicVerifyWire, StagedVerifyWire,
-    VerifyDraftsWire, WireError,
+    accept_quic, accept_staged, dial_quic, dial_staged, PrefacedWire, QuicVerifyWire,
+    StagedVerifyWire, VerifyDraftsWire, WireError,
 };
 
 use modelswarm_session::negotiation::{Backend, EngineDisclosure, Preset, SessionBudget};
@@ -207,7 +211,10 @@ pub fn default_supported_presets() -> Vec<Preset> {
 }
 
 /// Classifies an inbound family frame by its discriminant keys (strict
-/// parsing happens in the session crate; this only routes).
+/// parsing happens in the session crate; this only routes). The
+/// session-open lease carrier ([`WireSessionLease`]) never reaches this
+/// router: it is consumed (strictly parsed) by [`serve::read_session_open`]
+/// BEFORE the serve loop starts.
 pub(crate) enum FamilyFrame {
     /// A `VerifyDrafts` request (carries `window_tokens`).
     Request,
@@ -253,6 +260,32 @@ pub(crate) struct WirePrefixCommit {
     pub profile_id: String,
     pub generation_params_hash: String,
     pub sender: String,
+}
+
+/// Wire mirror of the session-open LEASE CARRIER (ADR-032 §2 admission
+/// order: the coordinator presents its consume lease AT SESSION OPEN —
+/// the family-side equivalent of msp-v1's per-request `capability_token`,
+/// decided per the 2026-10-12 activation gap). The BARE object
+/// `{"lease": "<wire token>"}` — no envelope tag, exactly one field,
+/// parsed STRICTLY (`deny_unknown_fields` + serde types) at the carrier's
+/// entry by [`serve::read_session_open`]; the token string itself is the
+/// UNCHANGED `modelswarm-eligibility` wire form (`to_wire`:
+/// `base64url(json).base64url(sig)`) — no invented fields, no new
+/// signature, no new lease shape. The field name discriminates the
+/// carrier from every other family frame (`SessionOffer`, `VerifyDrafts`,
+/// `PrefixCommit`, results/rejects/cancels — none carries a `lease` key).
+///
+/// Freeze-ADR record (for the architect): this carrier is a minimal typed
+/// wrapper in the verifydrafts module, NOT a protocol-schema change; when
+/// ADR-032's wire freeze lands, the carrier should be recorded in
+/// `protocol/` alongside the family's other bare frames.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WireSessionLease {
+    /// The wire lease token exactly as the tracker issued it
+    /// (`EligibilityLease::to_wire`); validated against the SAME pinned
+    /// hub key the msp-v1 per-request gate uses.
+    pub lease: String,
 }
 
 impl WirePrefixCommit {
@@ -391,6 +424,51 @@ mod tests {
             demux_family_frame(&json!({"preset": "fast"})),
             FamilyFrame::Unknown
         ));
+    }
+
+    /// The session-open lease carrier: the BARE `{"lease": …}` object —
+    /// strict schema (`deny_unknown_fields`, typed field), and a `lease`
+    /// key discriminates it from EVERY other family frame (an offer, a
+    /// request, a commit, a result/reject/cancel never carries one).
+    #[test]
+    fn wire_session_lease_is_the_bare_strict_carrier() {
+        use serde_json::json;
+        let carrier = json!({ "lease": "YmFyZQ.YmF6" });
+        let parsed: WireSessionLease =
+            serde_json::from_value(carrier.clone()).expect("the bare carrier parses");
+        assert_eq!(parsed.lease, "YmFyZQ.YmF6");
+        assert_eq!(
+            serde_json::to_value(&WireSessionLease {
+                lease: "tok".into()
+            })
+            .unwrap(),
+            json!({ "lease": "tok" })
+        );
+        // Unknown fields / envelope tags / wrong types all fail closed.
+        let mut extra = carrier.clone();
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("profile_id".to_string(), json!("msp1:x"));
+        assert!(serde_json::from_value::<WireSessionLease>(extra).is_err());
+        let mut tagged = carrier.clone();
+        tagged
+            .as_object_mut()
+            .unwrap()
+            .insert("session_lease".to_string(), json!({}));
+        assert!(serde_json::from_value::<WireSessionLease>(tagged).is_err());
+        assert!(serde_json::from_value::<WireSessionLease>(json!({ "lease": 7 })).is_err());
+        // The discriminant never collides with any other family frame.
+        for frame in [
+            json!({"session_id": "s", "preset": "verified"}),
+            json!({"window_tokens": [1]}),
+            json!({"accepted_token_ids": [1]}),
+            json!({"engine": {}}),
+            json!({"code": "bad_frame"}),
+            json!({"reason": "round_mismatch"}),
+        ] {
+            assert!(frame.get("lease").is_none(), "collision: {frame}");
+        }
     }
 
     #[test]

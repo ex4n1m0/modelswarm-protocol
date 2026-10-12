@@ -12,6 +12,7 @@
 //! | `list_models` | verified-catalog active profiles |
 //! | `download_model` | streams `download` events, returns artifact state |
 //! | `set_hosting` | starts/stops the in-process node (+ roster heartbeat) |
+//! | `family_probe` | opens one real family session on an eligible peer, PRESENTING this installation's earned lease (ADR-032 §2); returns the honest outcome, never the lease itself |
 //! | `send_chat` | one function: chat through the node's loopback gateway |
 //! | `hf_search_models` | public HF Hub repo search (ADR-023 picker) |
 //! | `hf_list_ggufs` | pinned revision + artifact rows for one repo |
@@ -112,9 +113,11 @@ struct FamilyStatus {
     /// batch_window_max) when the bridge inited — from the engine, never
     /// hand-set.
     disclosure: Option<serde_json::Value>,
-    /// Coordinators with a lease on file (0 = refusing every family
-    /// session fail-closed until the roster wiring seeds one — the
-    /// ADR-026 discipline, surfaced instead of hidden).
+    /// Coordinators with a lease on file in the daemon's roster (0 is
+    /// NORMAL today — nothing feeds the roster; coordinators PRESENT
+    /// their hub-signed lease at session open instead, the ADR-032 §2
+    /// admission order. The count is reported so the tracker-fed roster
+    /// future shows up when it lands).
     lease_roster_peers: usize,
 }
 
@@ -397,10 +400,14 @@ fn family_prompt_tokens(data_dir: &Path) -> Option<Vec<u32>> {
 
 /// Builds the composed daemon's family half (ADR-032 §7 disposition item
 /// ii): the RC-L1 production lease source — a [`RosterFamilyLeases`]
-/// under the pinned hub key, EMPTY at start (every family session refuses
-/// fail-closed until the roster wiring seeds a validated lease; the exact
-/// refusal classification rides the telemetry) — and the engine source
-/// for this build (the real C-API bridge under `verifydrafts-capi`).
+/// under the pinned hub key — and the engine source for this build (the
+/// real C-API bridge under `verifydrafts-capi`). Since the 2026-10-12
+/// presented-lease activation, family admission does not wait for roster
+/// feeding: the coordinator PRESENTS its hub-signed lease in the
+/// session-open carrier (validated with every binding the msp-v1
+/// per-request gate enforces — profile, consume right, slots, peer,
+/// freshness under the pinned hub key); the roster is the tracker-fed
+/// future path through the same validation.
 ///
 /// `None` = the family cannot serve; the caller keeps the plain msp-v1
 /// bridge (honest degradation, never a silent family-off). Every `None`
@@ -530,10 +537,12 @@ async fn compose_family_serving(
         return (None, FamilyStatus::off("engine_bridge_failed"));
     };
 
-    // RC-L1: the production lease source under the PINNED hub key. The
-    // roster starts EMPTY — the ADR-026 discipline refuses every family
-    // session (stable `no_lease` label) until the roster wiring seeds a
-    // validated lease for the authenticated coordinator.
+    // RC-L1 + the §2 admission order: the production lease source under
+    // the PINNED hub key. The roster starts EMPTY and nothing feeds it —
+    // coordinators PRESENT their hub-signed lease at session open (the
+    // carrier read by the composed loop), validated with every binding
+    // the msp-v1 per-request gate enforces; the roster remains the
+    // tracker-fed future distribution path on top of the same validation.
     let lease = std::sync::Arc::new(RosterFamilyLeases::new(
         modelswarm_node::serving::LeasePolicy::production(),
     ));
@@ -544,6 +553,7 @@ async fn compose_family_serving(
         "family.enabled",
         &[
             ("profile", profile),
+            ("lease_path", "presented_at_session_open"),
             ("lease_roster_peers", &lease_roster_peers.to_string()),
         ],
     );
@@ -1604,6 +1614,250 @@ async fn lookup_peers(
             })
         })
         .collect())
+}
+
+/// The desktop's family REQUESTER wiring (ADR-032 §2 admission order,
+/// 2026-10-12): opens one real family session against an eligible
+/// exact-profile peer, PRESENTING this installation's cached/earned
+/// consume lease in the session-open carrier — the same lease the msp-v1
+/// swarm path presents per request. This is the two-desktop pairing
+/// diagnostic: a valid presented lease reaches the peer's accept (the
+/// lease gate passed on REAL transport); a refusal surfaces the honest
+/// reason (the serving peer telemeters the exact classification; this
+/// side reports the transport-level outcome), never a silent
+/// family-off. No rounds are driven and no prompt content crosses the
+/// wire — the probe opens the session and closes it cleanly.
+#[tauri::command]
+async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Value, String> {
+    let fail =
+        |reason: &str| serde_json::json!({ "probed": false, "opened": false, "reason": reason });
+    let (profile, gateway, tracker_url, data_dir) = {
+        let inner = state.inner.lock().await;
+        let running = inner.node.as_ref();
+        let Some(running) = running else {
+            return Ok(fail("hosting_off"));
+        };
+        let Some(profile) = &inner.profile_id else {
+            return Ok(fail("no_profile"));
+        };
+        (
+            profile.clone(),
+            running.handle.local_addr.to_string(),
+            inner.tracker_url.clone(),
+            inner.data_dir.clone(),
+        )
+    };
+
+    // A build without the family tier can honestly say so before earning
+    // anything.
+    #[cfg(not(feature = "verifydrafts"))]
+    {
+        let _ = (&profile, &gateway, &tracker_url, &data_dir);
+        log_event(
+            &state.telemetry,
+            "warn",
+            "family.probe",
+            &[("reason", "family_not_compiled")],
+        );
+        return Ok(fail("family_not_compiled"));
+    }
+
+    // The lease to present: earned through the hosting challenge and
+    // cached per profile (F3(2)) — exactly what the msp-v1 swarm path
+    // presents. `earn_lease` already telemeters every failure step.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let lease = earn_lease(
+        &state.inner,
+        &tracker_url,
+        &data_dir,
+        &state.telemetry,
+        &gateway,
+        &profile,
+        now_ms,
+    )
+    .await;
+    let Some(lease) = lease else {
+        log_event(
+            &state.telemetry,
+            "warn",
+            "family.probe",
+            &[("reason", "no_presentable_lease")],
+        );
+        return Ok(fail("no_presentable_lease"));
+    };
+
+    // An eligible peer: exact profile, real QUIC address, free slots, not
+    // ourselves (the try_swarm_chat candidate predicate).
+    let tracker = match tracker_client(&tracker_url, &data_dir, &state.telemetry).await {
+        Ok(t) => t,
+        Err(e) => {
+            log_event(
+                &state.telemetry,
+                "warn",
+                "family.probe",
+                &[("reason", "tracker_client"), ("error", &e)],
+            );
+            return Ok(fail("tracker_unavailable"));
+        }
+    };
+    let peers = match tracker.lookup(&profile, 10).await {
+        Ok(p) => p,
+        Err(e) => {
+            log_event(
+                &state.telemetry,
+                "warn",
+                "family.probe",
+                &[("reason", "lookup"), ("error", &e.to_string())],
+            );
+            return Ok(fail("lookup_failed"));
+        }
+    };
+    let identity = match load_or_create_identity(&data_dir, &state.telemetry) {
+        Ok(i) => i,
+        Err(_) => return Ok(fail("identity_unavailable")),
+    };
+    let own_peer_id = identity.peer_id();
+    let candidate = peers.into_iter().find(|p| {
+        p.peer_id != own_peer_id
+            && p.free_slots > 0
+            && p.addresses
+                .iter()
+                .any(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))
+    });
+    let Some(candidate) = candidate else {
+        log_event(
+            &state.telemetry,
+            "info",
+            "family.probe",
+            &[("reason", "no_eligible_peer")],
+        );
+        return Ok(fail("no_eligible_peer"));
+    };
+    let addr = candidate
+        .addresses
+        .iter()
+        .find(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))
+        .expect("the candidate predicate guarantees a QUIC addr")
+        .clone();
+    // The verifier key is PINNED from the roster peer id (ADR-020
+    // derivation) — never a payload claim.
+    let Ok(verifier_key) =
+        modelswarm_node::verifydrafts::verifying_key_from_peer_id(&candidate.peer_id)
+    else {
+        return Ok(serde_json::json!({
+            "probed": true, "opened": false,
+            "peer_id": candidate.peer_id, "reason": "peer_id_not_ed25519",
+        }));
+    };
+
+    let mut config =
+        modelswarm_node::verifydrafts::VerifyDraftsClientConfig::new(profile.clone(), verifier_key);
+    config.lease = Some(lease);
+    let wire = match modelswarm_node::verifydrafts::dial_quic(
+        &addr,
+        &identity,
+        &verifier_key,
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(w) => w,
+        Err(e) => {
+            log_event(
+                &state.telemetry,
+                "warn",
+                "family.probe",
+                &[
+                    ("reason", "dial"),
+                    ("peer", &candidate.peer_id),
+                    ("error", &e.to_string()),
+                ],
+            );
+            return Ok(serde_json::json!({
+                "probed": true, "opened": false,
+                "peer_id": candidate.peer_id, "reason": "dial_failed",
+            }));
+        }
+    };
+    match modelswarm_node::verifydrafts::VerifyDraftsClient::negotiate(
+        wire,
+        identity,
+        config,
+        &state.telemetry,
+    )
+    .await
+    {
+        Ok(client) => {
+            let disclosure = client.engine_disclosure().clone();
+            let session_id = client.session_id().to_string();
+            log_event(
+                &state.telemetry,
+                "info",
+                "family.probe",
+                &[
+                    ("peer", &candidate.peer_id),
+                    ("session", &session_id),
+                    ("opened", "true"),
+                ],
+            );
+            Ok(serde_json::json!({
+                "probed": true, "opened": true,
+                "peer_id": candidate.peer_id,
+                "session_id": session_id,
+                "backend": disclosure.backend.to_string(),
+                "batch_verify": disclosure.batch_verify,
+                "batch_window_max": disclosure.batch_window_max,
+            }))
+        }
+        Err(error) => {
+            // The honest degradation path: the serving peer's exact
+            // refusal classification is on ITS telemetry; this side
+            // reports the transport-level outcome truthfully.
+            let reason = family_open_error_reason(&error);
+            log_event(
+                &state.telemetry,
+                "warn",
+                "family.probe",
+                &[
+                    ("peer", &candidate.peer_id),
+                    ("reason", reason),
+                    ("error", &error.to_string()),
+                ],
+            );
+            Ok(serde_json::json!({
+                "probed": true, "opened": false,
+                "peer_id": candidate.peer_id,
+                "reason": reason,
+                "detail": error.to_string(),
+            }))
+        }
+    }
+}
+
+/// Stable UI labels for a refused family session open (labels only — the
+/// lease itself never crosses into any surface). The serving peer's own
+/// `FamilyLeaseRefusal` classification lives on ITS telemetry
+/// (`verifydrafts.family_refused`); this is the requester-side truth: a
+/// lease refusal ends the session before any accept, which the client
+/// observes as the honest transport failure.
+#[cfg(feature = "verifydrafts")]
+fn family_open_error_reason(
+    error: &modelswarm_node::verifydrafts::ClientOpenError,
+) -> &'static str {
+    use modelswarm_node::verifydrafts::ClientOpenError;
+    match error {
+        // The session-end refusal (lease gate fail-closed, peer closed
+        // without an accept) — the probe's primary expected failure.
+        ClientOpenError::Io(_) => "open_refused",
+        ClientOpenError::Rejected(_) => "peer_rejected",
+        ClientOpenError::Ineligible { .. } => "verifier_ineligible",
+        ClientOpenError::InvalidAccept(_) => "invalid_accept",
+        ClientOpenError::Protocol(_) => "protocol",
+        ClientOpenError::Misconfigured(_) => "misconfigured",
+    }
 }
 
 /// F3(2): earn a consume lease for `profile` the honest way — the
@@ -2956,6 +3210,7 @@ pub fn run() {
             set_hosting,
             select_model,
             lookup_peers,
+            family_probe,
             send_chat,
             open_approval_page,
             hf_search_models,
@@ -3231,5 +3486,58 @@ mod tests {
         assert_eq!(json["reason"], "family_prompt_unpinned");
         assert!(json["disclosure"].is_null());
         assert_eq!(json["lease_roster_peers"], 0);
+    }
+
+    /// The on-status shape with an EMPTY roster is the presentation
+    /// configuration, not a refusal state: the UI must render "presented
+    /// at session open (roster 0)" — never the pre-activation "refusing
+    /// until seeded" text (0 is normal; nothing feeds the roster yet).
+    #[test]
+    fn family_status_on_with_empty_roster_is_presentation() {
+        let status = FamilyStatus {
+            state: "on".into(),
+            reason: None,
+            disclosure: Some(serde_json::json!({
+                "backend": "cpu", "batch_verify": true, "batch_window_max": 32
+            })),
+            lease_roster_peers: 0,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["state"], "on");
+        assert_eq!(json["lease_roster_peers"], 0);
+        // The UI's family-line contract for the on+empty-roster case.
+        let d = json["disclosure"].as_object().unwrap();
+        let line = format!(
+            "batch-verify family: on — {}, batch window {}, coordinator leases: presented at session open (roster {})",
+            d["backend"].as_str().unwrap(),
+            d["batch_window_max"],
+            json["lease_roster_peers"]
+        );
+        assert!(line.contains("presented at session open"));
+        assert!(!line.contains("refusing"));
+    }
+
+    /// The probe's refusal labels are stable and carry NO lease material
+    /// (the requester-side mirror of the serving peer's
+    /// `FamilyLeaseRefusal` telemetry — labels only).
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn family_open_error_labels_are_stable() {
+        use modelswarm_node::verifydrafts::ClientOpenError;
+        assert_eq!(
+            family_open_error_reason(&ClientOpenError::Io("recv accept")),
+            "open_refused"
+        );
+        assert_eq!(
+            family_open_error_reason(&ClientOpenError::Rejected("backend_mismatch")),
+            "peer_rejected"
+        );
+        assert_eq!(
+            family_open_error_reason(&ClientOpenError::Misconfigured("bad params".into())),
+            "misconfigured"
+        );
+        // The detail string is the error's own Display — never a token.
+        let detail = ClientOpenError::Io("recv accept").to_string();
+        assert!(!detail.contains("lease"));
     }
 }

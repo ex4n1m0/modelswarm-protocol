@@ -8,6 +8,14 @@
 //! gap (see `docs/reviews/handoff-windows-product-verifydrafts-wiring-2026-10-11.md`);
 //! these tests ride the ADR-018 amended staging — the exact path ADR-032
 //! designates for the family's bare-JSON frames.
+//!
+//! Presented-lease activation (2026-10-12): the session-open lease carrier
+//! is pinned here too — a PRESENTED valid lease opens a full lifecycle on
+//! an EMPTY roster (the two-fresh-installations pairing), and a broken
+//! presented lease refuses BEFORE the engine is ever consulted. These
+//! gates need the production [`modelswarm_node::verifydrafts::composed`]
+//! lease source, which is compiled under `verifydrafts` +
+//! `libp2p-backend` (the CI feature steps enable both explicitly).
 
 #![cfg(feature = "verifydrafts")]
 
@@ -45,7 +53,6 @@ const ACCEPT_DEADLINE: Duration = Duration::from_secs(10);
 struct ScriptedEngine {
     disclosure: EngineDisclosure,
     outcomes: Mutex<VecDeque<(u32, Option<u32>)>>,
-    #[allow(dead_code)]
     calls: Mutex<usize>,
 }
 
@@ -56,6 +63,11 @@ impl ScriptedEngine {
             outcomes: Mutex::new(outcomes.into()),
             calls: Mutex::new(0),
         })
+    }
+
+    /// How many engine passes ran (the "engine untouched on refusal" pin).
+    fn calls(&self) -> usize {
+        *self.calls.lock().expect("calls lock")
     }
 }
 
@@ -714,4 +726,234 @@ async fn wait_commit_timeout_abandons_and_next_round_gaps_forward() {
     );
     assert_eq!(report.committed_output_tokens, 4); // 3 accepted + correction
     assert_eq!(report.ended_by, ServeEndReason::ClientClosed);
+}
+
+// ---------------------------------------------------------------------------
+// Presented-lease activation (ADR-032 §2 admission order, 2026-10-12)
+// ---------------------------------------------------------------------------
+
+/// The staged-venue pins of the session-open lease presentation: the
+/// production lease source (`RosterFamilyLeases`) is compiled under
+/// `verifydrafts` + `libp2p-backend` (the composed-daemon feature pair;
+/// CI enables both explicitly), so these gates ride the same pair.
+#[cfg(all(feature = "verifydrafts", feature = "libp2p-backend"))]
+mod presented_lease {
+    use super::*;
+    use modelswarm_node::verifydrafts::composed::RosterFamilyLeases;
+    use modelswarm_node::verifydrafts::{FamilyLeaseRefusal, FamilyLeaseSource};
+
+    /// A DIFFERENT well-formed profile (the presented wrong-profile arm).
+    const OTHER_PROFILE: &str =
+        "msp1:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    /// Issues a consume lease for (profile, peer) under `key` and returns
+    /// the wire token (the serving.rs lease_helpers pattern).
+    fn lease_wire(key: &ed25519_dalek::SigningKey, profile: &str, peer_id: &str) -> String {
+        fn rfc3339(plus_secs: i64) -> String {
+            time::OffsetDateTime::now_utc()
+                .saturating_add(time::Duration::seconds(plus_secs))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        }
+        modelswarm_eligibility::EligibilityLease::issue(
+            peer_id,
+            "test-installation",
+            profile,
+            rfc3339(-60),
+            rfc3339(300),
+            rfc3339(360),
+            true,
+            true,
+            1,
+            modelswarm_eligibility::CapacityClass::GpuMid,
+            1,
+            "test-challenge",
+            "test-nonce",
+            key,
+        )
+        .to_wire()
+    }
+
+    /// The lease policy over a fresh test hub key.
+    fn policy_over(key: &ed25519_dalek::SigningKey) -> modelswarm_node::serving::LeasePolicy {
+        modelswarm_node::serving::LeasePolicy::from_hex(&hex::encode(
+            key.verifying_key().to_bytes(),
+        ))
+        .unwrap()
+    }
+
+    /// The presented-lease VALID arm (the two-fresh-installations
+    /// pairing): the client presents its hub-signed lease in the
+    /// session-open carrier, the daemon-side gate (EMPTY roster — nothing
+    /// is fed to it) validates the PRESENTED token, and the session opens
+    /// and serves a full round. The serve side drives exactly the
+    /// composed daemon's family branch: `read_session_open` →
+    /// `lease_for(presented)` → `PrefacedWire`.
+    #[tokio::test]
+    async fn presented_lease_lifecycle_opens_and_serves() {
+        let server_identity = InstallationIdentity::from_bytes(&[0xF1; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[0xF2; 32]);
+        let telemetry = Arc::new(Telemetry::memory().0);
+
+        let hub = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let token = lease_wire(&hub, TEST_PROFILE, &client_identity.peer_id());
+        // The production source with an EMPTY roster: presentation is the
+        // only admission path — exactly the shipped-desktop configuration.
+        let roster = Arc::new(RosterFamilyLeases::new(policy_over(&hub)));
+        assert!(roster.is_empty());
+
+        let engine = ScriptedEngine::new(batch_engine(8), vec![(2, Some(901))]);
+        let mut config =
+            VerifyDraftsServeConfig::honest(TEST_PROFILE.to_string(), server_identity.clone());
+        config.engine = batch_engine(8);
+        config.session_idle = Duration::from_secs(60);
+
+        let listener = SignedFrameTransport::listen("127.0.0.1:0")
+            .await
+            .expect("loopback listen");
+        let addr = listener.local_addr().expect("bound").to_string();
+        let mut trusted: HashMap<String, VerifyingKey> = HashMap::new();
+        trusted.insert(client_identity.peer_id(), client_identity.verifying_key());
+        let gate_roster = Arc::clone(&roster);
+        let serve_engine = Arc::clone(&engine);
+        let serve_config = config.clone();
+        let expected_token = token.clone();
+        let server = tokio::spawn(async move {
+            let mut wire = accept_staged(&listener, &trusted, ACCEPT_DEADLINE)
+                .await
+                .expect("authenticated accept");
+            // The composed daemon's family branch, verbatim in shape.
+            let first = wire.recv_json(ACCEPT_DEADLINE).await.expect("first frame");
+            let (presented, offer) =
+                modelswarm_node::verifydrafts::read_session_open(&mut wire, first, ACCEPT_DEADLINE)
+                    .await
+                    .expect("session-open exchange");
+            assert_eq!(
+                presented.as_deref(),
+                Some(expected_token.as_str()),
+                "the carrier carried the presented token"
+            );
+            let lease_expires_at_ms = gate_roster
+                .lease_for(wire.remote_peer_id(), presented.as_deref(), TEST_PROFILE)
+                .expect("the presented lease admits on the empty roster");
+            let mut cfg = serve_config;
+            cfg.lease_expires_at_ms = lease_expires_at_ms;
+            let preface = modelswarm_node::verifydrafts::PrefacedWire::new(wire, Some(offer));
+            serve_verifydrafts_session(preface, cfg, serve_engine, &telemetry).await
+        });
+
+        let wire = dial_staged(
+            &addr,
+            &client_identity,
+            TEST_PROFILE,
+            &server_identity.verifying_key(),
+            ACCEPT_DEADLINE,
+        )
+        .await
+        .expect("dial + handshake");
+        let mut client_config = VerifyDraftsClientConfig::new(
+            TEST_PROFILE.to_string(),
+            server_identity.verifying_key(),
+        );
+        client_config.lease = Some(token);
+        let tel = Telemetry::memory().0;
+        let mut client = VerifyDraftsClient::negotiate(wire, client_identity, client_config, &tel)
+            .await
+            .expect("the presented lease opened the session");
+
+        let r1 = client.round(&[81, 82], &tel).await.expect("round 1");
+        assert_eq!(r1.committed, vec![81, 82, 901]);
+        assert_eq!(client.committed_stream(), vec![81, 82, 901]);
+
+        drop(client.into_wire());
+        let report = tokio::time::timeout(ACCEPT_DEADLINE, server)
+            .await
+            .expect("server settles")
+            .expect("server task ok");
+        assert!(report.accepted);
+        assert_eq!(report.rounds_committed, 1);
+        assert_eq!(report.committed_output_tokens, 3);
+        assert_eq!(report.ended_by, ServeEndReason::ClientClosed);
+        assert_eq!(engine.calls(), 1, "exactly the one real engine pass");
+    }
+
+    /// The presented-lease BROKEN arm: a coordinator presenting a lease
+    /// signed for ANOTHER profile is refused at the gate — before the
+    /// serve loop, so the ENGINE IS NEVER CONSULTED — and the client
+    /// surfaces the honest transport failure (its fallback-to-single
+    /// signal). The refusal carries the msp-v1 gate's own classification.
+    #[tokio::test]
+    async fn presented_broken_lease_refuses_before_engine() {
+        let server_identity = InstallationIdentity::from_bytes(&[0xF3; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[0xF4; 32]);
+        let telemetry = Arc::new(Telemetry::memory().0);
+
+        let hub = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        // A VALIDLY SIGNED lease — but for ANOTHER profile (the
+        // coordinator hosts a different model): the signature is honest,
+        // the pairing is not, and the gate says so.
+        let wrong = lease_wire(&hub, OTHER_PROFILE, &client_identity.peer_id());
+        let roster = Arc::new(RosterFamilyLeases::new(policy_over(&hub)));
+        assert!(roster.is_empty());
+
+        let engine = ScriptedEngine::new(batch_engine(8), vec![(1, Some(1))]);
+
+        let listener = SignedFrameTransport::listen("127.0.0.1:0")
+            .await
+            .expect("loopback listen");
+        let addr = listener.local_addr().expect("bound").to_string();
+        let mut trusted: HashMap<String, VerifyingKey> = HashMap::new();
+        trusted.insert(client_identity.peer_id(), client_identity.verifying_key());
+        let gate_roster = Arc::clone(&roster);
+        let server = tokio::spawn(async move {
+            let mut wire = accept_staged(&listener, &trusted, ACCEPT_DEADLINE)
+                .await
+                .expect("authenticated accept");
+            let first = wire.recv_json(ACCEPT_DEADLINE).await.expect("first frame");
+            let (presented, _offer) =
+                modelswarm_node::verifydrafts::read_session_open(&mut wire, first, ACCEPT_DEADLINE)
+                    .await
+                    .expect("session-open exchange");
+            // The gate refuses: NO serve loop, NO engine — drop the wire
+            // (the composed loop's honest session end).
+            let refusal = gate_roster
+                .lease_for(wire.remote_peer_id(), presented.as_deref(), TEST_PROFILE)
+                .expect_err("a wrong-profile presented lease must refuse");
+            drop(wire);
+            refusal
+        });
+
+        let wire = dial_staged(
+            &addr,
+            &client_identity,
+            TEST_PROFILE,
+            &server_identity.verifying_key(),
+            ACCEPT_DEADLINE,
+        )
+        .await
+        .expect("dial + handshake");
+        let mut client_config = VerifyDraftsClientConfig::new(
+            TEST_PROFILE.to_string(),
+            server_identity.verifying_key(),
+        );
+        client_config.lease = Some(wrong);
+        let tel = Telemetry::memory().0;
+        match VerifyDraftsClient::negotiate(wire, client_identity, client_config, &tel).await {
+            Err(ClientOpenError::Io(_)) => {}
+            Ok(_) => panic!("a wrong-profile presented lease must never open a session"),
+            Err(other) => panic!("expected the honest transport failure, got {other:?}"),
+        }
+
+        let refusal = tokio::time::timeout(ACCEPT_DEADLINE, server)
+            .await
+            .expect("server settles")
+            .expect("server task ok");
+        assert_eq!(refusal, FamilyLeaseRefusal::ProfileMismatch);
+        assert_eq!(
+            engine.calls(),
+            0,
+            "the engine is never consulted for a refused session"
+        );
+        let _ = telemetry;
+    }
 }

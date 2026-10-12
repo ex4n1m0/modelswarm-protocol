@@ -13,17 +13,25 @@
 //!   check (`LeasePolicy`), §6.4 clamps, executor streaming;
 //! - **family sessions** (raw-JSON ADR-032 frames): the unchanged
 //!   [`super::serve::serve_verifydrafts_session`] loop, with the
-//!   coordinator's lease derived AT SESSION OPEN from the
-//!   QUIC-authenticated PeerId through the [`FamilyLeaseSource`] seam
-//!   (fail-closed: no lease ⇒ no family session — the family's offer wire
-//!   carries no lease field, wiring handoff §5-A2/G3; the production
-//!   source is the daemon's eligibility/roster state, injected here).
+//!   coordinator's lease checked AT SESSION OPEN (ADR-032 §2 admission
+//!   order — session/lease gate passed at open, wired 2026-10-12): the
+//!   coordinator PRESENTS its hub-signed lease in the minimal
+//!   session-open carrier immediately before its `SessionOffer`
+//!   ([`super::serve::read_session_open`]), and the presented token is
+//!   validated against the SERVED profile through the
+//!   [`FamilyLeaseSource`] seam with every binding the msp-v1
+//!   per-request gate enforces (fail-closed: no valid lease ⇒ no family
+//!   session).
 //!
 //!   Since the RC-L1 discharge (ADR-032 §7 disposition item i,
 //!   2026-10-12) the seam is PROFILE-bound: [`RosterFamilyLeases`]
 //!   validates the coordinator's lease against the SERVED profile with
 //!   every binding the msp-v1 per-request gate enforces
-//!   ([`FamilyLeaseRefusal`] mirrors its classification).
+//!   ([`FamilyLeaseRefusal`] mirrors its classification), and accepts
+//!   the lease from either of two sources with ONE validation engine:
+//!   the tracker-fed ROSTER entry (the future distribution path) or the
+//!   PRESENTED carrier token (the msp-v1-equivalent discipline that
+//!   makes two fresh desktops with earned leases able to pair today).
 //!
 //! # Demux
 //!
@@ -44,7 +52,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -59,8 +66,10 @@ use modelswarm_transport::TransportError;
 use crate::serving::{rfc3339_now, send_error, serve_one_seeded, Admission, LeasePolicy};
 
 use super::engine_source::FamilyEngineSource;
-use super::serve::{serve_verifydrafts_session, VerifyDraftsServeConfig};
-use super::wire::{QuicVerifyWire, VerifyDraftsWire, WireError};
+use super::serve::{
+    read_session_open, serve_verifydrafts_session, SessionOpenError, VerifyDraftsServeConfig,
+};
+use super::wire::{PrefacedWire, QuicVerifyWire};
 
 /// How long a composed session may wait for its FIRST frame (mirrors the
 /// msp-v1 loop's between-requests wait — both vocabularies get the same
@@ -125,39 +134,46 @@ impl std::fmt::Display for FamilyLeaseRefusal {
     }
 }
 
-/// ADR-026 lease derivation for family sessions AT SESSION OPEN — the
+/// ADR-026 lease admission for family sessions AT SESSION OPEN — the
 /// composed daemon's seam. Given the QUIC-authenticated coordinator
-/// PeerId, returns the lease expiry (unix ms) the session serves under —
-/// validated against the SERVED profile with every binding the msp-v1
-/// per-request gate enforces (RC-L1) — or the refusal; a refusal means NO
-/// family session (the coordinator's client surfaces a transport failure
-/// and falls back to single, never silently).
+/// PeerId and the lease the coordinator PRESENTED in the session-open
+/// carrier (`None` when it opened offer-first), returns the lease expiry
+/// (unix ms) the session serves under — validated against the SERVED
+/// profile with every binding the msp-v1 per-request gate enforces
+/// (RC-L1) — or the refusal; a refusal means NO family session (the
+/// coordinator's client surfaces a transport failure and falls back to
+/// single, never silently).
 ///
-/// The family's offer wire carries no lease field (wiring handoff
-/// G3/§5-A2); the production source is the daemon's eligibility/roster
-/// state for the authenticated peer, wired in here
-/// ([`RosterFamilyLeases`]).
+/// The token comes from whichever source the implementation trusts — the
+/// PRESENTED carrier token (the msp-v1-equivalent discipline: hub-signed,
+/// so a self-asserted token is exactly as strong as the one on the wire
+/// in `InferenceRequest.capability_token`) and/or the tracker-fed roster
+/// ([`RosterFamilyLeases`] honors both with one validation engine).
 pub trait FamilyLeaseSource: Send + Sync {
     /// The validated lease expiry (unix ms) for `coordinator_peer_id` (the
     /// transport-authenticated remote PeerId) serving `served_profile`
-    /// (this daemon's pinned profile), or the refusal.
+    /// (this daemon's pinned profile), given the PRESENTED wire token
+    /// (`None` = the coordinator opened without presenting) — or the
+    /// refusal.
     fn lease_for(
         &self,
         coordinator_peer_id: &str,
+        presented_lease: Option<&str>,
         served_profile: &str,
     ) -> Result<u64, FamilyLeaseRefusal>;
 }
 
-/// Fail-closed default: refuses every family session (the honest default
-/// until the daemon wires a real lease source — serving family sessions
-/// without a lease derivation would break the ADR-026 discipline the
-/// msp-v1 path enforces per request).
+/// Fail-closed default: refuses every family session regardless of what
+/// was presented (the honest default until the daemon wires a real lease
+/// source — serving family sessions without a lease check would break the
+/// ADR-026 discipline the msp-v1 path enforces per request).
 pub struct RefuseFamilyLeases;
 
 impl FamilyLeaseSource for RefuseFamilyLeases {
     fn lease_for(
         &self,
         _coordinator_peer_id: &str,
+        _presented_lease: Option<&str>,
         _served_profile: &str,
     ) -> Result<u64, FamilyLeaseRefusal> {
         Err(FamilyLeaseRefusal::NoLease)
@@ -173,6 +189,7 @@ impl FamilyLeaseSource for StaticLeaseExpiry {
     fn lease_for(
         &self,
         _coordinator_peer_id: &str,
+        _presented_lease: Option<&str>,
         _served_profile: &str,
     ) -> Result<u64, FamilyLeaseRefusal> {
         Ok(self.0)
@@ -180,31 +197,38 @@ impl FamilyLeaseSource for StaticLeaseExpiry {
 }
 
 /// The production [`FamilyLeaseSource`] (RC-L1, ADR-032 §7 disposition
-/// item i): the daemon's eligibility/roster state — the hub-signed lease
-/// tokens the daemon holds per coordinator peer — validated AT SESSION
-/// OPEN with the SAME discipline `crate::serving::LeasePolicy::check`
-/// applies per msp-v1 request: hub signature + freshness, binding to the
-/// daemon's pinned profile, `can_consume` with `slots >= 1`, and binding
-/// to the transport-authenticated PeerId. The family wire carries no
-/// lease field (ADR-032 §3; the offer-form-v3 oracle ruling), so the
-/// ROSTER — not the peer — is where the token comes from; a peer with no
-/// roster entry is refused fail-closed exactly like the empty-roster
-/// default.
+/// item i; PRESENTED-lease activation 2026-10-12): the daemon's
+/// eligibility/roster state — the hub-signed lease tokens the daemon
+/// holds per coordinator peer — PLUS the lease the coordinator PRESENTS
+/// at session open, validated with the SAME discipline
+/// `crate::serving::LeasePolicy::check` applies per msp-v1 request: hub
+/// signature + freshness, binding to the daemon's pinned profile,
+/// `can_consume` with `slots >= 1`, and binding to the
+/// transport-authenticated PeerId.
+///
+/// Lookup order: a ROSTER entry for the authenticated peer wins (the
+/// tracker-fed future — the daemon's own record of the coordinator's
+/// lease); without one, the PRESENTED token is validated directly (the
+/// msp-v1-equivalent discipline: the hub signature is the authority, so
+/// two fresh installations holding earned leases can pair with an EMPTY
+/// roster). Either way the SAME [`validate_family_lease`] runs — a
+/// stale, misfiled, or forged entry refuses exactly like a missing one,
+/// the same "well-formed but policy-violating leases must fail at every
+/// enforcing peer" stance `EligibilityLease::issue` documents.
 ///
 /// The roster trusts its FEEDER (the tracker/roster wiring that calls
-/// [`Self::upsert`]); every lookup re-validates the token fully, so a
-/// stale, misfiled, or revoked-epoch entry refuses exactly like a missing
-/// one — the same "well-formed but policy-violating leases must fail at
-/// every enforcing peer" stance `EligibilityLease::issue` documents.
+/// [`Self::upsert`]); presented tokens trust the pinned hub key —
+/// nothing else.
 pub struct RosterFamilyLeases {
     policy: LeasePolicy,
     roster: Mutex<HashMap<String, String>>,
 }
 
 impl RosterFamilyLeases {
-    /// An empty roster under `policy` — refuses every family session until
-    /// [`Self::upsert`] seeds a lease (the fail-closed production
-    /// default).
+    /// An empty roster under `policy` — family sessions then admit only
+    /// through a PRESENTED lease (the fail-closed production default:
+    /// nothing is on file, so the coordinator must bring its own
+    /// hub-signed token).
     pub fn new(policy: LeasePolicy) -> Self {
         Self {
             policy,
@@ -221,7 +245,8 @@ impl RosterFamilyLeases {
             .insert(coordinator_peer_id.to_string(), wire_lease.to_string());
     }
 
-    /// Drops a peer's entry (revocation / audit-sweep wiring).
+    /// Drops a peer's entry (revocation / audit-sweep wiring); the peer
+    /// may still present a valid lease at its next session open.
     pub fn remove(&self, coordinator_peer_id: &str) {
         self.roster
             .lock()
@@ -229,8 +254,9 @@ impl RosterFamilyLeases {
             .remove(coordinator_peer_id);
     }
 
-    /// Number of entries on file (diagnostics: the honest "verifying
-    /// nobody yet" label for an empty roster).
+    /// Number of entries on file (diagnostics: the honest roster size —
+    /// 0 means presentation is the only admission path, which the status
+    /// surface says instead of implying refusal).
     pub fn len(&self) -> usize {
         self.roster.lock().expect("family lease roster lock").len()
     }
@@ -245,16 +271,34 @@ impl FamilyLeaseSource for RosterFamilyLeases {
     fn lease_for(
         &self,
         coordinator_peer_id: &str,
+        presented_lease: Option<&str>,
         served_profile: &str,
     ) -> Result<u64, FamilyLeaseRefusal> {
-        let token = self
+        let roster_token = self
             .roster
             .lock()
             .expect("family lease roster lock")
             .get(coordinator_peer_id)
-            .cloned()
-            .ok_or(FamilyLeaseRefusal::NoLease)?;
-        validate_family_lease(&self.policy, &token, coordinator_peer_id, served_profile)
+            .cloned();
+        match roster_token {
+            // The tracker-fed roster entry is authoritative when present.
+            Some(token) => {
+                validate_family_lease(&self.policy, &token, coordinator_peer_id, served_profile)
+            }
+            // No roster entry: the PRESENTED token is the whole claim —
+            // validated exactly like the msp-v1 per-request gate
+            // validates its `capability_token` (empty/unverified forms
+            // classify as NoLease, that gate's "no lease presented").
+            None => match presented_lease {
+                Some(token) => validate_presented_lease(
+                    &self.policy,
+                    token,
+                    coordinator_peer_id,
+                    served_profile,
+                ),
+                None => Err(FamilyLeaseRefusal::NoLease),
+            },
+        }
     }
 }
 
@@ -292,6 +336,22 @@ fn validate_family_lease(
     let seconds =
         u64::try_from(expires_at.unix_timestamp()).map_err(|_| FamilyLeaseRefusal::InvalidLease)?;
     Ok(seconds * 1000 + u64::from(expires_at.millisecond()))
+}
+
+/// The PRESENTED-token entry classification (the msp-v1 gate's first
+/// check, verbatim): an empty or `f0-unverified` placeholder token is "no
+/// lease presented" ([`FamilyLeaseRefusal::NoLease`]), anything else runs
+/// the full binding validation.
+fn validate_presented_lease(
+    policy: &LeasePolicy,
+    presented: &str,
+    authenticated_peer_id: &str,
+    served_profile: &str,
+) -> Result<u64, FamilyLeaseRefusal> {
+    if presented.is_empty() || presented.starts_with("f0-unverified") {
+        return Err(FamilyLeaseRefusal::NoLease);
+    }
+    validate_family_lease(policy, presented, authenticated_peer_id, served_profile)
 }
 
 /// The family half of the composed daemon's configuration.
@@ -350,31 +410,10 @@ async fn demux_first_frame(session: &mut Libp2pSession, idle: Duration) -> First
     }
 }
 
-/// Hands the peeked first family frame to the serve loop pre-read: the
-/// first `recv_json` returns it, everything after delegates to the QUIC
-/// wire (whose Drop still FINs + drains gracefully).
-struct PrefacedQuicWire {
-    first: Option<Value>,
-    inner: QuicVerifyWire,
-}
-
-#[async_trait]
-impl VerifyDraftsWire for PrefacedQuicWire {
-    async fn send_json(&mut self, value: &Value, deadline: Duration) -> Result<(), WireError> {
-        self.inner.send_json(value, deadline).await
-    }
-
-    async fn recv_json(&mut self, deadline: Duration) -> Result<Value, WireError> {
-        match self.first.take() {
-            Some(value) => Ok(value),
-            None => self.inner.recv_json(deadline).await,
-        }
-    }
-
-    fn remote_peer_id(&self) -> &str {
-        self.inner.remote_peer_id()
-    }
-}
+// The peeked first family frame is handed to the serve loop pre-read via
+// the venue-agnostic `PrefacedWire<W>` (wire.rs); the composed loop
+// constructs it per accepted family session over the QUIC wire (whose
+// Drop still FINs + drains gracefully).
 
 /// The composed serve loop: ONE listener, BOTH vocabularies, ONE
 /// admission gate, ONE lease discipline. Lifecycle contract identical to
@@ -387,12 +426,15 @@ impl VerifyDraftsWire for PrefacedQuicWire {
 ///    that frame and honestly sees the session close);
 /// 2. classify by first frame (see [`demux_first_frame`]);
 /// 3. msp-v1 → [`serve_one_seeded`] with the peeked frame (per-request
-///    lease checks unchanged inside); family → the profile-bound lease
-///    seam ([`FamilyLeaseSource::lease_for`] against the served profile,
-///    fail-closed with the [`FamilyLeaseRefusal`] classification), engine
-///    from [`FamilyEngineSource::engine_for`] (per-session, prefilled),
-///    disclosure overridden with the engine's real capabilities, then
-///    [`serve_verifydrafts_session`].
+///    lease checks unchanged inside); family → the session-open exchange
+///    ([`read_session_open`]: optional lease carrier, then the offer),
+///    the profile-bound lease seam ([`FamilyLeaseSource::lease_for`] with
+///    the PRESENTED token against the served profile, fail-closed with
+///    the [`FamilyLeaseRefusal`] classification), engine from
+///    [`FamilyEngineSource::engine_for`] (per-session, prefilled — never
+///    constructed for a refused session), disclosure overridden with the
+///    engine's real capabilities, then [`serve_verifydrafts_session`] with
+///    the offer handed pre-read ([`PrefacedWire`]).
 pub async fn serve_sessions_composed(
     mut listener: Libp2pListener,
     executor: Arc<dyn InferenceExecutor>,
@@ -467,25 +509,62 @@ pub async fn serve_sessions_composed(
                         session_telemetry.warn("serving.session_ended", &[("code", code.as_str())]);
                     }
                 }
-                FirstFrame::Family(offer) => {
-                    // ADR-026 at family session open (RC-L1): the
-                    // coordinator's lease derives from the
-                    // QUIC-authenticated PeerId and the daemon's lease
-                    // source, validated against the SERVED profile with
-                    // every binding the msp-v1 per-request gate enforces —
-                    // fail-closed; no frozen family reject code exists for
-                    // a refused lease, so the honest answer is the session
-                    // end (the client's fallback-to-single signal).
-                    let lease_expires_at_ms = match family_lease.lease_for(&peer_id, &profile) {
-                        Ok(expires_at_ms) => expires_at_ms,
-                        Err(refusal) => {
+                FirstFrame::Family(first) => {
+                    // The session-open exchange (ADR-032 §2 admission
+                    // order): the coordinator's FIRST frame is its lease
+                    // carrier when it presents one, immediately followed
+                    // by the `SessionOffer`. Reading both here (before any
+                    // engine work) keeps the lease gate AT SESSION OPEN
+                    // and the engine untouched on refusal.
+                    let mut wire = QuicVerifyWire::over_session(session);
+                    let (presented, offer) = match read_session_open(
+                        &mut wire,
+                        first,
+                        family_config.io_deadline,
+                    )
+                    .await
+                    {
+                        Ok(open) => open,
+                        Err(SessionOpenError::BadCarrier) => {
+                            // A carrier that fails its strict schema
+                            // IS a malformed presented lease — the
+                            // gate's own classification.
                             session_telemetry.warn(
                                 "verifydrafts.family_refused",
-                                &[("peer", &peer_id), ("reason", refusal.as_str())],
+                                &[("peer", &peer_id), ("reason", "invalid_lease")],
                             );
                             return;
                         }
+                        Err(SessionOpenError::OfferTimeout) => {
+                            session_telemetry
+                                .info("serving.session_ended", &[("code", "offer_timeout")]);
+                            return;
+                        }
+                        Err(SessionOpenError::Wire(_)) => {
+                            session_telemetry
+                                .info("serving.session_ended", &[("code", "wire_failure")]);
+                            return;
+                        }
                     };
+                    // ADR-026 at family session open (RC-L1): the
+                    // coordinator's lease — PRESENTED at open and/or on
+                    // file in the daemon's source — is validated against
+                    // the SERVED profile with every binding the msp-v1
+                    // per-request gate enforces, fail-closed; no frozen
+                    // family reject code exists for a refused lease, so
+                    // the honest answer is the session end (the client's
+                    // fallback-to-single signal).
+                    let lease_expires_at_ms =
+                        match family_lease.lease_for(&peer_id, presented.as_deref(), &profile) {
+                            Ok(expires_at_ms) => expires_at_ms,
+                            Err(refusal) => {
+                                session_telemetry.warn(
+                                    "verifydrafts.family_refused",
+                                    &[("peer", &peer_id), ("reason", refusal.as_str())],
+                                );
+                                return;
+                            }
+                        };
                     let engine = match family_engine.engine_for().await {
                         Ok(engine) => engine,
                         Err(_) => {
@@ -503,10 +582,7 @@ pub async fn serve_sessions_composed(
                     // The honest disclosure from the engine's REAL
                     // geometry (RC-8) — never the hand-set field.
                     config.engine = engine.capabilities();
-                    let wire = PrefacedQuicWire {
-                        first: Some(offer),
-                        inner: QuicVerifyWire::over_session(session),
-                    };
+                    let wire = PrefacedWire::new(wire, Some(offer));
                     // The report's end reason is telemetered inside the
                     // serve loop (`verifydrafts.session_ended`).
                     let _report =
@@ -581,12 +657,12 @@ mod tests {
 
     /// The fail-closed default refuses every family session (no lease, no
     /// serving — the ADR-026 discipline the msp-v1 path enforces per
-    /// request).
+    /// request), regardless of what was presented.
     #[test]
     fn fail_closed_lease_source_refuses_everything() {
         let source = RefuseFamilyLeases;
         assert_eq!(
-            source.lease_for("12D3Kooanything", TEST_PROFILE),
+            source.lease_for("12D3Kooanything", Some("any-token"), TEST_PROFILE),
             Err(FamilyLeaseRefusal::NoLease)
         );
     }
@@ -596,18 +672,35 @@ mod tests {
     #[test]
     fn static_lease_source_supplies_expiry() {
         let source = StaticLeaseExpiry(u64::MAX);
-        assert_eq!(source.lease_for("peer", TEST_PROFILE), Ok(u64::MAX));
+        assert_eq!(source.lease_for("peer", None, TEST_PROFILE), Ok(u64::MAX));
     }
 
-    /// RC-L1: an empty production roster refuses fail-closed (NoLease) —
-    /// the honest default until the daemon's roster wiring seeds a lease.
+    /// RC-L1: an empty production roster with NOTHING presented refuses
+    /// fail-closed (NoLease) — the ADR-026 discipline.
     #[test]
     fn empty_roster_refuses_fail_closed() {
         let key = SigningKey::generate(&mut rand_core::OsRng);
         let roster = RosterFamilyLeases::new(policy_over(&key));
         assert!(roster.is_empty());
         assert_eq!(
-            roster.lease_for("peer-a", TEST_PROFILE),
+            roster.lease_for("peer-a", None, TEST_PROFILE),
+            Err(FamilyLeaseRefusal::NoLease)
+        );
+    }
+
+    /// The msp-v1 gate's first check, verbatim on the PRESENTED token:
+    /// empty and `f0-unverified` placeholders classify as `no_lease`
+    /// ("no lease presented"), not `invalid_lease`.
+    #[test]
+    fn presented_placeholder_forms_classify_as_no_lease() {
+        let key = SigningKey::generate(&mut rand_core::OsRng);
+        let roster = RosterFamilyLeases::new(policy_over(&key));
+        assert_eq!(
+            roster.lease_for("peer-a", Some(""), TEST_PROFILE),
+            Err(FamilyLeaseRefusal::NoLease)
+        );
+        assert_eq!(
+            roster.lease_for("peer-a", Some("f0-unverified-peer-a"), TEST_PROFILE),
             Err(FamilyLeaseRefusal::NoLease)
         );
     }
@@ -623,7 +716,7 @@ mod tests {
         roster.upsert("peer-a", &token);
         assert_eq!(roster.len(), 1);
         let expires_ms = roster
-            .lease_for("peer-a", TEST_PROFILE)
+            .lease_for("peer-a", None, TEST_PROFILE)
             .expect("valid lease serves");
         // within (300 s - 120 s skew, 300 s] of now, in ms
         let now_ms = OffsetDateTime::now_utc().unix_timestamp() as u64 * 1000;
@@ -635,40 +728,98 @@ mod tests {
         // The served profile was part of the validation: the same token
         // under another served profile is a ProfileMismatch, not a serve.
         assert_eq!(
-            roster.lease_for("peer-a", OTHER_PROFILE),
+            roster.lease_for("peer-a", None, OTHER_PROFILE),
             Err(FamilyLeaseRefusal::ProfileMismatch)
         );
         // And the authenticated peer matters: another peer id has no
         // entry at all.
         assert_eq!(
-            roster.lease_for("peer-b", TEST_PROFILE),
+            roster.lease_for("peer-b", None, TEST_PROFILE),
             Err(FamilyLeaseRefusal::NoLease)
         );
-        // Removal (revocation wiring) refuses again.
+        // Removal (revocation wiring) refuses again — until the peer
+        // presents a valid lease of its own (below).
         roster.remove("peer-a");
         assert_eq!(
-            roster.lease_for("peer-a", TEST_PROFILE),
+            roster.lease_for("peer-a", None, TEST_PROFILE),
             Err(FamilyLeaseRefusal::NoLease)
         );
     }
 
-    /// RC-L1, binding-by-binding (each refuses with the msp-v1 gate's own
-    /// classification): wrong profile, expired beyond skew, can_consume
-    /// false, slots zero, lease bound to another peer, and a token signed
-    /// by a foreign hub.
+    /// The PRESENTED-lease activation (2026-10-12): with an EMPTY roster,
+    /// the token the coordinator presents at session open is the whole
+    /// claim — validated exactly like the msp-v1 per-request
+    /// `capability_token` (the same pin set as the roster arm above).
     #[test]
-    fn roster_refuses_each_broken_binding_with_the_msp_v1_classification() {
+    fn presented_lease_admits_on_an_empty_roster() {
         let key = SigningKey::generate(&mut rand_core::OsRng);
-        let policy = policy_over(&key);
-
-        // Wrong profile: lease for OTHER_PROFILE on file under peer-a.
-        let token = lease_wire(&key, OTHER_PROFILE, "peer-a", true, 1, 300);
+        let token = lease_wire(&key, TEST_PROFILE, "peer-a", true, 2, 300);
         let roster = RosterFamilyLeases::new(policy_over(&key));
-        roster.upsert("peer-a", &token);
+        assert!(roster.is_empty(), "nothing on file — presentation only");
+        let expires_ms = roster
+            .lease_for("peer-a", Some(&token), TEST_PROFILE)
+            .expect("a presented valid lease serves on an empty roster");
+        let now_ms = OffsetDateTime::now_utc().unix_timestamp() as u64 * 1000;
+        assert!(expires_ms > now_ms + 120 * 1000);
+        // The same bindings the roster arm checks: profile + peer.
+        let other = lease_wire(&key, OTHER_PROFILE, "peer-a", true, 1, 300);
         assert_eq!(
-            roster.lease_for("peer-a", TEST_PROFILE),
+            roster.lease_for("peer-a", Some(&other), TEST_PROFILE),
             Err(FamilyLeaseRefusal::ProfileMismatch)
         );
+        let stranger = lease_wire(&key, TEST_PROFILE, "peer-b", true, 1, 300);
+        assert_eq!(
+            roster.lease_for("peer-a", Some(&stranger), TEST_PROFILE),
+            Err(FamilyLeaseRefusal::PeerMismatch)
+        );
+    }
+
+    /// Roster precedence: when a roster entry exists it IS the lease under
+    /// test (the tracker-fed record is authoritative); the presented token
+    /// is then not even consulted — pinned by a garbage roster entry
+    /// refusing despite a valid presented lease (fail-closed feeder
+    /// posture; `remove` restores the presentation path).
+    #[test]
+    fn roster_entry_takes_precedence_over_the_presented_token() {
+        let key = SigningKey::generate(&mut rand_core::OsRng);
+        let roster = RosterFamilyLeases::new(policy_over(&key));
+        roster.upsert("peer-a", "not-a-lease");
+        let valid = lease_wire(&key, TEST_PROFILE, "peer-a", true, 1, 300);
+        assert_eq!(
+            roster.lease_for("peer-a", Some(&valid), TEST_PROFILE),
+            Err(FamilyLeaseRefusal::InvalidLease),
+            "the roster entry (garbage) is the lease under test"
+        );
+        roster.remove("peer-a");
+        assert!(roster
+            .lease_for("peer-a", Some(&valid), TEST_PROFILE)
+            .is_ok());
+    }
+
+    /// RC-L1, binding-by-binding (each refuses with the msp-v1 gate's own
+    /// classification) — EVERY broken binding pinned through BOTH token
+    /// sources: filed in the roster AND presented at session open on an
+    /// empty roster. Wrong profile, expired beyond skew, can_consume
+    /// false, slots zero, lease bound to another peer, a token signed by
+    /// a foreign hub, and undecodable garbage.
+    #[test]
+    fn each_broken_binding_refuses_via_roster_and_via_presentation() {
+        let key = SigningKey::generate(&mut rand_core::OsRng);
+        // Both arms share one check: file the token (roster arm) or
+        // present it (presentation arm, empty roster).
+        let check = |token: String| {
+            let roster = RosterFamilyLeases::new(policy_over(&key));
+            roster.upsert("peer-a", &token);
+            let via_roster = roster.lease_for("peer-a", None, TEST_PROFILE);
+            let presented = RosterFamilyLeases::new(policy_over(&key));
+            let via_presented = presented.lease_for("peer-a", Some(&token), TEST_PROFILE);
+            (via_roster, via_presented)
+        };
+
+        // Wrong profile: lease for OTHER_PROFILE.
+        let (roster, presented) = check(lease_wire(&key, OTHER_PROFILE, "peer-a", true, 1, 300));
+        assert_eq!(roster, Err(FamilyLeaseRefusal::ProfileMismatch));
+        assert_eq!(presented, Err(FamilyLeaseRefusal::ProfileMismatch));
 
         // Expired beyond the ±120 s skew (issued 10 min ago, expired
         // 5 min ago): fails hub verification.
@@ -689,59 +840,40 @@ mod tests {
             &key,
         )
         .to_wire();
-        let roster = RosterFamilyLeases::new(policy_over(&key));
-        roster.upsert("peer-a", &expired);
-        assert_eq!(
-            roster.lease_for("peer-a", TEST_PROFILE),
-            Err(FamilyLeaseRefusal::InvalidLease)
-        );
+        let (roster, presented) = check(expired);
+        assert_eq!(roster, Err(FamilyLeaseRefusal::InvalidLease));
+        assert_eq!(presented, Err(FamilyLeaseRefusal::InvalidLease));
 
         // can_consume false.
-        let token = lease_wire(&key, TEST_PROFILE, "peer-a", false, 1, 300);
-        let roster = RosterFamilyLeases::new(policy_over(&key));
-        roster.upsert("peer-a", &token);
-        assert_eq!(
-            roster.lease_for("peer-a", TEST_PROFILE),
-            Err(FamilyLeaseRefusal::NoConsumeRight)
-        );
+        let (roster, presented) = check(lease_wire(&key, TEST_PROFILE, "peer-a", false, 1, 300));
+        assert_eq!(roster, Err(FamilyLeaseRefusal::NoConsumeRight));
+        assert_eq!(presented, Err(FamilyLeaseRefusal::NoConsumeRight));
 
         // Slots zero.
-        let token = lease_wire(&key, TEST_PROFILE, "peer-a", true, 0, 300);
-        let roster = RosterFamilyLeases::new(policy_over(&key));
-        roster.upsert("peer-a", &token);
-        assert_eq!(
-            roster.lease_for("peer-a", TEST_PROFILE),
-            Err(FamilyLeaseRefusal::NoConsumeRight)
-        );
+        let (roster, presented) = check(lease_wire(&key, TEST_PROFILE, "peer-a", true, 0, 300));
+        assert_eq!(roster, Err(FamilyLeaseRefusal::NoConsumeRight));
+        assert_eq!(presented, Err(FamilyLeaseRefusal::NoConsumeRight));
 
-        // Bound to another peer (misfiled/stolen token: filed under
+        // Bound to another peer (misfiled/stolen token: carried by
         // peer-a, signed for peer-b — the signature binds peer-b, so the
         // authenticated-peer check refuses).
-        let token = lease_wire(&key, TEST_PROFILE, "peer-b", true, 1, 300);
-        let roster = RosterFamilyLeases::new(policy_over(&key));
-        roster.upsert("peer-a", &token);
-        assert_eq!(
-            roster.lease_for("peer-a", TEST_PROFILE),
-            Err(FamilyLeaseRefusal::PeerMismatch)
-        );
+        let (roster, presented) = check(lease_wire(&key, TEST_PROFILE, "peer-b", true, 1, 300));
+        assert_eq!(roster, Err(FamilyLeaseRefusal::PeerMismatch));
+        assert_eq!(presented, Err(FamilyLeaseRefusal::PeerMismatch));
 
         // Signed by a FOREIGN hub: signature verification fails.
         let stranger = SigningKey::generate(&mut rand_core::OsRng);
-        let token = lease_wire(&stranger, TEST_PROFILE, "peer-a", true, 1, 300);
-        let roster = RosterFamilyLeases::new(policy.clone());
-        roster.upsert("peer-a", &token);
-        assert_eq!(
-            roster.lease_for("peer-a", TEST_PROFILE),
-            Err(FamilyLeaseRefusal::InvalidLease)
-        );
+        let (roster, presented) =
+            check(lease_wire(&stranger, TEST_PROFILE, "peer-a", true, 1, 300));
+        assert_eq!(roster, Err(FamilyLeaseRefusal::InvalidLease));
+        assert_eq!(presented, Err(FamilyLeaseRefusal::InvalidLease));
 
-        // Undecodable garbage on file: fails closed the same way.
-        let roster = RosterFamilyLeases::new(policy);
-        roster.upsert("peer-a", "not-a-lease");
-        assert_eq!(
-            roster.lease_for("peer-a", TEST_PROFILE),
-            Err(FamilyLeaseRefusal::InvalidLease)
-        );
+        // Undecodable garbage: fails closed the same way in both arms
+        // (and on the wire, a malformed carrier is BadCarrier → the same
+        // invalid_lease classification).
+        let (roster, presented) = check("not-a-lease".to_string());
+        assert_eq!(roster, Err(FamilyLeaseRefusal::InvalidLease));
+        assert_eq!(presented, Err(FamilyLeaseRefusal::InvalidLease));
     }
 
     /// The refusal labels are stable (telemetry contract) and the Display

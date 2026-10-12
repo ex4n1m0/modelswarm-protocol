@@ -355,6 +355,42 @@ pub async fn accept_quic(
     ))
 }
 
+/// Hands one already-read frame back to a serve loop pre-read: the first
+/// `recv_json` returns [`Self::first`], everything after delegates to the
+/// wrapped wire. The composed daemon's demux and the session-open lease
+/// gate read frames straight off the session (to classify and gate BEFORE
+/// any engine work); this wrapper then feeds the winning frame to the
+/// venue-agnostic serve loop — never decoded twice, never dropped.
+pub struct PrefacedWire<W> {
+    first: Option<Value>,
+    inner: W,
+}
+
+impl<W> PrefacedWire<W> {
+    /// Wraps `inner`, replaying `first` on the next `recv_json`.
+    pub fn new(inner: W, first: Option<Value>) -> Self {
+        Self { first, inner }
+    }
+}
+
+#[async_trait]
+impl<W: VerifyDraftsWire> VerifyDraftsWire for PrefacedWire<W> {
+    async fn send_json(&mut self, value: &Value, deadline: Duration) -> Result<(), WireError> {
+        self.inner.send_json(value, deadline).await
+    }
+
+    async fn recv_json(&mut self, deadline: Duration) -> Result<Value, WireError> {
+        match self.first.take() {
+            Some(value) => Ok(value),
+            None => self.inner.recv_json(deadline).await,
+        }
+    }
+
+    fn remote_peer_id(&self) -> &str {
+        self.inner.remote_peer_id()
+    }
+}
+
 /// Dials a cooperative peer over QUIC. The connected PeerId is verified
 /// against the pinned server key's ADR-020 derivation (an impostor fails
 /// the binding inside `dial`), and the returned wire reports that pinned

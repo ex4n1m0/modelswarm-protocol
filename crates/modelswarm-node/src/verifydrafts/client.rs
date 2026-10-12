@@ -1,8 +1,13 @@
 //! The VerifyDrafts requester client (ADR-032; feature `verifydrafts`) —
-//! the coordinator side, library-level (tests + future desktop use; NOT
-//! wired into the desktop UI in this tier).
+//! the coordinator side, library-level (tests + the desktop's
+//! `family_probe` pairing diagnostic since the 2026-10-12 presented-lease
+//! activation).
 //!
-//! The client opens a session (offer → accept/reject), then drives rounds
+//! The client opens a session (optional lease carrier → offer →
+//! accept/reject — the ADR-032 §2 admission order: when
+//! [`VerifyDraftsClientConfig::lease`] is set the coordinator PRESENTS its
+//! hub-signed consume lease as the FIRST frame, the family-side equivalent
+//! of msp-v1's per-request `capability_token`), then drives rounds
 //! against [`modelswarm_session::verifydrafts::VerifyDraftsCoordinator`]:
 //! builds and signs `VerifyDrafts` (the coordinator's own RC-7 `seq`
 //! counter, fresh single-use nonce, chained parent hash), tracks the
@@ -13,9 +18,9 @@
 //! and sends the reproducing `PrefixCommit` (RC-4/§8 WAIT_COMMIT →
 //! COMMITTED).
 //!
-//! Fallback honesty (ADR-032 §3): a rejected offer or an ineligible accept
-//! surfaces as [`ClientOpenError`] — the caller falls back to single
-//! (`SingleDecode`), never silently.
+//! Fallback honesty (ADR-032 §3): a rejected offer, a lease-refused open,
+//! or an ineligible accept surfaces as [`ClientOpenError`] — the caller
+//! falls back to single (`SingleDecode`), never silently.
 
 use std::time::{Duration, Instant};
 
@@ -179,6 +184,16 @@ pub struct VerifyDraftsClientConfig {
     /// them through `generation_params_hash`; see the handoff's
     /// negotiation-gap note).
     pub sampling_params: SamplingParams,
+    /// The hub-signed consume lease to PRESENT at session open (ADR-032 §2
+    /// admission order): the coordinator's FIRST frame is the minimal
+    /// `{"lease": …}` carrier ([`super::WireSessionLease`]) carrying the
+    /// UNCHANGED `EligibilityLease::to_wire` token — the same lease the
+    /// msp-v1 swarm path presents per request. The serving side feeds it
+    /// into the same validation the roster path runs; a refusal ends the
+    /// session honestly (this client surfaces `ClientOpenError::Io`, the
+    /// fallback-to-single signal). `None` = open without presenting
+    /// (roster-fed / stub venues).
+    pub lease: Option<String>,
     /// Per-round `deadline_ms` (clamped to `[1000, 120000]` by the gate).
     pub round_deadline_ms: u32,
     /// How long to wait for a result after sending a request.
@@ -189,7 +204,8 @@ pub struct VerifyDraftsClientConfig {
 
 impl VerifyDraftsClientConfig {
     /// Defaults for loopback/tests: CPU pairing, `verified` preset, a
-    /// 120-second budget envelope, 2.5 s round deadlines, 10 s result wait.
+    /// 120-second budget envelope, 2.5 s round deadlines, 10 s result wait,
+    /// NO presented lease (set [`Self::lease`] for the presentation path).
     pub fn new(profile_id: String, verifier_key: VerifyingKey) -> Self {
         Self {
             profile_id,
@@ -202,6 +218,7 @@ impl VerifyDraftsClientConfig {
             verifier_backend: Backend::Cpu,
             verifier_key,
             sampling_params: SamplingParams::default(),
+            lease: None,
             round_deadline_ms: 2_500,
             result_wait: Duration::from_secs(10),
             io_deadline: FAMILY_IO_DEADLINE,
@@ -228,6 +245,14 @@ impl<W: VerifyDraftsWire> VerifyDraftsClient<W> {
     /// Sends a `SessionOffer` and waits for the accept/reject. On success
     /// the returned client is ready to drive rounds; every error variant is
     /// an honest fallback-to-single signal (ADR-032 §3).
+    ///
+    /// When [`VerifyDraftsClientConfig::lease`] is set, the coordinator's
+    /// FIRST frame is the lease carrier (ADR-032 §2 admission order):
+    /// the lease is presented AT SESSION OPEN, exactly like the msp-v1
+    /// path presents its `capability_token` per request. A lease refusal
+    /// happens before any accept: the serving daemon ends the session and
+    /// this client surfaces `ClientOpenError::Io` — the same honest
+    /// fallback-to-single signal as every other refused open.
     pub async fn negotiate(
         mut wire: W,
         identity: InstallationIdentity,
@@ -237,6 +262,18 @@ impl<W: VerifyDraftsWire> VerifyDraftsClient<W> {
         let params_hash = batch_generation_params_hash(&config.sampling_params)
             .map_err(|why| ClientOpenError::Misconfigured(why.to_string()))?;
         let session_id = format!("vd-{}", new_nonce());
+        // ADR-032 §2 admission order: present the lease BEFORE the offer
+        // (the minimal bare carrier — no envelope, no new fields; the
+        // token is the unchanged wire lease string).
+        if let Some(lease) = &config.lease {
+            let carrier = serde_json::to_value(super::WireSessionLease {
+                lease: lease.clone(),
+            })
+            .expect("lease carrier serializes");
+            wire.send_json(&carrier, config.io_deadline)
+                .await
+                .map_err(|_| ClientOpenError::Io("send lease carrier"))?;
+        }
         // ADR-032 revision 4 §3/G3: the offer binds the coordinator's
         // pinned profile and sampling parameters (offer form v3) so the
         // serving side can refuse a mismatched pairing honestly at

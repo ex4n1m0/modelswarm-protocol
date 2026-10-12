@@ -3,11 +3,15 @@
 //! pinned staged engine and the same exactness pins as
 //! `verifydrafts_capi_e2e.rs`, but through `serve_sessions_composed` —
 //! ONE listener, BOTH vocabularies — with the PRODUCTION lease source
-//! (`RosterFamilyLeases`, RC-L1: a valid profile-bound lease seeded for
-//! the coordinator serves; a WRONG-PROFILE lease refuses before any
-//! engine work) and the msp-v1 arm answering through its own executor on
-//! the same listener. This is the path the desktop's hosting start drives
-//! since the 2026-10-12 light-up swap.
+//! (`RosterFamilyLeases`, RC-L1) fed by PRESENTED leases (ADR-032 §2
+//! admission order, the 2026-10-12 activation): the roster stays EMPTY —
+//! nothing feeds it, exactly the shipped-desktop configuration — and the
+//! coordinator's hub-signed lease, PRESENTED in the session-open carrier,
+//! is the whole claim (a valid presented lease opens the session on the
+//! real engine; a WRONG-PROFILE presented lease refuses before any
+//! engine work) while the msp-v1 arm answers through its own executor on
+//! the same listener. This is the path two fresh desktops with earned
+//! leases take to open a family session.
 //!
 //! Performance numbers are printed environment-labeled, never asserted.
 //!
@@ -317,7 +321,7 @@ async fn real_capi_engine_serves_verifydrafts_through_composed_daemon() {
     );
 
     // ---- the composed daemon: production lease source + real engine -----
-    label("COMPOSED DAEMON (roster leases + Capi engine source)");
+    label("COMPOSED DAEMON (presented leases + Capi engine source)");
     let backend = VerifyBackend::of_bundle(&engine_dir).expect("backend of the staged bundle");
     assert_eq!(backend, VerifyBackend::Cpu, "this test stages the CPU set");
     let adapter = Arc::new(
@@ -348,27 +352,27 @@ async fn real_capi_engine_serves_verifydrafts_through_composed_daemon() {
     let requester = InstallationIdentity::from_bytes(&[0xB1; 32]);
 
     // ONE test hub backs both vocabularies: the msp-v1 arm presents its
-    // token on the wire; the family coordinators' tokens sit in the
-    // PRODUCTION roster (RC-L1) — the family coordinator holds a valid
-    // lease for THIS profile, the second peer a validly-signed lease for
-    // ANOTHER profile (must refuse).
+    // token on the wire per request; the family coordinators PRESENT
+    // their leases in the session-open carrier — the PRODUCTION roster
+    // stays EMPTY (nothing feeds it; the hub-signed presented token is
+    // the whole claim, exactly the shipped-desktop configuration). The
+    // family coordinator holds a valid lease for THIS profile; the second
+    // peer a validly-signed lease for ANOTHER profile (must refuse).
     let hub = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let policy = modelswarm_node::serving::LeasePolicy::from_hex(&hex::encode(
         hub.verifying_key().to_bytes(),
     ))
     .unwrap();
     let roster = RosterFamilyLeases::new(policy.clone());
-    roster.upsert(
-        &coordinator.peer_id().to_string(),
-        &e2e_lease_wire(&hub, TEST_PROFILE, &coordinator.peer_id().to_string()),
+    assert!(
+        roster.is_empty(),
+        "presentation only — the roster is never fed"
     );
-    roster.upsert(
+    let coordinator_lease = e2e_lease_wire(&hub, TEST_PROFILE, &coordinator.peer_id().to_string());
+    let wrong_profile_lease = e2e_lease_wire(
+        &hub,
+        OTHER_PROFILE,
         &wrong_profile_peer.peer_id().to_string(),
-        &e2e_lease_wire(
-            &hub,
-            OTHER_PROFILE,
-            &wrong_profile_peer.peer_id().to_string(),
-        ),
     );
 
     let mut config =
@@ -400,8 +404,9 @@ async fn real_capi_engine_serves_verifydrafts_through_composed_daemon() {
         shutdown_rx,
     ));
 
-    // ---- RC-L1 live: the wrong-profile lease refuses BEFORE the engine --
-    label("RC-L1 (wrong-profile lease refuses)");
+    // ---- RC-L1 live: the wrong-profile PRESENTED lease refuses BEFORE
+    // the engine (session-open gate, empty roster) ------------------------
+    label("RC-L1 (wrong-profile presented lease refuses)");
     let refused_wire = dial_quic(
         &addr,
         &wrong_profile_peer,
@@ -411,16 +416,14 @@ async fn real_capi_engine_serves_verifydrafts_through_composed_daemon() {
     .await
     .expect("dial itself is lease-agnostic");
     let tel = Telemetry::memory().0;
-    match VerifyDraftsClient::negotiate(
-        refused_wire,
-        wrong_profile_peer,
-        VerifyDraftsClientConfig::new(TEST_PROFILE.to_string(), server_identity.verifying_key()),
-        &tel,
-    )
-    .await
+    let mut refused_config =
+        VerifyDraftsClientConfig::new(TEST_PROFILE.to_string(), server_identity.verifying_key());
+    refused_config.lease = Some(wrong_profile_lease);
+    match VerifyDraftsClient::negotiate(refused_wire, wrong_profile_peer, refused_config, &tel)
+        .await
     {
         Err(modelswarm_node::verifydrafts::ClientOpenError::Io(_)) => {}
-        Ok(_) => panic!("a wrong-profile lease must never open a family session"),
+        Ok(_) => panic!("a wrong-profile presented lease must never open a family session"),
         Err(other) => panic!("expected an honest transport failure, got {other}"),
     }
     println!("OK: refused with the honest session end (no accept frame)");
@@ -472,7 +475,7 @@ async fn real_capi_engine_serves_verifydrafts_through_composed_daemon() {
     println!("OK: msp-v1 streamed through the composed listener");
 
     // ---- the family arm over the REAL engine ----------------------------
-    label("FAMILY ARM (roster lease + real engine)");
+    label("FAMILY ARM (presented lease + real engine, empty roster)");
     let wire = dial_quic(
         &addr,
         &coordinator,
@@ -482,14 +485,13 @@ async fn real_capi_engine_serves_verifydrafts_through_composed_daemon() {
     .await
     .expect("family dial into the composed listener");
     let tel = Telemetry::memory().0;
-    let mut client = VerifyDraftsClient::negotiate(
-        wire,
-        coordinator.clone(),
-        VerifyDraftsClientConfig::new(TEST_PROFILE.to_string(), server_identity.verifying_key()),
-        &tel,
-    )
-    .await
-    .expect("offer accepted through the composed demux");
+    let mut family_client_config =
+        VerifyDraftsClientConfig::new(TEST_PROFILE.to_string(), server_identity.verifying_key());
+    family_client_config.lease = Some(coordinator_lease);
+    let mut client =
+        VerifyDraftsClient::negotiate(wire, coordinator.clone(), family_client_config, &tel)
+            .await
+            .expect("session opened through the composed demux on the PRESENTED lease");
     // The disclosure is the real engine's geometry (the composed loop's
     // per-session override), not the config's hand-set default.
     assert_eq!(client.engine_disclosure(), &expected_disclosure);

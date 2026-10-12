@@ -908,6 +908,31 @@ condition-vs-letter ruling). The flag-flip package items therefore are:
 swap + feature enable; (iii) the item-2 exactness reruns on the
 production build; (iv) the release approval itself (owner).
 
+**Light-up executed (2026-10-12; owner approval "all approved and you may
+release").** All four package items are discharged: (i) the profile-bound
+production lease path — `RosterFamilyLeases` with the full ADR-026
+discipline (`55d802e`) plus the coordinator PRESENTED-lease admission
+path (`2ffc8a7`: `WireSessionLease` carrier at family session open,
+roster-first precedence, two-fresh-desktops confirmation); (ii) the
+desktop composed-daemon swap with `verifydrafts-capi` chained into
+`tauri-shell` — the shipped release build carries the family ON
+(`55d802e`); (iii) the item-2 exactness evidence record
+`docs/verification/adr-032-lightup-exactness-2026-10-12.md` (composed
+real-engine E2E ×3: full-accept + bonus, exact divergence +
+replacement, 14/14 tokens == HTTP ground truth, verify_pass_ms 12–14 —
+Windows-only engine evidence, Linux/macOS compile-verified by the new
+`check-nonwindows-capi` gate, honestly stated); (iv) **released as
+v0.2.21, all-OS, live at modelswarm.deepflux.space** (train record
+`docs/reviews/handoff-test-release-v0.2.21-2026-10-12.md`; commits
+`39dea6f`–`2cfdf6d`; SHA256SUMS guarded; counting-route downloads live).
+Runtime opt-in gates at ship time (honest UI status): `MSP_LISTENER=1`,
+family prompt file + C-API bridge on the serving side, direct/LAN
+networks only (no relay). Open items carried forward: RAM-doubling vs
+the resource governor (Resource Engineer coordination queued), the
+routed advisories (A-2/A-3, freeze-ADR records incl. the lease-carrier
+form and the RC-5(b) wording dissent), E0 cross-machine determinism
+certification, and the F2B relay proof.
+
 ### 8. Verifier round state machine (per session; reviewer-facing)
 
 ```text

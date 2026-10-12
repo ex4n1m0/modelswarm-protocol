@@ -1,7 +1,7 @@
 # Review — pre-light-up release disposition (Test and Release seat)
 
-Date: 2026-10-12. Seat: Test and Release Engineer (release gate). Base:
-`4b35d81` (main). Inputs: (1) the ADR-032 revision-4 disposition
+Date: 2026-10-12. Seat: Test and Release Engineer (release gate). Inputs:
+(1) the ADR-032 revision-4 disposition
 (`docs/adr/ADR-032-batched-speculative-verification.md` rev 4, the §7
 item-(iv) migrations at `4b35d81`); (2) the light-up CI steps
 (`f9ec2ff` verifydrafts feature steps, `4e8fc18` verifydrafts-capi
@@ -10,16 +10,26 @@ combo, in `.github/workflows/rust.yml`); (3) the two cross-boundary
 (`4b35d81`, flagged for this seat). Method: independent re-runs of
 every claimed gate on this machine (rustc/cargo 1.99.0, matching the
 `rust-toolchain.toml` pin and the CI `dtolnay/rust-toolchain@1.99.0`
-step), a clean-worktree baseline re-run at the parent commit `4e8fc18`
-for count reconciliation, and programmatic fixture verification
-against `git show` of the parent commit. No self-reported number in
-this review is trusted without a re-run.
+step), plus clean-worktree re-runs at the exact input commits
+(`4e8fc18` and `4b35d81`) for count reconciliation, and programmatic
+fixture verification against `git show` of the parent commit. No
+self-reported number in this review is trusted without a re-run.
+
+**Shared-working-tree note (correction of this review's first
+draft).** The Security seat's sibling review (`c1fb927`, same
+disposition round) landed in this shared working tree WHILE the gate
+runs were executing, adding one security pin. First-draft totals
+taken from the shared tree (469/514/532) initially looked like a
+mis-count in the migration handoff; clean-worktree re-runs at the
+exact commits proved the migration handoff EXACT and re-attributed
+the +1 to `c1fb927` (its own claim "468+1 pin" is correct). All
+numbers below are now stated per tree.
 
 ## Verdicts
 
 | Input | Verdict |
 |---|---|
-| 1. ADR-032 rev-4 disposition (§7 item-(iv) migrations, `4b35d81`) | **APPROVE** (1 record correction + 2 advisories) |
+| 1. ADR-032 rev-4 disposition (§7 item-(iv) migrations, `4b35d81`) | **APPROVE** (0 corrections owed; 2 advisories) |
 | 2. CI steps (`f9ec2ff`, `4e8fc18`, current `rust.yml`) | **APPROVE WITH REQUIRED CHANGES** — the required change is APPLIED by this seat in this review (explicit `libp2p-backend` in both feature steps) |
 | 3. Cross-boundary sim edits (`apps/modelswarm-sim`, `4b35d81`) | **APPROVE** |
 | Overall light-up gate disposition | **NOT BLOCKED from the release seat** — see the disposition statement |
@@ -126,52 +136,50 @@ migrations plus the fixture obligations.
   residual gap recorded (freeze-ADR item) — recorded, not improvised,
   matching the handoff.
 
-**Record correction (owed, not blocking):** every claimed workspace
-total in the `4b35d81` commit message and handoff under-counts by
-exactly ONE test. The security-pins delta is +3, not +2: besides the
-re-scoped late-commit pin and the two listed pins, the commit adds
-`pin_stale_commit_for_older_round_while_newer_outstanding_is_charged`,
-which the handoff's "New pins, by contract item" section does not
-list. Correct numbers (mine, re-run):
+**Gate-count reconciliation (all numbers this seat's own runs):**
 
-| Config | Handoff claim | This re-run (4b35d81) |
-|---|---|---|
-| `cargo test --workspace` | 468/0/6 | **469/0/6** |
-| `--features modelswarm-node/verifydrafts` | 513/0/7 | **514/0/7** |
-| `--features modelswarm-node/verifydrafts-capi` | 531/0/12 | **532/0/12** |
+| Tree | default | verifydrafts | verifydrafts-capi |
+|---|---|---|---|
+| `4e8fc18` (clean worktree) | 462/0/6 | — | — |
+| `4b35d81` (clean worktree) | **468/0/6** | **513/0/7** | **531/0/12** |
+| `4b35d81`+`c1fb927` (working tree; = this change's base) | 469/0/6 | 514/0/7 | 532/0/12 |
+| + this review's explicit-CI forms | — | 514/0/7 | 532/0/12 |
 
-The error direction is benign (MORE coverage than claimed, 0 failures
-everywhere, ignored counts exact), and the baseline claim itself
-reproduces exactly (clean worktree at `4e8fc18`: 462/0/6 across 64
-binaries — the per-binary delta to `4b35d81` is precisely +3 pins, +2
-vectors, +1 disjointness binary, +1 negotiation unit = +7). Gate-count
-claims must still be exact; the implementer session should correct the
-handoff record.
+The migration handoff's claimed totals (468/0/6, 513/0/7, 531/0/12)
+are **EXACT** for `4b35d81` — no record correction is owed. The +1 in
+the shared working tree is `c1fb927`'s
+`pin_stale_commit_for_older_round_while_newer_outstanding_is_charged`
+(the Security seat's A-1 pin, disclosed by them as "468+1"); their
+claimed 469/514/532 are exact for their tree. fmt clean and clippy
+`-D warnings` clean in all three configs re-verified by this seat at
+`4b35d81` directly (not only on the shared tree).
 
 **Advisories (routed):**
 
-1. **RC-5(b) corner-case wording → Protocol Architect.** The unlisted
-   corner pin freezes a STRICT reading of the exemption's
-   precondition "no outstanding result left to reproduce against": a
-   stale commit for an ABANDONED older round arriving while a NEWER
-   round's result is outstanding is CHARGED `commit_mismatch`
-   (violation + abandonment of the newer round's result), because the
-   exemption fires only when NO round is outstanding at all. This is
-   defensible under the rev-4 letter (there IS an outstanding result
-   at that instant; fail-closed; I2 unaffected either way;
-   threshold-two still required for teardown) and matches the
-   handoff's stated operational definition (`outstanding == None`).
-   But the exemption's RATIONALE (an honest-but-slow coordinator's
-   in-flight commit must not tear the session) is reachable in this
-   corner too: coordinator sends the round-3 commit (in flight) →
-   verifier expires round 3 → coordinator gap-forwards per RC-5(c)
-   with round 5 → verifier admits round 5 → the round-3 commit
-   finally arrives → one violation, and round 5's result is
-   discarded. Recommend a rev-5 clarification of whether the
-   exemption is per-round (round abandoned) or global (no outstanding
-   round at all). Not a blocker.
+1. **RC-5(b) corner-case wording → Protocol Architect (concur with
+   Security A-1, with one reachability dissent).** The corner pin
+   (Security's, `c1fb927`) freezes the STRICT reading of the
+   exemption's precondition "no outstanding result left to reproduce
+   against": a stale commit for an ABANDONED older round arriving
+   while a NEWER round's result is outstanding is CHARGED
+   `commit_mismatch` (violation + abandonment of the newer round's
+   result), because the exemption fires only when NO round is
+   outstanding at all. This is defensible under the rev-4 letter
+   (there IS an outstanding result at that instant; fail-closed; I2
+   unaffected either way; threshold-two still required for teardown)
+   and matches the migration handoff's stated operational definition
+   (`outstanding == None`). Security's review calls the corner
+   "unreachable for honest coordinators"; this seat dissents on that
+   detail: an honest-but-slow coordinator CAN reach it (round-3
+   commit in flight → verifier expires round 3 → coordinator
+   gap-forwards per RC-5(c) with round 5 → verifier admits round 5 →
+   the delayed round-3 commit arrives → one violation, and round 5's
+   result is discarded) — narrow, but nonzero. Either way the routing
+   is the same: a rev-5 clarification of whether the exemption is
+   per-round (round abandoned) or global (no outstanding round at
+   all). Not a blocker.
 2. **Stale-classification boundary (pre-existing, disclosed in
-   handoff §4.2):** `apply_prefix_commit` is clock-free, so
+   migration handoff §4.2):** `apply_prefix_commit` is clock-free, so
    "already abandoned" is the outstanding-state operational
    definition; a commit in the instant between grace expiry and the
    next serve-loop poll is classified by the outstanding-state path
@@ -229,8 +237,9 @@ handoff record.
   verifydrafts steps and the combo steps now pass
   `modelswarm-node/libp2p-backend` EXPLICITLY. Verified
   coverage-equivalent: the updated commands produce the SAME counts
-  (514/0/7 and 532/0/12; `verifydrafts_composed` 2/0 present in the
-  log) and clippy is clean in both explicit combinations.
+  (514/0/7 and 532/0/12 on this tree; `verifydrafts_composed` 2/0
+  present in the log) and clippy is clean in both explicit
+  combinations.
 - **Advisory:** a bare `cargo test -p modelswarm-node --features
   verifydrafts` compiles zero composed coverage (the module is simply
   absent) — local-run guidance, already documented in the compose
@@ -286,26 +295,33 @@ derivation expression; acceptable for two construction sites.
 owner flag-flip package.** The §7 item-(iv) migration list — the
 "before the family carries traffic" precondition the ADR attaches to
 rev 4 — is discharged and independently verified at `4b35d81`
-(input 1). The per-push CI the ADR venue matrix owes is present and
-now robust (input 2; the required change is the explicit
-`libp2p-backend` combination, applied and verified coverage-equivalent
-in this change — push it WITH the flag-flip package). The
-cross-boundary sim edits are correct and honest (input 3).
+(input 1; counts exact, gates green at the commit itself). The
+per-push CI the ADR venue matrix owes is present and now robust
+(input 2; the required change is the explicit `libp2p-backend`
+combination, applied and verified coverage-equivalent in this change
+— push it WITH the flag-flip package). The cross-boundary sim edits
+are correct and honest (input 3).
 
-The remaining §7 rev-4 owner-gated items stand UNCHANGED and remain
-preconditions/obligations of the flag flip itself, not blockers
-introduced by this review: (i) the `capi-adapter` flag flip in
-serving; (ii) the item-2 family exactness-pin reruns (the
-`real-model-e2e.yml` extension or an owner-local run with a
-`docs/verification/` record — venue-matrix obligation at light-up);
-(iii) the Windows-Product composition completion (desktop surfaces,
-the `serve_sessions_composed` plumb) and the F2B cross-machine relay
-proof. When the family carries real traffic, the `MSP_LIVE=1`
-live-wire harness obligation applies (`crates/modelswarm-node/tests/live_tracker.rs`
-precedent). Record corrections owed by the implementer session: the
-468/513/531 totals → 469/514/532, and the unlisted RC-5(b) corner pin.
-One advisory routes to the Protocol Architect (RC-5(b) corner-case
-wording, §1 advisory 1 above).
+The remaining preconditions/obligations of the flag flip itself,
+unchanged or newly recorded by this review round, and tracked by this
+seat as release-gate items:
+
+- ADR §7 rev-4 owner-gated items: (i) the `capi-adapter` flag flip in
+  serving; (ii) the item-2 family exactness-pin reruns (the
+  `real-model-e2e.yml` extension or an owner-local run with a
+  `docs/verification/` record — venue-matrix obligation at light-up);
+  (iii) the Windows-Product composition completion (desktop surfaces,
+  the `serve_sessions_composed` plumb) and the F2B cross-machine
+  relay proof.
+- Security seat's REQUIRED RC-L1 (`c1fb927`): the production
+  `FamilyLeaseSource` must be PROFILE-bound — a stated CONDITION of
+  light-up, routes to the composition work; this seat will check it
+  in the flag-flip package.
+- When the family carries real traffic, the `MSP_LIVE=1` live-wire
+  harness obligation applies (`crates/modelswarm-node/tests/live_tracker.rs`
+  precedent).
+- One advisory routes to the Protocol Architect (RC-5(b) corner-case
+  wording, §1 advisory 1 above).
 
 ## Fixes made by this seat (this change)
 
@@ -317,28 +333,31 @@ wording, §1 advisory 1 above).
 
 ## Exact commands and outcomes (this seat, 2026-10-12)
 
-| Command | Outcome |
-|---|---|
-| `cargo fmt --all --check` | clean |
-| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
-| `cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts -- -D warnings` | clean |
-| `cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts-capi -- -D warnings` | clean |
-| `cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts,modelswarm-node/libp2p-backend -- -D warnings` (new CI form) | clean |
-| `cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts-capi,modelswarm-node/libp2p-backend -- -D warnings` (new CI form) | clean |
-| `cargo test --workspace` | **469 / 0 / 6** (claim 468 — off by the unlisted pin; baseline at `4e8fc18` re-run in a clean worktree: 462/0/6, exact) |
-| `cargo test --workspace --features modelswarm-node/verifydrafts` | **514 / 0 / 7** (claim 513) |
-| `cargo test --workspace --features modelswarm-node/verifydrafts-capi` | **532 / 0 / 12** (claim 531) |
-| `cargo test --workspace --features modelswarm-node/verifydrafts,modelswarm-node/libp2p-backend` (new CI form) | **514 / 0 / 7**, `verifydrafts_composed` 2/0 present |
-| `cargo test --workspace --features modelswarm-node/verifydrafts-capi,modelswarm-node/libp2p-backend` (new CI form) | **532 / 0 / 12** |
-| `cargo test -p modelswarm-session --test verifydrafts_admission_properties` | **15 / 0** (conjunction sweep green; §8e boundary pins re-based) |
-| `cargo test -p modelswarm-session --test verifydrafts_security_review_pins` | **6 / 0** (was 3 at `4e8fc18`) |
-| `cargo test -p modelswarm-session --test verifydrafts_vectors` | **13 / 0** |
-| `cargo test -p modelswarm-session --test verifydrafts_vocabulary_disjointness` | **1 / 0** |
-| `cargo test -p modelswarm-sim --test mixed_swarm` / `-p modelswarm-scheduler` | **6 / 0** / **36 / 0** |
-| `cargo run -p modelswarm-session --example gen-verifydrafts-vectors` (×2) | 12 files; double-run `git diff` empty (idempotent) |
-| `cargo test -p modelswarm-node --features verifydrafts --test verifydrafts_composed -- --list` | **0 tests** (the implicit-coverage proof) |
-| `cargo test --workspace --features modelswarm-node/verifydrafts --test verifydrafts_composed -- --list` | **2 tests** (unification proof) |
-| Fixture checks (python vs `git show 4b35d81~1:`) | reject-1 four existing canonicalizations byte-identical; offer-2 description-only; carrier golden: rule-2 recompute + canonical sha + 8-key form + fixture-1 hash match all TRUE |
+| Command | Tree | Outcome |
+|---|---|---|
+| `cargo fmt --all --check` | working tree (`4b35d81`+`c1fb927`) | clean |
+| `cargo fmt --all --check` | clean worktree `4b35d81` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | both trees | clean |
+| `cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts -- -D warnings` | both trees | clean |
+| `cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts-capi -- -D warnings` | both trees | clean |
+| `cargo clippy ... --features modelswarm-node/verifydrafts,modelswarm-node/libp2p-backend -- -D warnings` (new CI form) | working tree | clean |
+| `cargo clippy ... --features modelswarm-node/verifydrafts-capi,modelswarm-node/libp2p-backend -- -D warnings` (new CI form) | working tree | clean |
+| `cargo test --workspace` | clean worktree `4e8fc18` | 462/0/6 (64 binaries — baseline claim exact) |
+| `cargo test --workspace` | clean worktree `4b35d81` | **468/0/6** — handoff claim EXACT |
+| `cargo test --workspace --features modelswarm-node/verifydrafts` | clean worktree `4b35d81` | **513/0/7** — handoff claim EXACT |
+| `cargo test --workspace --features modelswarm-node/verifydrafts-capi` | clean worktree `4b35d81` | **531/0/12** — handoff claim EXACT |
+| `cargo test --workspace` (and the two feature forms) | working tree (`+c1fb927`) | 469/0/6, 514/0/7, 532/0/12 (the +1 is Security's A-1 pin) |
+| `cargo test --workspace --features modelswarm-node/verifydrafts,modelswarm-node/libp2p-backend` (new CI form) | working tree | **514/0/7**, `verifydrafts_composed` 2/0 present |
+| `cargo test --workspace --features modelswarm-node/verifydrafts-capi,modelswarm-node/libp2p-backend` (new CI form) | working tree | **532/0/12** |
+| `cargo test -p modelswarm-session --test verifydrafts_admission_properties` | working tree | **15/0** (conjunction sweep green; §8e boundary pins re-based) |
+| `cargo test -p modelswarm-session --test verifydrafts_security_review_pins` | working tree | **6/0** (5 at `4b35d81` + Security's corner pin) |
+| `cargo test -p modelswarm-session --test verifydrafts_vectors` | working tree | **13/0** |
+| `cargo test -p modelswarm-session --test verifydrafts_vocabulary_disjointness` | working tree | **1/0** |
+| `cargo test -p modelswarm-sim --test mixed_swarm` / `-p modelswarm-scheduler` | working tree | **6/0** / **36/0** |
+| `cargo run -p modelswarm-session --example gen-verifydrafts-vectors` (×2) | working tree | 12 files; double-run `git diff` empty (idempotent) |
+| `cargo test -p modelswarm-node --features verifydrafts --test verifydrafts_composed -- --list` | working tree | **0 tests** (the implicit-coverage proof) |
+| `cargo test --workspace --features modelswarm-node/verifydrafts --test verifydrafts_composed -- --list` | working tree | **2 tests** (unification proof) |
+| Fixture checks (python vs `git show 4b35d81~1:`) | — | reject-1 four existing canonicalizations byte-identical; offer-2 description-only; carrier golden: rule-2 recompute + canonical sha + 8-key form + fixture-1 hash match all TRUE |
 
 ## Assumptions
 
@@ -348,8 +367,8 @@ wording, §1 advisory 1 above).
    still run — the libp2p-backend step unchanged, and it now shares
    explicit features with the verifydrafts step).
 2. Test-count equality across environments holds (same toolchain pin
-   1.99.0 local and CI; the +1 delta is a handoff accounting error,
-   proven by the clean-worktree baseline and the per-binary diff).
+   1.99.0 local and CI; every discrepancy this review saw traces to
+   the shared-tree sibling commit, proven by the clean-worktree runs).
 3. The corner-pin reading of RC-5(b) is treated as contract-compliant
    pending the Architect clarification (advisory 1); it is not
    grounds to block because it fails closed and I2 holds either way.
@@ -357,8 +376,10 @@ wording, §1 advisory 1 above).
 ## Unresolved risks
 
 1. The RC-5(b) corner semantics (strict global-no-outstanding
-   exemption) is pinned by a test but the ADR text is ambiguous —
-   routed to the Protocol Architect (advisory 1).
+   exemption) is pinned (by Security) but the ADR text is ambiguous —
+   routed to the Protocol Architect (advisory 1); this seat's
+   reachability dissent is recorded there for the Architect to
+   adjudicate.
 2. The G6 prompt-commitment gap stands (owner-gated freeze-ADR item,
    correctly recorded, not improvised).
 3. A wire-level foreign-sender commit over the real transport is
@@ -374,8 +395,9 @@ wording, §1 advisory 1 above).
 
 1. Merge this review + the `rust.yml` explicit-features fix WITH the
    owner flag-flip package (it is that package's CI).
-2. Ask the rev-4 implementer session to correct the handoff/commit
-   totals (469/514/532) and add the unlisted corner pin to the
-   record.
-3. Route advisory 1 (RC-5(b) corner wording) to the Protocol
-   Architect for a rev-5 clarification.
+2. Route advisory 1 (RC-5(b) corner wording, with the two seats'
+   reachability positions) to the Protocol Architect for a rev-5
+   clarification.
+3. Track Security's RC-L1 (profile-bound `FamilyLeaseSource`) as a
+   flag-flip package item — it is their stated condition of
+   light-up.

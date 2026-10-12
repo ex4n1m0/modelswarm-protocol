@@ -134,6 +134,17 @@ jobs:
             echo "::error::binary artifacts must never be committed (installers ship via gitignored downloads)"
             exit 1
           fi
+      # Pattern-based secret scan (no key material in this file): the
+      # advisory-plane API key lives ONLY in local client config outside
+      # the repo (owner directive 2026-10-12) — a tracked provider-key
+      # pattern is a leak by definition.
+      - name: No provider API keys are committed
+        run: |
+          LEAK=$(git ls-files -z | xargs -0 grep -rlE 'sk-[0-9a-f]{32}' -- 2>/dev/null | grep -vx '.github/workflows/rust.yml' || true)
+          if [ -n "$LEAK" ]; then
+            echo "::error::API-key pattern (sk-<32 hex>) found in tracked files — keys live only in local client config, never in the repo: $LEAK"
+            exit 1
+          fi
       - name: Version is single-sourced
         run: |
           if jq -e 'has("version")' crates/modelswarm-desktop/tauri.conf.json; then

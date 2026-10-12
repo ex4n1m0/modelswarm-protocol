@@ -243,3 +243,85 @@ config pin as a CI guard (optional; the Rust-side
 tauri-shell suite on drift) and stages a signed dummy `latest.json`
 against a scratch build to exercise the first real round-trip before
 0.2.22 ships.
+
+## 8. A-1 closure — bounded download (2026-10-13, after the security review)
+
+Commit `27c854b`, closing advisory A-1 of
+`docs/reviews/review-updater-security-2026-10-13.md` (unbounded in-memory
+package buffering + no download timeout → a compromised origin could
+OOM-crash the client during download; `on_chunk` cannot cancel). One file
+changed: `crates/modelswarm-desktop/src/app/updater.rs`.
+
+**Mechanism.** `download_with_progress` now runs the plugin's
+`update.download(...)` inside `drive_bounded_download`, which enforces
+both bounds:
+
+- **Wall clock**: `tokio::time::timeout` over the whole download phase
+  (connect + stream + buffering) — the bound that always bites, since a
+  drip-feed origin under the byte cap can otherwise hold the download
+  open (and grow its buffer) indefinitely.
+- **Byte cap, mid-stream**: `ChunkIngress` (the `on_chunk` body) counts
+  every chunk against the cap and fires a one-shot channel on the FIRST
+  breach; a `tokio::select!` between the download future and that signal
+  resolves on the breach and **drops the download future** — dropping the
+  future is the cancel `on_chunk` cannot perform; the drop closes the
+  plugin's response stream and frees the partial buffer. A tail-race
+  check re-reads the counter when the future resolved `Ok` in the same
+  poll in which it crossed the cap (and the select-reported at-breach
+  count wins over the later counter — one chunk can land between signal
+  and drop). No progress is ever claimed past the cap.
+
+**The constants chosen.**
+
+| Constant | Value | Rationale |
+|---|---|---|
+| `DOWNLOAD_TIMEOUT` | 10 min (`600 s`) | Any legitimate package (≤ the cap) completes inside 10 min on a link sustaining ≥ ~0.9 MiB/s; slower is an honestly-reported failed update, running version intact. (The review sketched 30 min; 10 min is tighter and still ~an order of magnitude above observed install times.) |
+| `DOWNLOAD_BYTE_CAP` | 512 MiB (`536,870,912` B) | Far above any installer the train ships (engines included); enforced per chunk, so exactly-at-cap is still accepted. |
+
+**Honest-status strings (pinned verbatim by tests):**
+
+- timeout: `update failed — this version keeps running (download timeout)`
+- cap: `update failed — this version keeps running (download exceeded the 512 MiB cap)`
+- plugin errors keep the prior shape: `… (download: <reason>)`.
+
+Both A-1 edges land in the existing terminal-state discipline:
+`InstallFailed`, never a crash, never a restart loop — the 6h timer still
+starts the next cycle, `install()` never receives the bytes, and the
+running version keeps running.
+
+**Tests added (5; pure/injected-stream discipline, no plugin
+construction):**
+
+1. `download_bounds_are_the_reviewed_a1_constants` — pins 10 min / 512
+   MiB so drift is a deliberate re-review.
+2. `chunk_ingress_throttles_progress_and_signals_the_breach_once` —
+   percent-boundary throttle (silent chunk), one boundary report at
+   exactly-at-cap, breach signalled exactly once, no progress past the
+   cap.
+3. `a1_byte_cap_aborts_the_stream_and_no_install_is_attempted` —
+   injected 12 × 64 MiB chunk stream aborts AT the breaching 9th chunk
+   (576 MiB — the last three chunks never arrive); exact cap line;
+   `InstallBegin` ignored; next `CheckStarted` still moves to Checking.
+4. `a1_wall_clock_timeout_aborts_a_slow_stream_and_no_install_is_attempted`
+   — injected drip-then-silent stream (8 MiB then nothing, under the cap)
+   times out under a 50 ms injected bound; exact timeout line; same
+   no-install / next-cycle pins.
+5. `a_download_within_both_bounds_completes_untouched_and_reaches_ready`
+   — exactly-at-cap (8 × 64 MiB = 512 MiB) passes through untouched and
+   is the only road to `Ready`.
+
+**Gates (re-run for the closure):** `cargo fmt --check` clean;
+`cargo clippy --workspace -- -D warnings` clean;
+`TAURI_CONFIG='{"bundle":{"resources":[]}}' cargo clippy -p
+modelswarm-desktop --features tauri-shell --all-targets -- -D warnings`
+clean; `cargo test --workspace` **495 / 0 / 6** (baseline exact);
+tauri-shell desktop suite **45 / 0 / 0** (was 40; +5), plus 20/20 re-runs
+of the cap test against the select-order race and 5 consecutive clean
+full-suite runs.
+
+Residual (unchanged from the review): a breach aborts only after the
+crossing chunk has been observed, so a bounded sliver past the cap
+(chunk-granularity) can be buffered before the drop — the process-wide
+OOM vector is closed, the sliver is not zero. A-2 (redirect scheme), A-3
+(exit-hook replacement), A-4 (post-hook `ShellExecuteW` failure), A-5
+(unsigned installers) remain as recorded in the review.

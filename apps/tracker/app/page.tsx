@@ -167,25 +167,29 @@ export default function Home() {
         <section aria-labelledby="get-heading">
           <h2 id="get-heading">Desktop app</h2>
           <div className="rule">
-            <b>v0.2.21</b> — test builds, unsigned. Same-model cooperation
-            (faster or verified-accurate answers, never worse than the
+            <b>v0.2.22</b> — test builds, unsigned. This build keeps
+            itself current: it checks for updates on start and every six
+            hours, verifies each update against a key built into the
+            app, and restarts to install — this is the last manual
+            download. Same-model cooperation (faster or
+            verified-accurate answers, never worse than the
             fastest single host) works between two peers on a direct or LAN
             network; the app reports honest status for anything not engaged.
             <ul style={{ margin: "0.8rem 0 0", padding: "0 0 0 1.1rem" }}>
               <li>
-                <a href="/api/download/ModelSwarm-Setup-0.2.21-windows-x64.exe">
+                <a href="/api/download/ModelSwarm-Setup-0.2.22-windows-x64.exe">
                   Windows installer (.exe)
                 </a>
               </li>
               <li>
-                <a href="/api/download/ModelSwarm-0.2.21-linux-amd64.deb">Linux (.deb)</a>
+                <a href="/api/download/ModelSwarm-0.2.22-linux-amd64.deb">Linux (.deb)</a>
                 {" · "}
-                <a href="/api/download/ModelSwarm-0.2.21-linux-amd64.AppImage">
-                  AppImage
+                <a href="/api/download/ModelSwarm-0.2.22-linux-amd64.AppImage">
+                  AppImage (self-updating)
                 </a>
               </li>
               <li>
-                <a href="/api/download/ModelSwarm-0.2.21-macos-arm64.dmg">
+                <a href="/api/download/ModelSwarm-0.2.22-macos-arm64.dmg">
                   macOS (Apple Silicon, .dmg)
                 </a>
               </li>

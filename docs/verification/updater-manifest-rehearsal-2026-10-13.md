@@ -1,0 +1,165 @@
+# Updater manifest rehearsal — v0.2.22 staged signing (2026-10-13)
+
+Required by `docs/reviews/review-updater-security-2026-10-13.md`
+(§10 assumption 2: "T&R's staged-manifest rehearsal is the remaining
+proof and should run before the 0.2.22 artifacts go public") and the
+RC-1 standing obligation (§6: sign with `--app-version`, key stays
+owner-local, rotation = manual client ship). Executed by the Test and
+Release Engineer at owner-local staging on 2026-10-13 (local 01:15–01:40
++0800 / 2026-10-12 17:15–17:40 UTC). The private key
+`C:\Users\igorc\ModelSwarm-updater.key` never entered the repo, CI, or
+any log; only its PATH appears in command lines below. `.sig` files and
+the manifest signature fields are public by design (signatures).
+
+## Artifacts and provenance
+
+Desktop-installer run **38283004626** (workflow_dispatch on the bump
+commit `aa90731`, matrix green: windows nsis / ubuntu deb+appimage /
+macos arm64 dmg; engine `b11407` hash-verified per job and verified
+INSIDE each artifact by the workflow's unpack checks). Hash chain
+verified THREE ways before staging — CI job-log `sha256sum` output ==
+per-job artifact `SHA256SUMS.txt` == local `gh run download` files ==
+staged copies (`sha256sum -c` all OK):
+
+| canonical staged name | sha256 | bytes |
+|---|---|---|
+| `ModelSwarm-Setup-0.2.22-windows-x64.exe` | `b38dd07de95adbc65d2958951bafe07cd11ee4fb24776d51120d4563a68ebc89` | 21,249,083 |
+| `ModelSwarm-0.2.22-linux-amd64.deb` | `2848ede9822cd96aea4fd0866f8a41eebe5846b4e1911b61d884b95f5e2736ac` | 39,069,126 |
+| `ModelSwarm-0.2.22-linux-amd64.AppImage` | `74a89987086504b65d05a257a57e537d1f18033730144e2304e4169d152c5c02` | 105,425,400 |
+| `ModelSwarm-0.2.22-macos-arm64.dmg` | `012f0046c60f164135312b78e48e944e169b8f07e676321c4ebee6768e6646d0` | 37,163,558 |
+
+Tauri's underscored outputs were renamed to the canonical dashed
+filenames the `/api/download` surface and the guards expect (same
+rename discipline as the 0.2.21 train). 0.2.21 binaries removed from
+the (gitignored) staging dir per the all-OS-together rule.
+
+## Signing (owner-local, at staging)
+
+For EACH installer, in `apps/tracker/public/downloads/`:
+
+```text
+npx -y @tauri-apps/cli@2 signer sign -f "C:\Users\igorc\ModelSwarm-updater.key" --app-version 0.2.22 <file>
+```
+
+All four produced `<file>.sig` (non-interactive; the key carries no
+password — a password-protected key would have failed closed here
+rather than prompt). Decoding each `.sig` (public material) shows the
+trusted comment the client's `requireSignedVersion` checks, e.g.:
+
+```text
+trusted comment: timestamp:1791826357	file:ModelSwarm-Setup-0.2.22-windows-x64.exe	version:0.2.22
+```
+
+All four carry `version:0.2.22` and the canonical filename. Note:
+this CLI writes `.sig` as the single-line base64 of the whole classic
+minisign signature text — i.e. exactly the string the plugin's
+`base64_to_string` + `Signature::decode` chain expects — so the
+manifest `signature` field is the `.sig` file's content verbatim.
+
+Key identity (public material only): `C:\Users\igorc\
+ModelSwarm-updater.key.pub` decodes to `untrusted comment: minisign
+public key: 38FC98CB4B064F37` + key `RWQ3TwZLy5j8OCiXv6/
+e7C5T1YnLt2Fq+veByS9favUE2Obnuy4o7PNa`, byte-identical to the key
+embedded at build time in `crates/modelswarm-desktop/tauri.conf.json`
+(`plugins.updater.pubkey`). Verification below therefore holds against
+both spellings of the same key.
+
+## (a) latest.json serves correctly from the staging dir
+
+`apps/tracker/public/downloads/latest.json` (2,557 bytes):
+`version "0.2.22"`, one honest notes paragraph (650 chars), RFC 3339
+UTC `pub_date`, platforms `windows-x86_64` / `linux-x86_64` /
+`darwin-aarch64`, each `{signature, url}` with `url` =
+`https://modelswarm.deepflux.space/api/download/<file>` (exe, the
+AppImage — the self-replacing rider; the deb stays site-only for
+humans — and the dmg). Served over plain HTTP from the staging tree
+with the plugin's full URL shape including query parameters:
+
+```text
+$ python -m http.server 8124 --directory apps/tracker/public
+$ curl -o latest-fetched.json -w "%{http_code} %{size_download}\n" \
+    "http://127.0.0.1:8124/downloads/latest.json?target=windows-x86_64&arch=x86_64&current_version=0.2.21"
+HTTP 200 2557 bytes
+fetched == staged manifest: True   (json.load equality, all fields)
+$ curl -r 0-1023 .../downloads/ModelSwarm-Setup-0.2.22-windows-x64.exe   -> 200
+```
+
+Static serving ignores `target/arch/current_version` (they ride as
+query parameters by design, ready for a dynamic server without a
+client change — updater handoff §1).
+
+## (b) every manifest signature verifies against the public key over the staged bytes
+
+Tool: `tests/updater-manifest-verify` (new, T/R-owned, workspace-
+excluded; pinned to `minisign-verify =0.3.0`, the exact locked version
+`tauri-plugin-updater 2.13.3` verifies with). It replays the plugin
+chain verbatim: embedded pubkey → `PublicKey::decode`; manifest
+`signature` → `base64::STANDARD` decode → `Signature::decode`;
+`public_key.verify(bytes, &signature, /* allow_legacy */ true)` over
+the STAGED artifact bytes; then the `requireSignedVersion` check
+(`version:` field of the signature-covered trusted comment must equal
+the manifest version).
+
+```text
+$ cargo run --manifest-path tests/updater-manifest-verify/Cargo.toml
+PASS [manifest] latest.json parses as JSON (...\apps\tracker\public\downloads\latest.json)
+PASS [manifest] version=0.2.22 pub_date=2026-10-12T17:33:14Z notes=650 chars
+PASS [pubkey] embedded tauri.conf.json pubkey decodes (minisign)
+PASS [platform darwin-aarch64]  minisign verify OK over ModelSwarm-0.2.22-macos-arm64.dmg   (37163558 bytes); signed version == 0.2.22
+PASS [platform linux-x86_64]    minisign verify OK over ModelSwarm-0.2.22-linux-amd64.AppImage (105425400 bytes); signed version == 0.2.22
+PASS [platform windows-x86_64]  minisign verify OK over ModelSwarm-Setup-0.2.22-windows-x64.exe (21249083 bytes); signed version == 0.2.22
+PASS [...] sha256 per artifact (matches SHA256SUMS.txt — independent third hash implementation)
+ALL MANIFEST SIGNATURES VERIFY against the embedded public key over the staged artifact bytes.   (exit 0)
+```
+
+Negative controls (the verification bites; staging restored and
+re-verified by `sha256sum -c` + a final PASS run afterwards):
+
+```text
+control 1 — one byte appended to the staged exe:
+FAIL [platform windows-x86_64] MINISIGN VERIFY FAILED ... InvalidSignature
+MANIFEST VERIFICATION FAILED — do not deploy this staging.
+
+control 2 — manifest version field changed to 0.2.23:
+FAIL [platform darwin-aarch64] signed version "0.2.22" != manifest version "0.2.23"
+FAIL [platform linux-x86_64]   signed version "0.2.22" != manifest version "0.2.23"
+FAIL [platform windows-x86_64] signed version "0.2.22" != manifest version "0.2.23"
+```
+
+## (c) the /api/download/<file> targets resolve
+
+Real route, real staged bytes (Next dev server on the tracker,
+MemoryStore, `apps/tracker` — the same route.ts that deploys):
+
+```text
+$ curl -I -L http://127.0.0.1:8125/api/download/<file>
+exe       302 -> /downloads/<file> -> 200 Content-Length: 21249083
+AppImage  302 -> /downloads/<file> -> 200 Content-Length: 105425400
+dmg       302 -> /downloads/<file> -> 200 Content-Length: 37163558
+$ curl -L -r 0-4095 .../api/download/ModelSwarm-Setup-0.2.22-windows-x64.exe
+HTTP 206, 4096 bytes, final URL /downloads/<file>
+```
+
+Content-lengths equal the staged file sizes exactly; the 302→206
+ranged behavior matches the live production probe recorded for 0.2.21
+(updater handoff §2). The deb (site-only) resolves through the same
+route. Live production resolution for 0.2.22 happens at the Integrator's
+Vercel deploy — post-deploy check: `curl -sI
+https://modelswarm.deepflux.space/api/download/ModelSwarm-Setup-0.2.22-windows-x64.exe`
+must answer 302 with the `/downloads/` location.
+
+## Standing obligations recorded (RC-1, every future train)
+
+1. Sign every installer at owner staging with `--app-version <VERSION>`
+   — mandatory; without it every client rejects the update
+   (`MissingSignedVersion`).
+2. The private key never enters the repo, CI, or logs (no
+   `TAURI_SIGNING_PRIVATE_KEY` anywhere in `.github/`; not set in this
+   train — signing happened locally against the key file path only).
+3. Key rotation = a manual client ship with a new embedded pubkey;
+   until adoption completes, the OLD public key stays valid on
+   deployed clients — treat the old private key as
+   compromised-and-live for one full adoption cycle.
+4. Re-run this rehearsal (the tool is committed at
+   `tests/updater-manifest-verify`) at every release staging before
+   the manifest goes public.

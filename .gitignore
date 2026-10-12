@@ -40,10 +40,15 @@ Thumbs.db
 # Installers are deploy-time artifacts only (published to
 # modelswarm.deepflux.space via Vercel), never tracked in git — the repo
 # ships raw code only (owner directive 2026-10-05). Checksums stay tracked.
+# The updater's .sig files and latest.json manifest are likewise
+# owner-local staging (signatures ride inside the manifest; the
+# rehearsal record in docs/verification/ is the in-git evidence).
 apps/tracker/public/downloads/*.exe
 apps/tracker/public/downloads/*.deb
 apps/tracker/public/downloads/*.AppImage
 apps/tracker/public/downloads/*.dmg
+apps/tracker/public/downloads/*.sig
+apps/tracker/public/downloads/latest.json
 
 # Staged pinned engine (installer/stage-engine-windows.mjs or CI); never committed
 crates/modelswarm-desktop/engine/

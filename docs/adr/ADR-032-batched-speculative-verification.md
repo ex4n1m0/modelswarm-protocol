@@ -884,6 +884,30 @@ arm, the §8 RC-5(b) stale-commit reclassification with its amended pins,
 the §2 carrier `sender` check, and the §2 vocabulary-disjointness
 assertion.
 
+**Pre-light-up disposition (2026-10-12, both seats).** The revision-4
+migrations (`4b35d81`) and the light-up surfaces were disposition-reviewed.
+Test and Release (`docs/reviews/review-lightup-disposition-testrelease-2026-10-12.md`,
+`e4eb851`/`0bda25a`): rev-4 disposition APPROVE (all five items faithful +
+fixtures), CI steps APPROVE WITH CHANGES APPLIED (the composed-daemon
+coverage gap — implicit cargo feature stacking ran 0 of its tests under
+`-p`; both feature steps now pass `modelswarm-node/libp2p-backend`
+explicitly, coverage-equivalent), sim
+edits APPROVE; **overall: nothing blocks the owner flag-flip package**;
+one dissent-on-reachability routed to the architect (RC-5(b) corner
+wording, fails closed either way). Security
+(`docs/reviews/review-lightup-disposition-security-2026-10-12.md`,
+`c1fb927`): APPROVE WITH REQUIRED CHANGES — 0 blockers; all five rev-4
+rulings verified faithful; **RC-L1 (required, a condition on the light-up
+event, not a landed defect): the production `FamilyLeaseSource` must be
+profile/consume/slots-bound before the family carries traffic** (the
+landed seam is peer+expiry only, fail-closed); 4 advisories routed
+(Network cross-vocabulary stash bound; Windows Product + Protocol
+dribble-residence; freeze-ADR vocabulary record; the A-1
+condition-vs-letter ruling). The flag-flip package items therefore are:
+(i) RC-L1 profile-bound lease source; (ii) the desktop composed-daemon
+swap + feature enable; (iii) the item-2 exactness reruns on the
+production build; (iv) the release approval itself (owner).
+
 ### 8. Verifier round state machine (per session; reviewer-facing)
 
 ```text

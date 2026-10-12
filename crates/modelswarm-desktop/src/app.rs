@@ -11,6 +11,7 @@
 //! | `accept_privacy` | records the first-run license acceptance |
 //! | `list_models` | verified-catalog active profiles |
 //! | `census` | live per-profile peer counts (public `/api/v1/stats`) for the picker chips |
+//! | `resource_sample` | one CPU/RAM/working-set/GPU/VRAM reading for the monitor panel (null per field = "n/a") |
 //! | `download_model` | streams `download` events, returns artifact state |
 //! | `set_hosting` | starts/stops the in-process node (+ roster heartbeat) |
 //! | `family_probe` | opens one real family session on an eligible peer, PRESENTING this installation's earned lease (ADR-032 §2); returns the honest outcome, never the lease itself |
@@ -32,6 +33,7 @@ use modelswarm_node::artifact::{ArtifactManager, EnsuredArtifact};
 #[cfg(feature = "verifydrafts")]
 use modelswarm_node::verifydrafts::{FamilyServing, RosterFamilyLeases, VerifyDraftsServeConfig};
 use modelswarm_node::{catalog, load_or_create_identity, Node, NodeConfig, NodeHandle};
+use modelswarm_resource::SampleSource;
 use modelswarm_telemetry::Telemetry;
 use modelswarm_tracker_api::TrackerClient;
 use serde::{Deserialize, Serialize};
@@ -61,6 +63,11 @@ pub struct DesktopState {
     /// not open FileSinks per call: redaction rules apply at this boundary
     /// and multiple writers on one file are exactly what it prevents.
     telemetry: std::sync::Arc<Telemetry>,
+    /// The task-manager-style resource monitor (owner request 2026-10-12):
+    /// ONE lazily-created sampler behind a sync mutex (PDH handles are not
+    /// documented thread-safe; `sample()` takes `&mut self`), polled at
+    /// 1 Hz by the UI timer through `resource_sample`. Read-only/advisory.
+    monitor: Arc<std::sync::Mutex<Option<PanelMonitor>>>,
 }
 
 struct Inner {
@@ -174,6 +181,7 @@ impl DesktopState {
         Self {
             hardware: tokio::sync::OnceCell::new(),
             telemetry,
+            monitor: Arc::new(std::sync::Mutex::new(None)),
             inner: Mutex::new(Inner {
                 data_dir,
                 tracker_url: config.tracker,
@@ -1290,6 +1298,103 @@ async fn census(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Val
             Err(e)
         }
     }
+}
+
+// ---- Resource monitor panel (owner request 2026-10-12) --------------------
+//
+// A task-manager-style CPU/GPU/RAM panel in the right column. The sampling
+// layer is the resource crate's `ResourceSampler` (advisory/read-only —
+// NEVER an enforcement mechanism; the M2 governor is separate); this
+// section owns scoping + the one IPC poll.
+//
+// Scoping: the process tree equals the SUPERVISED set — the winjob
+// kill-on-close job-object membership (sampler handoff §4, preferred
+// option (a)) plus the desktop's own process, so CPU%/working-set cover
+// this app and every supervised engine child exactly, immune to PID-reuse
+// orphans. The sampler is rebuilt when the root set changes (hosting
+// start/stop): one tick of honest CPU "n/a" while the fresh baseline
+// establishes, never a fabricated number.
+//
+// Cadence: the UI polls `resource_sample` at 1 Hz from ONE timer; the
+// platform sample runs on the blocking pool (sync Toolhelp/PDH FFI) and
+// the sync mutex serializes any overlap. Every unavailable field crosses
+// as null and renders "n/a" (the degraded-chips pattern).
+
+/// The panel's process-tree scope roots: this process plus the winjob
+/// job-object membership (the supervised engine set). Sorted + deduped so
+/// equality comparison against the sampler's current roots is stable.
+fn monitor_roots() -> Vec<u32> {
+    let mut roots = vec![std::process::id()];
+    // Windows only: job membership is the supervised set. Elsewhere the
+    // desktop's own tree (this process + descendants) is the honest scope.
+    #[cfg(windows)]
+    roots.extend(modelswarm_winjob::supervised_process_ids());
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+}
+
+/// One panel sampler bound to the root set it was built for.
+struct PanelMonitor {
+    roots: Vec<u32>,
+    sampler: modelswarm_resource::ResourceSampler<Box<dyn SampleSource>>,
+}
+
+impl PanelMonitor {
+    fn new(roots: Vec<u32>) -> Self {
+        let scope = modelswarm_resource::ProcessScope::Roots(roots.clone());
+        Self {
+            roots,
+            sampler: modelswarm_resource::ResourceSampler::platform(scope),
+        }
+    }
+}
+
+/// Keeps the panel sampler bound to the CURRENT root set: creates it on
+/// the first poll and rebuilds it whenever the supervised set changed
+/// (hosting start/stop). Returns whether the sampler was rebuilt this
+/// call (a rebuild costs one tick of CPU "n/a" — the fresh baseline).
+fn ensure_panel_monitor(panel: &mut Option<PanelMonitor>, roots: Vec<u32>) -> bool {
+    match panel {
+        Some(existing) if existing.roots == roots => false,
+        Some(_) | None => {
+            *panel = Some(PanelMonitor::new(roots));
+            true
+        }
+    }
+}
+
+/// The IPC shape of one sample: the `ResourceSample` field names verbatim
+/// (one source of truth), `null` per field when the sampler could not read
+/// it this tick (the UI renders "n/a", never a guess).
+fn resource_sample_json(sample: &modelswarm_resource::ResourceSample) -> serde_json::Value {
+    serde_json::json!({
+        "process_tree_cpu_percent": sample.process_tree_cpu_percent,
+        "system_ram_used_percent": sample.system_ram_used_percent,
+        "system_ram_used_bytes": sample.system_ram_used_bytes,
+        "system_ram_total_bytes": sample.system_ram_total_bytes,
+        "process_tree_working_set_bytes": sample.process_tree_working_set_bytes,
+        "gpu_utilization_percent": sample.gpu_utilization_percent,
+        "gpu_vram_used_bytes": sample.gpu_vram_used_bytes,
+    })
+}
+
+#[tauri::command]
+async fn resource_sample(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<serde_json::Value, String> {
+    let monitor = Arc::clone(&state.monitor);
+    let sample = tokio::task::spawn_blocking(move || {
+        let mut guard = monitor.lock().map_err(|e| e.to_string())?;
+        ensure_panel_monitor(&mut guard, monitor_roots());
+        let panel = guard
+            .as_mut()
+            .expect("ensure_panel_monitor always leaves a sampler");
+        Ok::<_, String>(panel.sampler.sample())
+    })
+    .await
+    .map_err(|e| format!("monitor task failed: {e}"))??;
+    Ok(resource_sample_json(&sample))
 }
 
 #[tauri::command]
@@ -3423,6 +3528,7 @@ pub fn run() {
             accept_privacy,
             list_models,
             census,
+            resource_sample,
             download_model,
             set_hosting,
             select_model,
@@ -3927,5 +4033,90 @@ mod tests {
         // The detail string is the error's own Display — never a token.
         let detail = ClientOpenError::Io("recv accept").to_string();
         assert!(!detail.contains("lease"));
+    }
+
+    // ---- Resource monitor panel (owner request 2026-10-12) ---------------
+
+    /// The panel's scope always includes this process (the panel is about
+    /// OUR footprint), is sorted + deduped (stable equality for the
+    /// rebuild decision), and is stable across calls while nothing changes.
+    #[test]
+    fn monitor_roots_cover_self_and_are_stable() {
+        let roots = monitor_roots();
+        assert!(
+            roots.contains(&std::process::id()),
+            "own pid must be a root: {roots:?}"
+        );
+        let mut sorted = roots.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(roots, sorted, "roots are sorted + deduped");
+        assert_eq!(monitor_roots(), roots, "stable while the set is unchanged");
+    }
+
+    /// The sampler is created on the first poll and rebuilt EXACTLY when
+    /// the supervised root set changes (hosting start/stop): same roots =
+    /// keep the sampler (baseline preserved), changed roots = rebuild.
+    #[test]
+    fn panel_monitor_rebuilds_only_on_scope_change() {
+        let mut panel: Option<PanelMonitor> = None;
+        assert!(ensure_panel_monitor(&mut panel, vec![7, 9]));
+        assert_eq!(panel.as_ref().unwrap().roots, vec![7, 9]);
+        // Same roots: no rebuild (the delta baseline survives).
+        assert!(!ensure_panel_monitor(&mut panel, vec![7, 9]));
+        // Hosting started: the supervised set grew -> rebuild.
+        assert!(ensure_panel_monitor(&mut panel, vec![7, 9, 31]));
+        assert_eq!(panel.as_ref().unwrap().roots, vec![7, 9, 31]);
+        assert!(!ensure_panel_monitor(&mut panel, vec![7, 9, 31]));
+        // Hosting stopped: the engine left the set -> rebuild.
+        assert!(ensure_panel_monitor(&mut panel, vec![7]));
+    }
+
+    /// The IPC shape maps every `ResourceSample` field verbatim and keeps
+    /// per-field honesty: an unreadable field crosses as null (the UI's
+    /// "n/a"), never a guessed number.
+    #[test]
+    fn resource_sample_json_maps_every_field_and_nulls_honestly() {
+        let full = modelswarm_resource::ResourceSample {
+            process_tree_cpu_percent: Some(12.5),
+            system_ram_used_percent: Some(51.0),
+            system_ram_used_bytes: Some(16_000_000_000),
+            system_ram_total_bytes: Some(32_000_000_000),
+            process_tree_working_set_bytes: Some(9_500_000),
+            gpu_utilization_percent: Some(3.25),
+            gpu_vram_used_bytes: Some(6_600_000_000),
+        };
+        let json = resource_sample_json(&full);
+        for key in [
+            "process_tree_cpu_percent",
+            "system_ram_used_percent",
+            "system_ram_used_bytes",
+            "system_ram_total_bytes",
+            "process_tree_working_set_bytes",
+            "gpu_utilization_percent",
+            "gpu_vram_used_bytes",
+        ] {
+            assert!(
+                json[key] != serde_json::Value::Null,
+                "{key} must carry the value"
+            );
+        }
+        assert_eq!(json["process_tree_cpu_percent"], 12.5);
+        assert_eq!(json["gpu_vram_used_bytes"], 6_600_000_000u64);
+        // Every field unreadable (e.g. the macOS fallback source): all
+        // null — seven honest n/a's, no zeros, no errors.
+        let empty = resource_sample_json(&modelswarm_resource::ResourceSample::default());
+        assert_eq!(
+            empty,
+            serde_json::json!({
+                "process_tree_cpu_percent": null,
+                "system_ram_used_percent": null,
+                "system_ram_used_bytes": null,
+                "system_ram_total_bytes": null,
+                "process_tree_working_set_bytes": null,
+                "gpu_utilization_percent": null,
+                "gpu_vram_used_bytes": null,
+            })
+        );
     }
 }

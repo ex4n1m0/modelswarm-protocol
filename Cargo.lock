@@ -3430,6 +3430,7 @@ dependencies = [
  "modelswarm-gateway",
  "modelswarm-identity",
  "modelswarm-node",
+ "modelswarm-resource",
  "modelswarm-scheduler",
  "modelswarm-store",
  "modelswarm-telemetry",

@@ -51,6 +51,13 @@
     .chips { display: flex; flex-wrap: wrap; gap: 6px; }
     .chip { font-size: 11.5px; font-family: var(--mono); padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
     .chip[data-state="active"] { color: var(--warn); border-color: var(--warn); background: rgba(224,169,62,.12); }
+    /* Resource monitor (owner request 2026-10-12): three labeled meters in
+       the right column. Collapsed by default (one summary line) so the
+       panel never forces the 648px window into overflow; "details" expands
+       the meters. Every unmeasurable field renders n/a, never a guess. */
+    .meter { display: grid; grid-template-columns: 30px 1fr max-content; gap: 8px; align-items: center; margin-top: 6px; }
+    .meter .mlabel { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+    .meter .mval { font-family: var(--mono); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
     #chat { display: flex; flex-direction: column; gap: 6px; flex: 1; min-height: 0; }
     #transcript { flex: 1 1 auto; min-height: 80px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
     .msg { border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; white-space: pre-wrap; }
@@ -202,6 +209,20 @@
           <li>The tracker is content-blind: it never sees prompts or completions.</li>
           <li>Secrets (identity seed, engine key, lease tokens) stay in the node process — never in this UI.</li>
         </ul>
+      </section>
+
+      <section aria-labelledby="res-h">
+        <h2 id="res-h">Resources</h2>
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <span class="note" id="res-summary" style="margin:0">sampling…</span>
+          <button type="button" class="ghost" id="res-toggle" aria-expanded="false" aria-controls="res-details">details</button>
+        </div>
+        <div id="res-details" hidden>
+          <div class="meter"><span class="mlabel">CPU</span><div class="bar" aria-hidden="true"><div id="bar-cpu"></div></div><span class="mval" id="val-cpu">n/a</span></div>
+          <div class="meter"><span class="mlabel">RAM</span><div class="bar" aria-hidden="true"><div id="bar-ram"></div></div><span class="mval" id="val-ram">n/a</span></div>
+          <div class="meter"><span class="mlabel">GPU</span><div class="bar" aria-hidden="true"><div id="bar-gpu"></div></div><span class="mval" id="val-gpu">n/a</span></div>
+          <p class="note" style="margin:6px 0 0">CPU + working set: this app + supervised engines · RAM %: whole system · GPU: busiest adapter. n/a = not measurable this tick.</p>
+        </div>
       </section>
     </div>
   </main>
@@ -527,6 +548,42 @@
       busy = false; refresh();
     };
 
+    // ---- Resource monitor panel (owner request 2026-10-12): a
+    // task-manager-style CPU/GPU/RAM readout. The daemon owns the sampling
+    // (one `resource_sample` poll, 1 Hz, one timer — never per frame);
+    // this file renders the returned fields verbatim with per-field
+    // honesty: null = "n/a", never a guessed number (the degraded-chips
+    // pattern). Collapsed by default so the right column keeps fitting
+    // the 1152×648 window; "details" expands the three meters.
+    const fmtBytes = (b) => b == null ? null : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(0) + " MB" : Math.round(b) + " B";
+    const pctText = (v) => v == null ? null : v.toFixed(v < 10 ? 1 : 0) + "%";
+    function setMeter(barId, valId, pct, text) {
+      $(barId).style.width = (pct == null ? 0 : Math.min(100, Math.max(0, pct))) + "%";
+      $(valId).textContent = text;
+    }
+    async function refreshResources() {
+      let s;
+      try { s = await invoke("resource_sample"); }
+      catch { return; /* keep the last render; the next tick retries */ }
+      const cpu = pctText(s.process_tree_cpu_percent);
+      const ram = pctText(s.system_ram_used_percent);
+      const ws = fmtBytes(s.process_tree_working_set_bytes);
+      const gpu = pctText(s.gpu_utilization_percent);
+      const vram = fmtBytes(s.gpu_vram_used_bytes);
+      setMeter("bar-cpu", "val-cpu", s.process_tree_cpu_percent, cpu ?? "n/a");
+      setMeter("bar-ram", "val-ram", s.system_ram_used_percent,
+        [ram, ws != null ? "ours " + ws : null].filter(Boolean).join(" · ") || "n/a");
+      setMeter("bar-gpu", "val-gpu", s.gpu_utilization_percent,
+        [gpu, vram != null ? vram + " VRAM" : null].filter(Boolean).join(" · ") || "n/a");
+      $("res-summary").textContent = "CPU " + (cpu ?? "n/a") + " · RAM " + (ram ?? "n/a") + " · GPU " + (gpu ?? "n/a");
+    }
+    $("res-toggle").onclick = () => {
+      const details = $("res-details");
+      details.hidden = !details.hidden;
+      $("res-toggle").setAttribute("aria-expanded", String(!details.hidden));
+      $("res-toggle").textContent = details.hidden ? "details" : "hide";
+    };
+
     function addMsg(role, content, meta) {
       const div = document.createElement("div");
       div.className = "msg " + role;
@@ -576,8 +633,8 @@
       $("send-btn").disabled = false; busy = false; $("chat-input").focus();
     };
 
-    refresh(); refreshModels(); refreshCensus();
-    setInterval(refresh, 2000); setInterval(refreshModels, 15000); setInterval(refreshCensus, 30000);
+    refresh(); refreshModels(); refreshCensus(); refreshResources();
+    setInterval(refresh, 2000); setInterval(refreshModels, 15000); setInterval(refreshCensus, 30000); setInterval(refreshResources, 1000);
   </script>
 </body>
 </html>

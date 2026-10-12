@@ -30,6 +30,7 @@ tauri-shell = [
     "dep:modelswarm-identity",
     "dep:modelswarm-telemetry",
     "dep:modelswarm-scheduler",
+    "dep:modelswarm-resource",
     "dep:futures-util",
     "dep:tokio",
     "dep:reqwest",
@@ -68,6 +69,10 @@ modelswarm-telemetry = { path = "../modelswarm-telemetry", optional = true }
 # roster with the frozen cost model over F15 measurements and logs the
 # decision; never acts on it.
 modelswarm-scheduler = { path = "../modelswarm-scheduler", optional = true }
+# The task-manager-style resource monitor panel (owner request
+# 2026-10-12): live CPU/RAM/working-set/GPU/VRAM sampling, read-only and
+# advisory — never an enforcement mechanism (the M2 governor is separate).
+modelswarm-resource = { path = "../modelswarm-resource", optional = true }
 tokio = { version = "1", optional = true, features = ["macros", "rt", "sync", "time"] }
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }

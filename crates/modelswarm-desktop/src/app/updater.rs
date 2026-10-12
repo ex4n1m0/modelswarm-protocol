@@ -827,5 +827,53 @@ mod tests {
             updater["windows"]["installMode"].as_str().unwrap(),
             "passive"
         );
+        // Security review 2026-10-13: NOTHING in the config may weaken the
+        // chain. A config regression that re-enables downgrade installs,
+        // relaxes TLS, or allows non-https endpoints must fail HERE, in
+        // this suite, not in the field. `allowDowngrades` must be absent
+        // or false (absent -> the plugin's strict "strictly newer"
+        // comparison applies), and the dangerous* flags must not exist at
+        // all (they all default to false only when unset).
+        assert!(
+            !updater
+                .get("allowDowngrades")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "allowDowngrades must never be enabled (anti-downgrade)"
+        );
+        for flag in [
+            "dangerousAcceptInvalidCerts",
+            "dangerousAcceptInvalidHostnames",
+            "dangerousInsecureTransportProtocol",
+        ] {
+            assert!(
+                updater.get(flag).is_none(),
+                "{flag} must not appear in the updater config"
+            );
+        }
+        assert!(
+            endpoints
+                .iter()
+                .all(|e| e.as_str().unwrap().starts_with("https://")),
+            "every update endpoint must be https"
+        );
+        // No webview capability may grant the updater's invoke commands
+        // (check/download/install/download_and_install): the supervisor
+        // drives updates from Rust and only status LINES cross into the
+        // UI. Pins the ACL against a future capability grant — in EVERY
+        // capability file, not just the default one.
+        let caps_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
+        let files = std::fs::read_dir(&caps_dir)
+            .expect("capabilities/ directory readable")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"));
+        for file in files {
+            let text = std::fs::read_to_string(file.path()).expect("capability file readable");
+            assert!(
+                !text.contains("updater:"),
+                "the webview must hold no updater permission (found one in {})",
+                file.path().display()
+            );
+        }
     }
 }

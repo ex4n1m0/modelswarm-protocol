@@ -94,6 +94,48 @@ that was not resolved to a full commit hash + digest by an admin and validated
 by test nodes. Dependency audits (cargo audit / npm audit) run in CI from
 Phase 1 onward.
 
+### 4.5 Desktop auto-update chain (added 2026-10-13; review:
+`docs/reviews/review-updater-security-2026-10-13.md`)
+
+Surface: Tauri 2 updater plugin (`tauri-plugin-updater` 2.13.3, locked) driven
+from Rust in the desktop shell. Manifest endpoint is the tracker site's static
+`https://modelswarm.deepflux.space/downloads/latest.json` (TLS-only,
+build-embedded); the minisign public key is embedded in `tauri.conf.json` at
+build time. The manifest itself is NOT signed — only the update package is.
+
+| Attack | Mitigation |
+|---|---|
+| Compromised site serves a crafted manifest AND a malicious package | The package signature is verified over the DOWNLOADED BYTES against the build-time-embedded public key before anything installs (`verify_signature` → `PublicKey::verify`, plugin `updater.rs`). The `.sig` travels in the site-controlled manifest, but its validity is anchored client-side: a package we never signed can never install. A missing/empty signature fails manifest parse or decode |
+| Version confusion (inflated manifest `version` + older genuine artifact) | `requireSignedVersion: true`: the minisign trusted comment — covered by the signature's global signature — must name the announced version (`SignedVersionMismatch` otherwise; no version in the comment → `MissingSignedVersion`) |
+| Downgrade to an old signed release | No custom comparator and `allowDowngrades` unset → the plugin's default rule applies: `release.version` must be strictly greater than the running version. A client at version N can never be moved to any version ≤ N |
+| Endpoint/TLS downgrade of the check | Endpoints validated https-only in release builds; `dangerous*` flags set nowhere; pubkey and endpoints come from build-embedded config only — no runtime override, no env override, and no webview capability grants the plugin's invoke commands (only status lines cross into the UI) |
+| Dev opt-out abuse | Only the exact env value `MSP_NO_AUTOUPDATE=1` skips checks; it disables checking, never verification |
+| Installer races a live engine binary | `on_before_exit` closes every retained kill-on-close winjob handle (all supervised engine children die) after signature verification and before the NSIS installer spawns |
+
+Residual risks, accepted for v0.2.x (invite-only tester population):
+
+1. **Update withholding.** A compromised origin (Vercel account/DNS+TLS) can
+   serve a stale manifest indefinitely, pinning clients at their current
+   version. Inherent to an unsigned (TLS-only) manifest.
+2. **Re-serving a yanked/future genuine release.** The origin can re-serve any
+   version we genuinely signed that is NEWER than the client's current one
+   (e.g. a pulled 0.2.24 to a client on 0.2.23). No minimum-version/rollback
+   fence exists; one (signed manifests or a baked-in version floor) is
+   REQUIRED before wider distribution (v1).
+3. **Download-side memory DoS.** The plugin buffers the package in memory
+   before verification with no size cap or timeout; a compromised origin can
+   OOM-crash the desktop app (local DoS only — no code execution; the
+   signature gate is unaffected). A wall-clock timeout and byte cap on the
+   download phase are advised.
+4. **Key lifecycle.** Rotation requires shipping a client with a new embedded
+   pubkey (manual install); until every deployed client has updated past the
+   rotation release, the old public key must be treated as still-valid —
+   rotation lead time is one full adoption cycle. Release-train obligations
+   (standing): sign every installer at owner staging with
+   `--app-version <VERSION>` (mandatory under `requireSignedVersion`); the
+   private key never enters the repo, CI, or logs; rotation is a manual client
+   ship recorded in the release checklist.
+
 ## 5. Explicit non-guarantees (v0.1)
 
 1. **No remote attestation.** A patched binary can claim to host while not
@@ -107,6 +149,9 @@ Phase 1 onward.
    reported honestly; relay/DCUtR is a later milestone.
 5. **No protection of the local machine from its own user** — a user who
    controls the OS controls the node.
+6. **No update-rollback fence** — a compromised update origin can withhold
+   updates or re-serve any previously-signed version newer than the client's
+   (§4.5); versions at or below the running one are refused.
 
 ## 6. Abuse tests and where they live
 

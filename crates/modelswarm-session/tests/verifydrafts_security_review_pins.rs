@@ -19,13 +19,19 @@
 //!    even when it carries a consumed nonce or no round is outstanding
 //!    (session-4 handoff assumption 3).
 //! 2. The verifier-side treatment of a LATE `PrefixCommit` after the
-//!    WAIT_COMMIT grace has expired (review advisory A1): the reproducing
-//!    commit is classified `CancelRound(commit_mismatch)` and counted as a
-//!    protocol violation, and the SECOND such commit by the same peer
-//!    tears the session down. The ADR pins the threshold-two rule for
-//!    coordinator-side results only; the verifier-side counting policy is
-//!    the implementation's (recorded, unpinned) choice — flagged in the
-//!    review for the owning session/architect to confirm or amend.
+//!    WAIT_COMMIT grace has expired (review advisory A1): AMENDED at
+//!    ADR-032 revision 4 (§8 RC-5(b), 2026-10-12) — post-expiry commits
+//!    are STALE `round_mismatch` no-ops exempt from the violation
+//!    counter (whether they would have reproduced is unknowable after
+//!    the RC-5(b) discard), while commits failing RC-4 reproduction
+//!    while the round's result is OUTSTANDING remain `commit_mismatch`
+//!    violations toward threshold-two teardown. This file freezes the
+//!    NEW semantics (the pre-revision-4 classification — post-expiry
+//!    reproductions counted — is superseded).
+//! 3. The §2 `PrefixCommit` carrier `sender` check (revision 4 §2/G2):
+//!    the unsigned carrier's `sender` MUST equal the installation id
+//!    pinned from the authenticated channel; mismatch is `bad_frame`
+//!    before any state is touched.
 
 use modelswarm_identity::InstallationIdentity;
 
@@ -270,11 +276,23 @@ fn pin_coordinator_replay_partition_genuine_drop_garbage_violation() {
 }
 
 // ---------------------------------------------------------------------------
-// Pin 2 — verifier-side LATE commit after WAIT_COMMIT expiry (review A1)
+// Pin 2 — verifier-side LATE commit after WAIT_COMMIT expiry (review A1,
+// AMENDED by ADR-032 revision 4 §8 RC-5(b), 2026-10-12)
 // ---------------------------------------------------------------------------
 
+/// Post-expiry commits are STALE ROUNDS, not violations (ADR-032 revision
+/// 4, §8 RC-5(b) / Security advisory A1, ruled 2026-10-12): a
+/// `PrefixCommit` arriving for a round already abandoned — round handled
+/// but uncommitted, no outstanding result left to reproduce against — is
+/// rejected `CancelRound("round_mismatch")` with NO state change and NO
+/// violation-counter increment; the commit is never applied (I2), and TWO
+/// late commits from an honest-but-slow coordinator do NOT tear the
+/// session down. The pre-revision-4 classification (post-expiry
+/// reproductions counted as `commit_mismatch` violations toward
+/// threshold-two teardown) is superseded; this pin freezes the new
+/// semantics.
 #[tokio::test]
-async fn pin_verifier_late_commit_after_expiry_is_commit_mismatch() {
+async fn pin_verifier_late_commit_after_expiry_is_exempt_stale_round_mismatch() {
     let coordinator = fixture_id(0x31);
     let engine = MockEngine {
         calls: AtomicUsize::new(0),
@@ -310,9 +328,8 @@ async fn pin_verifier_late_commit_after_expiry_is_commit_mismatch() {
     assert_eq!(gate.outstanding_round(), None);
 
     // The late REPRODUCING commit (it exactly matches the discarded
-    // result) is classified commit_mismatch and counts ONE violation —
-    // current implementation behavior, flagged as review advisory A1
-    // (unpinned ADR policy; an honest-but-slow coordinator is counted).
+    // result) is a stale round_mismatch NO-OP: no state change, NO
+    // violation-counter increment, never applied.
     let mut committed = frame.window_tokens.to_vec();
     committed.push(999);
     let late = CommitPrefix {
@@ -330,26 +347,103 @@ async fn pin_verifier_late_commit_after_expiry_is_commit_mismatch() {
         CommitApplyOutcome::CancelRound(CancelRoundFrame {
             session_id: SESSION.to_string(),
             round: 2,
-            reason: CancelRoundReason::CommitMismatch,
+            reason: CancelRoundReason::RoundMismatch,
         })
     );
-    assert_eq!(gate.violations_of(&coordinator.installation_id()), 1);
+    assert_eq!(
+        gate.violations_of(&coordinator.installation_id()),
+        0,
+        "an unknowable reproduction is never charged as a violation"
+    );
     assert_eq!(gate.committed_prefix_hash(), GENESIS_PREFIX_HASH);
-    assert!(!gate.is_torn_down(), "first late commit does not tear down");
+    assert_eq!(gate.committed_output_tokens(), 0);
+    assert_eq!(gate.last_committed_round(), 0);
 
-    // A SECOND late commit by the same peer tears the session down at the
-    // threshold (the implementation's verifier-side policy, unpinned by
-    // the ADR — see review advisory A1 for the requested ruling).
+    // A SECOND late commit by the same peer: still exempt — the session
+    // is NOT torn down (two late commits from an honest-but-slow
+    // coordinator must not end it; the exemption is not a counter).
     assert_eq!(
         gate.apply_prefix_commit(&late),
+        CommitApplyOutcome::CancelRound(CancelRoundFrame {
+            session_id: SESSION.to_string(),
+            round: 2,
+            reason: CancelRoundReason::RoundMismatch,
+        })
+    );
+    assert!(!gate.is_torn_down());
+    assert_eq!(gate.violations_of(&coordinator.installation_id()), 0);
+
+    // The coordinator learns of the abandonment honestly and gaps
+    // forward (RC-5(c)): the NEXT round chains on the unchanged
+    // committed hash and admits.
+    let next = build_request(&coordinator, 14, 3, "post-stale-nonce");
+    assert!(matches!(
+        gate.admit_verify_drafts(
+            &serde_json::to_value(&next).unwrap(),
+            NOW,
+            NOW,
+            &peer_of(&coordinator),
+        ),
+        AdmissionDecision::Admitted { .. }
+    ));
+}
+
+/// The exemption's scope (ADR-032 revision 4 §8 RC-5(b) tail): a commit
+/// failing RC-4 reproduction WHILE the round's result is outstanding
+/// remains a `commit_mismatch` violation toward threshold-two teardown,
+/// exactly as before the reclassification.
+#[tokio::test]
+async fn pin_commit_mismatch_while_result_outstanding_still_violates() {
+    let coordinator = fixture_id(0x37);
+    let engine = MockEngine {
+        calls: AtomicUsize::new(0),
+    };
+    let mut gate = gate(&coordinator);
+    gate.seed_pre_state(modelswarm_session::verifydrafts::GatePreStateSeed {
+        last_seq: vec![(coordinator.installation_id(), 12)],
+        last_handled_round: Some(1),
+        ..Default::default()
+    });
+    let frame = build_request(&coordinator, 13, 2, "outstanding-nonce");
+    assert!(matches!(
+        gate.admit_verify_drafts(
+            &serde_json::to_value(&frame).unwrap(),
+            NOW,
+            NOW,
+            &peer_of(&coordinator),
+        ),
+        AdmissionDecision::Admitted { .. }
+    ));
+    assert!(
+        matches!(
+            gate.dispatch_outstanding(&engine, NOW, NOW + 35).await,
+            DispatchOutcome::Dispatched(_)
+        ),
+        "dispatch must succeed (result outstanding)"
+    );
+
+    // A hash-VALID commit over different ids while the result is
+    // outstanding: commit_mismatch, ONE violation — unchanged semantics.
+    let impostor = CommitPrefix {
+        session_id: SESSION.to_string(),
+        round: 2,
+        previous_prefix_hash: GENESIS_PREFIX_HASH.to_string(),
+        accepted_token_ids: vec![9_700_001, 9_700_002],
+        new_prefix_hash: compute_prefix_hash(GENESIS_PREFIX_HASH, &[9_700_001, 9_700_002]).unwrap(),
+        model_profile_id: profile(),
+        generation_params_hash: params_hash(),
+        sender: coordinator.installation_id(),
+    };
+    assert_eq!(
+        gate.apply_prefix_commit(&impostor),
         CommitApplyOutcome::CancelRound(CancelRoundFrame {
             session_id: SESSION.to_string(),
             round: 2,
             reason: CancelRoundReason::CommitMismatch,
         })
     );
-    assert!(gate.is_torn_down());
-    assert_eq!(gate.teardown_reason(), Some("commit_mismatch"));
+    assert_eq!(gate.violations_of(&coordinator.installation_id()), 1);
+    assert!(!gate.is_torn_down(), "the first violation never tears down");
 }
 
 /// RC-1 (security review 2026-10-11, required change): a request
@@ -386,4 +480,79 @@ fn remote_peer_mismatch_fails_closed_before_stages() {
         matches!(ok, AdmissionDecision::Admitted { .. }),
         "correct-stream retry must admit after a mismatch reject"
     );
+}
+
+/// The §2 `PrefixCommit` carrier sender check (ADR-032 revision 4
+/// §2/G2): the carrier carries NO signature — its `sender` MUST equal
+/// the installation id pinned from the authenticated channel (the same
+/// pinned coordinator key that authenticates every `VerifyDrafts`), and
+/// a mismatch is `bad_frame` BEFORE any state is touched (no violation
+/// counter, no teardown, nothing consumed).
+#[tokio::test]
+async fn pin_carrier_sender_mismatch_is_bad_frame_before_state() {
+    let coordinator = fixture_id(0x41);
+    let stranger = fixture_id(0x42);
+    let engine = MockEngine {
+        calls: AtomicUsize::new(0),
+    };
+    let mut gate = gate(&coordinator);
+    gate.seed_pre_state(modelswarm_session::verifydrafts::GatePreStateSeed {
+        last_seq: vec![(coordinator.installation_id(), 12)],
+        last_handled_round: Some(1),
+        ..Default::default()
+    });
+    let frame = build_request(&coordinator, 13, 2, "sender-nonce");
+    assert!(matches!(
+        gate.admit_verify_drafts(
+            &serde_json::to_value(&frame).unwrap(),
+            NOW,
+            NOW,
+            &peer_of(&coordinator),
+        ),
+        AdmissionDecision::Admitted { .. }
+    ));
+    let DispatchOutcome::Dispatched(result) =
+        gate.dispatch_outstanding(&engine, NOW, NOW + 35).await
+    else {
+        panic!("dispatch must succeed")
+    };
+
+    // A perfectly REPRODUCING commit carrying a foreign sender: bad_frame
+    // (the carrier's only authentication is the channel — a foreign
+    // sender label fails closed), no violation, no teardown, and the
+    // round STAYS outstanding for a correctly-sent retry.
+    let mut committed = frame.window_tokens.to_vec();
+    committed.push(999);
+    let mut foreign_sender = CommitPrefix {
+        session_id: SESSION.to_string(),
+        round: 2,
+        previous_prefix_hash: GENESIS_PREFIX_HASH.to_string(),
+        accepted_token_ids: committed.clone(),
+        new_prefix_hash: result.new_prefix_hash.clone(),
+        model_profile_id: profile(),
+        generation_params_hash: params_hash(),
+        sender: stranger.installation_id(),
+    };
+    match gate.apply_prefix_commit(&foreign_sender) {
+        CommitApplyOutcome::FrameRejected(rejection) => {
+            assert_eq!(rejection.code, FrameRejectReason::BadFrame);
+        }
+        other => panic!("foreign-sender carrier must be bad_frame, got {other:?}"),
+    }
+    assert_eq!(gate.violations_of(&stranger.installation_id()), 0);
+    assert_eq!(gate.violations_of(&coordinator.installation_id()), 0);
+    assert!(!gate.is_torn_down());
+    assert_eq!(
+        gate.outstanding_round(),
+        Some(2),
+        "the round stays outstanding — nothing was consumed"
+    );
+
+    // The same commit under the pinned sender applies (RC-4).
+    foreign_sender.sender = coordinator.installation_id();
+    assert_eq!(
+        gate.apply_prefix_commit(&foreign_sender),
+        CommitApplyOutcome::Advanced { round: 2 }
+    );
+    assert_eq!(gate.committed_output_tokens(), committed.len() as u64);
 }

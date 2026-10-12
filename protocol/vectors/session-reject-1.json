@@ -3,7 +3,7 @@
   "coordinator_peer_id": "12D3KooWPqT2nMDSiXUSx5D7fasaxhxKigVhcqfkKqrLghCq9jxz",
   "coordinator_public_key_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
   "coordinator_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
-  "description": "SessionReject canonical form (ADR-032 §3 / A-4, plan §2.2): the honest offer-reject wire shape {session_id, protocol_version, reason} with the frozen reason vocabulary preset_unavailable | backend_mismatch | batch_verify_unsupported | budget_infeasible. The primary case is backend_mismatch (the E0 backend-pairing reject); the reasons list records ALL FOUR canonical serializations. Unsigned (handshake-authenticated session).",
+  "description": "SessionReject canonical form (ADR-032 §3 / A-4, plan §2.2): the honest offer-reject wire shape {session_id, protocol_version, reason} with the frozen reason vocabulary preset_unavailable | backend_mismatch | batch_verify_unsupported | budget_infeasible plus the two offer-form-v3 reasons profile_mismatch | params_mismatch (ADR-032 revision 4 §3/G3 — negotiation-level vocabulary, the same class as preset_unavailable; the §6.5 registry is untouched). The primary case is backend_mismatch (the E0 backend-pairing reject); the reasons list records ALL SIX canonical serializations (the first four are unchanged bytes from the pre-revision-4 file). Unsigned (handshake-authenticated session).",
   "name": "session-reject-1",
   "primary": {
     "canonical_json": "{\"protocol_version\":\"msp-cooperative-v1\",\"reason\":\"backend_mismatch\",\"session_id\":\"sess-coop-0003\"}",
@@ -55,6 +55,26 @@
         "session_id": "sess-coop-0003"
       },
       "reason": "budget_infeasible"
+    },
+    {
+      "canonical_json": "{\"protocol_version\":\"msp-cooperative-v1\",\"reason\":\"profile_mismatch\",\"session_id\":\"sess-coop-0003\"}",
+      "canonical_json_sha256": "59a4718f9561d71257cdd26bc6f93aafa39907dfd4f35ab0863c4703fad99ac0",
+      "fields": {
+        "protocol_version": "msp-cooperative-v1",
+        "reason": "profile_mismatch",
+        "session_id": "sess-coop-0003"
+      },
+      "reason": "profile_mismatch"
+    },
+    {
+      "canonical_json": "{\"protocol_version\":\"msp-cooperative-v1\",\"reason\":\"params_mismatch\",\"session_id\":\"sess-coop-0003\"}",
+      "canonical_json_sha256": "568bd23148b47c44421f1e919bfe319fb2336f355c7edd266f514cef3141fa3c",
+      "fields": {
+        "protocol_version": "msp-cooperative-v1",
+        "reason": "params_mismatch",
+        "session_id": "sess-coop-0003"
+      },
+      "reason": "params_mismatch"
     }
   ],
   "signed": "none — negotiation messages carry no signature of their own (msp-cooperative-v1 §1; msp-v1 §6.6 PeerId binding)",

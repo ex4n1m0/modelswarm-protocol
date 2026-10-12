@@ -818,6 +818,11 @@ pub struct VerifyDraftsGate {
     profile_id: String,
     generation_params_hash: String,
     coordinator_key: VerifyingKey,
+    /// `installation_id_for(coordinator_key)` — the installation id pinned
+    /// from the authenticated channel; the §2 `PrefixCommit` carrier's
+    /// `sender` MUST equal it (ADR-032 revision 4 §2/G2; mismatch is
+    /// `bad_frame`).
+    coordinator_installation_id: String,
     /// `peer_id_for(coordinator_key)` — the PeerId the serve loop's
     /// `remote_peer_id` argument must equal on every request (ADR-032
     /// §1 rule 5's second half; security review RC-1, 2026-10-11).
@@ -875,6 +880,7 @@ impl VerifyDraftsGate {
             profile_id: config.profile_id,
             generation_params_hash: config.generation_params_hash,
             coordinator_key: config.coordinator_key,
+            coordinator_installation_id: installation_id_for(&config.coordinator_key.to_bytes()),
             coordinator_peer_id: peer_id_for(&config.coordinator_key.to_bytes()),
             verifier_installation_id: config.verifier_installation_id,
             engine: config.engine,
@@ -1137,20 +1143,31 @@ impl VerifyDraftsGate {
         if msg.window_tokens.len() as u64 > u64::from(effective_cap) {
             return self.reject(FrameRejectReason::PayloadTooLarge, Some(msg.round));
         }
-        // Stage 11 — session budget (I8/§8e): would-exceed on cumulative
-        // committed tokens or cumulative served seconds.
+        // Stage 11 — session budget (I8/§8e, revision 4 / T/R advisory
+        // A-2): WOULD-EXCEED on BOTH arms. The token arm refuses a round
+        // whose admission would push cumulative committed output tokens
+        // past `max_output_tokens`; the seconds arm reserves the round's
+        // bounded worst-case residence — clamped `deadline_ms` plus the
+        // WAIT_COMMIT grace (exactly the RC-5(b) expiry bound, which the
+        // stage-13 re-check makes exact) — and refuses when the ledger
+        // plus that reservation would exceed the cap. The one-outstanding
+        // rule (RC-5(a)) makes the reservation double-count-free. The
+        // seconds LEDGER itself keeps advancing on serve-loop wall-clock
+        // deltas (cumulative session seconds, §8e).
+        let clamped = msg
+            .deadline_ms
+            .clamp(DEADLINE_CLAMP_MIN_MS, DEADLINE_CLAMP_MAX_MS);
+        let reservation_ms = u64::from(clamped) + WAIT_COMMIT_GRACE_MS;
         if self.committed_tokens + msg.window_tokens.len() as u64
             > u64::from(self.budget.max_output_tokens)
-            || self.served_ms >= self.budget.max_endpoint_seconds.saturating_mul(1000)
+            || self.served_ms.saturating_add(reservation_ms)
+                > self.budget.max_endpoint_seconds.saturating_mul(1000)
         {
             return self.reject(FrameRejectReason::Overloaded, Some(msg.round));
         }
         // Stage 12 — deadline at admission. `deadline_ms` is CLAMPED to
         // [1000, 120000] (clamp, not reject — §2, msp-v1 §6.4); the
         // deadline expired iff arrival + clamped deadline <= now.
-        let clamped = msg
-            .deadline_ms
-            .clamp(DEADLINE_CLAMP_MIN_MS, DEADLINE_CLAMP_MAX_MS);
         let deadline_expires_at_ms = arrival_ms.saturating_add(u64::from(clamped));
         if deadline_expires_at_ms <= now_ms {
             return self.reject(FrameRejectReason::DeadlineExceeded, Some(msg.round));
@@ -1255,14 +1272,22 @@ impl VerifyDraftsGate {
 
     // -- WAIT_COMMIT admission (RC-4) + the gate's own chain (plan §3.4) --
 
-    /// Applies a `PrefixCommit` (the shipped [`CommitPrefix`] shape rides
-    /// this family; ADR-032 §2 defers old-vocabulary binding to the freeze
-    /// ADR). The commit is applied ONLY if it reproduces the outstanding
-    /// result: `accepted_token_ids == window_tokens[..accepted_prefix_len]
+    /// Applies a `PrefixCommit` in its §2 carrier form (the bare object
+    /// with the shipped `CommitPrefix` field names, no envelope tag, no
+    /// signature — ADR-032 revision 4 §2/G2; the serve loop parses the
+    /// carrier STRICTLY, and the carrier's `sender` MUST equal the
+    /// installation id pinned from the authenticated channel or the
+    /// commit is `bad_frame` here before any state is touched). The
+    /// commit is applied ONLY if it reproduces the outstanding result:
+    /// `accepted_token_ids == window_tokens[..accepted_prefix_len]
     /// ++ [correction]` AND `new_prefix_hash == result.new_prefix_hash`
     /// (RC-4). A commit that chains validly from the parent but does not
-    /// reproduce the result is `CancelRound("commit_mismatch")` and the
-    /// round is abandoned.
+    /// reproduce the result WHILE the round is outstanding is
+    /// `CancelRound("commit_mismatch")` and the round is abandoned; a
+    /// commit for a round already abandoned (handled but uncommitted, no
+    /// outstanding result left — RC-5(b) expiry) is a STALE
+    /// `round_mismatch` no-op with NO violation-counter increment
+    /// (revision 4, Security advisory A1).
     ///
     /// Chain rules (the gate's OWN state, NOT
     /// [`crate::SessionStateMachine::apply`] — gaps are allowed, I3):
@@ -1281,6 +1306,15 @@ impl VerifyDraftsGate {
         {
             return self.reject_commit(FrameRejectReason::BadFrame, commit.round);
         }
+        // §2 carrier sender check (ADR-032 revision 4 §2/G2): the carrier
+        // carries NO signature — its authentication is the cryptographically
+        // authenticated session channel — so its `sender` MUST equal the
+        // installation id pinned from that channel (the same pinned
+        // coordinator key that authenticates every `VerifyDrafts`). A
+        // mismatch is `bad_frame` before any state is touched.
+        if commit.sender != self.coordinator_installation_id {
+            return self.reject_commit(FrameRejectReason::BadFrame, commit.round);
+        }
         if commit.model_profile_id != self.profile_id {
             *self.violations.entry(commit.sender.clone()).or_insert(0) += 1;
             self.torn_down = Some("profile_mismatch".to_string());
@@ -1296,6 +1330,27 @@ impl VerifyDraftsGate {
             {
                 return CommitApplyOutcome::DuplicateRound;
             }
+            return self.cancel_round_commit(commit.round, CancelRoundReason::RoundMismatch);
+        }
+        // RC-5(b) post-expiry stale commits (ADR-032 revision 4 §8,
+        // Security advisory A1): a commit for a round already abandoned —
+        // handled but uncommitted, with no outstanding result left to
+        // reproduce against (the RC-5(b) discard cleared it) — is a STALE
+        // ROUND, not a violation: whether it would have reproduced is
+        // unknowable after the discard, and an unknowable fact is never
+        // charged as a protocol violation (two late commits from an
+        // honest-but-slow coordinator must not tear the session down).
+        // Rejected `CancelRound("round_mismatch")` with NO state change
+        // and NO violation-counter increment; the commit is never applied
+        // (an unverifiable commit never advances the chain; I2). The
+        // exemption is scoped exactly: a commit failing RC-4 reproduction
+        // WHILE the round's result is outstanding remains a
+        // `commit_mismatch` violation toward threshold-two teardown, as
+        // before (the outstanding check below).
+        if self.outstanding.is_none()
+            && commit.round <= self.last_handled_round
+            && commit.round > self.last_committed_round
+        {
             return self.cancel_round_commit(commit.round, CancelRoundReason::RoundMismatch);
         }
         // The chain must continue from the committed hash (I3).

@@ -47,9 +47,12 @@ const FIXTURE_MALFORMED: &str =
     include_str!("../../../protocol/vectors/verifydrafts-malformed.json");
 const SESSION_OFFER_1: &str = include_str!("../../../protocol/vectors/session-offer-1.json");
 const SESSION_OFFER_2: &str = include_str!("../../../protocol/vectors/session-offer-2.json");
+const SESSION_OFFER_3: &str = include_str!("../../../protocol/vectors/session-offer-3.json");
 const SESSION_ACCEPT_1: &str = include_str!("../../../protocol/vectors/session-accept-1.json");
 const SESSION_ACCEPT_2: &str = include_str!("../../../protocol/vectors/session-accept-2.json");
 const SESSION_REJECT_1: &str = include_str!("../../../protocol/vectors/session-reject-1.json");
+const COMMIT_CARRIER: &str =
+    include_str!("../../../protocol/vectors/verifydrafts-5-commit-carrier.json");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1015,17 +1018,53 @@ fn check_canonical_block(block: &Value) -> Value {
 }
 
 #[test]
-fn golden_session_offer_2_extended_canonical_form() {
+fn golden_session_offer_2_is_superseded_failing_data() {
+    // ADR-032 revision 4 §3/G3: the SECOND form (base +
+    // verifier_backend) is SUPERSEDED by the third — it is preserved as
+    // DATA whose canonical bytes are pinned and which does NOT
+    // deserialize into the v3 struct (missing profile_id +
+    // generation_params_hash), exactly as session-offer-1 pins the base
+    // form.
     let f = doc(SESSION_OFFER_2);
     assert_eq!(f["name"].as_str().unwrap(), "session-offer-2");
+    let fields = check_canonical_block(&f["block"]);
+    assert!(fields.as_object().unwrap().contains_key("verifier_backend"));
+    assert_eq!(fields["verifier_backend"], json!("cpu"));
+    assert!(
+        !fields.as_object().unwrap().contains_key("profile_id"),
+        "the v2 form predates the v3 binding fields"
+    );
+    assert!(
+        serde_json::from_value::<SessionOffer>(fields).is_err(),
+        "F-6/G3: the v2 offer form must fail the v3 schema"
+    );
+}
+
+#[test]
+fn golden_session_offer_3_third_canonical_form() {
+    let f = doc(SESSION_OFFER_3);
+    assert_eq!(f["name"].as_str().unwrap(), "session-offer-3");
     let fields = check_canonical_block(&f["block"]);
     // Deserializes into the extended struct and round-trips byte-equal.
     let offer: SessionOffer = serde_json::from_value(fields.clone()).unwrap();
     assert_eq!(serde_json::to_value(&offer).unwrap(), fields);
-    // The additive field is present and CPU-paired (E0 / ADR-032 §3).
-    assert!(fields.as_object().unwrap().contains_key("verifier_backend"));
+    // The v2 additive field is present and CPU-paired (E0 / ADR-032 §3).
     assert_eq!(fields["verifier_backend"], json!("cpu"));
     assert_eq!(fields["protocol_version"], COOPERATIVE_PROTOCOL_VERSION);
+    // The G3 binding fields: the pinned exact profile (msp1:<64 hex>) and
+    // this family's canonical generation-params hash (§1 rule-3 preimage
+    // over the runtime default — cross-checked against the live hash).
+    let profile_id = fields["profile_id"].as_str().unwrap();
+    assert!(
+        profile_id.starts_with("msp1:") && is_bare_hash(profile_id.strip_prefix("msp1:").unwrap()),
+        "profile_id is the §1 msp1:<64 hex> form"
+    );
+    let params_hash = batch_generation_params_hash(&SamplingParams::default())
+        .expect("default sampling params are integral");
+    assert_eq!(fields["generation_params_hash"], json!(params_hash));
+    assert!(is_bare_hash(
+        fields["generation_params_hash"].as_str().unwrap()
+    ));
 }
 
 #[test]
@@ -1054,7 +1093,7 @@ fn golden_session_accept_2_engine_disclosure() {
 }
 
 #[test]
-fn golden_session_reject_1_all_four_reasons() {
+fn golden_session_reject_1_all_six_reasons() {
     let f = doc(SESSION_REJECT_1);
     assert_eq!(f["name"].as_str().unwrap(), "session-reject-1");
     let primary_fields = check_canonical_block(&f["primary"]);
@@ -1062,7 +1101,11 @@ fn golden_session_reject_1_all_four_reasons() {
     assert_eq!(primary.reason, SessionRejectReason::BackendMismatch);
 
     let reasons = f["reasons"].as_array().expect("reasons list");
-    assert_eq!(reasons.len(), 4, "all four frozen reasons are recorded");
+    assert_eq!(
+        reasons.len(),
+        6,
+        "all six frozen reasons are recorded (four pre-revision-4 + the two v3 reasons)"
+    );
     let mut seen: Vec<&str> = Vec::new();
     for block in reasons {
         let fields = check_canonical_block(block);
@@ -1077,10 +1120,195 @@ fn golden_session_reject_1_all_four_reasons() {
             "backend_mismatch",
             "batch_verify_unsupported",
             "budget_infeasible",
-            "preset_unavailable"
+            "params_mismatch",
+            "preset_unavailable",
+            "profile_mismatch"
         ],
-        "the frozen four-reason vocabulary (ADR-032 §3 / A-4)"
+        "the frozen six-reason vocabulary (ADR-032 §3 / A-4 + revision 4 §3/G3)"
     );
+}
+
+/// The commit-form golden vector the §2 carrier obligates (ADR-032
+/// revision 4 §2/G2: "a commit-form golden vector joins the §7 fixture
+/// set before any second consumer exists"). Pins the BARE-object wire
+/// form — exactly the shipped `SpecMessage::PrefixCommit` field names, no
+/// envelope tag, no signature — its canonical bytes, the §1-rule-2
+/// construction, the sender binding, and replays it through the real
+/// gate against the `verifydrafts-1-accept` request/result it reproduces.
+#[test]
+fn golden_verifydrafts_5_commit_carrier_bare_object_form() {
+    let f = doc(COMMIT_CARRIER);
+    assert_eq!(f["name"].as_str().unwrap(), "verifydrafts-5-commit-carrier");
+
+    // (1) The wire form: a BARE JSON object whose key set is EXACTLY the
+    // eight shipped field names — no envelope tag, no signature, no
+    // unknown fields (the §2 strict schema).
+    let fields = f["carrier"]["fields"].clone();
+    let object = fields.as_object().expect("carrier is a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut expected: Vec<&str> = f["field_names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(
+        keys, expected,
+        "the carrier carries exactly the shipped PrefixCommit field names"
+    );
+    assert_eq!(
+        expected.len(),
+        8,
+        "session_id, round, previous_prefix_hash, accepted_token_ids, new_prefix_hash, profile_id, generation_params_hash, sender"
+    );
+    assert!(
+        !keys.contains(&"signature"),
+        "the carrier is unsigned (§2/G2)"
+    );
+    assert!(
+        !keys.contains(&"prefix_commit") && !keys.contains(&"PrefixCommit"),
+        "no externally-tagged envelope"
+    );
+
+    // (2) Canonical bytes + sha256 (no signature to omit — the whole
+    // object IS the preimage).
+    let canonical = canonical_json(&fields).expect("carrier canonicalizes");
+    assert_eq!(
+        canonical,
+        f["carrier"]["canonical_json"].as_str().unwrap(),
+        "canonical bytes"
+    );
+    assert_eq!(
+        sha256_hex(canonical.as_bytes()),
+        f["carrier"]["canonical_json_sha256"].as_str().unwrap(),
+        "canonical sha256"
+    );
+
+    // (3) The §1-rule-2 construction: new_prefix_hash recomputes from the
+    // recorded construction inputs independent of our function.
+    let construction = &f["construction"];
+    let committed = token_ids(&construction["committed_token_ids"]);
+    assert_eq!(
+        token_ids(&fields["accepted_token_ids"]),
+        committed,
+        "the committed ids are the carrier's accepted_token_ids"
+    );
+    assert_eq!(
+        compute_prefix_hash(
+            construction["parent_prefix_hash"].as_str().unwrap(),
+            &committed
+        )
+        .unwrap(),
+        fields["new_prefix_hash"].as_str().unwrap(),
+        "new_prefix_hash recomputes from the recorded construction inputs"
+    );
+    assert_eq!(
+        construction["parent_prefix_hash"].as_str().unwrap(),
+        fields["previous_prefix_hash"].as_str().unwrap()
+    );
+
+    // (4) The sender binding: sender == the coordinator installation id
+    // recorded from the fixture keypair (§2: MUST equal the installation
+    // id pinned from the authenticated channel; mismatch is bad_frame).
+    assert_eq!(
+        fields["sender"].as_str().unwrap(),
+        f["coordinator_installation_id"].as_str().unwrap(),
+        "the carrier's sender is the authenticated-channel-pinned id"
+    );
+    let coord_key = verifying_key(f["coordinator_public_key_hex"].as_str().unwrap());
+    assert_eq!(
+        installation_id_for(&coord_key.to_bytes()),
+        fields["sender"].as_str().unwrap(),
+        "sender derives from the recorded coordinator key (§1 rule 5)"
+    );
+
+    // (5) Gate replay: the carrier reproduces the verifydrafts-1-accept
+    // result — admit fixture 1's request, dispatch ONE pass with the
+    // recorded outcome, apply THIS carrier (mapped to the state
+    // machine's CommitPrefix names), and the gate ADVANCES; the §2
+    // carrier sender check passes because the gate pins the same
+    // coordinator key.
+    let accept_fixture = doc(FIXTURE_ACCEPT);
+    let req = check_signed_request(
+        &accept_fixture["request"],
+        accept_fixture["coordinator_public_key_hex"]
+            .as_str()
+            .unwrap(),
+    );
+    let res = check_signed_result(
+        &accept_fixture["result"],
+        accept_fixture["verifier_public_key_hex"].as_str().unwrap(),
+    );
+    assert_eq!(fields["session_id"], json!(req.session_id));
+    assert_eq!(fields["round"], json!(req.round));
+    assert_eq!(fields["new_prefix_hash"], json!(res.new_prefix_hash));
+    let engine_disclosure: EngineDisclosure =
+        serde_json::from_value(accept_fixture["engine"].clone()).unwrap();
+    let anchor = unix_ms(accept_fixture["verify_at"].as_str().unwrap());
+    let mut gate = VerifyDraftsGate::new(VerifyDraftsGateConfig {
+        session_id: req.session_id.clone(),
+        profile_id: req.profile_id.clone(),
+        generation_params_hash: req.generation_params_hash.clone(),
+        committed_prefix_hash: GENESIS_PREFIX_HASH.to_string(),
+        coordinator_key: coord_key,
+        verifier_installation_id: f["verifier_installation_id"].as_str().unwrap().to_string(),
+        engine: engine_disclosure.clone(),
+        budget: SessionBudget {
+            max_endpoints: 1,
+            max_endpoint_seconds: 3600,
+            max_output_tokens: 1_000_000,
+        },
+        lease_expires_at_ms: anchor + 3_600_000,
+        sampling_params: SamplingParams::default(),
+        verifier_next_seq: res.seq,
+    })
+    .unwrap();
+    let coord_peer = peer_id_for(&coord_key.to_bytes());
+    assert!(matches!(
+        gate.admit_verify_drafts(
+            &accept_fixture["request"]["fields"],
+            anchor,
+            anchor,
+            &coord_peer
+        ),
+        AdmissionDecision::Admitted { .. }
+    ));
+    let engine =
+        MockVerifyEngine::new(engine_disclosure, (res.accepted_prefix_len, res.correction));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime");
+    assert!(matches!(
+        rt.block_on(gate.dispatch_outstanding(
+            &engine,
+            anchor,
+            anchor + u64::from(res.verify_pass_ms)
+        )),
+        DispatchOutcome::Dispatched(_)
+    ));
+    let commit = CommitPrefix {
+        session_id: fields["session_id"].as_str().unwrap().to_string(),
+        round: fields["round"].as_u64().unwrap(),
+        previous_prefix_hash: fields["previous_prefix_hash"].as_str().unwrap().to_string(),
+        accepted_token_ids: committed.clone(),
+        new_prefix_hash: fields["new_prefix_hash"].as_str().unwrap().to_string(),
+        model_profile_id: fields["profile_id"].as_str().unwrap().to_string(),
+        generation_params_hash: fields["generation_params_hash"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        sender: fields["sender"].as_str().unwrap().to_string(),
+    };
+    assert_eq!(
+        gate.apply_prefix_commit(&commit),
+        CommitApplyOutcome::Advanced {
+            round: fields["round"].as_u64().unwrap()
+        },
+        "the bare carrier applies through the real gate (RC-4 reproduction)"
+    );
+    assert_eq!(gate.committed_prefix_hash(), res.new_prefix_hash);
 }
 
 #[test]

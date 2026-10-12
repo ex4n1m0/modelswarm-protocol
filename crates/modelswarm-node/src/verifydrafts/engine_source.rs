@@ -28,6 +28,29 @@
 //! `VerifyDraftsServeConfig` pins the profile id and sampling parameters,
 //! and the Capi variant commits it as the PREFILLED root at engine
 //! construction — before any window can arrive.
+//!
+//! # How the offer-form-v3 fields interact with the prefill (ADR-032
+//! revision 4 §3/G3 + the compose handoff's G6, folded 2026-10-12)
+//!
+//! The v3 offer's `profile_id` and `generation_params_hash` are
+//! negotiation-time DISCOVERY: the serve loop compares both against its
+//! own pinned config and rejects `profile_mismatch` / `params_mismatch`
+//! before any accept. That closes the pairing half of the prefill
+//! assumption: the engine behind this seam is loaded under the daemon's
+//! pinned profile, and every `verify_window` pass runs under the pinned
+//! sampling parameters — a coordinator whose profile or params differ can
+//! no longer open the session at all, so the prefilled KV can never be
+//! consumed by a mismatched pairing. The PROMPT itself remains out of
+//! band: nothing in the offer (or any family frame) commits the
+//! coordinator's prompt, so the daemon's `prompt_tokens` and the
+//! coordinator's session prompt must still be pinned to the same
+//! tokenization by configuration. The residual gap — no
+//! prompt(-hash) commitment exists on the wire, so a misconfigured
+//! pairing is detectable only through acceptance collapse / audit
+//! divergence — is RECORDED, not improvised: closing it needs a
+//! freeze-ADR decision (a prompt-hash echo or commitment field), and this
+//! seam remains the single place to feed whatever lands
+//! (`FamilyEngineSource::Capi { prompt_tokens }`).
 
 use std::sync::Arc;
 

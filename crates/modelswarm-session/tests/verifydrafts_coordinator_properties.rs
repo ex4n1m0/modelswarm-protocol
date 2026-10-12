@@ -856,6 +856,8 @@ fn sample_offer() -> SessionOffer {
             max_output_tokens: 2_048,
         },
         verifier_backend: Backend::Cpu,
+        profile_id: profile(),
+        generation_params_hash: params_hash(),
     }
 }
 

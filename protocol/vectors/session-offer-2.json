@@ -18,7 +18,7 @@
   "coordinator_peer_id": "12D3KooWPqT2nMDSiXUSx5D7fasaxhxKigVhcqfkKqrLghCq9jxz",
   "coordinator_public_key_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
   "coordinator_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
-  "description": "Extended SessionOffer canonical form (ADR-032 §3 / A-4, plan §2.2): the base ADR-029 shape plus the ADDITIVE verifier_backend (the requester's own backend — under the project rule the requester hosts exact profile P too). Byte-pins the new canonical form required by F-6. Unsigned (handshake-authenticated session).",
+  "description": "SECOND SessionOffer canonical form (ADR-032 §3 / A-4, plan §2.2): the base ADR-029 shape plus the ADDITIVE verifier_backend (the requester's own backend). SUPERSEDED at ADR-032 revision 4 (§3/G3) by the THIRD form (session-offer-3.json, which adds the REQUIRED profile_id + generation_params_hash) and preserved as DATA that does NOT deserialize into the current extended struct — the F-6 discipline: no deployed fleet reads any earlier form, superseded forms fail schema. Unsigned (handshake-authenticated session).",
   "name": "session-offer-2",
   "signed": "none — negotiation messages carry no signature of their own (msp-cooperative-v1 §1; msp-v1 §6.6 PeerId binding)",
   "verifier_installation_id": "2Hk79b5B6ZtNHtWKHkVzgrByaAebfLP3xRkBcCsvpGH3",

@@ -231,7 +231,17 @@ pub(crate) fn demux_family_frame(value: &serde_json::Value) -> FamilyFrame {
 /// shipped `SpecMessage::PrefixCommit` names, `profile_id` for the state
 /// machine's `model_profile_id`, and no signature: the commit rides the
 /// authenticated session, and the gate checks RC-4 reproduction).
+///
+/// FORMAL carrier since ADR-032 revision 4 (§2/G2): the BARE object with
+/// exactly these field names — no envelope tag, no signature — parsed
+/// STRICTLY at the carrier's entry (the serve loop): unknown fields and
+/// wrong types fail deserialization (`deny_unknown_fields` + serde
+/// types), non-bare-hex hashes fail
+/// [`WirePrefixCommit::passes_strict_carrier_schema`], and a `sender`
+/// that does not equal the installation id pinned from the authenticated
+/// channel is `bad_frame` in the gate — all BEFORE any state is touched.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WirePrefixCommit {
     pub session_id: String,
     pub round: u64,
@@ -241,6 +251,26 @@ pub(crate) struct WirePrefixCommit {
     pub profile_id: String,
     pub generation_params_hash: String,
     pub sender: String,
+}
+
+impl WirePrefixCommit {
+    /// The §2 strict-schema form check beyond serde's (unknown fields /
+    /// wrong types fail `from_value` itself): every hash field is BARE
+    /// 64-char lowercase hex ([`is_bare_hash`]) and `profile_id` is the
+    /// `msp1:<64 hex>` §1 form. A carrier failing this is `bad_frame`
+    /// before the gate is touched (ADR-032 revision 4 §2: "a commit frame
+    /// that fails the carrier schema … is `bad_frame` before any state is
+    /// touched").
+    pub(crate) fn passes_strict_carrier_schema(&self) -> bool {
+        let profile_ok = self
+            .profile_id
+            .strip_prefix("msp1:")
+            .is_some_and(modelswarm_session::verifydrafts::is_bare_hash);
+        profile_ok
+            && modelswarm_session::verifydrafts::is_bare_hash(&self.previous_prefix_hash)
+            && modelswarm_session::verifydrafts::is_bare_hash(&self.new_prefix_hash)
+            && modelswarm_session::verifydrafts::is_bare_hash(&self.generation_params_hash)
+    }
 }
 
 impl From<&modelswarm_session::CommitPrefix> for WirePrefixCommit {
@@ -394,5 +424,58 @@ mod tests {
             .into();
         assert_eq!(back.model_profile_id, "msp1:x");
         assert_eq!(back.accepted_token_ids, vec![7, 8]);
+    }
+
+    /// §2 carrier strict schema (ADR-032 revision 4 §2/G2): unknown
+    /// fields fail deserialization, non-bare-hex hashes (and a non-`msp1:`
+    /// profile form) fail the form check — every failure is the serve
+    /// loop's `bad_frame` path before the gate is touched. A valid carrier
+    /// passes both.
+    #[test]
+    fn wire_prefix_commit_strict_schema_pins_the_g2_carrier() {
+        use serde_json::json;
+        let valid = json!({
+            "session_id": "sess-1",
+            "round": 3,
+            "previous_prefix_hash": "a".repeat(64),
+            "accepted_token_ids": [7, 8],
+            "new_prefix_hash": "b".repeat(64),
+            "profile_id": format!("msp1:{}", "ab".repeat(32)),
+            "generation_params_hash": "c".repeat(64),
+            "sender": "coordinator"
+        });
+        let parsed: WirePrefixCommit = serde_json::from_value(valid.clone()).unwrap();
+        assert!(parsed.passes_strict_carrier_schema());
+
+        // Unknown field -> deserialization failure (deny_unknown_fields).
+        let mut unknown = valid.clone();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("signature".to_string(), json!("not-in-this-carrier"));
+        assert!(serde_json::from_value::<WirePrefixCommit>(unknown).is_err());
+        let mut envelope = valid.clone();
+        envelope
+            .as_object_mut()
+            .unwrap()
+            .insert("prefix_commit".to_string(), json!({}));
+        assert!(
+            serde_json::from_value::<WirePrefixCommit>(envelope).is_err(),
+            "an envelope-tagged form is not the bare carrier"
+        );
+
+        // Non-bare-hex hashes -> the strict form check fails.
+        let mut prefixed = valid.clone();
+        *prefixed.get_mut("new_prefix_hash").unwrap() = json!(format!("sha256:{}", "b".repeat(64)));
+        let parsed: WirePrefixCommit = serde_json::from_value(prefixed).unwrap();
+        assert!(!parsed.passes_strict_carrier_schema());
+        let mut short = valid.clone();
+        *short.get_mut("previous_prefix_hash").unwrap() = json!("a".repeat(63));
+        let parsed: WirePrefixCommit = serde_json::from_value(short).unwrap();
+        assert!(!parsed.passes_strict_carrier_schema());
+        let mut bad_profile = valid;
+        *bad_profile.get_mut("profile_id").unwrap() = json!("msp:x");
+        let parsed: WirePrefixCommit = serde_json::from_value(bad_profile).unwrap();
+        assert!(!parsed.passes_strict_carrier_schema());
     }
 }

@@ -279,6 +279,112 @@ async fn backend_mismatch_rejects_honestly() {
     );
 }
 
+/// Offer-form-v3 binding over the wire (ADR-032 revision 4 §3/G3): the
+/// offer carries `profile_id` + `generation_params_hash`; a mismatch
+/// against the serve side's own pinned config rejects honestly with the
+/// two new reasons BEFORE any accept — no session that would fail every
+/// round at stages 4/7, no lease or serving slot consumed. The client
+/// surfaces the reject as the mandatory fallback-to-single signal.
+#[tokio::test]
+async fn offer_v3_profile_and_params_mismatch_reject_honestly() {
+    async fn rejected_offer_case(
+        profile_override: Option<&str>,
+        params_override: Option<&str>,
+    ) -> (String, ServeEndReason, bool) {
+        let server_identity = InstallationIdentity::from_bytes(&[0xB3; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[0xB4; 32]);
+        let telemetry = Arc::new(Telemetry::memory().0);
+
+        let engine = ScriptedEngine::new(batch_engine(8), vec![(1, Some(1))]);
+        let config =
+            VerifyDraftsServeConfig::honest(TEST_PROFILE.to_string(), server_identity.clone());
+
+        let listener = SignedFrameTransport::listen("127.0.0.1:0")
+            .await
+            .expect("loopback listen");
+        let addr = listener.local_addr().expect("bound").to_string();
+        let mut trusted: HashMap<String, VerifyingKey> = HashMap::new();
+        trusted.insert(client_identity.peer_id(), client_identity.verifying_key());
+        let server = tokio::spawn(async move {
+            let wire = accept_staged(&listener, &trusted, ACCEPT_DEADLINE)
+                .await
+                .expect("authenticated accept");
+            serve_verifydrafts_session(wire, config, engine, &telemetry).await
+        });
+
+        let mut wire = dial_staged(
+            &addr,
+            &client_identity,
+            TEST_PROFILE,
+            &server_identity.verifying_key(),
+            ACCEPT_DEADLINE,
+        )
+        .await
+        .expect("dial + handshake");
+
+        // A manual v3 offer with the mismatched field(s).
+        let params_hash =
+            modelswarm_session::verifydrafts::batch_generation_params_hash(&Default::default())
+                .expect("default params are integral");
+        let offer = SessionOffer {
+            session_id: "vd-v3-mismatch".to_string(),
+            protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
+            preset: modelswarm_session::negotiation::Preset::Verified,
+            budget: modelswarm_session::negotiation::SessionBudget {
+                max_endpoints: 1,
+                max_endpoint_seconds: 120,
+                max_output_tokens: 64,
+            },
+            verifier_backend: Backend::Cpu,
+            profile_id: profile_override.unwrap_or(TEST_PROFILE).to_string(),
+            generation_params_hash: params_override.unwrap_or(&params_hash).to_string(),
+        };
+        wire.send_json(
+            &serde_json::to_value(&offer).expect("offer serializes"),
+            ACCEPT_DEADLINE,
+        )
+        .await
+        .expect("send offer");
+        let reply = wire.recv_json(ACCEPT_DEADLINE).await.expect("reject reply");
+        let reject: modelswarm_session::negotiation::SessionReject =
+            serde_json::from_value(reply).expect("reject schema");
+        let report = tokio::time::timeout(ACCEPT_DEADLINE, server)
+            .await
+            .expect("server settles")
+            .expect("server task ok");
+        (
+            reject.reason.as_str().to_string(),
+            report.ended_by,
+            report.accepted,
+        )
+    }
+
+    // profile mismatch: a well-formed but different exact profile.
+    let other_profile = "msp1:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    let (reason, ended_by, accepted) = rejected_offer_case(Some(other_profile), None).await;
+    assert_eq!(reason, "profile_mismatch");
+    assert_eq!(
+        ended_by,
+        ServeEndReason::RejectedOffer(
+            modelswarm_session::negotiation::SessionRejectReason::ProfileMismatch
+        )
+    );
+    assert!(!accepted);
+
+    // params mismatch: a well-formed but different params hash (sha256 of
+    // "other params" — bare 64-hex, not the pinned preimage).
+    let other_params = "cd".repeat(32);
+    let (reason, ended_by, accepted) = rejected_offer_case(None, Some(&other_params)).await;
+    assert_eq!(reason, "params_mismatch");
+    assert_eq!(
+        ended_by,
+        ServeEndReason::RejectedOffer(
+            modelswarm_session::negotiation::SessionRejectReason::ParamsMismatch
+        )
+    );
+    assert!(!accepted);
+}
+
 /// RC-1 over the wire: when the gate's coordinator key is pinned to a key
 /// the stream's authenticated PeerId does NOT derive from, every
 /// `VerifyDrafts` fails closed as `bad_frame` BEFORE any admission stage —
@@ -481,7 +587,12 @@ async fn wait_commit_timeout_abandons_and_next_round_gaps_forward() {
 
     // Manual offer/accept + rounds: the library client always commits on
     // acceptance, and this test needs the round-1 commit deliberately
-    // withheld.
+    // withheld. The offer carries the v3 binding fields (ADR-032 rev 4
+    // §3/G3) so the serve side's negotiation-time profile/params checks
+    // pass — the config's own pinned values.
+    let params_hash =
+        modelswarm_session::verifydrafts::batch_generation_params_hash(&Default::default())
+            .expect("default params are integral");
     let offer = SessionOffer {
         session_id: "vd-gap-test".to_string(),
         protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
@@ -492,6 +603,8 @@ async fn wait_commit_timeout_abandons_and_next_round_gaps_forward() {
             max_output_tokens: 64,
         },
         verifier_backend: Backend::Cpu,
+        profile_id: TEST_PROFILE.to_string(),
+        generation_params_hash: params_hash.clone(),
     };
     wire.send_json(
         &serde_json::to_value(&offer).expect("offer serializes"),
@@ -503,9 +616,6 @@ async fn wait_commit_timeout_abandons_and_next_round_gaps_forward() {
         serde_json::from_value(wire.recv_json(ACCEPT_DEADLINE).await.expect("accept"))
             .expect("accept schema");
 
-    let params_hash =
-        modelswarm_session::verifydrafts::batch_generation_params_hash(&Default::default())
-            .expect("default params are integral");
     let mut seq = 0u64;
     let mut request_round = |round: u64, window: Vec<u32>| {
         seq += 1;

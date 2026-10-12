@@ -237,12 +237,21 @@ impl<W: VerifyDraftsWire> VerifyDraftsClient<W> {
         let params_hash = batch_generation_params_hash(&config.sampling_params)
             .map_err(|why| ClientOpenError::Misconfigured(why.to_string()))?;
         let session_id = format!("vd-{}", new_nonce());
+        // ADR-032 revision 4 §3/G3: the offer binds the coordinator's
+        // pinned profile and sampling parameters (offer form v3) so the
+        // serving side can refuse a mismatched pairing honestly at
+        // negotiation instead of opening a session that fails every
+        // round. Discovery fields — the verifier's own pinning (stages
+        // 4/7, §8 commit-time equality) remains the enforcement
+        // authority.
         let offer = SessionOffer {
             session_id: session_id.clone(),
             protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
             preset: config.preset,
             budget: config.budget.clone(),
             verifier_backend: config.verifier_backend,
+            profile_id: config.profile_id.clone(),
+            generation_params_hash: params_hash.clone(),
         };
         let offer_value = serde_json::to_value(&offer).expect("offer serializes");
         wire.send_json(&offer_value, config.io_deadline)

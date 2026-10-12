@@ -330,6 +330,54 @@ pub async fn serve_verifydrafts_session<W: VerifyDraftsWire>(
         );
         return report;
     }
+    // Offer-form-v3 binding checks (ADR-032 revision 4 §3/G3): the offer
+    // carries the coordinator's pinned `profile_id` and
+    // `generation_params_hash`; the serving side compares BOTH against its
+    // own pinned config and rejects honestly — the fail-closed gap the
+    // wiring tier recorded (a params-mismatched pairing opened a session
+    // that then failed EVERY round at stage 4 with no teardown and no
+    // discovery; a profile mismatch was discoverable only at first round
+    // plus teardown). Discovery, not trusted input: verifier-side pinning
+    // (stage 4 params equality, stage 7 profile + teardown, §8
+    // commit-time equality) remains the enforcement authority unchanged.
+    // Order among negotiation rejects is this loop's choice (only one
+    // fires); identity binding before capability pairing.
+    if offer.profile_id != config.profile_id {
+        send_reject(
+            &mut wire,
+            &offer,
+            SessionRejectReason::ProfileMismatch,
+            config.io_deadline,
+        )
+        .await;
+        report.ended_by = ServeEndReason::RejectedOffer(SessionRejectReason::ProfileMismatch);
+        telemetry.warn(
+            "verifydrafts.offer_rejected",
+            &[
+                ("peer", remote_peer_id.as_str()),
+                ("reason", "profile_mismatch"),
+            ],
+        );
+        return report;
+    }
+    if offer.generation_params_hash != params_hash {
+        send_reject(
+            &mut wire,
+            &offer,
+            SessionRejectReason::ParamsMismatch,
+            config.io_deadline,
+        )
+        .await;
+        report.ended_by = ServeEndReason::RejectedOffer(SessionRejectReason::ParamsMismatch);
+        telemetry.warn(
+            "verifydrafts.offer_rejected",
+            &[
+                ("peer", remote_peer_id.as_str()),
+                ("reason", "params_mismatch"),
+            ],
+        );
+        return report;
+    }
     // Backend pairing (E0: CPU ≠ Vulkan, never mixed) — the frozen honest
     // reject; the requester falls back to single, never silently.
     if offer.verifier_backend != config.engine.backend {
@@ -528,12 +576,18 @@ pub async fn serve_verifydrafts_session<W: VerifyDraftsWire>(
                 }
             }
             FamilyFrame::Commit => {
+                // §2 carrier (ADR-032 revision 4 §2/G2): STRICT parse at
+                // the carrier's entry — unknown fields and wrong types
+                // fail deserialization (`deny_unknown_fields`), non-bare-
+                // hex hashes fail the strict-schema form check — every
+                // failure is `bad_frame` BEFORE the gate (and any state)
+                // is touched.
                 let commit: CommitPrefix =
-                    match serde_json::from_value::<super::WirePrefixCommit>(frame)
-                        .map(CommitPrefix::from)
-                    {
-                        Ok(commit) => commit,
-                        Err(_) => {
+                    match serde_json::from_value::<super::WirePrefixCommit>(frame) {
+                        Ok(wire_commit) if wire_commit.passes_strict_carrier_schema() => {
+                            CommitPrefix::from(wire_commit)
+                        }
+                        _ => {
                             let rejection = RejectionFrame {
                                 session_id: session_id.clone(),
                                 code: FrameRejectReason::BadFrame,

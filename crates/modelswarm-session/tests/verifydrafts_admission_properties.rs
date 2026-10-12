@@ -64,8 +64,8 @@ fn fixture_id(seed: u8) -> InstallationIdentity {
 /// serialized reject frames for the ids without hash collisions.
 const BASE_WINDOW: [u32; 3] = [9_000_101, 9_000_102, 9_000_103];
 
-fn base_gate(coordinator: &InstallationIdentity) -> VerifyDraftsGate {
-    VerifyDraftsGate::new(VerifyDraftsGateConfig {
+fn base_gate_config(coordinator: &InstallationIdentity) -> VerifyDraftsGateConfig {
+    VerifyDraftsGateConfig {
         session_id: "sess-prop".to_string(),
         profile_id: profile(),
         generation_params_hash: params_hash(),
@@ -85,6 +85,27 @@ fn base_gate(coordinator: &InstallationIdentity) -> VerifyDraftsGate {
         lease_expires_at_ms: NOW + 3_600_000,
         sampling_params: SamplingParams::default(),
         verifier_next_seq: 4,
+    }
+}
+
+fn base_gate(coordinator: &InstallationIdentity) -> VerifyDraftsGate {
+    VerifyDraftsGate::new(base_gate_config(coordinator)).unwrap()
+}
+
+/// [`base_gate`] with a configurable seconds budget — the deadline-clamp
+/// cases need a WIDE one, because a clamp-ceiling reservation
+/// (`DEADLINE_CLAMP_MAX_MS` + grace = 120_250 ms) can never fit a 120 s
+/// cap under the §8e revision-4 would-exceed seconds arm (the
+/// reservation is charged at stage 11, before the deadline stage
+/// decides).
+fn base_gate_with_seconds(coordinator: &InstallationIdentity, seconds: u64) -> VerifyDraftsGate {
+    VerifyDraftsGate::new(VerifyDraftsGateConfig {
+        budget: SessionBudget {
+            max_endpoints: 1,
+            max_endpoint_seconds: seconds,
+            max_output_tokens: 1000,
+        },
+        ..base_gate_config(coordinator)
     })
     .unwrap()
 }
@@ -316,6 +337,9 @@ fn run_case(conds: &[Cond]) -> (VerifyDraftsGate, AdmissionDecision) {
         });
     }
     if conds.contains(&Cond::BudgetSeconds) {
+        // At the seconds cap the would-exceed reservation (§8e, revision
+        // 4: ledger + clamped deadline + grace) is over the ceiling for
+        // ANY deadline — the condition still fires at stage 11.
         gate.seed_pre_state(GatePreStateSeed {
             served_ms: Some(120_000),
             ..GatePreStateSeed::default()
@@ -1081,8 +1105,18 @@ fn budget_exhaustion_refuses_with_overloaded() {
     // Abandon the outstanding round so the seconds case starts clean.
     assert!(gate.expire_wait_commit_if_due(NOW + 500_000));
 
-    // Seconds ledger: advanced by serve-loop-reported deltas (§3.5).
-    gate.advance_session_seconds(119_999);
+    // Seconds arm (ADR-032 §8e, revision 4 / T/R advisory A-2):
+    // WOULD-EXCEED on BOTH arms. The seconds arm reserves the round's
+    // bounded worst-case residence — the clamped deadline_ms (2_500, in
+    // range so unclamped) plus the 250 ms WAIT_COMMIT grace = 2_750 ms —
+    // and refuses when the ledger plus that reservation would exceed
+    // `max_endpoint_seconds * 1000` (120_000 ms here). The
+    // one-outstanding rule makes the reservation double-count-free; the
+    // LEDGER itself keeps advancing on serve-loop deltas.
+    let reservation_ms = WAIT_COMMIT_GRACE_MS + 2_500u64;
+    assert_eq!(reservation_ms, 2_750);
+    // One below the boundary: 117_249 + 2_750 = 119_999 <= 120_000 admits.
+    gate.advance_session_seconds(120_000 - reservation_ms - 1);
     let frame2 = build_request(
         &coordinator,
         14,
@@ -1095,7 +1129,8 @@ fn budget_exhaustion_refuses_with_overloaded() {
         gate.admit_verify_drafts(&frame2, NOW, NOW, &peer_of(&coordinator)),
         AdmissionDecision::Admitted { .. }
     ));
-    // At the seconds ceiling (120 s served), the next request is refused.
+    // Exactly at the boundary: 117_250 + 2_750 == 120_000 — would not
+    // EXCEED, still admits (the would-exceed letter, not already-at-cap).
     assert!(gate.expire_wait_commit_if_due(NOW + 500_000));
     gate.advance_session_seconds(1);
     let frame3 = build_request(
@@ -1106,9 +1141,36 @@ fn budget_exhaustion_refuses_with_overloaded() {
         GENESIS_PREFIX_HASH,
         &BASE_WINDOW,
     );
-    match gate.admit_verify_drafts(&frame3, NOW, NOW, &peer_of(&coordinator)) {
+    assert!(matches!(
+        gate.admit_verify_drafts(&frame3, NOW, NOW, &peer_of(&coordinator)),
+        AdmissionDecision::Admitted { .. }
+    ));
+    // One past the boundary: 117_251 + 2_750 = 120_001 > 120_000 refuses.
+    assert!(gate.expire_wait_commit_if_due(NOW + 500_000));
+    gate.advance_session_seconds(1);
+    let frame4 = build_request(
+        &coordinator,
+        16,
+        5,
+        "budget-seconds-nonce-3",
+        GENESIS_PREFIX_HASH,
+        &BASE_WINDOW,
+    );
+    match gate.admit_verify_drafts(&frame4, NOW, NOW, &peer_of(&coordinator)) {
         AdmissionDecision::FrameRejected(f) => assert_eq!(f.code, FrameRejectReason::Overloaded),
-        other => panic!("seconds ceiling must refuse: {other:?}"),
+        other => panic!("seconds reservation must refuse: {other:?}"),
+    }
+    // A long-deadline round reserves more and refuses EARLIER: at the
+    // same 117_251 ms ledger, a 120 s (clamp-ceiling) deadline reserves
+    // 120_250 ms — far past the cap.
+    let mut long = serde_json::from_value::<VerifyDrafts>(frame4).unwrap();
+    long.deadline_ms = DEADLINE_CLAMP_MAX_MS;
+    long.nonce = "budget-seconds-nonce-4".to_string();
+    long.signature = sign_verify_drafts(&long, &coordinator).unwrap();
+    let long_frame = serde_json::to_value(&long).unwrap();
+    match gate.admit_verify_drafts(&long_frame, NOW, NOW, &peer_of(&coordinator)) {
+        AdmissionDecision::FrameRejected(f) => assert_eq!(f.code, FrameRejectReason::Overloaded),
+        other => panic!("the clamp-ceiling reservation must refuse: {other:?}"),
     }
 }
 
@@ -1119,7 +1181,10 @@ fn budget_exhaustion_refuses_with_overloaded() {
 #[test]
 fn deadline_past_at_admission_and_clamping_boundaries() {
     let coordinator = fixture_id(0x31);
-    let mut gate = base_gate(&coordinator);
+    // A WIDE seconds budget: the clamp-high case reserves the clamp
+    // ceiling + grace (120_250 ms) at stage 11, which can never fit a
+    // 120 s cap under the §8e revision-4 would-exceed seconds arm.
+    let mut gate = base_gate_with_seconds(&coordinator, 3_600);
     gate.seed_pre_state(GatePreStateSeed {
         last_seq: vec![(coordinator.installation_id(), 12)],
         last_handled_round: Some(1),

@@ -54,7 +54,8 @@ use modelswarm_session::negotiation::{
     SessionRejectReason, COOPERATIVE_PROTOCOL_VERSION,
 };
 use modelswarm_session::verifydrafts::{
-    eligible_batch_verifier, peer_reject_reason, validate_session_accept, WINDOW_CAP,
+    batch_generation_params_hash, eligible_batch_verifier, peer_reject_reason,
+    validate_session_accept, WINDOW_CAP,
 };
 use modelswarm_types::ModelProfileId;
 use serde::{Deserialize, Serialize};
@@ -377,7 +378,11 @@ pub fn run_mixed_swarm_decision(spec: &MixedSwarmSpec) -> Result<MixedSwarmDecis
 
     // 1. The offer (msp-cooperative-v1 §2 + the ADR-032 §3 additive
     //    requester backend; budget envelope generous — clamping is not
-    //    this scenario's subject).
+    //    this scenario's subject). The revision-4 offer-form-v3 binding
+    //    fields (§3/G3: profile_id + generation_params_hash) are carried
+    //    for form-completeness — the sim is negotiation ARITHMETIC, not a
+    //    wire endpoint, so the values are the scenario's pinned profile
+    //    label and the default-params family hash.
     let offer = SessionOffer {
         session_id: format!("sim-mixed-{}", spec.case),
         protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
@@ -388,6 +393,11 @@ pub fn run_mixed_swarm_decision(spec: &MixedSwarmSpec) -> Result<MixedSwarmDecis
             max_output_tokens: spec.target_tokens.max(1),
         },
         verifier_backend: spec.requester_backend,
+        profile_id: MIXED_PROFILE.to_string(),
+        generation_params_hash: batch_generation_params_hash(
+            &modelswarm_runtime::SamplingParams::default(),
+        )
+        .expect("default sampling params are integral"),
     };
 
     // 2. Negotiate with EVERY roster peer. The peer-side honest-reject

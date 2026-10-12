@@ -298,6 +298,11 @@ fn honesty_edge_batch_false_single_and_backend_mismatch_continues() {
             max_output_tokens: 16,
         },
         verifier_backend: Backend::Cpu,
+        profile_id: MIXED_PROFILE.to_string(),
+        generation_params_hash: modelswarm_session::verifydrafts::batch_generation_params_hash(
+            &modelswarm_runtime::SamplingParams::default(),
+        )
+        .expect("default sampling params are integral"),
     };
     let vulkan_engine = EngineDisclosure {
         backend: Backend::Vulkan,

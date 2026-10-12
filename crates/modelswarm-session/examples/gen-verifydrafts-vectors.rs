@@ -1048,8 +1048,50 @@ fn fixture_offer_1(coordinator: &Actor, verifier: &Actor) -> Value {
 }
 
 fn fixture_offer_2(coordinator: &Actor, verifier: &Actor) -> Value {
+    // Superseded SECOND form, preserved as DATA (ADR-032 revision 4
+    // §3/G3): the v2 shape (base + verifier_backend) does NOT
+    // deserialize into the v3 struct, exactly as session-offer-1 pins
+    // the base form against the v2 struct. Recorded as raw JSON — the
+    // live struct serializes the v3 form.
+    let mut doc = negotiation_header(
+        "session-offer-2",
+        "SECOND SessionOffer canonical form (ADR-032 §3 / A-4, plan §2.2): the base ADR-029 shape plus the ADDITIVE verifier_backend (the requester's own backend). SUPERSEDED at ADR-032 revision 4 (§3/G3) by the THIRD form (session-offer-3.json, which adds the REQUIRED profile_id + generation_params_hash) and preserved as DATA that does NOT deserialize into the current extended struct — the F-6 discipline: no deployed fleet reads any earlier form, superseded forms fail schema. Unsigned (handshake-authenticated session).",
+        coordinator,
+        verifier,
+    );
+    doc.as_object_mut().expect("doc").insert(
+        "block".to_string(),
+        canonical_block(json!({
+            "session_id": "sess-coop-0002",
+            "protocol_version": "msp-cooperative-v1",
+            "preset": "verified",
+            "budget": {
+                "max_endpoints": 1,
+                "max_endpoint_seconds": 120,
+                "max_output_tokens": 2048,
+            },
+            "verifier_backend": "cpu",
+        })),
+    );
+    doc
+}
+
+/// The THIRD offer canonical form (ADR-032 revision 4 §3/G3): v2 plus the
+/// REQUIRED `profile_id` (msp1:<64 hex>, §1 form) and
+/// `generation_params_hash` (bare 64-hex, §1 rule-3 preimage) — the
+/// coordinator's pinned exact profile and sampling parameters, both
+/// compared against the serving side's own pinned config at negotiation
+/// (honest `profile_mismatch` / `params_mismatch` rejects; discovery, not
+/// trusted input — verifier-side pinning stays the enforcement
+/// authority).
+fn fixture_offer_3(
+    coordinator: &Actor,
+    verifier: &Actor,
+    profile_id: &str,
+    params_hash: &str,
+) -> Value {
     let offer = SessionOffer {
-        session_id: "sess-coop-0002".to_string(),
+        session_id: "sess-coop-0003".to_string(),
         protocol_version: "msp-cooperative-v1".to_string(),
         preset: Preset::Verified,
         budget: SessionBudget {
@@ -1058,10 +1100,12 @@ fn fixture_offer_2(coordinator: &Actor, verifier: &Actor) -> Value {
             max_output_tokens: 2048,
         },
         verifier_backend: Backend::Cpu,
+        profile_id: profile_id.to_string(),
+        generation_params_hash: params_hash.to_string(),
     };
     let mut doc = negotiation_header(
-        "session-offer-2",
-        "Extended SessionOffer canonical form (ADR-032 §3 / A-4, plan §2.2): the base ADR-029 shape plus the ADDITIVE verifier_backend (the requester's own backend — under the project rule the requester hosts exact profile P too). Byte-pins the new canonical form required by F-6. Unsigned (handshake-authenticated session).",
+        "session-offer-3",
+        "THIRD SessionOffer canonical form (ADR-032 revision 4 §3/G3, 2026-10-12): the v2 shape plus the REQUIRED binding fields profile_id (msp1:<64 hex> — the coordinator's pinned exact profile under the project rule) and generation_params_hash (bare 64-hex, the §1 rule-3 canonical preimage). Absence of EITHER fails schema; the base and v2 forms are preserved as data that fails deserialization (session-offer-1/2.json). The serving side compares both against its own pinned config and rejects profile_mismatch / params_mismatch — negotiation-time discovery; verifier-side pinning (stage 4 params, stage 7 profile, §8 commit-time equality) remains the enforcement authority. Unsigned (handshake-authenticated session).",
         coordinator,
         verifier,
     );
@@ -1125,11 +1169,16 @@ fn fixture_accept_2(coordinator: &Actor, verifier: &Actor) -> Value {
 }
 
 fn fixture_reject_1(coordinator: &Actor, verifier: &Actor) -> Value {
+    // Six frozen reasons: the revision-2 four PLUS the two offer-form-v3
+    // reasons (revision 4 §3/G3). The four existing canonicalizations
+    // are UNCHANGED BYTES — the extended file only appends entries.
     let reasons = [
         SessionRejectReason::PresetUnavailable,
         SessionRejectReason::BackendMismatch,
         SessionRejectReason::BatchVerifyUnsupported,
         SessionRejectReason::BudgetInfeasible,
+        SessionRejectReason::ProfileMismatch,
+        SessionRejectReason::ParamsMismatch,
     ];
     let reason_list: Vec<Value> = reasons
         .iter()
@@ -1151,18 +1200,91 @@ fn fixture_reject_1(coordinator: &Actor, verifier: &Actor) -> Value {
     let primary = reason_list
         .iter()
         .find(|b| b["reason"] == json!("backend_mismatch"))
-        .expect("backend_mismatch is one of the four frozen reasons")
+        .expect("backend_mismatch is one of the frozen reasons")
         .clone();
 
     let mut doc = negotiation_header(
         "session-reject-1",
-        "SessionReject canonical form (ADR-032 §3 / A-4, plan §2.2): the honest offer-reject wire shape {session_id, protocol_version, reason} with the frozen reason vocabulary preset_unavailable | backend_mismatch | batch_verify_unsupported | budget_infeasible. The primary case is backend_mismatch (the E0 backend-pairing reject); the reasons list records ALL FOUR canonical serializations. Unsigned (handshake-authenticated session).",
+        "SessionReject canonical form (ADR-032 §3 / A-4, plan §2.2): the honest offer-reject wire shape {session_id, protocol_version, reason} with the frozen reason vocabulary preset_unavailable | backend_mismatch | batch_verify_unsupported | budget_infeasible plus the two offer-form-v3 reasons profile_mismatch | params_mismatch (ADR-032 revision 4 §3/G3 — negotiation-level vocabulary, the same class as preset_unavailable; the §6.5 registry is untouched). The primary case is backend_mismatch (the E0 backend-pairing reject); the reasons list records ALL SIX canonical serializations (the first four are unchanged bytes from the pre-revision-4 file). Unsigned (handshake-authenticated session).",
         coordinator,
         verifier,
     );
     let doc_map = doc.as_object_mut().expect("doc");
     doc_map.insert("primary".to_string(), primary);
     doc_map.insert("reasons".to_string(), Value::Array(reason_list));
+    doc
+}
+
+// ---------------------------------------------------------------------------
+// The commit-form carrier vector (ADR-032 §2/G2, revision 4: "a
+// commit-form golden vector joins the §7 fixture set before any second
+// consumer exists")
+// ---------------------------------------------------------------------------
+
+/// The family's `PrefixCommit` carrier as a golden vector: the BARE JSON
+/// object with exactly the shipped `SpecMessage::PrefixCommit` field
+/// names — NO externally-tagged envelope, NO signature — whose content
+/// reproduces the `verifydrafts-1-accept` result (same session, round,
+/// committed ids, chain hash), so the golden test can admit fixture 1's
+/// request and apply THIS carrier through the real gate.
+fn fixture_commit_carrier(
+    coordinator: &Actor,
+    verifier: &Actor,
+    profile_id: &str,
+    params_hash: &str,
+) -> Value {
+    // Exactly fixture_accept's committed set: window [101..108] ++ [999]
+    // bonus, chaining from the genesis root.
+    let mut committed: Vec<u32> = vec![101, 102, 103, 104, 105, 106, 107, 108];
+    committed.push(999);
+    let new_prefix_hash = compute_prefix_hash(GENESIS_PREFIX_HASH, &committed)
+        .expect("genesis parent is valid bare hex");
+
+    // The carrier, field-for-field (the shipped SpecMessage::PrefixCommit
+    // names; `profile_id` for the state machine's `model_profile_id`).
+    let carrier = json!({
+        "session_id": "sess-vd-accept-0001",
+        "round": 3,
+        "previous_prefix_hash": GENESIS_PREFIX_HASH,
+        "accepted_token_ids": committed,
+        "new_prefix_hash": new_prefix_hash,
+        "profile_id": profile_id,
+        "generation_params_hash": params_hash,
+        "sender": coordinator.identity.installation_id(),
+    });
+    let canonical = canonical_json(&carrier).expect("carrier has no floats");
+
+    let mut doc = json!({
+        "name": "verifydrafts-5-commit-carrier",
+        "description": "ADR-032 §2/G2 (revision 4, 2026-10-12): the family's PrefixCommit carrier as a commit-form golden vector — the BARE JSON object carrying exactly the shipped SpecMessage::PrefixCommit field names (session_id, round, previous_prefix_hash, accepted_token_ids, new_prefix_hash, profile_id, generation_params_hash, sender) WITHOUT the old vocabulary's externally-tagged envelope and WITHOUT signature. Authentication is the cryptographically authenticated session channel plus RC-4 reproduction: the carrier's sender MUST equal the installation id pinned from that channel (mismatch is bad_frame), and the content must reproduce the verifier's own outstanding VerifyDraftsResult. Parsing is STRICT (unknown fields, wrong types, non-bare-hex hashes are bad_frame before any state is touched). The content reproduces verifydrafts-1-accept's result (same session/round/ids/hash), so the golden test replays fixture 1's request and applies this carrier through the real gate. The freeze ADR's binding migration (version, nonce, deadline, signature) remains deferred.",
+        "field_names": [
+            "session_id",
+            "round",
+            "previous_prefix_hash",
+            "accepted_token_ids",
+            "new_prefix_hash",
+            "profile_id",
+            "generation_params_hash",
+            "sender",
+        ],
+        "carrier": {
+            "fields": carrier,
+            "canonical_json": canonical,
+            "canonical_json_sha256": sha256_hex(canonical.as_bytes()),
+        },
+        "construction": {
+            "rule": PREFIX_HASH_RULE,
+            "parent_prefix_hash": GENESIS_PREFIX_HASH,
+            "committed_token_ids": committed,
+        },
+        "binding": {
+            "signed": "none — the carrier carries NO signature (§2/G2); it rides the authenticated session channel",
+            "sender_rule": "sender MUST equal the installation id pinned from the authenticated channel (mismatch is bad_frame)",
+            "sender": coordinator.identity.installation_id(),
+        },
+    });
+    insert(&mut doc, coordinator.block("coordinator"));
+    insert(&mut doc, verifier.block("verifier"));
     doc
 }
 
@@ -1214,6 +1336,10 @@ fn main() {
             fixture_offer_2(&coordinator, &verifier),
         ),
         (
+            "session-offer-3.json",
+            fixture_offer_3(&coordinator, &verifier, PROFILE_ID, &params_hash),
+        ),
+        (
             "session-accept-1.json",
             fixture_accept_1(&coordinator, &verifier),
         ),
@@ -1224,6 +1350,10 @@ fn main() {
         (
             "session-reject-1.json",
             fixture_reject_1(&coordinator, &verifier),
+        ),
+        (
+            "verifydrafts-5-commit-carrier.json",
+            fixture_commit_carrier(&coordinator, &verifier, PROFILE_ID, &params_hash),
         ),
     ];
 

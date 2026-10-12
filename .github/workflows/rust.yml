@@ -44,10 +44,16 @@ jobs:
       # ADR-032 light-up tier: the VerifyDrafts serve loop + requester
       # client are OFF by default — without this step they ship uncompiled
       # and untested (the same blind spot the libp2p-backend step closes).
+      # libp2p-backend is EXPLICIT (T/R 2026-10-12): the composed daemon
+      # (verifydrafts/composed.rs + tests/verifydrafts_composed.rs) is
+      # cfg'd on BOTH features; its CI coverage previously depended on
+      # cargo's workspace-wide bare-feature side effect enabling the
+      # desktop dep-spec — an implicit chain whose silent breakage would
+      # drop the demux tests to 0 tests while staying green.
       - name: Clippy (verifydrafts feature)
-        run: cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts -- -D warnings
+        run: cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts,modelswarm-node/libp2p-backend -- -D warnings
       - name: Tests (verifydrafts feature)
-        run: cargo test --workspace --features modelswarm-node/verifydrafts
+        run: cargo test --workspace --features modelswarm-node/verifydrafts,modelswarm-node/libp2p-backend
       # ADR-031: the C-API research adapter carries the workspace's unsafe
       # FFI — an uncompiled feature is the same CI blind spot that hid the
       # 2026-10-08 lease break (review ruling: land now, not at
@@ -60,10 +66,13 @@ jobs:
       # real C-API engine (the trait-cycle resolution lives in the node
       # crate). Without this step the bridge and its disclosure mapping
       # ship uncompiled in the exact combination production will flip on.
+      # libp2p-backend EXPLICIT for the same reason as the verifydrafts
+      # step above: production's composed daemon needs both, and the
+      # combo must not lean on implicit feature unification.
       - name: Clippy (verifydrafts + capi combo)
-        run: cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts-capi -- -D warnings
+        run: cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts-capi,modelswarm-node/libp2p-backend -- -D warnings
       - name: Tests (verifydrafts + capi combo)
-        run: cargo test --workspace --features modelswarm-node/verifydrafts-capi
+        run: cargo test --workspace --features modelswarm-node/verifydrafts-capi,modelswarm-node/libp2p-backend
       # Desktop chat orchestration (send_chat/try_swarm_chat/earn_lease)
       # compiles only with tauri-shell; the stub build runs zero of it.
       # app.rs (2,300+ lines) previously shipped with ZERO clippy coverage

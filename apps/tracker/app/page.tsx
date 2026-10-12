@@ -12,6 +12,8 @@
 //   (2026-10-12 revision, owner directive "release to the website, I will
 //   get people to test it": a minimal honest download section is restored
 //   below — same copy rules apply: no engine/format names, honest tense)
+// - 2026-10-12 owner directive "move the live swarm census to the top": the
+//   census is the first section under the lede (before "The one rule")
 
 // Protocol-level execution presets (ADR-029 §1; master prompt §3).
 const PRESETS: Array<{ name: string; allows: string; correctness: string }> = [
@@ -108,6 +110,19 @@ export default function Home() {
       </p>
 
       <div className="wrap">
+        <section aria-labelledby="census-heading">
+          <h2 id="census-heading">Live swarm census</h2>
+          <div className="rule">
+            <span id="census-body" style={{ fontSize: "0.95rem" }}>
+              loading…
+            </span>
+            <p className="note" style={{ marginTop: "0.5rem" }}>
+              Models other peers are hosting right now — picking one of
+              these means the swarm can cooperate from your first session.
+            </p>
+          </div>
+        </section>
+
         <section aria-labelledby="rule-heading">
           <h2 id="rule-heading">The one rule</h2>
           <div className="rule">
@@ -200,19 +215,6 @@ export default function Home() {
               ))}
             </tbody>
           </table>
-        </section>
-
-        <section aria-labelledby="census-heading">
-          <h2 id="census-heading">Live swarm census</h2>
-          <div className="rule">
-            <span id="census-body" style={{ fontSize: "0.95rem" }}>
-              loading…
-            </span>
-            <p className="note" style={{ marginTop: "0.5rem" }}>
-              Models other peers are hosting right now — picking one of
-              these means the swarm can cooperate from your first session.
-            </p>
-          </div>
         </section>
 
           <script

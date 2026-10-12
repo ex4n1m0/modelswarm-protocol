@@ -1,14 +1,16 @@
 # ADR-032: Batched speculative verification (one engine pass per draft window)
 
-Status: **Accepted (revision 3, 2026-10-11; originally accepted 2026-10-11 —
+Status: **Accepted (revision 4, 2026-10-12; originally accepted 2026-10-11 —
 option B, with option A already live in code).** Both required reviews
 returned approve-with-required-changes and every required change is folded
 into revision 2; revision 3 folds the landed implementation sessions'
-resolved contract confirmations and corrections (see the revision-3
-amendment note). The wire-contract tier is implemented and green (§7
-implementation status); the ADR-031 productionization gate — revision 2's
-hard dependency for the real-engine path — has PASSED. Owner: Protocol
-Architect.
+resolved contract confirmations and corrections, and revision 4 decides the
+light-up tier's recorded gaps and the two implementation-review advisories
+routed to this seat (see the revision-3 and revision-4 amendment notes).
+The wire-contract tier is implemented and green, and the light-up tier is
+code-complete behind OFF-by-default features (§7 implementation status);
+the ADR-031 productionization gate — revision 2's hard dependency for the
+real-engine path — has PASSED. Owner: Protocol Architect.
 
 **Decision record (2026-10-11).** The owner accepted option B with the
 directive: the main goal is benefits from a swarm regardless of the
@@ -80,6 +82,36 @@ remaining: session 5 sim, scheduler 4a sign-off recording, the
 post-implementation Security + Test and Release review pass). The
 implementation plan is NOT amended — it remains the historical contract of
 record for sessions 1–4.
+
+**Amendment note (revision 4, 2026-10-12).** The light-up tier landed three
+commits (`f9ec2ff` serve-loop wiring, `339ae9e` `CapiVerifyEngine`,
+`cdaf378` QUIC venue; §7 records each) and its handoffs routed four
+contract questions to this seat; this revision decides them, folds the two
+implementation-review advisories routed here (T/R A-2, Security A1), and
+changes nothing else. (1) G2 — §2 pins the family's `PrefixCommit` carrier
+(the bare object with the shipped `SpecMessage::PrefixCommit` field names,
+no envelope tag, no signature, strict schema; serde stays out of the old
+vocabulary) and §8 RC-4 names it. (2) G3 — §3 binds `profile_id` and
+`generation_params_hash` into `SessionOffer`'s extended canonical form (the
+F-6 mechanism, a third form of the offer) with two honest `SessionReject`
+reasons (`profile_mismatch`, `params_mismatch`); verifier-side pinning
+remains the enforcement authority. (3) The QUIC session's two-variant
+decode (network handoff §5.4) — §2 pins ONE vocabulary per session, decided
+at session open and never switched, plus a disjointness rule between §6
+tags and family discriminant keys. (4) The `BatchVerifyEngine` trait home —
+§4 rules it stays in `modelswarm-session` with the node-hosted newtype impl
+as the recorded pattern (a runtime-crate impl is a Cargo cycle by graph
+fact, not a defect). (5) T/R advisory A-2 — §8e pins would-exceed for BOTH
+budget arms (the seconds arm reserves the round's deadline+grace worst
+case; the ledger keeps advancing on serve-loop deltas). (6) Security
+advisory A1 — §8 RC-5(b) reclassifies post-expiry commits as stale
+`round_mismatch` no-ops exempt from the violation counter. (7) §7 records
+the light-up ledger and the remaining owner-gated items, including the
+code/fixture migrations this revision requires (offer form v3 + vectors,
+the §8e seconds arm, the RC-5(b) reclassification with its amended pin, the
+§2 carrier `sender` check, the vocabulary-disjointness assertion) — each
+before the family carries traffic. Everything else is byte-stable from
+revision 3.
 
 Evidence base (all committed): `experiments/raw/PASS-2-ENGAGE-LAN-2026-10-10/ANALYSIS.md`
 · `experiments/raw/PASS-2-ENGAGE-LOOPBACK-2026-10-10/ANALYSIS.md` (the 9.6
@@ -286,10 +318,68 @@ Every state-changing message in the family binds: `protocol_version`,
 `session_id`, `seq` (strictly monotone per **(session, sender)** — RC-7),
 `round`, `profile_id`, accepted-prefix hash (`parent_prefix_hash`),
 generation-parameter hash, sender identity, single-use `nonce`,
-`deadline_ms`, and Ed25519 signature. This closes, for the new family, the
-gap ADR-029 §4 recorded for the old vocabulary (`PrefixCommit` omits
-version/nonce/deadline); migrating the remaining `SpecMessage` variants to
-this binding set belongs to the full freeze ADR, not this one.
+`deadline_ms`, and Ed25519 signature — with ONE decided exception, the
+`PrefixCommit` carrier below, whose authentication is the cryptographically
+authenticated session channel plus RC-4 reproduction. This closes, for the
+new family, the gap ADR-029 §4 recorded for the old vocabulary
+(`PrefixCommit` omits version/nonce/deadline); migrating the remaining
+`SpecMessage` variants to this binding set belongs to the full freeze ADR,
+not this one.
+
+**The family's `PrefixCommit` carrier (G2, decided at revision 4).** The
+coordinator's commit in this family is the BARE JSON object carrying
+exactly the shipped `SpecMessage::PrefixCommit` field names — `session_id`,
+`round`, `previous_prefix_hash`, `accepted_token_ids`, `new_prefix_hash`,
+`profile_id` (the state machine's `model_profile_id`),
+`generation_params_hash`, `sender` — WITHOUT the old vocabulary's
+externally-tagged envelope and WITHOUT `signature`. This is the wire form
+the light-up wiring tier pinned (`WirePrefixCommit`,
+`crates/modelswarm-node/src/verifydrafts/mod.rs`, `f9ec2ff`; unit-pinned
+field-for-field and exercised end-to-end by the staged and QUIC lifecycle
+tests at `f9ec2ff`/`cdaf378`), and it is hereby the family's FORMAL
+carrier: serde stays OUT of the old vocabulary (no derives are added to
+`spec.rs`'s `SpecMessage`/`CommitPrefix`; the old vocabulary keeps its own
+envelope-and-signature serialization), and the freeze ADR inherits this
+carrier as frozen input rather than re-deriving one. Authentication
+rationale: the commit rides a session whose channel is cryptographically
+authenticated in the commit's direction (QUIC: the TLS-authenticated
+ADR-020 PeerId, equal by construction to the pinned coordinator key — §1
+rule 5; staged TCP: the §6.1 Ed25519 handshake's client-key pinning), the
+carrier's `sender` MUST equal the installation id pinned from that
+authenticated channel (mismatch is `bad_frame`), and the content is
+constrained to reproduce the verifier's OWN outstanding result (§8 RC-4) —
+a forged commit can at worst abandon a round, exactly the harm of silence,
+and can never advance an unverified token (I2 unaffected). Parsing is
+STRICT: a commit frame that fails the carrier schema (unknown fields, wrong
+types, non-bare-hex hashes) is `bad_frame` before any state is touched.
+The freeze ADR's binding migration for the commit (version, nonce,
+deadline, signature) remains deferred as before; a commit-form golden
+vector joins the §7 fixture set before any second consumer exists.
+
+**One vocabulary per session (decided at revision 4; network handoff
+§5.4).** A session speaks EXACTLY ONE message vocabulary, decided at
+session open — by which listener accepted it and by the first application
+frame — and NEVER switched mid-session: a session opened by a
+`SessionOffer` speaks only the msp-cooperative-v1 family vocabulary
+(offer/accept/reject, `VerifyDrafts`/`VerifyDraftsResult`, the
+`PrefixCommit` carrier above, `CancelRound` and rejection frames); a
+session opened by a typed §6 message speaks only the msp-v1 vocabulary. A
+frame in the other vocabulary is malformed (`bad_frame`-class), never
+silently reinterpreted; transport control frames (PING) sit below the
+vocabulary layer. The transport's two-pass decode (typed `WireMessage`
+first, raw `Value` fallback) is a demux implementation detail for
+typed/raw interleaving on one session — not a license for mixed
+vocabularies — and it creates a collision hazard it must never be allowed
+to close silently: a future typed variant whose tag swallowed a family
+frame (or vice versa) would strand it in the wrong receive path. Two rules
+follow. (i) The frozen §6 variant tags and the family's discriminant keys
+— `window_tokens`, `accepted_token_ids`, plus the negotiation/result/reject
+keys (`preset`, `budget`, `verifier_backend`, `engine`, `reason`,
+`nonce_echo`, `code`) — are DISJOINT sets, and any change on either side
+that would break the disjointness requires an ADR and a collision test in
+the same change. (ii) A per-push assertion enumerating the frozen §6 tags
+against the family discriminant keys lands with the §7-recorded migrations
+at the latest.
 
 **`seq` semantics (RC-7, normative):** each sender maintains its own
 per-session counter, incremented by exactly 1 on each state-changing
@@ -425,6 +515,39 @@ Inside a cooperative session, the fallback primitive is the existing
   `session-accept-2.json` / `session-reject-1.json`).
   A tracker-side backend column for cohort pre-filtering is a possible
   future ADR, not this one.
+- **Offer-side profile and params binding (G3, decided at revision 4).**
+  `SessionOffer`'s extended canonical form gains two more REQUIRED fields:
+  `profile_id` (`msp1:<64 hex>`, §1 form) and `generation_params_hash`
+  (bare 64-hex, §1 rule-3 preimage) — the coordinator's pinned exact
+  profile and sampling parameters, both of which it already holds under
+  the project rule. The mechanism is exactly F-6's: additive to the
+  NAMESPACE as a NEW (third) canonical form of the offer, absence fails
+  schema, no deployed fleet reads any earlier form (the family carries no
+  traffic; `capi-adapter` stays OFF), and superseded forms are preserved
+  as DATA that fails deserialization, exactly as `session-offer-1.json`
+  pins the base form — a new `session-offer-3.json` pins the v3 form and
+  `session-offer-2.json` joins the failing-data set. The serving side
+  compares BOTH fields against its own pinned config at negotiation and
+  rejects honestly — the `SessionReject` reason vocabulary extends to
+  `profile_mismatch | params_mismatch` (negotiation-level vocabulary, the
+  same class as `preset_unavailable`; the §6.5 registry is untouched) —
+  because the alternative is the fail-closed gap the wiring tier recorded
+  (its G3): a params-mismatched pairing opens a session that then fails
+  EVERY round at stage 4 (`bad_frame`) with no teardown, no escalation,
+  and no discovery (honest but wasteful — lease consumed, serving slot
+  held until idle/budget), and a profile mismatch is discoverable only at
+  first round plus teardown. Verifier-side pinning REMAINS the enforcement
+  authority and is unchanged (stage 4 params equality, stage 7 profile +
+  teardown, §8 commit-time equality): the offer fields are
+  negotiation-time DISCOVERY, not trusted input — a lying offer is caught
+  exactly as a lying request is. `SessionAccept` does NOT echo the fields
+  (a valid accept is itself the equality confirmation; mismatch rejects),
+  and the frozen §5 `EligibilityLease` signed shape is untouched.
+  Migration (owner-gated, before the family carries traffic and before any
+  second consumer): the client `negotiate` and serve-loop offer validation
+  add the fields; `session-offer-3.json` lands; `session-reject-1.json`
+  extends to the two new reasons (the four existing canonicalizations are
+  unchanged bytes).
 - **What misreporting can and cannot do (A-1 wording).** The committed
   stream is always the verifier engine's own continuation; a lying proposer
   can only get drafts rejected. A peer misreporting its backend or
@@ -505,6 +628,33 @@ Inside a cooperative session, the fallback primitive is the existing
   rather than advised). This scheduler-crate change needs Scheduler +
   Protocol sign-off and precedes any light-up (it is option A below, and B
   includes it).
+
+- **Trait home: `BatchVerifyEngine` stays in `modelswarm-session`; the
+  node-hosted impl is the recorded pattern (ruled at revision 4; Runtime
+  handoff §4).** The trait is this family's session-side engine seam — its
+  `capabilities()` returns the wire-visible `EngineDisclosure` carried by
+  `SessionAccept.engine`, and the gate consumes it at stage 10 and the I4
+  one-pass assertion — so it belongs beside its consumer. The existing
+  `modelswarm-session` → `modelswarm-runtime` dependency is correct and
+  load-bearing (`SamplingParams` is the §1 rule-3 hash-preimage input;
+  `RuntimeError` is the engine error vocabulary), and the graph fact the
+  Runtime seat proved — a `modelswarm-runtime` lib type cannot implement a
+  session-crate trait without a reverse package edge Cargo rejects as
+  cyclic — is an expected consequence, not a defect. Re-homing was
+  considered and rejected: a new leaf crate churns the crate graph
+  mid-light-up for zero contract gain, and moving the trait (with its
+  wire-visible `EngineDisclosure`/`Backend`) into `modelswarm-runtime`
+  would relocate protocol-surface types out of the protocol-owned crate.
+  The proven pattern stands: the composition crate (`modelswarm-node`,
+  which already depends on both) hosts the impl — `CapiVerifyEngineAsTrait`
+  and the `VerifyEngineCaps → EngineDisclosure` mapping from
+  `crates/modelswarm-runtime/tests/capi_verify.rs` are the drop-in
+  reference — and the serve loop already takes
+  `Arc<dyn BatchVerifyEngine>` directly (`f9ec2ff`). Migration note:
+  runtime's labeled `BatchVerifyEngineMirror` is transitional and should
+  be deleted when the node hosts the real impl; its dev-dependency on
+  `modelswarm-session` is legal meanwhile (build-time only, no lib-level
+  cycle).
 
 ### 5. Options considered
 
@@ -680,9 +830,59 @@ cap asymmetry — pin or amend before light-up), A-3/A-4 test hardening,
 A-5 sim eligibility-skip case, plus the Security advisories A1–A7
 (late-commit policy ruling to the architect, bounded sets, frame-size
 source, `+250` overflow guard, F-4 de-rank value, `GatePreStateSeed`
-visibility). Remaining beyond the wire tier: the light-up tier
-(serve-loop wiring + `capi-adapter` flag flip + item-2 exactness-pin
-reruns), owner-gated.
+visibility). Remaining beyond the wire tier: the light-up tier — landed state and
+residual owner-gated items recorded in the revision-4 light-up status
+below.
+
+**Light-up implementation status (revision 4, 2026-10-12).** Three
+light-up-tier commits are landed and green. (1) `f9ec2ff` (Windows Product
+handoff `docs/reviews/handoff-windows-product-verifydrafts-wiring-2026-10-11.md`):
+the §8 serve loop over the staged backend behind a `VerifyDraftsWire` port
+— negotiation with honest `SessionReject` and the budget clamped DOWN
+only, the coordinator key pinned from the transport-authenticated remote
+PeerId (the inverse ADR-020 derivation, fail-closed), and ALL FOUR RC-2
+obligations discharged (draft signing; PeerId supply on every admission
+call; seconds-ledger advancement on wall-clock deltas — the cumulative
+session-seconds interpretation; WAIT_COMMIT deadline+grace polling through
+non-destructive recv wake-ups) — plus the library-level requester client
+(RC-3 admission with nonce echo, per-verifier EWMA + `verify_pass_ms`
+cross-check, the RC-4 reproducing commit), 5 staged-loopback integration
+tests, and the two per-push `rust.yml` verifydrafts feature steps. Its
+recorded gaps are decided by this revision: G2 (§2 carrier) and G3 (§3
+offer binding); G5 (no coordinator resync after `parent_mismatch`) stands
+as a recorded limitation. (2) `339ae9e` (Runtime handoff
+`docs/reviews/handoff-runtime-verify-engine-2026-10-11.md`; verification
+record `docs/verification/capi-verify-engine-2026-10-11.md`):
+`CapiVerifyEngine` — the real engine behind the family trait over the
+productionized C-API adapter (ONE batched pass/I4, KV rollback +
+replacement, EOG prefix-only commit with fail-closed post-EOG refusal,
+capability disclosure from real geometry, pre-engine-work cap refusals,
+honest `kv_budget_exceeded`), exact through the trait on the pinned CPU
+bundle and Vulkan per its env-gated pins; its trait-cycle finding is
+resolved by the §4 ruling. (3) `cdaf378` (Network handoff
+`docs/reviews/handoff-network-verifydrafts-quic-2026-10-11.md`): G1 CLOSED
+— `Libp2pSession::send_json`/`recv_json` with the stash discipline and
+pre-write 256 KiB refusal, CANCEL-SAFE partial-buffer frame re-assembly (a
+recv timeout mid-frame no longer desynchronizes the stream) and
+`close_graceful` (FIN + bounded drain so a caller's last frame — the final
+`PrefixCommit`, a `SessionReject` — is delivered), `QuicVerifyWire` (no
+pump; the QUIC-TLS-authenticated PeerId), `serve_verifydrafts_quic`, and
+the QUIC-venue loopback proof (4/0, repeated 5×, zero flakes; workspace
+500/0/7 with the feature). Its two-variant-decode collision concern is
+ruled in §2. Visibility: (1) and (2) land behind OFF-by-default features;
+(3)'s transport strengthening is default-compiled with no observable
+change for frames that worked before (its assumption 1), while its family
+adapter rides the `verifydrafts` feature. REMAINING, owner-gated: (i) the
+`capi-adapter` flag flip at family light-up in serving; (ii) the item-2
+family exactness-pin reruns (venue matrix: `real-model-e2e.yml` extension);
+(iii) the Windows-Product composition work in flight (daemon listener demux
+with `serving.rs` `Admission`, lease derivation, desktop surfaces) and the
+F2B cross-machine relay proof; and (iv) the revision-4 contract migrations
+before the family carries traffic — the §3 offer-form-v3 fields + two
+`SessionReject` reasons with their vectors, the §8e would-exceed seconds
+arm, the §8 RC-5(b) stale-commit reclassification with its amended pins,
+the §2 carrier `sender` check, and the §2 vocabulary-disjointness
+assertion.
 
 ### 8. Verifier round state machine (per session; reviewer-facing)
 
@@ -705,14 +905,22 @@ session open (ADR-026 lease gate passed, SessionOffer accepted / SessionReject h
                                    └─► ReceiptV2 (two-phase, ADR-030; counters labeled verifier-claimed)
 ```
 
-**WAIT_COMMIT admission (RC-4, normative):** a `PrefixCommit` for round n
-is applied only if `accepted_token_ids == window_tokens[..accepted_prefix_len]
+**WAIT_COMMIT admission (RC-4, normative; carrier named at revision 4).**
+The commit arrives in the §2 `PrefixCommit` carrier (the bare object with
+the shipped `SpecMessage::PrefixCommit` field names, no envelope tag, no
+signature); the serve loop parses it strictly — parse failure is
+`bad_frame` before the gate is touched — and the gate enforces
+session/profile/params equality and chain validity before reproduction is
+checked. A `PrefixCommit` for round n is applied only if
+`accepted_token_ids == window_tokens[..accepted_prefix_len]
 ++ [correction]` of the verifier's own outstanding `VerifyDraftsResult` for
 round n AND `new_prefix_hash` equals that result's `new_prefix_hash`. A
 commit that chains validly from the parent but does not reproduce the
-result is rejected (`CancelRound` reason `commit_mismatch`) and the round is
-abandoned. Without this rule invariant I2 is unenforceable: the shipped
-`apply()` path verifies hash chaining only.
+result WHILE that result is outstanding is rejected (`CancelRound` reason
+`commit_mismatch`) and the round is abandoned. Without this rule invariant
+I2 is unenforceable: the shipped `apply()` path verifies hash chaining
+only. A commit arriving after RC-5(b) expiry is governed by the stale-round
+rule in RC-5(b), not by this clause.
 
 **State-machine pinning (RC-5, normative).** (a) At most ONE outstanding
 `VerifyDrafts` per session: a `VerifyDrafts` received while a round is in
@@ -721,17 +929,49 @@ nonce repeats, `bad_frame` otherwise — and is NEVER queued for engine work.
 (b) WAIT_COMMIT is bounded by the outstanding request's `deadline_ms` plus
 a fixed 250 ms grace; expiry abandons the round, discards the pending
 result, and returns to PREFILLED — the verifier never holds an uncommitted
-round for a vanished coordinator. (c) Round numbers are strictly monotone
-per session; a round abandoned without a commit leaves a gap, and the next
-`VerifyDrafts` must carry `round` > last handled round with
-`parent_prefix_hash` equal to the current committed hash. Contiguity is NOT
-required — the shipped `round == state.round() + 1` check forbids gaps and
-MUST NOT be inherited by this family. (d) PREFILLED accepts `VerifyDrafts`
-only when no round is outstanding. (e) The verifier enforces the effective
-`SessionAccept` budget on this family (`max_output_tokens` cumulative
-committed, `max_endpoint_seconds` cumulative), refusing `VerifyDrafts` that
-would exceed it (`overloaded`, budget exhausted) — otherwise a hostile
-coordinator burns unbounded engine seconds inside one admitted session.
+round for a vanished coordinator. **Post-expiry commits are stale rounds,
+not violations (Security advisory A1, ruled at revision 4).** A
+`PrefixCommit` arriving for a round already abandoned — `round` handled
+but uncommitted, no outstanding result left to reproduce against — is
+rejected `CancelRound(reason="round_mismatch")` with no state change and
+NO violation-counter increment: whether such a commit would have
+reproduced is UNKNOWABLE after the RC-5(b) discard, and an unknowable fact
+must never be charged as a protocol violation — two late commits from an
+honest-but-slow coordinator must not tear the session down. The commit is
+never applied (an unverifiable commit never advances the chain; I2), and
+the coordinator learns of the abandonment honestly — through this
+stale-round reject or the next round's `parent_mismatch` (the G5 no-resync
+limitation stands). The exemption is scoped exactly: a commit failing RC-4
+reproduction while the round's result is outstanding remains a
+`commit_mismatch` violation toward threshold-two teardown, as before; the
+pre-revision-4 classification (post-expiry reproductions counted) is
+superseded and the Security review's pin is amended to freeze this
+semantics. (c) Round numbers are strictly monotone per session; a round
+abandoned without a commit leaves a gap, and the next `VerifyDrafts` must
+carry `round` > last handled round with `parent_prefix_hash` equal to the
+current committed hash. Contiguity is NOT required — the shipped `round ==
+state.round() + 1` check forbids gaps and MUST NOT be inherited by this
+family. (d) PREFILLED accepts `VerifyDrafts` only when no round is
+outstanding. (e) The verifier enforces the effective `SessionAccept`
+budget on this family with WOULD-EXCEED semantics on BOTH arms (T/R
+advisory A-2, pinned at revision 4): the token arm refuses a `VerifyDrafts`
+whose admission would push cumulative committed output tokens past
+`max_output_tokens`; the seconds arm refuses when the ledger plus the
+round's bounded worst-case residence would exceed the cap — `served_ms +
+(clamped deadline_ms + WAIT_COMMIT_GRACE_MS) > max_endpoint_seconds ×
+1000` — where the clamped `deadline_ms` (§2 clamp) plus the 250 ms grace
+is exactly the bound that makes the residence worst-case exact (RC-5(b)
+expiry; the stage-13 re-check) and the one-outstanding rule (a) makes the
+reservation double-count-free; refusal is `overloaded` (budget exhausted)
+at stage 11, before the deadline stage. The seconds LEDGER itself keeps
+advancing on serve-loop wall-clock deltas (cumulative session seconds from
+the accept — the `f9ec2ff` interpretation). Otherwise a hostile
+coordinator burns unbounded engine seconds inside one admitted session;
+this pins the ADR's original would-exceed letter over the landed
+already-at-cap approximation (which admitted one deadline+grace-bounded
+round past the cap). The stage ORDER is unchanged (the conjunction sweep
+stands); the session-crate amendment and any affected boundary pins land
+before light-up (owner-gated, §7).
 
 Invariants: **(I1)** the committed stream equals the verifier engine's own
 continuation under pinned params (engine-side test only); **(I2)** every

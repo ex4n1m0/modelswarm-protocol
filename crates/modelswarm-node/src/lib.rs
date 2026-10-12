@@ -57,6 +57,8 @@ pub mod measure;
 pub mod remote;
 #[cfg(feature = "libp2p-backend")]
 pub mod serving;
+#[cfg(feature = "verifydrafts")]
+pub mod verifydrafts;
 
 #[cfg(any(test, feature = "node-selftest"))]
 pub mod selftest;

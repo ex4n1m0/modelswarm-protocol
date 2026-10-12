@@ -3499,6 +3499,7 @@ version = "0.2.20"
 dependencies = [
  "async-trait",
  "axum",
+ "bs58",
  "ed25519-dalek 2.2.0",
  "futures-util",
  "hex",
@@ -3507,6 +3508,7 @@ dependencies = [
  "modelswarm-identity",
  "modelswarm-runtime",
  "modelswarm-scheduler",
+ "modelswarm-session",
  "modelswarm-store",
  "modelswarm-telemetry",
  "modelswarm-tracker-api",

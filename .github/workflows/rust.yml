@@ -41,6 +41,13 @@ jobs:
         run: cargo clippy --workspace --all-targets --features modelswarm-node/libp2p-backend -- -D warnings
       - name: Tests (libp2p-backend feature)
         run: cargo test --workspace --features modelswarm-node/libp2p-backend
+      # ADR-032 light-up tier: the VerifyDrafts serve loop + requester
+      # client are OFF by default — without this step they ship uncompiled
+      # and untested (the same blind spot the libp2p-backend step closes).
+      - name: Clippy (verifydrafts feature)
+        run: cargo clippy --workspace --all-targets --features modelswarm-node/verifydrafts -- -D warnings
+      - name: Tests (verifydrafts feature)
+        run: cargo test --workspace --features modelswarm-node/verifydrafts
       # ADR-031: the C-API research adapter carries the workspace's unsafe
       # FFI — an uncompiled feature is the same CI blind spot that hid the
       # 2026-10-08 lease break (review ruling: land now, not at

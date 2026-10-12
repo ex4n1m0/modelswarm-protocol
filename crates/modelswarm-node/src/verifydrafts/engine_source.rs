@@ -52,6 +52,8 @@
 //! seam remains the single place to feed whatever lands
 //! (`FamilyEngineSource::Capi { prompt_tokens }`).
 
+#[cfg(feature = "verifydrafts-capi")]
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use modelswarm_runtime::RuntimeError;
@@ -147,6 +149,81 @@ impl FamilyEngineSource {
     }
 }
 
+/// Constructs the production [`FamilyEngineSource::Capi`] over an
+/// INSTALLED pinned bundle — the daemon-composition entry the desktop's
+/// hosting start calls (ADR-032 §7 disposition item ii). `engine_dirs`
+/// are the installed bundle candidates in preference order (e.g. the
+/// daemon's serving variant first); the first one whose C-API library is
+/// detectable (`VerifyBackend::of_bundle` — a file check, nothing loaded)
+/// wins and is CONSTRUCTED exactly once — a second, different bundle can
+/// never register in one process (ADR-031 §2's one-bundle guard), so the
+/// fallback is chosen before any load, not after a failure.
+///
+/// The backend is DETECTED from the winning bundle (the disclosure
+/// reports what the bundle really is, never a hand-set value), the
+/// adapter load is blocking so it runs under `spawn_blocking`, and a
+/// candidate list with no C-API bundle (or a failed construction) errors
+/// honestly — the caller falls back to plain serving, never silently.
+///
+/// `prompt_tokens` is the daemon-pinned session prompt (the G6-family
+/// out-of-band gap: the family wire never carries it; an EMPTY prompt is
+/// accepted here but refuses every session at
+/// [`FamilyEngineSource::engine_for`], fail-closed).
+#[cfg(feature = "verifydrafts-capi")]
+pub async fn capi_family_source(
+    engine_dirs: Vec<PathBuf>,
+    model_path: PathBuf,
+    engine: Option<modelswarm_runtime::llamacpp::EngineIdentity>,
+    profile_id: String,
+    prompt_tokens: Vec<u32>,
+) -> Result<Arc<FamilyEngineSource>, RuntimeError> {
+    let (engine_dir, backend) = engine_dirs
+        .iter()
+        .find_map(|dir| {
+            modelswarm_runtime::capi::verify::VerifyBackend::of_bundle(dir).map(|b| (dir.clone(), b))
+        })
+        .ok_or_else(|| {
+            RuntimeError::MalformedResponse(format!(
+                "no C-API engine bundle among {} — the family engine needs a pinned bundle with the C-API library",
+                engine_dirs
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+    let mut config = modelswarm_runtime::capi::CapiConfig::new(engine_dir, model_path);
+    if let Some(identity) = engine {
+        config = config.with_engine(identity);
+    }
+    // `LlamaCppCapi::new` loads the library AND the model — blocking by
+    // contract; keep the async context responsive.
+    let adapter =
+        tokio::task::spawn_blocking(move || modelswarm_runtime::capi::LlamaCppCapi::new(config))
+            .await
+            .map_err(|e| {
+                RuntimeError::MalformedResponse(format!("engine load task failed: {e}"))
+            })??;
+    Ok(Arc::new(FamilyEngineSource::Capi {
+        adapter: Arc::new(adapter),
+        backend,
+        profile_id,
+        prompt_tokens,
+    }))
+}
+
+/// The source's disclosed geometry as JSON — the desktop status surface
+/// (state fields only; the authoritative per-session form stays the
+/// engine's own `capabilities()`).
+pub fn disclosure_json(source: &FamilyEngineSource) -> serde_json::Value {
+    let disclosure = source.disclosure();
+    serde_json::json!({
+        "backend": disclosure.backend.as_str(),
+        "batch_verify": disclosure.batch_verify,
+        "batch_window_max": disclosure.batch_window_max,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +268,44 @@ mod tests {
             .await
             .expect("pass through the seam");
         assert_eq!((accepted, correction), (3, Some(999)));
+    }
+
+    /// The status surface mirrors the disclosure exactly (backend label,
+    /// batch flag, window) — the desktop's UI shows the engine's real
+    /// geometry from this JSON, never a hand-set field.
+    #[test]
+    fn disclosure_json_mirrors_the_source_geometry() {
+        let source = FamilyEngineSource::Shared(Arc::new(FixedEngine));
+        let json = disclosure_json(&source);
+        assert_eq!(json["backend"], "cpu");
+        assert_eq!(json["batch_verify"], true);
+        assert_eq!(json["batch_window_max"], 8);
+    }
+
+    /// A candidate list with no C-API bundle (missing dirs, or bundles
+    /// without the library) fails the constructor HONESTLY — the caller
+    /// falls back to plain serving, never a half-inited family (the
+    /// desktop's degrade path). No load is attempted: the failure is the
+    /// cheap file check.
+    #[cfg(feature = "verifydrafts-capi")]
+    #[tokio::test]
+    async fn capi_source_fails_closed_on_a_missing_bundle() {
+        let missing = std::env::temp_dir().join("modelswarm-no-such-bundle");
+        let error = match capi_family_source(
+            vec![missing],
+            std::env::temp_dir().join("model.gguf"),
+            None,
+            "msp1:x".to_string(),
+            vec![1, 2, 3],
+        )
+        .await
+        {
+            Ok(_) => panic!("a missing bundle must fail the constructor"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("no C-API engine bundle"),
+            "honest reason, got: {error}"
+        );
     }
 }

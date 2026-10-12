@@ -444,6 +444,7 @@ impl Node {
             data_dir: config.data_dir,
             tracker,
             engine_port: engine.as_ref().map(|e| e.port),
+            engine_identity: engine.as_ref().map(|e| e.identity.clone()),
             engine_backend: engine.as_ref().map(|e| e.backend.clone()),
             executor: Some(executor),
             shutdown_rx: handle_shutdown_rx,
@@ -470,10 +471,15 @@ pub struct NodeHandle {
     pub tracker: Option<Arc<TrackerClient>>,
     /// The supervised engine's loopback port, when one was started.
     pub engine_port: Option<u16>,
+    /// The supervised engine's pinned identity (tag + canonical build
+    /// hash) — lets attachés (the ADR-032 family engine bridge) label
+    /// their in-process engine with the SAME pin the sidecar verified
+    /// against, instead of the zero placeholder.
+    pub engine_identity: Option<modelswarm_runtime::llamacpp::EngineIdentity>,
     /// The serving executor (F0(3)): lets the desktop attach the P2P
     /// serving bridge to the SAME executor the local gateway uses.
     pub executor: Option<Arc<dyn modelswarm_gateway::InferenceExecutor>>,
-    /// Cloned shutdown receiver: attachées (P2P serving) die with the node.
+    /// Cloned shutdown receiver: attachés (P2P serving) die with the node.
     pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
     /// The backend the engine actually serves on ("cpu" or a GPU variant
     /// name, ADR-024); `None` when no engine was started.

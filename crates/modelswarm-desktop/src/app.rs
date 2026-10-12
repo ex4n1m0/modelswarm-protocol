@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 
 use modelswarm_gateway::DEFAULT_PORT;
 use modelswarm_node::artifact::{ArtifactManager, EnsuredArtifact};
+#[cfg(feature = "verifydrafts")]
+use modelswarm_node::verifydrafts::{FamilyServing, RosterFamilyLeases, VerifyDraftsServeConfig};
 use modelswarm_node::{catalog, load_or_create_identity, Node, NodeConfig, NodeHandle};
 use modelswarm_telemetry::Telemetry;
 use modelswarm_tracker_api::TrackerClient;
@@ -38,6 +40,16 @@ use tokio::sync::Mutex;
 /// The registered no-listener-yet multiaddr: present in the roster, fails
 /// direct-connect honestly for every remote peer (beta boundary).
 const ADDR_NO_LISTENER: &str = "/ip4/0.0.0.0/tcp/0";
+
+/// The daemon-pinned family session prompt (ADR-032 light-up): whitespace-
+/// separated token ids, read from `<data_dir>/family-prompt-tokens.txt`.
+/// The family wire never carries the session prompt (the recorded G6 gap
+/// — a freeze-ADR item), so the daemon pins it OUT OF BAND: a coordinator
+/// pairing with this installation must chain its windows on the same
+/// tokenization. Absent/unparsable = the family engine stays down
+/// HONESTLY (sessions refuse fail-closed; never a mismatched prompt).
+#[cfg(feature = "verifydrafts")]
+const FAMILY_PROMPT_TOKENS_FILE: &str = "family-prompt-tokens.txt";
 
 pub struct DesktopState {
     inner: Mutex<Inner>,
@@ -76,6 +88,45 @@ struct Inner {
     /// reports it so the UI's "remote serve" chip is truth, not a
     /// static label.
     listener_addr: Option<String>,
+    /// The composed daemon's family half (ADR-032 light-up): what the UI
+    /// must show honestly — on (both vocabularies, behind the RC-L1
+    /// lease gate) vs off with the exact reason. None while not hosting.
+    family: Option<FamilyStatus>,
+}
+
+/// The composed daemon's family half, reported to the UI exactly as the
+/// daemon decided it — never a static label (the ADR-032 disclosure
+/// rule): `on` means the listener serves BOTH vocabularies behind the
+/// RC-L1 profile-bound lease gate; `off` carries the stable reason and
+/// `disclosure` carries the real engine's geometry when the bridge
+/// inited.
+#[derive(Debug, Clone, Default, Serialize)]
+struct FamilyStatus {
+    /// "on" | "off"
+    state: String,
+    /// Stable off reason (telemetry label): "family_prompt_unpinned" |
+    /// "engine_bridge_failed" | "engine_bridge_not_compiled" |
+    /// "verifier_identity_unavailable".
+    reason: Option<String>,
+    /// The engine's real disclosed geometry (backend / batch_verify /
+    /// batch_window_max) when the bridge inited — from the engine, never
+    /// hand-set.
+    disclosure: Option<serde_json::Value>,
+    /// Coordinators with a lease on file (0 = refusing every family
+    /// session fail-closed until the roster wiring seeds one — the
+    /// ADR-026 discipline, surfaced instead of hidden).
+    lease_roster_peers: usize,
+}
+
+impl FamilyStatus {
+    fn off(reason: &str) -> Self {
+        Self {
+            state: "off".into(),
+            reason: Some(reason.into()),
+            disclosure: None,
+            lease_roster_peers: 0,
+        }
+    }
 }
 
 struct RunningNode {
@@ -127,6 +178,7 @@ impl DesktopState {
                 swarm_executor: None,
                 peer_metrics: None,
                 listener_addr: None,
+                family: None,
             }),
         }
     }
@@ -296,6 +348,219 @@ async fn bind_serving_listener(
         .replace("/0.0.0.0/", &format!("/{lan_ip}/"));
     log_event(telemetry, "info", "listener.bound", &[("addr", &addr)]);
     Some((listener, addr))
+}
+
+// ---- The composed daemon's family half (ADR-032 light-up; cfg
+// `verifydrafts`) -----------------------------------------------
+
+/// The installed engine bundle directories in the daemon's preference
+/// order. The family engine prefers the SAME variant class the serving
+/// engine runs (ADR-024 preference; E0 keeps CPU/Vulkan sessions from
+/// mixing WITHIN a session, never across engines): the GPU bundle first
+/// when the sidecar serves Vulkan, else the CPU bundle first with the GPU
+/// set as the detect-only fallback. Selection is a file check — the
+/// one-bundle-per-process guard (ADR-031 §2) means the load happens
+/// exactly once, on the winner, inside the node helper.
+#[cfg(feature = "verifydrafts")]
+fn family_engine_dirs(
+    cpu_engine_exe: &Path,
+    gpu_engine_exe: Option<&Path>,
+    serving_backend: Option<&str>,
+) -> Vec<PathBuf> {
+    let cpu = cpu_engine_exe
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let gpu = gpu_engine_exe.and_then(|exe| exe.parent().map(Path::to_path_buf));
+    match (serving_backend, gpu) {
+        (Some("vulkan"), Some(gpu)) => vec![gpu, cpu],
+        (_, Some(gpu)) => vec![cpu, gpu],
+        (_, None) => vec![cpu],
+    }
+}
+
+/// Reads the daemon-pinned family session prompt (token ids,
+/// whitespace-separated, STRICT — any unparsable token unpins the whole
+/// file; never a partially-loaded prompt). None = unpinned: the family
+/// engine stays down honestly (sessions refuse fail-closed rather than
+/// verify against a mismatched prompt — the G6 out-of-band pairing gap,
+/// a recorded freeze-ADR item).
+#[cfg(feature = "verifydrafts")]
+fn family_prompt_tokens(data_dir: &Path) -> Option<Vec<u32>> {
+    let raw = std::fs::read_to_string(data_dir.join(FAMILY_PROMPT_TOKENS_FILE)).ok()?;
+    let ids: Vec<u32> = raw
+        .split_whitespace()
+        .map(|token| token.parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Builds the composed daemon's family half (ADR-032 §7 disposition item
+/// ii): the RC-L1 production lease source — a [`RosterFamilyLeases`]
+/// under the pinned hub key, EMPTY at start (every family session refuses
+/// fail-closed until the roster wiring seeds a validated lease; the exact
+/// refusal classification rides the telemetry) — and the engine source
+/// for this build (the real C-API bridge under `verifydrafts-capi`).
+///
+/// `None` = the family cannot serve; the caller keeps the plain msp-v1
+/// bridge (honest degradation, never a silent family-off). Every `None`
+/// path telemeters its stable reason and mirrors it in the returned
+/// [`FamilyStatus`].
+#[cfg(feature = "verifydrafts")]
+async fn compose_family_serving(
+    app: &tauri::AppHandle,
+    data_dir: &Path,
+    profile: &str,
+    model_path: &Path,
+    handle: &NodeHandle,
+    telemetry: &std::sync::Arc<Telemetry>,
+) -> (Option<FamilyServing>, FamilyStatus) {
+    // The verifier identity: the SAME per-installation identity the
+    // serving listener authenticated with — it signs every
+    // VerifyDraftsResult (RC-2).
+    let Ok(verifier_identity) = load_or_create_identity(data_dir, telemetry) else {
+        log_event(
+            telemetry,
+            "warn",
+            "family.fallback",
+            &[("reason", "verifier_identity_unavailable")],
+        );
+        return (None, FamilyStatus::off("verifier_identity_unavailable"));
+    };
+    let config = VerifyDraftsServeConfig::honest(profile.to_string(), verifier_identity);
+    // (The config's hand-set disclosure stays the honest `batch_verify:
+    // false` default — the composed loop overrides it per session with
+    // the engine's REAL geometry; the status below reports the same
+    // real geometry, never this field.)
+
+    // The engine source for THIS build.
+    #[cfg(feature = "verifydrafts-capi")]
+    let engine: Option<(
+        std::sync::Arc<modelswarm_node::verifydrafts::FamilyEngineSource>,
+        serde_json::Value,
+    )> = {
+        // G6: the family wire never carries the session prompt, so the
+        // daemon pins it out of band; an unpinned daemon is not a
+        // verifier — fail closed, visibly.
+        let Some(prompt_tokens) = family_prompt_tokens(data_dir) else {
+            log_event(
+                telemetry,
+                "warn",
+                "family.fallback",
+                &[
+                    ("reason", "family_prompt_unpinned"),
+                    ("file", FAMILY_PROMPT_TOKENS_FILE),
+                ],
+            );
+            return (None, FamilyStatus::off("family_prompt_unpinned"));
+        };
+        let dirs = family_engine_dirs(
+            &engine_binary_path(app),
+            engine_gpu_binary_path(app).as_deref(),
+            handle.engine_backend.as_deref(),
+        );
+        match modelswarm_node::verifydrafts::engine_source::capi_family_source(
+            dirs,
+            model_path.to_path_buf(),
+            handle.engine_identity.clone(),
+            profile.to_string(),
+            prompt_tokens,
+        )
+        .await
+        {
+            Ok(source) => {
+                let disclosure =
+                    modelswarm_node::verifydrafts::engine_source::disclosure_json(&source);
+                let backend = disclosure["backend"].as_str().unwrap_or("").to_string();
+                let window = disclosure["batch_window_max"].to_string();
+                log_event(
+                    telemetry,
+                    "info",
+                    "family.engine_ready",
+                    &[
+                        ("backend", &backend),
+                        ("batch_window_max", &window),
+                        ("batch_verify", "true"),
+                    ],
+                );
+                Some((source, disclosure))
+            }
+            Err(error) => {
+                // The bridge could not init (missing C-API bundle, model
+                // load failure, ABI canary): honest degradation with the
+                // local error detail in the log only.
+                log_event(
+                    telemetry,
+                    "warn",
+                    "family.fallback",
+                    &[
+                        ("reason", "engine_bridge_failed"),
+                        ("error", &error.to_string()),
+                    ],
+                );
+                return (None, FamilyStatus::off("engine_bridge_failed"));
+            }
+        }
+    };
+    #[cfg(not(feature = "verifydrafts-capi"))]
+    let engine: Option<(
+        std::sync::Arc<modelswarm_node::verifydrafts::FamilyEngineSource>,
+        serde_json::Value,
+    )> = {
+        // A dev build without the C-API bridge: the honest engine answer
+        // is the http-adapter disclosure (`batch_verify: false` — a
+        // first-class single, never a batch verifier), i.e. no family
+        // serving from this binary.
+        log_event(
+            telemetry,
+            "warn",
+            "family.fallback",
+            &[
+                ("reason", "engine_bridge_not_compiled"),
+                ("disclosure", "batch_verify:false (http adapter)"),
+            ],
+        );
+        return (None, FamilyStatus::off("engine_bridge_not_compiled"));
+    };
+
+    let Some((engine, disclosure)) = engine else {
+        // Every None path returned above; this is unreachable by
+        // construction, kept as a fail-closed guard rather than an
+        // `expect`.
+        return (None, FamilyStatus::off("engine_bridge_failed"));
+    };
+
+    // RC-L1: the production lease source under the PINNED hub key. The
+    // roster starts EMPTY — the ADR-026 discipline refuses every family
+    // session (stable `no_lease` label) until the roster wiring seeds a
+    // validated lease for the authenticated coordinator.
+    let lease = std::sync::Arc::new(RosterFamilyLeases::new(
+        modelswarm_node::serving::LeasePolicy::production(),
+    ));
+    let lease_roster_peers = lease.len();
+    log_event(
+        telemetry,
+        "info",
+        "family.enabled",
+        &[
+            ("profile", profile),
+            ("lease_roster_peers", &lease_roster_peers.to_string()),
+        ],
+    );
+    let status = FamilyStatus {
+        state: "on".into(),
+        reason: None,
+        disclosure: Some(disclosure),
+        lease_roster_peers,
+    };
+    (
+        Some(FamilyServing {
+            config,
+            engine,
+            lease,
+        }),
+        status,
+    )
 }
 
 async fn tracker_client(
@@ -605,6 +870,10 @@ async fn get_status(
             "listener_addr": inner.listener_addr,
             "enrollment": enrollment,
         },
+        // The ADR-032 family half, exactly as the daemon decided it (on
+        // with the real engine geometry / off with the reason); null
+        // while not hosting. Never a static label.
+        "family": serde_json::to_value(&inner.family).unwrap_or(serde_json::Value::Null),
         "chat_turns": inner.chat_log.len(),
     }))
 }
@@ -855,6 +1124,7 @@ async fn set_hosting_inner(
             let _ = running.handle.stopped().await;
         }
         inner.listener_addr = None;
+        inner.family = None;
         return Ok(serde_json::json!({ "hosting": false }));
     }
 
@@ -913,9 +1183,15 @@ async fn set_hosting_inner(
         }
     };
 
-    // F0(3): attach the P2P serving bridge to the node's executor. The
-    // bridge dies with the node via the shared shutdown watch; the
-    // advertised multiaddr is the listener's real bound address.
+    // F0(3) + the ADR-032 light-up: attach the serving bridge to the
+    // node's executor. The bridge dies with the node via the shared
+    // shutdown watch; the advertised multiaddr is the listener's real
+    // bound address. With the family tier compiled in (verifydrafts),
+    // ONE listener serves BOTH vocabularies through the composed daemon —
+    // msp-v1 unchanged, family sessions behind the RC-L1 profile-bound
+    // lease gate; when the family half cannot init the daemon degrades
+    // HONESTLY to the plain msp-v1 bridge (a logged reason + the status
+    // field, never a silent family-off).
     let mut advertised_addr: Option<String> = None;
     if let Some((listener, addr)) = bind_serving_listener(&inner.data_dir, &state.telemetry).await {
         if let (Some(executor), Some(profile)) =
@@ -924,15 +1200,70 @@ async fn set_hosting_inner(
             advertised_addr = Some(addr);
             inner.listener_addr = advertised_addr.clone();
             let serving_shutdown = handle.shutdown_rx.clone();
+            let serving_telemetry = std::sync::Arc::clone(&state.telemetry);
+
+            #[cfg(feature = "verifydrafts")]
+            let (family_serving, family_status) = compose_family_serving(
+                app,
+                &inner.data_dir,
+                &profile,
+                &ensured.path,
+                &handle,
+                &state.telemetry,
+            )
+            .await;
+            #[cfg(feature = "verifydrafts")]
+            {
+                inner.family = Some(family_status);
+                match family_serving {
+                    Some(family) => {
+                        tokio::spawn(modelswarm_node::verifydrafts::serve_sessions_composed(
+                            listener,
+                            executor,
+                            profile,
+                            modelswarm_node::serving::LeasePolicy::production(),
+                            family,
+                            serving_telemetry,
+                            serving_shutdown,
+                        ));
+                    }
+                    // Honest degradation: the pre-light-up msp-v1 bridge,
+                    // with the reason already telemetered and in status.
+                    None => {
+                        tokio::spawn(modelswarm_node::serving::serve_sessions(
+                            listener,
+                            executor,
+                            profile,
+                            modelswarm_node::serving::LeasePolicy::production(),
+                            serving_telemetry,
+                            serving_shutdown,
+                        ));
+                    }
+                }
+            }
+            #[cfg(not(feature = "verifydrafts"))]
             tokio::spawn(modelswarm_node::serving::serve_sessions(
                 listener,
                 executor,
                 profile,
                 modelswarm_node::serving::LeasePolicy::production(),
-                std::sync::Arc::clone(&state.telemetry),
+                serving_telemetry,
                 serving_shutdown,
             ));
         }
+    }
+
+    // The family status must be the truth in EVERY configuration: when the
+    // serving listener never bound (MSP_LISTENER off) there is no family
+    // serving regardless of features; when the family tier is not compiled
+    // in, this build is a dev shell — both carry their exact reason
+    // instead of a null field the UI would have to guess about.
+    if inner.family.is_none() {
+        #[cfg(feature = "verifydrafts")]
+        let reason = "listener_off";
+        #[cfg(not(feature = "verifydrafts"))]
+        let reason = "family_not_compiled";
+        inner.family = Some(FamilyStatus::off(reason));
     }
 
     // Roster heartbeat: device-enroll (approval gated) → session →
@@ -2820,5 +3151,85 @@ mod tests {
         assert!(rows[1].contains("\"shadow_pick\":\"peer-7\""));
         assert!(rows[1].contains("\"reason\":\"empty_reply\""));
         assert!(rows[1].contains("\"wall_ms\":\"42\""));
+    }
+
+    /// The G6 out-of-band pairing file parses STRICTLY: absent, empty, or
+    /// containing any junk token unpins the family engine (None — the
+    /// honest fail-closed); valid ids parse in order across whitespace
+    /// kinds.
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn family_prompt_tokens_parses_strictly_or_unpins() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent -> unpinned.
+        assert_eq!(family_prompt_tokens(dir.path()), None);
+        // Whitespace-only -> unpinned.
+        std::fs::write(dir.path().join(FAMILY_PROMPT_TOKENS_FILE), " \n\t ").unwrap();
+        assert_eq!(family_prompt_tokens(dir.path()), None);
+        // Valid ids (mixed separators) parse in order.
+        std::fs::write(
+            dir.path().join(FAMILY_PROMPT_TOKENS_FILE),
+            "72 101\n108\t44",
+        )
+        .unwrap();
+        assert_eq!(
+            family_prompt_tokens(dir.path()),
+            Some(vec![72, 101, 108, 44])
+        );
+        // ANY junk token unpins the WHOLE file — never a partially
+        // loaded prompt (a mismatched-prompt verifier is worse than none).
+        std::fs::write(dir.path().join(FAMILY_PROMPT_TOKENS_FILE), "72 -1 44").unwrap();
+        assert_eq!(family_prompt_tokens(dir.path()), None);
+        std::fs::write(dir.path().join(FAMILY_PROMPT_TOKENS_FILE), "0x10 4").unwrap();
+        assert_eq!(family_prompt_tokens(dir.path()), None);
+    }
+
+    /// The engine-bundle preference: match the serving engine's variant
+    /// class (Vulkan-serving daemons try the GPU bundle first, ADR-024),
+    /// CPU-first otherwise, GPU absent = CPU only.
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn family_engine_dirs_prefer_the_serving_variant() {
+        let cpu = Path::new("C:/app/engine/llama-server.exe");
+        let gpu = Path::new("C:/app/engine-vulkan/llama-server.exe");
+        assert_eq!(
+            family_engine_dirs(cpu, Some(gpu), Some("vulkan")),
+            vec![
+                PathBuf::from("C:/app/engine-vulkan"),
+                PathBuf::from("C:/app/engine")
+            ]
+        );
+        // CPU-serving (or no engine yet): CPU first, GPU detect-only.
+        assert_eq!(
+            family_engine_dirs(cpu, Some(gpu), Some("cpu")),
+            vec![
+                PathBuf::from("C:/app/engine"),
+                PathBuf::from("C:/app/engine-vulkan")
+            ]
+        );
+        assert_eq!(
+            family_engine_dirs(cpu, Some(gpu), None),
+            vec![
+                PathBuf::from("C:/app/engine"),
+                PathBuf::from("C:/app/engine-vulkan")
+            ]
+        );
+        // No GPU bundle staged: the CPU bundle alone.
+        assert_eq!(
+            family_engine_dirs(cpu, None, Some("vulkan")),
+            vec![PathBuf::from("C:/app/engine")]
+        );
+    }
+
+    /// The off-status shape the UI renders for every honest fallback
+    /// (state off + the stable reason; no disclosure, empty roster).
+    #[test]
+    fn family_status_off_carries_the_reason() {
+        let status = FamilyStatus::off("family_prompt_unpinned");
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["state"], "off");
+        assert_eq!(json["reason"], "family_prompt_unpinned");
+        assert!(json["disclosure"].is_null());
+        assert_eq!(json["lease_roster_peers"], 0);
     }
 }

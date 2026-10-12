@@ -13,6 +13,11 @@ build = "build.rs"
 # (the tauri/wry dependency tree is heavy and platform-specific). Enable with
 # `cargo check -p modelswarm-desktop --features tauri-shell`. See
 # docs/verification/phase-g-notes.md for the Phase G attempt outcome.
+# Since the ADR-032 light-up (2026-10-12) the shell chains the family:
+# the shipped build path (`cargo build -p modelswarm-desktop --features
+# tauri-shell`) produces a binary with the composed daemon and the real
+# batch-verify engine compiled IN — the family rides the same libp2p
+# listener as msp-v1 serving, behind the RC-L1 profile-bound lease gate.
 tauri-shell = [
     "dep:tauri",
     "dep:tauri-plugin-opener",
@@ -30,7 +35,19 @@ tauri-shell = [
     "dep:reqwest",
     "dep:serde",
     "dep:serde_json",
+    "verifydrafts-capi",
 ]
+# ADR-032 light-up tier in the desktop: the composed daemon
+# (serve_sessions_composed — ONE listener, BOTH vocabularies, the RC-L1
+# production FamilyLeaseSource). Without tauri-shell this only turns the
+# node crate's family tier on for library consumers; the desktop's swap
+# itself lives in app.rs (compiled only under tauri-shell).
+verifydrafts = ["dep:modelswarm-node", "modelswarm-node/verifydrafts"]
+# The G4 engine bridge (implies `verifydrafts` and Runtime's
+# `capi-adapter`): the family's real C-API batch-verify engine. The
+# desktop degrades HONESTLY when the bridge cannot init (plain msp-v1
+# serving + a visible reason — never a silent family-off).
+verifydrafts-capi = ["verifydrafts", "modelswarm-node/verifydrafts-capi"]
 
 [target.'cfg(windows)'.dependencies]
 modelswarm-winjob = { path = "../modelswarm-winjob" }
@@ -60,6 +77,9 @@ futures-util = { version = "0.3", optional = true, default-features = false, fea
 
 [build-dependencies]
 tauri-build = { version = "2", optional = true, default-features = false , features = [] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

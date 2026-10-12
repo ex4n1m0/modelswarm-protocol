@@ -5,14 +5,19 @@
 //!
 //! - `one_listener_serves_both_vocabularies`: a SpecMessage (msp-v1)
 //!   session and a VerifyDrafts family session coexist on one listener —
-//!   the required demux pin — with the family's engine disclosure coming
-//!   from the INJECTED engine through the seam (real geometry, never the
-//!   hand-set config field), and the msp-v1 path streaming through its
-//!   executor unchanged.
+//!   the required demux pin — with the family's lease derived through the
+//!   PRODUCTION roster source (RC-L1: profile-bound, hub-verified) and
+//!   the family's engine disclosure coming from the INJECTED engine
+//!   through the seam (real geometry, never the hand-set config field),
+//!   while the msp-v1 path streams through its executor unchanged.
 //! - `family_session_refused_without_lease`: the fail-closed lease seam —
 //!   no lease derivation for the authenticated coordinator PeerId means
 //!   no family session (the honest fallback-to-single signal on the
 //!   client), telemetered with a stable label.
+//! - `family_session_refused_on_wrong_profile_lease` (RC-L1): a
+//!   coordinator whose roster lease is signed for ANOTHER profile is
+//!   refused before any engine work — the profile binding the security
+//!   disposition made a condition of light-up.
 
 #![cfg(all(feature = "verifydrafts", feature = "libp2p-backend"))]
 
@@ -29,7 +34,7 @@ use modelswarm_gateway::{
 };
 use modelswarm_identity::InstallationIdentity;
 use modelswarm_node::verifydrafts::composed::{
-    serve_sessions_composed, FamilyServing, RefuseFamilyLeases, StaticLeaseExpiry,
+    serve_sessions_composed, FamilyServing, RefuseFamilyLeases, RosterFamilyLeases,
 };
 use modelswarm_node::verifydrafts::engine_source::FamilyEngineSource;
 use modelswarm_node::verifydrafts::{
@@ -46,6 +51,8 @@ use modelswarm_transport::message::{
 
 /// A profile id that passes the msp1 form checks (serving.rs test pattern).
 const TEST_PROFILE: &str = "msp1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// A DIFFERENT well-formed profile (the RC-L1 wrong-profile arm).
+const OTHER_PROFILE: &str = "msp1:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
 const ACCEPT_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -136,15 +143,11 @@ fn rfc3339(plus_secs: i64) -> String {
         .unwrap()
 }
 
-/// Issues a consume lease for (profile, peer) under a fresh test hub key;
-/// returns (policy over that key, wire token) — the serving.rs
-/// lease_helpers pattern (not reachable from an integration test).
-fn policy_and_lease(
-    profile: &str,
-    peer_id: &str,
-) -> (modelswarm_node::serving::LeasePolicy, String) {
-    let signing = SigningKey::generate(&mut rand_core::OsRng);
-    let lease = EligibilityLease::issue(
+/// Issues a valid consume lease for (profile, peer) under `key` and
+/// returns the wire token (the serving.rs lease_helpers pattern,
+/// parameterized so one hub key backs both vocabularies' arms).
+fn lease_wire(key: &SigningKey, profile: &str, peer_id: &str) -> String {
+    EligibilityLease::issue(
         peer_id,
         "test-installation",
         profile,
@@ -158,23 +161,26 @@ fn policy_and_lease(
         1,
         "test-challenge",
         "test-nonce",
-        &signing,
-    );
-    let token = lease.to_wire();
-    let policy = modelswarm_node::serving::LeasePolicy::from_hex(&hex::encode(
-        signing.verifying_key().to_bytes(),
-    ))
-    .unwrap();
-    (policy, token)
+        key,
+    )
+    .to_wire()
+}
+
+/// The lease policy over a fresh test hub key.
+fn policy_over(key: &SigningKey) -> modelswarm_node::serving::LeasePolicy {
+    modelswarm_node::serving::LeasePolicy::from_hex(&hex::encode(key.verifying_key().to_bytes()))
+        .unwrap()
 }
 
 /// The required demux pin: a SpecMessage (msp-v1) session and a
 /// VerifyDrafts family session COEXIST on one listener — classified by
 /// their first frames, both admitted through the one `Admission` gate,
-/// the family's lease derived from its authenticated PeerId, and the
-/// family's engine disclosure reported from the INJECTED engine (the
-/// seam's real geometry: window 8, batch true — not the hand-set
-/// `honest()` default `batch_verify: false`).
+/// the family's lease derived through the PRODUCTION roster source
+/// (RC-L1: a valid, hub-signed, profile-bound consume lease seeded for
+/// the authenticated coordinator PeerId), and the family's engine
+/// disclosure reported from the INJECTED engine (the seam's real
+/// geometry: window 8, batch true — not the hand-set `honest()` default
+/// `batch_verify: false`).
 #[tokio::test]
 async fn one_listener_serves_both_vocabularies() {
     let server_identity = InstallationIdentity::from_bytes(&[0xE1; 32]);
@@ -198,7 +204,17 @@ async fn one_listener_serves_both_vocabularies() {
     let addr = listener.bound_addr().to_string();
     let expected_server_peer = transport.peer_id();
 
-    let (policy, token) = policy_and_lease(TEST_PROFILE, &requester.peer_id().to_string());
+    // ONE test hub backs both vocabularies' lease arms: the msp-v1
+    // requester presents its token on the wire, the family coordinator's
+    // token sits in the production roster (the family wire carries none).
+    let hub = SigningKey::generate(&mut rand_core::OsRng);
+    let policy = policy_over(&hub);
+    let token = lease_wire(&hub, TEST_PROFILE, &requester.peer_id().to_string());
+    let roster = RosterFamilyLeases::new(policy_over(&hub));
+    roster.upsert(
+        &coordinator.peer_id().to_string(),
+        &lease_wire(&hub, TEST_PROFILE, &coordinator.peer_id().to_string()),
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let serving_telemetry = Arc::clone(&telemetry);
     tokio::spawn(serve_sessions_composed(
@@ -209,7 +225,7 @@ async fn one_listener_serves_both_vocabularies() {
         FamilyServing {
             config: family_config,
             engine: Arc::new(FamilyEngineSource::Shared(engine)),
-            lease: Arc::new(StaticLeaseExpiry(u64::MAX)),
+            lease: Arc::new(roster),
         },
         serving_telemetry,
         shutdown_rx,
@@ -317,7 +333,7 @@ async fn family_session_refused_without_lease() {
         .await
         .expect("loopback quic");
     let addr = listener.bound_addr().to_string();
-    let (policy, _unused) = policy_and_lease(TEST_PROFILE, "someone-else");
+    let policy = policy_over(&SigningKey::generate(&mut rand_core::OsRng));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let serving_telemetry = Arc::clone(&telemetry);
     let serving = tokio::spawn(serve_sessions_composed(
@@ -367,6 +383,93 @@ async fn family_session_refused_without_lease() {
     assert!(
         events.contains("\"reason\":\"no_lease\"") || events.contains("\"reason\": \"no_lease\""),
         "the no-lease reason must be stable: {events}"
+    );
+    drop(shutdown_tx);
+    tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("composed loop exits when the shutdown sender drops")
+        .expect("composed loop task ok");
+}
+
+/// RC-L1, live on the composed daemon: a coordinator whose roster lease is
+/// signed for ANOTHER profile is REFUSED before any engine work (the
+/// scripted engine is never consumed) — the profile binding the security
+/// disposition made a condition of the light-up, telemetered with the
+/// msp-v1 gate's own classification.
+#[tokio::test]
+async fn family_session_refused_on_wrong_profile_lease() {
+    let server_identity = InstallationIdentity::from_bytes(&[0xA1; 32]);
+    let coordinator = InstallationIdentity::from_bytes(&[0xA2; 32]);
+    let (telemetry, sink) = Telemetry::memory();
+    let telemetry = Arc::new(telemetry);
+
+    let engine = ScriptedEngine::new(batch_engine(8), vec![(1, Some(1))]);
+    let family_config =
+        VerifyDraftsServeConfig::honest(TEST_PROFILE.to_string(), server_identity.clone());
+
+    let transport = Libp2pTransport::new(&server_identity).expect("server transport");
+    let listener = transport
+        .listen("127.0.0.1:0")
+        .await
+        .expect("loopback quic");
+    let addr = listener.bound_addr().to_string();
+    // The hub key is trusted; the coordinator's lease on file is validly
+    // signed but for ANOTHER profile — a coordinator hosting a different
+    // model must not verify against this daemon.
+    let hub = SigningKey::generate(&mut rand_core::OsRng);
+    let roster = RosterFamilyLeases::new(policy_over(&hub));
+    roster.upsert(
+        &coordinator.peer_id().to_string(),
+        &lease_wire(&hub, OTHER_PROFILE, &coordinator.peer_id().to_string()),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let serving_telemetry = Arc::clone(&telemetry);
+    let serving = tokio::spawn(serve_sessions_composed(
+        listener,
+        Arc::new(NeverExecutor),
+        TEST_PROFILE.to_string(),
+        policy_over(&hub),
+        FamilyServing {
+            config: family_config,
+            engine: Arc::new(FamilyEngineSource::Shared(engine)),
+            lease: Arc::new(roster),
+        },
+        serving_telemetry,
+        shutdown_rx,
+    ));
+
+    let wire = modelswarm_node::verifydrafts::dial_quic(
+        &addr,
+        &coordinator,
+        &server_identity.verifying_key(),
+        ACCEPT_DEADLINE,
+    )
+    .await
+    .expect("dial itself is lease-agnostic");
+    let tel = Telemetry::memory().0;
+    match VerifyDraftsClient::negotiate(
+        wire,
+        coordinator,
+        VerifyDraftsClientConfig::new(TEST_PROFILE.to_string(), server_identity.verifying_key()),
+        &tel,
+    )
+    .await
+    {
+        Err(modelswarm_node::verifydrafts::ClientOpenError::Io(_)) => {}
+        Ok(_) => panic!("a wrong-profile lease must never open a family session"),
+        Err(other) => panic!("expected an honest transport failure, got {other}"),
+    }
+
+    // The refusal carries the msp-v1 gate's own classification label.
+    let events = sink.snapshot().join("\n");
+    assert!(
+        events.contains("verifydrafts.family_refused"),
+        "the refusal must be telemetered: {events}"
+    );
+    assert!(
+        events.contains("\"reason\":\"profile_mismatch\"")
+            || events.contains("\"reason\": \"profile_mismatch\""),
+        "the wrong-profile reason must be stable: {events}"
     );
     drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(5), serving)

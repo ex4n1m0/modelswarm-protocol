@@ -188,6 +188,7 @@
           <span class="chip" role="listitem" id="chip-direct" data-state="inactive">direct-connect fail (no listener)</span>
           <span class="chip" role="listitem" id="chip-hosting" data-state="inactive">not hosting</span>
         </div>
+        <p class="note" id="family-line" style="margin:6px 0 0;font-size:11.5px">batch-verify family: unknown</p>
       </section>
 
       <section aria-labelledby="priv-h">
@@ -406,6 +407,21 @@
       $("chip-direct").textContent = listener
         ? "remote serve: on (" + listener + ")"
         : "remote serve: off (dev listener flag not set)";
+      // ADR-032 family: the daemon's own verdict with its real engine
+      // geometry — on (cpu|vulkan, batch window) / off (exact reason) /
+      // null while not hosting. Never a static label.
+      const fam = s.family;
+      if (!s.node.running || !fam) {
+        $("family-line").textContent = "batch-verify family: off (hosting off)";
+      } else if (fam.state === "on") {
+        const d = fam.disclosure || {};
+        $("family-line").textContent =
+          "batch-verify family: on — " + (d.backend || "?") + ", batch window " +
+          (d.batch_window_max || "?") + ", lease roster " + (fam.lease_roster_peers ?? 0) +
+          (fam.lease_roster_peers ? "" : " (refusing family sessions until a coordinator lease is seeded)");
+      } else {
+        $("family-line").textContent = "batch-verify family: off — " + (fam.reason || "unknown");
+      }
       $("chat-input").disabled = !hostingOn;
       $("send-btn").disabled = !hostingOn;
       $("chat-input").placeholder = hostingOn ? "Ask the hosted model…" : "start hosting to chat";

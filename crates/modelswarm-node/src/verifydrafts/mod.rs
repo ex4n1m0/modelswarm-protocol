@@ -49,7 +49,9 @@
 //!   ONE listener serving BOTH vocabularies — the msp-v1 bridge and this
 //!   family — behind ONE `Admission` gate and ONE ADR-026 lease
 //!   discipline (the lease seam: [`composed::FamilyLeaseSource`],
-//!   fail-closed at family session open).
+//!   profile-bound and fail-closed at family session open since the
+//!   RC-L1 discharge — the production source is
+//!   [`composed::RosterFamilyLeases`]).
 //! - [`engine_source::FamilyEngineSource`]: the injection seam — a
 //!   mock/stub engine, or the production C-API engine under the
 //!   `verifydrafts-capi` feature ([`engine_bridge`], the G4 bridge that
@@ -72,8 +74,8 @@ pub use client::{
 };
 #[cfg(all(feature = "verifydrafts", feature = "libp2p-backend"))]
 pub use composed::{
-    serve_sessions_composed, FamilyLeaseSource, FamilyServing, RefuseFamilyLeases,
-    StaticLeaseExpiry,
+    serve_sessions_composed, FamilyLeaseRefusal, FamilyLeaseSource, FamilyServing,
+    RefuseFamilyLeases, RosterFamilyLeases, StaticLeaseExpiry,
 };
 #[cfg(feature = "verifydrafts-capi")]
 pub use engine_bridge::{capi_disclosure, CapiBatchVerifyEngine};

@@ -219,21 +219,27 @@
     const FIT_BADGE = { gpu_full: "● GPU", gpu_partial: "◐ GPU+CPU", ram_only: "◍ CPU" };
     let showAll = false;
 
-    async function refreshModels() {
-      let models = [];
-      let hw = null;
-      try {
-        [models, hw] = await Promise.all([invoke("list_models"), invoke("analyze_hardware").catch(() => null)]);
-        error("");
-      } catch (e) {
-        // Show the real error (fetched URL, TLS/DNS/timeout/signature cause) —
-        // never a bare "unreachable" that hides the actual failure.
-        const note = document.createElement("div");
-        note.className = "note";
-        note.textContent = "catalog unreachable — " + e;
-        $("model-cards").replaceChildren(note);
-        return;
-      }
+    // ---- Live peer census (owner directive 2026-10-12): an honest
+    // "how many people host this" chip per card. The daemon owns the
+    // logic — the 30 s `census` poll refreshes its cache from the
+    // tracker's public stats (the same counts the website census shows)
+    // and every `list_models` response arrives pre-joined: per-card
+    // `census_chip` ("N peers" / "first peer" / "census n/a") and the
+    // canonical order (shortlist -> fit tier -> peers -> name). This file
+    // renders both verbatim and recomputes nothing — no mirror to drift.
+    let lastModels = null, lastHw = null;
+    async function refreshCensus() {
+      // Never blocks the picker: whatever the outcome, we just re-pull the
+      // catalog; a failed poll means the daemon dropped its cache and the
+      // next render reads "census n/a" everywhere.
+      try { await invoke("census"); } catch { /* honest n/a on next render */ }
+      refreshModels();
+    }
+
+    function renderModels() {
+      if (!lastModels) return; // catalog fetch failed: keep its honest error note
+      const models = lastModels;
+      const hw = lastHw;
       // Hardware line: what the analyser found on THIS machine.
       if (hw && hw.ram_mb > 0) {
         const ram = (hw.ram_mb / 1024).toFixed(0);
@@ -246,6 +252,7 @@
       const anyRecommended = models.some(m => m.recommended);
       // Shortlist by default (owner directive: 6 picks per machine);
       // downloaded/selected models always stay visible; "show all" restores.
+      // Card order is the daemon's canonical census order — kept verbatim.
       const visible = showAll || !anyRecommended ? models
         : models.filter(m => m.recommended || m.downloaded || m.selected);
       const hidden = models.length - visible.length;
@@ -261,12 +268,13 @@
           ? `<button type="button" class="stop-card" data-stop="${m.profile_id}">Stop</button>`
           : `<button type="button" data-start="${m.profile_id}">${m.downloaded ? "Start" : "Download & start"}</button>`;
         const fit = m.fit ? `<span style="color:var(--accent)">${FIT_BADGE[m.fit] ?? ""}</span> · ` : "";
+        const censusNote = " · " + (m.census_chip ?? "census n/a");
         return `
         <div class="card ${m.selected ? "selected" : ""}" role="button" aria-selected="${!!m.selected}" aria-disabled="${busy}"
              data-id="${m.profile_id}" tabindex="0">
           <div><div class="name">${m.display_name}</div>
                <div class="meta">profile ${m.profile_id.slice(0, 18)}… · ${m.quantization}</div>
-               <div class="meta" style="margin-top:2px">${fit}${m.hw ? m.hw.download_mb + ' MB download · needs ≈ ' + (m.hw.ram_mb_est/1024).toFixed(1) + ' GB RAM' : 'size unknown'}</div></div>
+               <div class="meta" style="margin-top:2px">${fit}${m.hw ? m.hw.download_mb + ' MB download · needs ≈ ' + (m.hw.ram_mb_est/1024).toFixed(1) + ' GB RAM' + censusNote : 'size unknown' + censusNote}</div></div>
           <div class="action-row"><div class="meta">${badge}</div>${action}</div>
         </div>`;
       }).join("");
@@ -283,6 +291,25 @@
       }
       const sel = models.find(m => m.selected);
       if (sel) $("model-name-line").textContent = sel.display_name + " · " + sel.quantization;
+    }
+
+    async function refreshModels() {
+      let models = null, hw = null;
+      try {
+        [models, hw] = await Promise.all([invoke("list_models"), invoke("analyze_hardware").catch(() => null)]);
+        error("");
+      } catch (e) {
+        // Show the real error (fetched URL, TLS/DNS/timeout/signature cause) —
+        // never a bare "unreachable" that hides the actual failure.
+        lastModels = null;
+        const note = document.createElement("div");
+        note.className = "note";
+        note.textContent = "catalog unreachable — " + e;
+        $("model-cards").replaceChildren(note);
+        return;
+      }
+      lastModels = models; lastHw = hw;
+      renderModels();
     }
     const selectedProfile = () => document.querySelector(".card.selected")?.dataset.id ?? null;
 
@@ -549,7 +576,8 @@
       $("send-btn").disabled = false; busy = false; $("chat-input").focus();
     };
 
-    refresh(); refreshModels(); setInterval(refresh, 2000); setInterval(refreshModels, 15000);
+    refresh(); refreshModels(); refreshCensus();
+    setInterval(refresh, 2000); setInterval(refreshModels, 15000); setInterval(refreshCensus, 30000);
   </script>
 </body>
 </html>

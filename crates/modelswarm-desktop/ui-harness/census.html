@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MSP picker — census stub harness</title>
+  <style>
+    body { font: 13px/1.5 system-ui, sans-serif; color: #e8edf7; background: #10141c; margin: 1.5rem; }
+    h1 { font-size: 16px; } h2 { font-size: 13px; color: #9aa7bf; text-transform: uppercase; }
+    .pass { color: #43c78f; } .fail { color: #e06565; }
+    td, th { text-align: left; padding: 3px 10px 3px 0; border-bottom: 1px solid #2c3850; }
+    code { color: #a855f7; }
+  </style>
+</head>
+<body>
+  <h1>Picker census stub harness</h1>
+  <p>Loads the REAL <code>../ui/index.html</code> into a same-origin iframe with a stubbed
+  <code>window.__TAURI__</code> bridge, then asserts the per-model live peer chips, the card
+  order, and the downloaded/selected visibility for two scenarios: census reachable and
+  census unreachable. The <code>list_models</code> stub returns cards exactly as the daemon
+  does — pre-joined (<code>census_chip</code>) and in the canonical order — so this harness
+  pins the RENDER contract; the join/order/chip logic itself is pinned by the Rust unit
+  tests in <code>src/app.rs</code>.</p>
+  <p><strong>Run:</strong> serve the crate root over http — e.g.
+  <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> —
+  then open <code>http://127.0.0.1:4817/ui-harness/census.html</code>.
+  Opening from <code>file://</code> cannot work (the harness fetches the UI same-origin).</p>
+  <h2>Results</h2>
+  <div id="results">running…</div>
+  <script>
+    // list_models-shaped fixtures, already in the daemon's canonical order
+    // (shortlist -> fit tier -> peers -> name). aa/bb (gpu_full) + cc
+    // (gpu_partial) recommended; dd (ram_only, downloaded) and ee (unknown
+    // fit/size) not. Catalog order in the fixture is NOT the display order.
+    const CATALOG = [
+      { profile_id: "msp1:aa", display_name: "Alpha 9B", quantization: "Q4_K_M (4 bit)",
+        runtime: "b6000", downloaded: null, hw: { download_mb: 5680, ram_mb_est: 6144 },
+        fit: "gpu_full", feasible: true, selected: false, recommended: true },
+      { profile_id: "msp1:bb", display_name: "Bravo 9B", quantization: "Q4_K_M (4 bit)",
+        runtime: "b6000", downloaded: null, hw: { download_mb: 5680, ram_mb_est: 6144 },
+        fit: "gpu_full", feasible: true, selected: false, recommended: true },
+      { profile_id: "msp1:cc", display_name: "Charlie 14B", quantization: "Q4_K_M (4 bit)",
+        runtime: "b6000", downloaded: null, hw: { download_mb: 9000, ram_mb_est: 9344 },
+        fit: "gpu_partial", feasible: true, selected: false, recommended: true },
+      { profile_id: "msp1:dd", display_name: "Delta 27B", quantization: "Q4_K_M (4 bit)",
+        runtime: "b6000", downloaded: { bytes: 18973000000 }, hw: { download_mb: 18973, ram_mb_est: 19968 },
+        fit: "ram_only", feasible: true, selected: false, recommended: false },
+      { profile_id: "msp1:ee", display_name: "Echo 32B", quantization: "Q4_K_M (4 bit)",
+        runtime: "b6000", downloaded: null, hw: null, fit: null, feasible: true,
+        selected: false, recommended: false },
+    ];
+    // Census-reachable view: bb has 3 live peers, dd 1, the rest zero.
+    const PEERS_OK = { "msp1:bb": 3, "msp1:dd": 1 };
+    const chipOf = (peers) => peers == null ? "census n/a"
+      : peers === 0 ? "first peer" : peers + (peers === 1 ? " peer" : " peers");
+    // Canonical order helper (test-side only; the daemon computes this for real).
+    const TIER = { gpu_full: 0, gpu_partial: 1, ram_only: 2 };
+    const canonical = (peers) => CATALOG.map((m, i) => ({
+      i, rec: m.recommended ? 0 : 1, tier: TIER[m.fit] ?? 3,
+      peers: peers ? (peers[m.profile_id] ?? 0) : 0,
+      name: m.display_name, id: m.profile_id }))
+      .sort((a, b) => a.rec - b.rec || a.tier - b.tier || b.peers - a.peers || a.name.localeCompare(b.name));
+    const modelsFor = (peers) => canonical(peers).map(({ i }) => {
+      const m = CATALOG[i];
+      const peers_n = peers ? (peers[m.profile_id] ?? 0) : null;
+      return { ...m, peers: peers_n, census_chip: chipOf(peers_n) };
+    });
+
+    const STATUS = {
+      version: "0.0.0-harness", tracker: "https://stub.local", data_dir: "C:/stub",
+      engine_available: true, engine_path: "C:/stub/engine/llama-server.exe",
+      gpu_engine_available: false, license_accepted: true, profile_id: null, artifact: null,
+      node: { running: false, hosting: false, gateway_addr: null, installation_id: null,
+              engine_port: null, engine_backend: null, listener_addr: null, enrollment: null },
+      family: null, chat_turns: 0,
+    };
+
+    window.__censusMode = "ok";
+    window.__stubInvoke = async (cmd) => {
+      switch (cmd) {
+        case "get_status": return STATUS;
+        case "analyze_hardware": return { ram_mb: 32000, cpu_cores: 12, gpu: { name: "RTX 3080", vram_mb: 9216 } };
+        case "list_models": return modelsFor(window.__censusMode === "ok" ? PEERS_OK : null);
+        case "census":
+          if (window.__censusMode === "na") throw new Error("tracker unreachable (stub)");
+          return { peers_online: 4, counts: PEERS_OK };
+        default: return {};
+      }
+    };
+
+    // Injected into the iframe BEFORE the UI's own script: the stub bridge.
+    const STUB = '<scr' + 'ipt>window.__TAURI__ = { core: { invoke: (cmd, args) => parent.__stubInvoke(cmd, args) }, event: { listen: async () => {} } };</scr' + 'ipt>';
+
+    async function runScenario(ui) {
+      const frame = document.createElement("iframe");
+      frame.setAttribute("aria-hidden", "true");
+      // Rendered at the app's default 1152x648 but parked off-screen.
+      frame.style.cssText = "width:1152px;height:648px;border:0;position:absolute;left:-12000px;top:0;";
+      document.body.appendChild(frame);
+      frame.srcdoc = ui.replace("<head>", "<head>" + STUB);
+      // srcdoc iframes fire an early about:blank load; poll until the
+      // picker actually rendered. The stub invokes settle in microtasks
+      // (before any timer), so first card presence implies the census
+      // re-render is done too.
+      let doc = null;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        await new Promise((r) => setTimeout(r, 100));
+        doc = frame.contentDocument;
+        if (doc && doc.querySelectorAll("#model-cards .card").length) break;
+      }
+      const cards = [...doc.querySelectorAll("#model-cards .card")];
+      const out = {
+        ids: cards.map((c) => c.dataset.id),
+        chip: Object.fromEntries(cards.map((c) => {
+          const m = c.innerHTML.match(/· (census n\/a|first peer|\d+ peers?)/);
+          return [c.dataset.id, m ? m[1] : "(none)"];
+        })),
+        more: doc.getElementById("show-all-models").textContent,
+        moreHidden: doc.getElementById("more-models").hidden,
+      };
+      frame.remove();
+      return out;
+    }
+
+    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    function render(rows) {
+      const table = document.createElement("table");
+      for (const { label, pass, detail } of rows) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td class="${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</td><td>${label}</td><td><code>${detail ?? ""}</code></td>`;
+        table.appendChild(tr);
+      }
+      const all = rows.every((r) => r.pass);
+      const summary = document.createElement("p");
+      summary.innerHTML = `<strong class="${all ? "pass" : "fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
+      const results = document.getElementById("results");
+      results.replaceChildren(summary, table);
+    }
+
+    (async () => {
+      const ui = await (await fetch("../ui/index.html")).text();
+      const rows = [];
+      // ---- Scenario 1: census reachable (bb: 3 peers, dd: 1) ----------
+      window.__censusMode = "ok";
+      const ok = await runScenario(ui);
+      rows.push({ label: "reachable: order kept verbatim = shortlist → tier → peers (bb 3p before aa 0p), downloaded dd visible, ee hidden",
+        pass: eq(ok.ids, ["msp1:bb", "msp1:aa", "msp1:cc", "msp1:dd"]), detail: JSON.stringify(ok.ids) });
+      rows.push({ label: "reachable: chips — bb 3 peers, dd 1 peer (singular), aa/cc first peer",
+        pass: eq(ok.chip, { "msp1:bb": "3 peers", "msp1:aa": "first peer", "msp1:cc": "first peer", "msp1:dd": "1 peer" }),
+        detail: JSON.stringify(ok.chip) });
+      rows.push({ label: "reachable: shortlist filter untouched (1 more model behind the button)",
+        pass: !ok.moreHidden && ok.more.includes("5 models") && ok.more.includes("1 more"), detail: ok.more });
+      // ---- Scenario 2: census unreachable ------------------------------
+      window.__censusMode = "na";
+      const na = await runScenario(ui);
+      rows.push({ label: "unreachable: every chip degrades to census n/a (never 'first peer')",
+        pass: eq(na.chip, { "msp1:aa": "census n/a", "msp1:bb": "census n/a", "msp1:cc": "census n/a", "msp1:dd": "census n/a" }),
+        detail: JSON.stringify(na.chip) });
+      rows.push({ label: "unreachable: order falls back to shortlist → tier → name (no invented counts)",
+        pass: eq(na.ids, ["msp1:aa", "msp1:bb", "msp1:cc", "msp1:dd"]), detail: JSON.stringify(na.ids) });
+      rows.push({ label: "unreachable: downloaded dd still visible",
+        pass: na.ids.includes("msp1:dd") && !na.ids.includes("msp1:ee"), detail: JSON.stringify(na.ids) });
+      render(rows);
+    })().catch((e) => {
+      document.getElementById("results").innerHTML =
+        `<span class="fail">harness error: ${e}<br>(did you open this over http? file:// cannot fetch the UI)</span>`;
+    });
+  </script>
+</body>
+</html>

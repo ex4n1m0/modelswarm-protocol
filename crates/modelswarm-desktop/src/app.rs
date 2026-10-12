@@ -10,6 +10,7 @@
 //! | `set_tracker` | saves the tracker base URL |
 //! | `accept_privacy` | records the first-run license acceptance |
 //! | `list_models` | verified-catalog active profiles |
+//! | `census` | live per-profile peer counts (public `/api/v1/stats`) for the picker chips |
 //! | `download_model` | streams `download` events, returns artifact state |
 //! | `set_hosting` | starts/stops the in-process node (+ roster heartbeat) |
 //! | `family_probe` | opens one real family session on an eligible peer, PRESENTING this installation's earned lease (ADR-032 §2); returns the honest outcome, never the lease itself |
@@ -68,6 +69,11 @@ struct Inner {
     profile_id: Option<String>,
     /// Cached HF artifact sizes for requirement hints: profile -> (bytes, fetched_unix_ms).
     size_cache: std::collections::HashMap<String, (u64, u64)>,
+    /// Last good public-stats census (owner directive 2026-10-12):
+    /// profile_id -> live peers. Refreshed by the 30 s `census` poll;
+    /// dropped on any failure (stale counts must read "census n/a", not
+    /// pretend to be live). Joined into `list_models` responses.
+    census_counts: Option<Arc<std::collections::BTreeMap<String, u64>>>,
     /// Cached swarm consume-lease (F3(2)): (profile, wire lease, unix expiry).
     /// Earned via the hosting-challenge chain; reused until it expires.
     swarm_lease: Option<(String, String, u64)>,
@@ -172,6 +178,7 @@ impl DesktopState {
                 data_dir,
                 tracker_url: config.tracker,
                 size_cache: Default::default(),
+                census_counts: None,
                 profile_id: config.profile_id,
                 license_accepted,
                 artifact: None,
@@ -1065,7 +1072,29 @@ async fn list_models(
     for (i, entry) in out.iter_mut().enumerate() {
         entry["recommended"] = serde_json::json!(recommended.contains(&i));
     }
-    Ok(out)
+
+    // The census join (owner directive 2026-10-12): the last good public
+    // stats fetch (the 30 s `census` poll) joined against THIS loaded
+    // catalog — per-card live peer count (`peers`, null = census n/a) +
+    // the honest `census_chip` — and the cards returned in the canonical
+    // picker order (shortlist -> fit tier -> peers -> name). The webview
+    // renders them in exactly this order; it recomputes nothing.
+    let census_counts = inner.census_counts.clone();
+    for entry in out.iter_mut() {
+        let peers = census_peers(
+            entry["profile_id"].as_str().unwrap_or(""),
+            census_counts.as_deref(),
+        );
+        entry["peers"] = serde_json::json!(peers);
+        entry["census_chip"] = serde_json::json!(census_chip(peers));
+    }
+    let mut ordered: Vec<serde_json::Value> = Vec::with_capacity(out.len());
+    for (i, _) in census_view(&out, census_counts.as_deref()) {
+        // The view is a permutation of the card indices — each is taken
+        // exactly once, so the Nulls left behind are never read again.
+        ordered.push(std::mem::take(&mut out[i]));
+    }
+    Ok(ordered)
 }
 
 #[tauri::command]
@@ -1074,6 +1103,193 @@ async fn analyze_hardware(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<serde_json::Value, String> {
     serde_json::to_value(hardware_of(&app, &state).await).map_err(|e| e.to_string())
+}
+
+// ---- Live peer census (owner directive 2026-10-12) ----------------------
+//
+// "we should have indication on what models people are hosting, so new
+// people can select those that have more people": the tracker's PUBLIC
+// stats endpoint — the same one the website's census reads (GET
+// /api/v1/stats, no auth, counts only, content-blind by construction) —
+// joined against the picker's loaded catalog. The `census` IPC command
+// below refreshes a daemon-side cache on its own 30 s cadence;
+// `list_models` joins that cache into every catalog response (per-card
+// `peers` + `census_chip` and the canonical card order), so the picker
+// logic lives HERE, once, testable — the webview is a dumb renderer.
+// Honesty rules:
+// - never blocks the picker: the join reads whatever cache exists; no
+//   fresh census reads "census n/a" (the degraded-chips pattern), never
+//   a zero, and a failed poll DROPS the stale cache.
+// - never reorders the hardware shortlist: fit stays primary; live peers
+//   only break ties WITHIN one fit tier (`census_order`), and census
+//   counts NEVER change which six cards are recommended (membership is
+//   hardware-scored in `list_models`).
+// - empty and unreachable are different states: a well-formed stats body
+//   with no hosting peers is `Some(0)` ("first peer"); a malformed body
+//   is an error (`parse_census_counts` is strict) so garbage can never
+//   render as "nobody hosting".
+
+/// Parses the public `/api/v1/stats` body into (peersOnline, per-profile
+/// live counts). STRICT: any missing or non-numeric field is an error —
+/// an empty-but-valid census (nobody hosting) and an unreadable one are
+/// different honest states and must never collapse into "first peer".
+fn parse_census_counts(
+    body: &serde_json::Value,
+) -> Result<(u64, std::collections::BTreeMap<String, u64>), String> {
+    let peers_online = body["peersOnline"]
+        .as_u64()
+        .ok_or("stats body missing numeric peersOnline")?;
+    let models = body["models"]
+        .as_array()
+        .ok_or("stats body missing models array")?;
+    let mut counts = std::collections::BTreeMap::new();
+    for entry in models {
+        let profile_id = entry["profileId"]
+            .as_str()
+            .ok_or("stats model entry missing profileId")?;
+        let peers = entry["peers"]
+            .as_u64()
+            .ok_or("stats model entry missing numeric peers")?;
+        counts.insert(profile_id.to_string(), peers);
+    }
+    Ok((peers_online, counts))
+}
+
+/// One model's live peer count: `None` = census unreachable, `Some(0)` =
+/// reachable and nobody hosting it (profile absent from the counts —
+/// stats only lists profiles with a live lease).
+fn census_peers(
+    profile_id: &str,
+    counts: Option<&std::collections::BTreeMap<String, u64>>,
+) -> Option<u64> {
+    counts.map(|c| c.get(profile_id).copied().unwrap_or(0))
+}
+
+/// The honest per-card census chip: the exact live count, "first peer"
+/// at zero, "census n/a" while unreachable — no invented numbers.
+fn census_chip(peers: Option<u64>) -> String {
+    match peers {
+        None => "census n/a".into(),
+        Some(0) => "first peer".into(),
+        Some(1) => "1 peer".into(),
+        Some(n) => format!("{n} peers"),
+    }
+}
+
+/// Fit tier rank for the picker order: full GPU offload first, partial
+/// next, RAM-only after, unknown (size not known) last.
+fn tier_rank(fit: Option<&str>) -> u8 {
+    match fit {
+        Some("gpu_full") => 0,
+        Some("gpu_partial") => 1,
+        Some("ram_only") => 2,
+        _ => 3,
+    }
+}
+
+/// The canonical picker order: the v0.2.19 hardware shortlist stays
+/// PRIMARY — recommended cards first — then fit tier, then MORE LIVE
+/// PEERS first (equal for every card while the census is n/a — no
+/// invented counts), then display name, and the stable catalog order for
+/// full ties. `list_models` returns cards in exactly this order; the
+/// webview renders them in it verbatim.
+fn census_order(
+    models: &[serde_json::Value],
+    counts: Option<&std::collections::BTreeMap<String, u64>>,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..models.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (ma, mb) = (&models[a], &models[b]);
+        mb["recommended"]
+            .as_bool()
+            .unwrap_or(false)
+            .cmp(&ma["recommended"].as_bool().unwrap_or(false))
+            .then(tier_rank(ma["fit"].as_str()).cmp(&tier_rank(mb["fit"].as_str())))
+            .then(
+                census_peers(mb["profile_id"].as_str().unwrap_or(""), counts).cmp(&census_peers(
+                    ma["profile_id"].as_str().unwrap_or(""),
+                    counts,
+                )),
+            )
+            .then(
+                ma["display_name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(mb["display_name"].as_str().unwrap_or("")),
+            )
+    });
+    order
+}
+
+/// The joined render the picker shows: `(model index, chip)` pairs in
+/// `census_order` — the same view `list_models` bakes into its cards.
+fn census_view(
+    models: &[serde_json::Value],
+    counts: Option<&std::collections::BTreeMap<String, u64>>,
+) -> Vec<(usize, String)> {
+    census_order(models, counts)
+        .into_iter()
+        .map(|i| {
+            (
+                i,
+                census_chip(census_peers(
+                    models[i]["profile_id"].as_str().unwrap_or(""),
+                    counts,
+                )),
+            )
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn census(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Value, String> {
+    let tracker_url = {
+        let inner = state.inner.lock().await;
+        inner.tracker_url.clone()
+    };
+    // Public GET /api/v1/stats — the same no-auth, counts-only endpoint
+    // the website's census reads. The tracker-api client's surface is the
+    // signed msp-v1 roster set (no stats method, and that crate is not
+    // this agent's to extend), so this is a plain reqwest GET against the
+    // SAME configured tracker base URL. Short timeout: the picker never
+    // waits on it — `list_models` joins whatever cache exists.
+    let http = reqwest::Client::new();
+    let fetched: Result<(u64, std::collections::BTreeMap<String, u64>), String> = async {
+        let body: serde_json::Value = http
+            .get(format!("{tracker_url}/api/v1/stats"))
+            .timeout(Duration::from_secs(6))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        parse_census_counts(&body)
+    }
+    .await;
+    let mut inner = state.inner.lock().await;
+    match fetched {
+        Ok((peers_online, counts)) => {
+            inner.census_counts = Some(Arc::new(counts.clone()));
+            Ok(serde_json::json!({
+                "peers_online": peers_online,
+                "counts": counts,
+            }))
+        }
+        Err(e) => {
+            // Drop the stale cache: a failed poll must read "census n/a"
+            // on the next render, never yesterday's counts.
+            inner.census_counts = None;
+            log_event(
+                &state.telemetry,
+                "warn",
+                "census.error",
+                &[("error", &e), ("tracker", &tracker_url)],
+            );
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]
@@ -3206,6 +3422,7 @@ pub fn run() {
             set_tracker,
             accept_privacy,
             list_models,
+            census,
             download_model,
             set_hosting,
             select_model,
@@ -3350,6 +3567,177 @@ mod tests {
 
         // Unknown size -> no invented numbers (fail-closed display).
         assert!(hardware_requirements(None).is_none());
+    }
+
+    // ---- Live peer census (owner directive 2026-10-12) ----------------
+
+    /// `list_models`-shaped fixture — only the fields the census join and
+    /// order read: profile_id, display_name, fit, recommended.
+    fn census_fixture_models() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "profile_id": "msp1:aa", "display_name": "Alpha 9B",
+                "fit": "gpu_full", "recommended": true
+            }),
+            serde_json::json!({
+                "profile_id": "msp1:bb", "display_name": "Bravo 9B",
+                "fit": "gpu_full", "recommended": true
+            }),
+            serde_json::json!({
+                "profile_id": "msp1:cc", "display_name": "Charlie 14B",
+                "fit": "gpu_partial", "recommended": true
+            }),
+            serde_json::json!({
+                "profile_id": "msp1:dd", "display_name": "Delta 27B",
+                "fit": "ram_only", "recommended": false
+            }),
+            serde_json::json!({
+                "profile_id": "msp1:ee", "display_name": "Echo 32B",
+                "fit": null, "recommended": false
+            }),
+        ]
+    }
+
+    fn counts_of(pairs: &[(&str, u64)]) -> std::collections::BTreeMap<String, u64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    fn census_view_ids<'a>(
+        view: &[(usize, String)],
+        models: &'a [serde_json::Value],
+    ) -> Vec<&'a str> {
+        view.iter()
+            .map(|(i, _)| models[*i]["profile_id"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn census_join_builds_honest_chips() {
+        let models = census_fixture_models();
+        let counts = counts_of(&[("msp1:aa", 2), ("msp1:bb", 1), ("msp1:cc", 5)]);
+        let view = census_view(&models, Some(&counts));
+        let chip_of = |id: &str| {
+            view.iter()
+                .find(|(i, _)| models[*i]["profile_id"] == id)
+                .map(|(_, chip)| chip.as_str())
+                .unwrap()
+        };
+        assert_eq!(chip_of("msp1:aa"), "2 peers");
+        assert_eq!(chip_of("msp1:bb"), "1 peer"); // singular, like the site census
+        assert_eq!(chip_of("msp1:cc"), "5 peers");
+        // Reachable census, nobody hosting it -> the honest zero state.
+        assert_eq!(chip_of("msp1:dd"), "first peer");
+        assert_eq!(chip_of("msp1:ee"), "first peer");
+    }
+
+    #[test]
+    fn census_unreachable_is_na_never_first_peer() {
+        let models = census_fixture_models();
+        let view = census_view(&models, None);
+        // Every chip degrades honestly — an unreachable tracker is NOT
+        // "nobody hosting" (the exact collapse the strict parser prevents
+        // on the wire side too).
+        assert!(
+            view.iter().all(|(_, chip)| chip == "census n/a"),
+            "unreachable must read n/a everywhere: {view:?}"
+        );
+        // Order falls back to shortlist -> tier -> name (peers equal for
+        // every card while n/a: no invented counts reorder anything).
+        assert_eq!(
+            census_view_ids(&view, &models),
+            ["msp1:aa", "msp1:bb", "msp1:cc", "msp1:dd", "msp1:ee"]
+        );
+    }
+
+    #[test]
+    fn census_order_is_shortlist_primary_then_tier_peers_name() {
+        let models = census_fixture_models();
+        // A crowded NON-shortlist card (9 live peers) must still sort
+        // after every recommended card: the v0.2.19 hardware shortlist
+        // stays the primary order — peers only break ties within a tier.
+        let counts = counts_of(&[
+            ("msp1:aa", 1),
+            ("msp1:bb", 3),
+            ("msp1:cc", 0),
+            ("msp1:dd", 9),
+            ("msp1:ee", 9),
+        ]);
+        let view = census_view(&models, Some(&counts));
+        assert_eq!(
+            census_view_ids(&view, &models),
+            // Shortlist first: gpu_full tier by peers (bb 3 > aa 1), then
+            // the gpu_partial cc (0 peers — honest "first peer" chip but
+            // still shortlisted); only then the crowded non-shortlist
+            // cards (dd ram_only before ee unknown tier).
+            ["msp1:bb", "msp1:aa", "msp1:cc", "msp1:dd", "msp1:ee"]
+        );
+    }
+
+    #[test]
+    fn census_order_ties_fall_to_name_then_catalog_order() {
+        // Same tier, same count: name ascending decides; identical names:
+        // stable catalog order (the daemon sorts once — `list_models`
+        // returns this exact order and the webview renders it verbatim).
+        let models = vec![
+            serde_json::json!({
+                "profile_id": "msp1:z1", "display_name": "Same 7B",
+                "fit": "ram_only", "recommended": true
+            }),
+            serde_json::json!({
+                "profile_id": "msp1:z2", "display_name": "Ada 7B",
+                "fit": "ram_only", "recommended": true
+            }),
+            serde_json::json!({
+                "profile_id": "msp1:z3", "display_name": "Same 7B",
+                "fit": "ram_only", "recommended": true
+            }),
+        ];
+        let counts = counts_of(&[("msp1:z1", 2), ("msp1:z2", 2), ("msp1:z3", 2)]);
+        let view = census_view(&models, Some(&counts));
+        assert_eq!(
+            census_view_ids(&view, &models),
+            ["msp1:z2", "msp1:z1", "msp1:z3"]
+        );
+    }
+
+    #[test]
+    fn parse_census_counts_is_strict() {
+        let ok = serde_json::json!({
+            "peersOnline": 3,
+            "models": [
+                { "profileId": "msp1:aa", "peers": 2 },
+                { "profileId": "msp1:bb", "peers": 1 }
+            ]
+        });
+        let (online, counts) = parse_census_counts(&ok).unwrap();
+        assert_eq!(online, 3);
+        assert_eq!(counts["msp1:aa"], 2);
+        assert_eq!(counts["msp1:bb"], 1);
+
+        // Empty-but-valid: nobody hosting — the honest "first peer" state.
+        let empty = serde_json::json!({ "peersOnline": 0, "models": [] });
+        assert_eq!(
+            parse_census_counts(&empty).unwrap(),
+            (0, std::collections::BTreeMap::new())
+        );
+
+        // Malformed bodies must ERROR — they can never read as zero peers.
+        assert!(parse_census_counts(&serde_json::json!({ "models": [] })).is_err());
+        assert!(parse_census_counts(&serde_json::json!({ "peersOnline": 1 })).is_err());
+        assert!(parse_census_counts(&serde_json::json!({
+            "peersOnline": 1.5, "models": []
+        }))
+        .is_err());
+        assert!(parse_census_counts(&serde_json::json!({
+            "peersOnline": 1,
+            "models": [{ "profileId": "msp1:aa", "peers": "2" }]
+        }))
+        .is_err());
+        assert!(parse_census_counts(&serde_json::json!({
+            "peersOnline": 1,
+            "models": [{ "profileId": "msp1:aa" }]
+        }))
+        .is_err());
     }
 
     #[test]

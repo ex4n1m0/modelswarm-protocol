@@ -36,6 +36,8 @@ tauri-shell = [
     "dep:reqwest",
     "dep:serde",
     "dep:serde_json",
+    "dep:sha2",
+    "dep:hex",
     "verifydrafts-capi",
 ]
 # ADR-032 light-up tier in the desktop: the composed daemon
@@ -79,6 +81,9 @@ serde_json = { version = "1", optional = true }
 # "stream": incremental SSE consumption for the per-delta chat path (P1).
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+# ADR-034 family pin identity: bare sha256 over LE-u32 token ids.
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
 
 [build-dependencies]
 tauri-build = { version = "2", optional = true, default-features = false , features = [] }

@@ -349,6 +349,11 @@ impl Node {
 
         // Runtime selection (ADR-019).
         let runtime = select_runtime(&config, &telemetry, engine.as_ref())?;
+        // The handle keeps the SAME runtime instance (ADR-034: the desktop
+        // derives the family pin and drafts the probe's pairing window
+        // through the node — the sidecar's bearer secret never crosses the
+        // process boundary, ADR-002).
+        let handle_runtime = runtime.clone();
         if let Some(runtime) = &runtime {
             let descriptor = runtime.id();
             telemetry.info(
@@ -446,6 +451,7 @@ impl Node {
             engine_port: engine.as_ref().map(|e| e.port),
             engine_identity: engine.as_ref().map(|e| e.identity.clone()),
             engine_backend: engine.as_ref().map(|e| e.backend.clone()),
+            runtime: handle_runtime,
             executor: Some(executor),
             shutdown_rx: handle_shutdown_rx,
             server,
@@ -471,6 +477,14 @@ pub struct NodeHandle {
     pub tracker: Option<Arc<TrackerClient>>,
     /// The supervised engine's loopback port, when one was started.
     pub engine_port: Option<u16>,
+    /// The supervised pinned runtime — the SAME instance the gateway
+    /// executor serves through — when one was configured. Lets the desktop
+    /// compose ADR-034's family-pin derivation ([`Self::engine_tokenize`])
+    /// and the probe's coordinator-side drafting
+    /// ([`Self::engine_propose_window`]) through the node, so the
+    /// sidecar's bearer secret never crosses the process boundary
+    /// (ADR-002: only the Rust node talks to the sidecar).
+    pub runtime: Option<Arc<dyn InferenceRuntime>>,
     /// The supervised engine's pinned identity (tag + canonical build
     /// hash) — lets attachés (the ADR-032 family engine bridge) label
     /// their in-process engine with the SAME pin the sidecar verified
@@ -494,6 +508,62 @@ impl NodeHandle {
     pub async fn stopped(self) {
         let _ = self.server.await;
     }
+
+    /// Tokenizes `text` under the supervised engine's PINNED tokenizer (the
+    /// sidecar's `/tokenize` surface — ADR-034 rule 3: "the C-API
+    /// adapter's tokenizer or the sidecar's tokenization surface, any
+    /// surface yielding the pinned engine's token ids"). Errors honestly
+    /// when no engine is supervised (engine-less gateway / mock node) or
+    /// the engine refused the call.
+    pub async fn engine_tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
+        runtime_tokenize(self.runtime.as_ref(), text).await
+    }
+
+    /// The coordinator's GREEDY CONTINUATION of a token-id prefix through
+    /// THIS node's own hosting engine (ADR-034 rule 6b: the family probe's
+    /// pairing window is drafted by the coordinator's pinned engine — its
+    /// hosting sidecar; no second engine on the coordinator). May return
+    /// fewer than `window` ids when the engine emits EOS early (an honest
+    /// short window, never padded).
+    pub async fn engine_propose_window(
+        &self,
+        profile_id: &str,
+        prefix: &[u32],
+        window: u32,
+    ) -> Result<Vec<u32>, String> {
+        let runtime = self.runtime.as_ref();
+        runtime_propose_window(runtime, profile_id, prefix, window).await
+    }
+}
+
+/// The free-function core of [`NodeHandle::engine_tokenize`] — public so
+/// the desktop can run the same seam over a cloned runtime handle
+/// (testable with the mock runtime without a live node).
+pub async fn runtime_tokenize(
+    runtime: Option<&Arc<dyn InferenceRuntime>>,
+    text: &str,
+) -> Result<Vec<u32>, String> {
+    let runtime = runtime.ok_or("no supervised engine")?;
+    runtime.tokenize(text).await.map_err(|e| e.to_string())
+}
+
+/// The free-function core of [`NodeHandle::engine_propose_window`] —
+/// public for the desktop's probe path (see [`runtime_tokenize`]).
+pub async fn runtime_propose_window(
+    runtime: Option<&Arc<dyn InferenceRuntime>>,
+    profile_id: &str,
+    prefix: &[u32],
+    window: u32,
+) -> Result<Vec<u32>, String> {
+    let runtime = runtime.ok_or("no supervised engine")?;
+    let handle = runtime
+        .load(profile_id)
+        .await
+        .map_err(|e| format!("engine load: {e}"))?;
+    runtime
+        .propose(&handle, prefix, window)
+        .await
+        .map_err(|e| format!("engine propose: {e}"))
 }
 
 /// Picks the runtime per ADR-019:
@@ -911,5 +981,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// ADR-034 seams: `engine_tokenize` maps text through the runtime's
+    /// pinned tokenizer, and both seams fail HONESTLY (a stable label,
+    /// never a panic) when no engine is supervised. The mock runtime's
+    /// tokenizer is the UTF-8 byte sequence, so the mapping is exact.
+    #[tokio::test]
+    async fn engine_seams_tokenize_and_fail_closed_without_a_runtime() {
+        let none = runtime_tokenize(None, "pin").await;
+        assert_eq!(none.unwrap_err(), "no supervised engine");
+        let none = runtime_propose_window(None, "msp1:x", &[1, 2], 8).await;
+        assert_eq!(none.unwrap_err(), "no supervised engine");
+
+        let runtime: Arc<dyn InferenceRuntime> = Arc::new(modelswarm_runtime::MockRuntime::new(
+            0x5EED_0000_0000_0002,
+            1.0,
+        ));
+        let ids = runtime_tokenize(Some(&runtime), "pin").await.unwrap();
+        assert_eq!(ids, vec![u32::from(b'p'), u32::from(b'i'), u32::from(b'n')]);
+
+        // The propose seam loads the profile and returns a bounded greedy
+        // continuation of the prefix (deterministic per the mock's
+        // splitmix64 mixing: two identical calls propose identical ids).
+        let prefix = vec![u32::from(b'p'), u32::from(b'i'), u32::from(b'n')];
+        let window = runtime_propose_window(Some(&runtime), "msp1:x", &prefix, 8)
+            .await
+            .unwrap();
+        assert!(!window.is_empty() && window.len() <= 8, "bounded window");
+        assert!(window.iter().all(|t| (*t as usize) < 256), "mock vocab");
+        let again = runtime_propose_window(Some(&runtime), "msp1:x", &prefix, 8)
+            .await
+            .unwrap();
+        assert_eq!(window, again, "greedy continuation is deterministic");
     }
 }

@@ -3427,6 +3427,7 @@ name = "modelswarm-desktop"
 version = "0.2.21"
 dependencies = [
  "futures-util",
+ "hex",
  "modelswarm-gateway",
  "modelswarm-identity",
  "modelswarm-node",
@@ -3440,6 +3441,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",

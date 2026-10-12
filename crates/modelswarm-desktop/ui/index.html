@@ -469,10 +469,16 @@
         $("family-line").textContent = "batch-verify family: off (hosting off)";
       } else if (fam.state === "on") {
         const d = fam.disclosure || {};
+        // ADR-034 rule 6a: pin provenance (auto family-prompt-v1 | file),
+        // token count, pin hash — counts and a hash only, never ids.
+        const pin = fam.pin
+          ? " — pin " + fam.pin.provenance + ", " + fam.pin.token_count + " tok, " +
+            String(fam.pin.pin_hash || "").slice(0, 8) + "…"
+          : "";
         $("family-line").textContent =
           "batch-verify family: on — " + (d.backend || "?") + ", batch window " +
           (d.batch_window_max || "?") + ", coordinator leases: presented at session open (roster " +
-          (fam.lease_roster_peers ?? 0) + ")";
+          (fam.lease_roster_peers ?? 0) + ")" + pin;
       } else {
         $("family-line").textContent = "batch-verify family: off — " + (fam.reason || "unknown");
       }
@@ -517,11 +523,24 @@
       $("family-probe-line").textContent = "family pairing: opening a session (challenge + lease + dial)…";
       try {
         const r = await invoke("family_probe");
+        // ADR-034 rule 6b: the one-round confirmation — counts only
+        // (accepted/window/divergence), never token ids. pin_mismatch
+        // means the context-or-backend divergence class (an E0
+        // cross-machine divergence can present the same way — the label
+        // is the diagnostic, not an accusation).
+        const pair = r.pairing
+          ? " — pairing: " + r.pairing +
+            (r.pairing_window != null
+              ? " (" + (r.pairing_accepted ?? "?") + "/" + r.pairing_window +
+                (r.pairing_divergence != null ? ", divergence at " + r.pairing_divergence : "") + ")"
+              : "") +
+            (r.pairing_detail ? " [" + r.pairing_detail + "]" : "")
+          : "";
         if (r.opened) {
           $("family-probe-line").textContent =
             "family pairing: OPENED with " + (r.peer_id || "?").slice(0, 16) + "… — " +
             (r.backend || "?") + ", batch window " + (r.batch_window_max || "?") +
-            " (presented lease accepted; session " + (r.session_id || "") + ")";
+            " (presented lease accepted; session " + (r.session_id || "") + ")" + pair;
         } else {
           $("family-probe-line").textContent = "family pairing: " + (r.reason || "failed") +
             (r.detail ? " — " + r.detail : "");

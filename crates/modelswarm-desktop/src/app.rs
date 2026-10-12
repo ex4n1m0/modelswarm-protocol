@@ -14,7 +14,7 @@
 //! | `resource_sample` | one CPU/RAM/working-set/GPU/VRAM reading for the monitor panel (null per field = "n/a") |
 //! | `download_model` | streams `download` events, returns artifact state |
 //! | `set_hosting` | starts/stops the in-process node (+ roster heartbeat) |
-//! | `family_probe` | opens one real family session on an eligible peer, PRESENTING this installation's earned lease (ADR-032 §2); returns the honest outcome, never the lease itself |
+//! | `family_probe` | opens one real family session on an eligible peer, PRESENTING this installation's earned lease (ADR-032 §2), then runs the ONE-round ADR-034 pairing confirmation (counts only); returns the honest outcome, never the lease or token ids |
 //! | `send_chat` | one function: chat through the node's loopback gateway |
 //! | `hf_search_models` | public HF Hub repo search (ADR-023 picker) |
 //! | `hf_list_ggufs` | pinned revision + artifact rows for one repo |
@@ -132,6 +132,25 @@ struct FamilyStatus {
     /// admission order. The count is reported so the tracker-fed roster
     /// future shows up when it lands).
     lease_roster_peers: usize,
+    /// ADR-034 rule 6a: the pin in force while the family is on —
+    /// provenance (`auto family-prompt-v1` | `file`), token count, and
+    /// pin hash. `None` while off/unpinned or not hosting (the off reason
+    /// carries why).
+    pin: Option<FamilyPinStatus>,
+}
+
+/// The ADR-034 rule-6a status fields: provenance, token count, pin hash —
+/// counts and a hash only, never token ids (rule 7 allows exactly these).
+#[derive(Debug, Clone, Serialize)]
+struct FamilyPinStatus {
+    /// `"auto family-prompt-v1"` | `"file"`.
+    provenance: String,
+    /// The prompt version in force (`family-prompt-v1`).
+    version: String,
+    /// Pinned token count.
+    token_count: u64,
+    /// Bare 64-hex sha256 over the LE-u32 ids.
+    pin_hash: String,
 }
 
 impl FamilyStatus {
@@ -141,6 +160,7 @@ impl FamilyStatus {
             reason: Some(reason.into()),
             disclosure: None,
             lease_roster_peers: 0,
+            pin: None,
         }
     }
 }
@@ -413,6 +433,253 @@ fn family_prompt_tokens(data_dir: &Path) -> Option<Vec<u32>> {
     (!ids.is_empty()).then_some(ids)
 }
 
+// ---- ADR-034 tier 1: the family auto-pin (deterministic serving-side
+// pin). Two stock installs hosting the same exact profile pair with zero
+// manual files; the expert seam (the file) survives with precedence; junk
+// stays fail-closed; nothing on the frozen wire changes. ---------------
+
+/// ADR-034 rule 2: the frozen, neutral v1 family prompt text. MUST be
+/// byte-identical in every implementation — it is a PROTOCOL PARAMETER,
+/// not content (rule 7: the text, version tag, token count, and pin hash
+/// MAY be logged, versioned, telemetered, and shown; the
+/// content-redaction rules bind session prompts, not ADR-defined
+/// constants).
+#[cfg(feature = "verifydrafts")]
+const FAMILY_PROMPT_V1: &str = "You are serving a ModelSwarm cooperative verification session. Continue the given context exactly as this model normally would.";
+
+/// The version tag that travels with the v1 pin in status and telemetry
+/// (ADR-034 rules 2/6a). A version bump is a pairing-visible event and
+/// rides the rule-4 rewrite discipline.
+#[cfg(feature = "verifydrafts")]
+const FAMILY_PROMPT_VERSION: &str = "family-prompt-v1";
+
+/// ADR-034 rule 3: render the prompt text as a SYSTEM-ONLY turn through
+/// the profile's pinned chat template. ChatML is the catalog's template
+/// family (ADR-025 rule 2: every promoted profile's `chat_template_hash`
+/// inputs are ChatML-shaped; a non-ChatML profile is gated per ADR-025
+/// rule 3 and tokenizes the raw text). Deliberately WITHOUT the assistant
+/// generation prompt — the pin is the root context the verifier prefills
+/// and the coordinator continues from; the derivation is constants plus
+/// the pinned tokenizer, nothing else (rule 1), so it is identical on
+/// every install hosting the same exact profile.
+#[cfg(feature = "verifydrafts")]
+fn family_prompt_render_system_only(text: &str) -> String {
+    format!("<|im_start|>system\n{text}<|im_end|>\n")
+}
+
+/// ADR-034 rule 3: the pin identity — the bare 64-hex `sha256` over the
+/// token ids rendered as little-endian u32 each (the ADR-032 §1 rule-2 id
+/// encoding, with no parent). Status and telemetry carry the HASH and the
+/// COUNT, never the ids.
+#[cfg(feature = "verifydrafts")]
+fn family_pin_hash(ids: &[u32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut bytes = Vec::with_capacity(ids.len() * 4);
+    for id in ids {
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    hex::encode(Sha256::digest(&bytes))
+}
+
+/// Derives one version's pin ids under an injected PINNED tokenizer (the
+/// determinism rule: same `ModelProfileId` ⇒ same template and tokenizer
+/// ⇒ same ids on every install; the C-API adapter's tokenizer or the
+/// sidecar's surface — any yielding the pinned engine's ids). An empty
+/// result is an error: an empty pin refuses every session at the engine
+/// source. The tokenizer is an async closure so production paths pass
+/// the node's engine seams and tests pass a deterministic in-memory one.
+#[cfg(feature = "verifydrafts")]
+async fn derive_family_prompt_ids<F, Fut>(text: &str, tokenize: F) -> Result<Vec<u32>, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u32>, String>>,
+{
+    let rendered = family_prompt_render_system_only(text);
+    let ids = tokenize(rendered)
+        .await
+        .map_err(|e| format!("pinned tokenizer: {e}"))?;
+    if ids.is_empty() {
+        return Err("pinned tokenizer returned an empty prompt".into());
+    }
+    Ok(ids)
+}
+
+/// ADR-034 rule 4's decision, before any derivation runs (an expert file
+/// needs NO tokenizer — it is honored as-is even with the engine down).
+#[cfg(feature = "verifydrafts")]
+#[derive(Debug)]
+enum FamilyPinPlan {
+    /// File ABSENT: derive the current version's ids and write them (the
+    /// two-stock-installs case).
+    WriteAuto,
+    /// File present, strictly parsable, and EQUAL to an older version's
+    /// derived ids (an unmodified automatic pin): derive the current
+    /// version's ids and rewrite the file.
+    RewriteAuto { previous_version: String },
+    /// File present, strictly parsable, anything else: honored AS-IS (the
+    /// documented expert override, including non-v1 pins — it WINS).
+    KeepFile(Vec<u32>),
+    /// File present but unparsable: fail-closed unpinned; the automatic
+    /// pin never silently overwrites a file the user may own.
+    Junk,
+}
+
+/// The pure core of the rule-4 write discipline: which action the pin
+/// file demands at hosting start. `previous_versions` carries each
+/// OLDER prompt version's derived ids (empty while v1 is the only
+/// version); the current version's ids are derived lazily by the caller
+/// only for the write/rewrite paths. `Err` = the local derivation is
+/// impossible (engine/tokenizer unavailable) — the unpinned degrade with
+/// the detail, never a guess.
+#[cfg(feature = "verifydrafts")]
+fn family_pin_plan(
+    dir: &Path,
+    previous_versions: &[(&str, Vec<u32>)],
+) -> Result<FamilyPinPlan, String> {
+    match std::fs::read_to_string(dir.join(FAMILY_PROMPT_TOKENS_FILE)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FamilyPinPlan::WriteAuto),
+        Err(e) => Err(format!("pin file unreadable: {e}")),
+        Ok(raw) => {
+            let parsed: Option<Vec<u32>> = raw
+                .split_whitespace()
+                .map(|token| token.parse::<u32>().ok())
+                .collect();
+            match parsed {
+                None => Ok(FamilyPinPlan::Junk),
+                Some(ids) if ids.is_empty() => Ok(FamilyPinPlan::Junk),
+                Some(ids) => {
+                    for (version, previous_ids) in previous_versions {
+                        if &ids == previous_ids {
+                            return Ok(FamilyPinPlan::RewriteAuto {
+                                previous_version: (*version).to_string(),
+                            });
+                        }
+                    }
+                    Ok(FamilyPinPlan::KeepFile(ids))
+                }
+            }
+        }
+    }
+}
+
+/// Writes the pin file atomically: `.part` sibling + rename (the
+/// artifact-download pattern). The rewrite path (destination exists)
+/// removes the old file first — std `rename` does not replace on Windows;
+/// the sub-millisecond window sits at hosting start, before any session
+/// can read the pin.
+#[cfg(feature = "verifydrafts")]
+fn write_family_pin_file(path: &Path, ids: &[u32]) -> Result<(), String> {
+    let tmp = path.with_extension("part");
+    let body = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ") + "\n";
+    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+/// The pin in force after rule 4 ran at hosting start.
+#[cfg(feature = "verifydrafts")]
+struct FamilyPin {
+    /// `"auto family-prompt-v1"` | `"file"` (rule 6a).
+    provenance: String,
+    /// The ids the verifier engine prefills (the file's when it wins).
+    ids: Vec<u32>,
+}
+
+/// ADR-034 rules 1–4 at hosting start: derive (or honor) the pin BEFORE
+/// it is read and before the engine source constructs. The derivation is
+/// local, deterministic, and content-free: the frozen v1 text rendered as
+/// a system-only ChatML turn, tokenized under the profile's pinned
+/// tokenizer — the sidecar's `/tokenize` surface through the node (the
+/// same runtime instance the gateway serves through; the sidecar's
+/// bearer secret never crosses the process boundary, ADR-002). `Err` =
+/// unpinned with the honest detail (junk file, unreadable file, or a
+/// failed derivation — the family engine stays down, never a guess).
+#[cfg(feature = "verifydrafts")]
+async fn ensure_family_pin(
+    data_dir: &Path,
+    handle: &NodeHandle,
+    telemetry: &Telemetry,
+) -> Result<FamilyPin, String> {
+    // Only one version exists today, so the version-advance table is
+    // empty; the rewrite rule is exercised by the unit tests with a
+    // two-version table and kicks in for real the day v2 ships.
+    let plan = family_pin_plan(data_dir, &[])?;
+    let derive_current = || {
+        derive_family_prompt_ids(FAMILY_PROMPT_V1, |text| async move {
+            handle.engine_tokenize(&text).await
+        })
+    };
+    let path = data_dir.join(FAMILY_PROMPT_TOKENS_FILE);
+    match plan {
+        FamilyPinPlan::WriteAuto => {
+            let ids = derive_current().await?;
+            write_family_pin_file(&path, &ids)?;
+            log_event(
+                telemetry,
+                "info",
+                "family.pin",
+                &[
+                    ("provenance", "auto"),
+                    ("version", FAMILY_PROMPT_VERSION),
+                    ("tokens", &ids.len().to_string()),
+                    ("hash", &family_pin_hash(&ids)),
+                ],
+            );
+            Ok(FamilyPin {
+                provenance: format!("auto {FAMILY_PROMPT_VERSION}"),
+                ids,
+            })
+        }
+        FamilyPinPlan::RewriteAuto { previous_version } => {
+            // An unmodified automatic pin of a previous version: rewrite
+            // to the current version (rule 4). Any other present file was
+            // KeepFile above and never reaches here.
+            let ids = derive_current().await?;
+            write_family_pin_file(&path, &ids)?;
+            log_event(
+                telemetry,
+                "info",
+                "family.pin",
+                &[
+                    ("provenance", "auto"),
+                    ("version", FAMILY_PROMPT_VERSION),
+                    ("rewrote_from", &previous_version),
+                    ("tokens", &ids.len().to_string()),
+                    ("hash", &family_pin_hash(&ids)),
+                ],
+            );
+            Ok(FamilyPin {
+                provenance: format!("auto {FAMILY_PROMPT_VERSION}"),
+                ids,
+            })
+        }
+        FamilyPinPlan::KeepFile(ids) => {
+            log_event(
+                telemetry,
+                "info",
+                "family.pin",
+                &[
+                    ("provenance", "file"),
+                    ("tokens", &ids.len().to_string()),
+                    ("hash", &family_pin_hash(&ids)),
+                ],
+            );
+            Ok(FamilyPin {
+                provenance: "file".into(),
+                ids,
+            })
+        }
+        FamilyPinPlan::Junk => {
+            Err("present pin file is not strictly parsable — left untouched (fail-closed)".into())
+        }
+    }
+}
+
 /// Builds the composed daemon's family half (ADR-032 §7 disposition item
 /// ii): the RC-L1 production lease source — a [`RosterFamilyLeases`]
 /// under the pinned hub key — and the engine source for this build (the
@@ -460,22 +727,37 @@ async fn compose_family_serving(
     let engine: Option<(
         std::sync::Arc<modelswarm_node::verifydrafts::FamilyEngineSource>,
         serde_json::Value,
+        FamilyPinStatus,
     )> = {
-        // G6: the family wire never carries the session prompt, so the
-        // daemon pins it out of band; an unpinned daemon is not a
-        // verifier — fail closed, visibly.
-        let Some(prompt_tokens) = family_prompt_tokens(data_dir) else {
-            log_event(
-                telemetry,
-                "warn",
-                "family.fallback",
-                &[
-                    ("reason", "family_prompt_unpinned"),
-                    ("file", FAMILY_PROMPT_TOKENS_FILE),
-                ],
-            );
-            return (None, FamilyStatus::off("family_prompt_unpinned"));
+        // ADR-034 rule 1: the serving desktop derives/ensures the pin at
+        // hosting start — BEFORE it is read and before `capi_family_source`
+        // constructs the engine. The derivation is local, deterministic,
+        // and content-free (the frozen v1 text through the profile's
+        // pinned tokenizer, nothing else); an unpinned daemon is not a
+        // verifier — fail closed, visibly, with the honest detail.
+        let pin = match ensure_family_pin(data_dir, handle, telemetry).await {
+            Ok(pin) => pin,
+            Err(detail) => {
+                log_event(
+                    telemetry,
+                    "warn",
+                    "family.fallback",
+                    &[
+                        ("reason", "family_prompt_unpinned"),
+                        ("file", FAMILY_PROMPT_TOKENS_FILE),
+                        ("detail", &detail),
+                    ],
+                );
+                return (None, FamilyStatus::off("family_prompt_unpinned"));
+            }
         };
+        let pin_status = FamilyPinStatus {
+            provenance: pin.provenance.clone(),
+            version: FAMILY_PROMPT_VERSION.to_string(),
+            token_count: pin.ids.len() as u64,
+            pin_hash: family_pin_hash(&pin.ids),
+        };
+        let prompt_tokens = pin.ids;
         let dirs = family_engine_dirs(
             &engine_binary_path(app),
             engine_gpu_binary_path(app).as_deref(),
@@ -505,7 +787,7 @@ async fn compose_family_serving(
                         ("batch_verify", "true"),
                     ],
                 );
-                Some((source, disclosure))
+                Some((source, disclosure, pin_status))
             }
             Err(error) => {
                 // The bridge could not init (missing C-API bundle, model
@@ -545,7 +827,7 @@ async fn compose_family_serving(
         return (None, FamilyStatus::off("engine_bridge_not_compiled"));
     };
 
-    let Some((engine, disclosure)) = engine else {
+    let Some((engine, disclosure, pin_status)) = engine else {
         // Every None path returned above; this is unreachable by
         // construction, kept as a fail-closed guard rather than an
         // `expect`.
@@ -577,6 +859,7 @@ async fn compose_family_serving(
         reason: None,
         disclosure: Some(disclosure),
         lease_roster_peers,
+        pin: Some(pin_status),
     };
     (
         Some(FamilyServing {
@@ -1938,21 +2221,25 @@ async fn lookup_peers(
 }
 
 /// The desktop's family REQUESTER wiring (ADR-032 §2 admission order,
-/// 2026-10-12): opens one real family session against an eligible
-/// exact-profile peer, PRESENTING this installation's cached/earned
-/// consume lease in the session-open carrier — the same lease the msp-v1
-/// swarm path presents per request. This is the two-desktop pairing
-/// diagnostic: a valid presented lease reaches the peer's accept (the
-/// lease gate passed on REAL transport); a refusal surfaces the honest
-/// reason (the serving peer telemeters the exact classification; this
-/// side reports the transport-level outcome), never a silent
-/// family-off. No rounds are driven and no prompt content crosses the
-/// wire — the probe opens the session and closes it cleanly.
+/// 2026-10-12; ADR-034 rule 6b pairing confirmation since 2026-10-13):
+/// opens one real family session against an eligible exact-profile peer,
+/// PRESENTING this installation's cached/earned consume lease in the
+/// session-open carrier — the same lease the msp-v1 swarm path presents
+/// per request. This is the two-desktop pairing diagnostic: a valid
+/// presented lease reaches the peer's accept (the lease gate passed on
+/// REAL transport); a refusal surfaces the honest reason (the serving
+/// peer telemeters the exact classification; this side reports the
+/// transport-level outcome), never a silent family-off. After a clean
+/// open the probe drives exactly ONE deterministic pairing round — the
+/// coordinator's greedy continuation of the ADR-034 v1 pin, drafted by
+/// this machine's own hosting engine — reporting `pairing_confirmed` /
+/// `pin_mismatch` (counts only; no prompt content and no token ids ever
+/// cross the wire or reach a result field).
 #[tauri::command]
 async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Value, String> {
     let fail =
         |reason: &str| serde_json::json!({ "probed": false, "opened": false, "reason": reason });
-    let (profile, gateway, tracker_url, data_dir) = {
+    let (profile, gateway, tracker_url, data_dir, engine) = {
         let inner = state.inner.lock().await;
         let running = inner.node.as_ref();
         let Some(running) = running else {
@@ -1966,6 +2253,7 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
             running.handle.local_addr.to_string(),
             inner.tracker_url.clone(),
             inner.data_dir.clone(),
+            running.handle.runtime.clone(),
         )
     };
 
@@ -1973,7 +2261,7 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
     // anything.
     #[cfg(not(feature = "verifydrafts"))]
     {
-        let _ = (&profile, &gateway, &tracker_url, &data_dir);
+        let _ = (&profile, &gateway, &tracker_url, &data_dir, &engine);
         log_event(
             &state.telemetry,
             "warn",
@@ -2111,9 +2399,52 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
     )
     .await
     {
-        Ok(client) => {
+        Ok(mut client) => {
             let disclosure = client.engine_disclosure().clone();
             let session_id = client.session_id().to_string();
+            // ADR-034 rule 5: the coordinator binds to the SAME pin — the
+            // local file when one is in force (the expert seam wins on
+            // both ends), else the SAME derivation on demand (the frozen
+            // v1 text through the pinned tokenizer — two stock installs
+            // pair with zero manual files). A present junk file stays
+            // fail-closed (rule 4): the probe reports `pin_unpinned`,
+            // never silently derives over a file the user may own.
+            let pin_ids = match family_prompt_tokens(&data_dir) {
+                Some(ids) => Ok(ids),
+                None if !data_dir.join(FAMILY_PROMPT_TOKENS_FILE).exists() => {
+                    let derive_engine = engine.clone();
+                    derive_family_prompt_ids(FAMILY_PROMPT_V1, |text| async move {
+                        modelswarm_node::runtime_tokenize(derive_engine.as_ref(), &text).await
+                    })
+                    .await
+                }
+                None => Err("present pin file is not strictly parsable".to_string()),
+            };
+            // Rule 6b: ONE round; w = min(8, the accepted batch_window_max);
+            // drafted by this machine's OWN hosting engine (its sidecar —
+            // no second engine on the coordinator), greedy under the
+            // session's pinned sampling params (both ends pin the same
+            // defaults through generation_params_hash).
+            let pairing = match pin_ids {
+                Err(_) => {
+                    family_probe_round(&mut client, &session_id, true, None, &state.telemetry).await
+                }
+                Ok(ids) => {
+                    let w = 8u32.min(client.engine_disclosure().batch_window_max);
+                    let window =
+                        modelswarm_node::runtime_propose_window(engine.as_ref(), &profile, &ids, w)
+                            .await
+                            .ok();
+                    family_probe_round(
+                        &mut client,
+                        &session_id,
+                        false,
+                        window.as_deref(),
+                        &state.telemetry,
+                    )
+                    .await
+                }
+            };
             log_event(
                 &state.telemetry,
                 "info",
@@ -2124,14 +2455,18 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
                     ("opened", "true"),
                 ],
             );
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "probed": true, "opened": true,
                 "peer_id": candidate.peer_id,
                 "session_id": session_id,
                 "backend": disclosure.backend.to_string(),
                 "batch_verify": disclosure.batch_verify,
                 "batch_window_max": disclosure.batch_window_max,
-            }))
+            });
+            for (key, value) in pairing {
+                result[key] = value;
+            }
+            Ok(result)
         }
         Err(error) => {
             // The honest degradation path: the serving peer's exact
@@ -2155,6 +2490,140 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
                 "detail": error.to_string(),
             }))
         }
+    }
+}
+
+/// The verdict for the probe's one pairing round (ADR-034 rule 6b):
+/// `pairing_confirmed` on FULL acceptance, `pin_mismatch` otherwise —
+/// divergence point 0 is the canonical mismatch signature. Pure and
+/// count-based: no token id can appear in a verdict.
+#[cfg(feature = "verifydrafts")]
+fn pairing_verdict(window_len: u32, accepted: u32, divergence: Option<u32>) -> &'static str {
+    if divergence.is_none() && accepted == window_len && window_len > 0 {
+        "pairing_confirmed"
+    } else {
+        "pin_mismatch"
+    }
+}
+
+/// Stable label for a pairing round that did not complete (ADR-034 rule
+/// 6b: "any rejection" reads `pin_mismatch`; this label is the honest
+/// DETAIL carried next to it — counts/reasons only, never frame
+/// payloads).
+#[cfg(feature = "verifydrafts")]
+fn pairing_round_failure_label(
+    failure: &modelswarm_node::verifydrafts::RoundFailure,
+) -> &'static str {
+    use modelswarm_node::verifydrafts::RoundFailure;
+    match failure {
+        RoundFailure::Rejected { .. } => "rejected",
+        RoundFailure::Cancelled { .. } => "cancelled",
+        RoundFailure::Violation(_) => "violation",
+        RoundFailure::TornDown(_) => "torn_down",
+        RoundFailure::Dropped(_) => "dropped",
+        RoundFailure::TimedOut => "timed_out",
+        RoundFailure::WindowTooLarge { .. } => "window_too_large",
+        RoundFailure::SessionTornDown => "session_torn_down",
+        RoundFailure::UnparsableResult => "unparsable_result",
+        RoundFailure::Io(_) => "io",
+    }
+}
+
+/// The counts-only result/telemetry shape for every pairing label — a
+/// label, three counts, an optional detail label. Structurally INCAPABLE
+/// of carrying token ids (no array field exists); pinned by test.
+#[cfg(feature = "verifydrafts")]
+fn pairing_result_fields(
+    pairing: &str,
+    window: Option<u32>,
+    accepted: Option<u32>,
+    divergence: Option<u32>,
+    detail: Option<&str>,
+) -> Vec<(String, serde_json::Value)> {
+    let mut out = vec![
+        ("pairing".to_string(), serde_json::json!(pairing)),
+        ("pairing_window".to_string(), serde_json::json!(window)),
+        ("pairing_accepted".to_string(), serde_json::json!(accepted)),
+        (
+            "pairing_divergence".to_string(),
+            serde_json::json!(divergence),
+        ),
+    ];
+    if let Some(detail) = detail {
+        out.push(("pairing_detail".to_string(), serde_json::json!(detail)));
+    }
+    out
+}
+
+/// Runs the probe's ONE deterministic pairing round (ADR-034 rule 6b)
+/// over the coordinator-drafted `window` and returns the counts-only
+/// result fields. `pin_unpinned`/`window` carry the honest pre-round
+/// states: no usable local pin ⇒ `pin_unpinned`; a pin the local engine
+/// could not draft (or an all-EOS zero-token draft) ⇒
+/// `draft_unavailable` — never a fabricated confirmation, never token
+/// ids in any field.
+#[cfg(feature = "verifydrafts")]
+async fn family_probe_round(
+    client: &mut modelswarm_node::verifydrafts::VerifyDraftsClient<
+        modelswarm_node::verifydrafts::QuicVerifyWire,
+    >,
+    session_id: &str,
+    pin_unpinned: bool,
+    window: Option<&[u32]>,
+    telemetry: &Telemetry,
+) -> Vec<(String, serde_json::Value)> {
+    let fields = |pairing: &str,
+                  window: Option<u32>,
+                  accepted: Option<u32>,
+                  divergence: Option<u32>,
+                  detail: Option<&str>|
+     -> Vec<(String, serde_json::Value)> {
+        telemetry.info(
+            "family.probe.pairing",
+            &[
+                ("session", session_id),
+                ("pairing", pairing),
+                ("window", &window.map(|w| w.to_string()).unwrap_or_default()),
+                (
+                    "accepted",
+                    &accepted.map(|a| a.to_string()).unwrap_or_default(),
+                ),
+                (
+                    "divergence",
+                    &divergence.map(|d| d.to_string()).unwrap_or_default(),
+                ),
+            ],
+        );
+        pairing_result_fields(pairing, window, accepted, divergence, detail)
+    };
+    if pin_unpinned {
+        return fields("pin_unpinned", None, None, None, None);
+    }
+    let Some(window) = window.filter(|w| !w.is_empty()) else {
+        return fields("draft_unavailable", None, None, None, None);
+    };
+    match client.round(window, telemetry).await {
+        Ok(outcome) => {
+            let verdict = pairing_verdict(
+                window.len() as u32,
+                outcome.accepted_prefix_len,
+                outcome.divergence_point,
+            );
+            fields(
+                verdict,
+                Some(window.len() as u32),
+                Some(outcome.accepted_prefix_len),
+                outcome.divergence_point,
+                None,
+            )
+        }
+        Err(failure) => fields(
+            "pin_mismatch",
+            Some(window.len() as u32),
+            None,
+            None,
+            Some(pairing_round_failure_label(&failure)),
+        ),
     }
 }
 
@@ -3971,7 +4440,9 @@ mod tests {
     }
 
     /// The off-status shape the UI renders for every honest fallback
-    /// (state off + the stable reason; no disclosure, empty roster).
+    /// (state off + the stable reason; no disclosure, empty roster, and
+    /// ADR-034 rule 6a: NO pin fields while unpinned — the reason carries
+    /// why).
     #[test]
     fn family_status_off_carries_the_reason() {
         let status = FamilyStatus::off("family_prompt_unpinned");
@@ -3980,6 +4451,10 @@ mod tests {
         assert_eq!(json["reason"], "family_prompt_unpinned");
         assert!(json["disclosure"].is_null());
         assert_eq!(json["lease_roster_peers"], 0);
+        assert!(
+            json["pin"].is_null(),
+            "unpinned = no pin fields, never a guessed pin"
+        );
     }
 
     /// The on-status shape with an EMPTY roster is the presentation
@@ -3995,6 +4470,7 @@ mod tests {
                 "backend": "cpu", "batch_verify": true, "batch_window_max": 32
             })),
             lease_roster_peers: 0,
+            pin: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["state"], "on");
@@ -4033,6 +4509,296 @@ mod tests {
         // The detail string is the error's own Display — never a token.
         let detail = ClientOpenError::Io("recv accept").to_string();
         assert!(!detail.contains("lease"));
+    }
+
+    // ---- ADR-034 tier 1: the family auto-pin (rules 1-7) ---------------
+
+    /// A deterministic byte-tokenizer stand-in for the pinned tokenizer
+    /// (any surface yielding the pinned engine's ids — the sidecar's
+    /// /tokenize maps bytes to ids exactly like this).
+    fn byte_tokenizer(text: &str) -> Result<Vec<u32>, String> {
+        Ok(text.as_bytes().iter().map(|b| u32::from(*b)).collect())
+    }
+
+    /// ADR-034 rule 3 (determinism): the v1 text renders as a SYSTEM-ONLY
+    /// ChatML turn (no assistant opener — the pin is the root), the same
+    /// text + pinned tokenizer yields IDENTICAL ids and pin hash across
+    /// runs, and the hash is the bare 64-hex LE-u32 sha256 (no parent).
+    #[cfg(feature = "verifydrafts")]
+    #[tokio::test]
+    async fn family_pin_derivation_is_deterministic_and_system_only() {
+        // Rule 2: the frozen text, byte-identical.
+        assert_eq!(
+            FAMILY_PROMPT_V1,
+            "You are serving a ModelSwarm cooperative verification session. Continue the given context exactly as this model normally would."
+        );
+        let rendered = family_prompt_render_system_only(FAMILY_PROMPT_V1);
+        assert!(
+            rendered.starts_with("<|im_start|>system\n"),
+            "system-only ChatML turn: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with("<|im_end|>\n"),
+            "closed turn, trailing newline: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("assistant"),
+            "NO generation prompt — the pin is the root the engine continues from"
+        );
+        assert_eq!(rendered, family_prompt_render_system_only(FAMILY_PROMPT_V1));
+
+        let first =
+            derive_family_prompt_ids(FAMILY_PROMPT_V1, |t| async move { byte_tokenizer(&t) })
+                .await
+                .unwrap();
+        let second =
+            derive_family_prompt_ids(FAMILY_PROMPT_V1, |t| async move { byte_tokenizer(&t) })
+                .await
+                .unwrap();
+        assert_eq!(first, second, "determinism across runs");
+        assert!(!first.is_empty(), "an empty pin is an error upstream");
+
+        let hash = family_pin_hash(&first);
+        assert_eq!(hash.len(), 64, "bare 64-hex");
+        assert!(
+            hash.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "lowercase hex: {hash}"
+        );
+        assert_eq!(hash, family_pin_hash(&second), "hash stability");
+        assert_ne!(hash, family_pin_hash(&[first[0]]), "hash binds the ids");
+        // The exact preimage rule: LE-u32 each, no parent bytes (pinned
+        // against an accidental parent-prefix form).
+        let mut preimage = Vec::new();
+        for id in &first {
+            preimage.extend_from_slice(&id.to_le_bytes());
+        }
+        use sha2::Digest;
+        assert_eq!(
+            hash,
+            hex::encode(sha2::Sha256::digest(&preimage)),
+            "sha256 over LE-u32 ids with NO parent"
+        );
+    }
+
+    /// ADR-034 rule 4 (auto-write-on-absent): an absent pin file plans a
+    /// WriteAuto; writing the derived ids lands them parsable, in order.
+    #[cfg(feature = "verifydrafts")]
+    #[tokio::test]
+    async fn family_pin_auto_writes_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !dir.path().join(FAMILY_PROMPT_TOKENS_FILE).exists(),
+            "fixture starts absent"
+        );
+        match family_pin_plan(dir.path(), &[]).unwrap() {
+            FamilyPinPlan::WriteAuto => {}
+            other => panic!("absent file must plan WriteAuto, got {other:?}"),
+        }
+        let ids = derive_family_prompt_ids(FAMILY_PROMPT_V1, |t| async move { byte_tokenizer(&t) })
+            .await
+            .unwrap();
+        write_family_pin_file(&dir.path().join(FAMILY_PROMPT_TOKENS_FILE), &ids).unwrap();
+        assert_eq!(family_prompt_tokens(dir.path()), Some(ids));
+        // No .part litter.
+        assert!(!dir.path().join("family-prompt-tokens.part").exists());
+    }
+
+    /// ADR-034 rule 4 (fail-closed): a present junk (or empty) file plans
+    /// Junk — the family stays unpinned and the file is never touched.
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn family_pin_junk_file_stays_fail_closed_and_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FAMILY_PROMPT_TOKENS_FILE);
+        for junk in ["72 -1 44", "0x10 4", "   ", ""] {
+            std::fs::write(&path, junk).unwrap();
+            assert!(
+                matches!(
+                    family_pin_plan(dir.path(), &[]).unwrap(),
+                    FamilyPinPlan::Junk
+                ),
+                "junk {junk:?} must stay fail-closed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                junk,
+                "never overwritten"
+            );
+            assert_eq!(family_prompt_tokens(dir.path()), None, "unpinned");
+        }
+    }
+
+    /// ADR-034 rule 4 (precedence): a present, strictly parsable file
+    /// WINS as-is (the expert override, including non-v1 pins) — no
+    /// derivation, no rewrite.
+    #[cfg(feature = "verifydrafts")]
+    #[tokio::test]
+    async fn family_pin_present_file_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FAMILY_PROMPT_TOKENS_FILE);
+        let expert = vec![999_999u32, 4, 17];
+        std::fs::write(&path, "999999 4 17").unwrap();
+        match family_pin_plan(dir.path(), &[]).unwrap() {
+            FamilyPinPlan::KeepFile(ids) => assert_eq!(ids, expert),
+            other => panic!("a parsable present file must KeepFile, got {other:?}"),
+        }
+        // ...even when it EQUALS the current derivation (provenance is
+        // still "file": it was present).
+        let derived =
+            derive_family_prompt_ids(FAMILY_PROMPT_V1, |t| async move { byte_tokenizer(&t) })
+                .await
+                .unwrap();
+        std::fs::write(
+            &path,
+            derived
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .unwrap();
+        match family_pin_plan(dir.path(), &[]).unwrap() {
+            FamilyPinPlan::KeepFile(ids) => assert_eq!(ids, derived),
+            other => panic!("present-but-equal must still KeepFile, got {other:?}"),
+        }
+    }
+
+    /// ADR-034 rule 4 (version advance): a present file whose ids EQUAL a
+    /// previous version's derived ids (an unmodified automatic pin) is
+    /// rewritten to the current version; any other present file
+    /// (KeepFile above) is never rewritten. Exercised with a two-version
+    /// table — the shipped table has one version, so the path is dormant
+    /// but correct for the day v2 ships.
+    #[cfg(feature = "verifydrafts")]
+    #[tokio::test]
+    async fn family_pin_version_advance_rewrites_only_unmodified_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FAMILY_PROMPT_TOKENS_FILE);
+        // The v0 derivation under the same tokenizer discipline.
+        let v0_text = "older neutral family prompt text";
+        let v0_ids = derive_family_prompt_ids(v0_text, |t| async move { byte_tokenizer(&t) })
+            .await
+            .unwrap();
+        let table = vec![("family-prompt-v0", v0_ids.clone())];
+
+        // An unmodified v0 auto pin -> rewrite planned, flagged with the
+        // previous version.
+        std::fs::write(
+            &path,
+            v0_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .unwrap();
+        match family_pin_plan(dir.path(), &table).unwrap() {
+            FamilyPinPlan::RewriteAuto { previous_version } => {
+                assert_eq!(previous_version, "family-prompt-v0");
+            }
+            other => panic!("unmodified auto pin must plan RewriteAuto, got {other:?}"),
+        }
+        // Applying it lands the v1 derivation in the file.
+        let v1_ids =
+            derive_family_prompt_ids(FAMILY_PROMPT_V1, |t| async move { byte_tokenizer(&t) })
+                .await
+                .unwrap();
+        write_family_pin_file(&path, &v1_ids).unwrap();
+        assert_eq!(family_prompt_tokens(dir.path()), Some(v1_ids));
+
+        // An expert file (not any previous derivation) is NEVER rewritten.
+        std::fs::write(&path, "1 2 3").unwrap();
+        assert!(matches!(
+            family_pin_plan(dir.path(), &table).unwrap(),
+            FamilyPinPlan::KeepFile(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1 2 3");
+    }
+
+    /// ADR-034 rule 6b (label stability + the redaction discipline): the
+    /// verdict labels, the failure-detail labels, and the counts-only
+    /// result shape are stable and structurally INCAPABLE of carrying
+    /// token ids — serialized, the fields contain no array at all.
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn pairing_labels_are_stable_and_results_carry_counts_only() {
+        use modelswarm_node::verifydrafts::RoundFailure;
+        // Full acceptance ⇒ confirmed; divergence 0 is the canonical
+        // mismatch signature; partial acceptance is a mismatch.
+        assert_eq!(pairing_verdict(8, 8, None), "pairing_confirmed");
+        assert_eq!(pairing_verdict(8, 8, Some(0)), "pin_mismatch");
+        assert_eq!(pairing_verdict(8, 5, Some(5)), "pin_mismatch");
+        assert_eq!(pairing_verdict(8, 7, None), "pin_mismatch");
+        // A zero-length round can never "confirm" (guard, not a real path).
+        assert_eq!(pairing_verdict(0, 0, None), "pin_mismatch");
+
+        assert_eq!(
+            pairing_round_failure_label(&RoundFailure::TimedOut),
+            "timed_out"
+        );
+        assert_eq!(
+            pairing_round_failure_label(&RoundFailure::WindowTooLarge {
+                requested: 9,
+                cap: 8
+            }),
+            "window_too_large"
+        );
+        assert_eq!(pairing_round_failure_label(&RoundFailure::Io("recv")), "io");
+
+        // Every label's result fields: counts only — no array, so no
+        // token-id list can ever ride the result (or the telemetry event
+        // built from the same numbers).
+        for (pairing, detail) in [
+            ("pairing_confirmed", None),
+            ("pin_mismatch", Some("rejected")),
+            ("pin_unpinned", None),
+            ("draft_unavailable", None),
+        ] {
+            let fields = pairing_result_fields(pairing, Some(8), Some(8), Some(0), detail);
+            let json = serde_json::json!(fields
+                .into_iter()
+                .collect::<serde_json::Map<String, serde_json::Value>>());
+            let text = json.to_string();
+            assert!(!text.contains('['), "no arrays in {pairing}: {text}");
+            assert_eq!(json["pairing"], pairing);
+        }
+    }
+
+    /// ADR-034 rule 6a (status provenance fields): the on-status carries
+    /// provenance (`auto family-prompt-v1` | `file`), token count, and
+    /// pin hash — and nothing else in the pin object (no ids).
+    #[cfg(feature = "verifydrafts")]
+    #[tokio::test]
+    async fn family_status_pin_provenance_fields() {
+        let ids = derive_family_prompt_ids(FAMILY_PROMPT_V1, |t| async move { byte_tokenizer(&t) })
+            .await
+            .unwrap();
+        for provenance in [format!("auto {FAMILY_PROMPT_VERSION}"), "file".to_string()] {
+            let status = FamilyStatus {
+                state: "on".into(),
+                reason: None,
+                disclosure: None,
+                lease_roster_peers: 0,
+                pin: Some(FamilyPinStatus {
+                    provenance: provenance.clone(),
+                    version: FAMILY_PROMPT_VERSION.to_string(),
+                    token_count: ids.len() as u64,
+                    pin_hash: family_pin_hash(&ids),
+                }),
+            };
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(json["pin"]["provenance"], provenance);
+            assert_eq!(json["pin"]["version"], FAMILY_PROMPT_VERSION);
+            assert_eq!(json["pin"]["token_count"], ids.len() as u64);
+            assert_eq!(json["pin"]["pin_hash"], family_pin_hash(&ids));
+            let pin = json["pin"].as_object().unwrap();
+            assert_eq!(pin.len(), 4, "counts and a hash only — no ids: {pin:?}");
+            assert!(
+                !json.to_string().contains(&format!("[{}", ids[0])),
+                "no token-id list in the status surface"
+            );
+        }
     }
 
     // ---- Resource monitor panel (owner request 2026-10-12) ---------------

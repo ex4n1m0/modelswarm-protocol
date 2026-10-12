@@ -1,16 +1,17 @@
 # ADR-032: Batched speculative verification (one engine pass per draft window)
 
-Status: **Accepted (revision 4, 2026-10-12; originally accepted 2026-10-11 —
+Status: **Accepted (revision 5, 2026-10-12; originally accepted 2026-10-11 —
 option B, with option A already live in code).** Both required reviews
 returned approve-with-required-changes and every required change is folded
 into revision 2; revision 3 folds the landed implementation sessions'
-resolved contract confirmations and corrections, and revision 4 decides the
+resolved contract confirmations and corrections; revision 4 decides the
 light-up tier's recorded gaps and the two implementation-review advisories
-routed to this seat (see the revision-3 and revision-4 amendment notes).
-The wire-contract tier is implemented and green, and the light-up tier is
-code-complete behind OFF-by-default features (§7 implementation status);
-the ADR-031 productionization gate — revision 2's hard dependency for the
-real-engine path — has PASSED. Owner: Protocol Architect.
+routed to this seat; and revision 5 is the consolidated freeze-records and
+rulings pass (see the amendment notes). The wire-contract tier is
+implemented and green; the light-up tier SHIPPED in the v0.2.21 release
+build with the family ON and is live (§7 light-up ledger); the ADR-031
+productionization gate — revision 2's hard dependency for the real-engine
+path — has PASSED. Owner: Protocol Architect.
 
 **Decision record (2026-10-11).** The owner accepted option B with the
 directive: the main goal is benefits from a swarm regardless of the
@@ -112,6 +113,26 @@ the §8e seconds arm, the RC-5(b) reclassification with its amended pin, the
 §2 carrier `sender` check, the vocabulary-disjointness assertion) — each
 before the family carries traffic. Everything else is byte-stable from
 revision 3.
+
+**Amendment note (revision 5, 2026-10-12).** The consolidated
+freeze-records and rulings pass — three records, no contract change beyond
+the §8(b) wording clarification. (1) The RC-5(b) reachability dissent
+(Security `c1fb927` advisory A-1 vs Test and Release `e4eb851` advisory 1)
+is resolved: §8(b) is clarified to the OUTSTANDING-GATED operational
+semantics the shipped gate and both pins already implement — the corner is
+ruled reachable-by-design (the T/R position, with Security's contrary
+position cited in §8(b)), fails closed either way, and the revision-4
+letter's round-scoped phrasing is superseded by the clarified wording. (2)
+§2 gains the family-vocabulary FREEZE RECORDS for the two typed carriers
+the 2026-10-12 activation added (`55d802e`/`2ffc8a7`) — the
+`WireSessionLease` session-open carrier and the serving side's
+prefill-pinning seam — and folds the Security A-4 demux-classification
+record into the same freeze record. (3) The G6 prompt-pairing product
+contract is ruled by ADR-034 (new); the §7 open item is discharged by
+reference, and `protocol/msp-cooperative-v1.md` §1 records the carrier
+under this revision's authority. (The status line's light-up clause is
+refreshed to the released v0.2.21 state §7 already records — no contract
+change.) Everything else is byte-stable from revision 4.
 
 Evidence base (all committed): `experiments/raw/PASS-2-ENGAGE-LAN-2026-10-10/ANALYSIS.md`
 · `experiments/raw/PASS-2-ENGAGE-LOOPBACK-2026-10-10/ANALYSIS.md` (the 9.6
@@ -380,6 +401,69 @@ that would break the disjointness requires an ADR and a collision test in
 the same change. (ii) A per-push assertion enumerating the frozen §6 tags
 against the family discriminant keys lands with the §7-recorded migrations
 at the latest.
+**Family-vocabulary freeze records (revision 5; the 2026-10-12
+activation's two typed carriers, plus the Security A-4 classification
+record).** The following are frozen family-vocabulary members; a schema
+change to any of them goes through an ADR, exactly as for the §1 messages.
+
+**(F1) The `WireSessionLease` session-open carrier.** Wire form:
+`{"lease": "<wire token>"}` — coordinator → serving peer, sent
+IMMEDIATELY BEFORE the `SessionOffer` at family session open (the
+family-side equivalent of msp-v1's per-request `capability_token`
+presentation, riding the ADR-026 lease gate at session open). Carrier
+discipline: a BARE object with exactly ONE string field, parsed STRICT
+(`deny_unknown_fields`; unknown fields, envelope tags, and non-string
+values are malformed), carrying the UNCHANGED `EligibilityLease::to_wire`
+token — no new signed shape, no envelope, no echo; the frozen §5
+`EligibilityLease` signed shape is untouched. Admission: consumed by the
+session-open reader BEFORE any engine work; the tracker-fed ROSTER entry
+takes PRECEDENCE when present (fail-closed feeder posture — a garbage
+entry refuses until removed) and the PRESENTED token is the fallback
+through the SAME validation engine (hub signature, `msp1:` form, expiry
+±120 s skew, lease cap, profile binding, `can_consume` + slots ≥ 1, peer
+binding against the QUIC-authenticated PeerId); empty/`f0-unverified`
+maps to no-lease, and a malformed carrier ends the session with the
+`invalid_lease` refusal. The token's `expires_at` (unix ms) becomes the
+session's stage-5 lease bound. An offer WITHOUT a preceding carrier
+remains valid (presented = None → roster-only; the stub venues and the
+roster future are unaffected). Disjointness: the discriminant key `lease`
+joins the rule-(i) enumerated family discriminant keys — disjoint from
+the frozen ten §6 tags — and the carrier never reaches the family frame
+router (it is consumed before the serve loop starts). Pins:
+`wire_session_lease_is_the_bare_strict_carrier` (strict schema +
+non-collision with every other family frame),
+`roster_entry_takes_precedence_over_the_presented_token`,
+`presented_lease_admits_on_an_empty_roster`. Hygiene: lease material on
+the wire has the same exposure and the same redaction posture as msp-v1's
+`capability_token` — it rides the authenticated session and never enters
+telemetry, logs, or the webview.
+
+**(F2) The serving side's prefill-pinning seam.** The LOCAL typed artifact
+`<data_dir>/family-prompt-tokens.txt` (whitespace-separated u32 token
+ids, STRICT parse: any unparsable token unpins the WHOLE file, never a
+partially-loaded prompt; absent/empty/unparsable = unpinned = the family
+engine stays down with the honest `family_prompt_unpinned` reason)
+feeding `FamilyEngineSource::Capi { prompt_tokens }` through
+`capi_family_source` — the engine bridge's pinned-prompt prefill,
+committed as the PREFILLED root at engine construction. It is NOT a wire
+frame: it carries no JSON keys, cannot collide with §6 tags, and rides no
+session (the disjointness rule's letter is satisfied vacuously); the
+PAIRING contract it serves — who computes the pin, what it may contain,
+how mismatches surface — is ruled by ADR-034, and this seam remains the
+single place a future prompt-hash commitment field would be consumed.
+Pin: `family_prompt_tokens_parses_strictly_or_unpins` (desktop).
+
+**(F3) Demux classification record (Security A-4, `c1fb927`).** Two
+classification facts of the two-vocabulary demux are contract, not
+accident: (i) a MALFORMED typed frame (valid JSON, §6 tag, payload that
+fails the variant's schema) classifies raw at the transport (typed decode
+fails) and therefore family at the composed demux → a bad-offer session
+end — never an msp-v1 `bad_frame` answer; (ii) a family client sending a
+well-formed non-PING §6 frame mid-session has it stashed indefinitely —
+invisible, no reply, no state change. Both end fail-closed with honest
+labels; neither reinterprets a frame across vocabularies. Second
+implementations MUST match this classification.
+
 
 **`seq` semantics (RC-7, normative):** each sender maintains its own
 per-session counter, incremented by exactly 1 on each state-changing
@@ -927,11 +1011,18 @@ v0.2.21, all-OS, live at modelswarm.deepflux.space** (train record
 `39dea6f`–`2cfdf6d`; SHA256SUMS guarded; counting-route downloads live).
 Runtime opt-in gates at ship time (honest UI status): `MSP_LISTENER=1`,
 family prompt file + C-API bridge on the serving side, direct/LAN
-networks only (no relay). Open items carried forward: RAM-doubling vs
-the resource governor (Resource Engineer coordination queued), the
-routed advisories (A-2/A-3, freeze-ADR records incl. the lease-carrier
-form and the RC-5(b) wording dissent), E0 cross-machine determinism
-certification, and the F2B relay proof.
+networks only (no relay). Open items carried forward: RAM-doubling vs the resource governor
+(Resource Engineer coordination queued — now the binding constraint on
+ADR-034's auto-pin posture); the routed advisories A-2 (Network: bounded
+cross-vocabulary stash) and A-3 (Windows Product + Protocol:
+dribble-residence lifetime ceiling); E0 cross-machine determinism
+certification; and the F2B relay proof. The freeze-ADR records queued in
+this list are DISCHARGED by revision 5: the lease-carrier form and the
+Security A-4 classification record are frozen in §2 (F1/F3), the RC-5(b)
+wording dissent is resolved by the §8(b) outstanding-gated clarification,
+and the G6 prompt-pairing gap is ruled by ADR-034 — whose tier-1 product
+surfaces (the deterministic pin, the status/probe pairing confirmation)
+are Windows Product work with no session-crate changes.
 
 ### 8. Verifier round state machine (per session; reviewer-facing)
 
@@ -979,20 +1070,66 @@ nonce repeats, `bad_frame` otherwise — and is NEVER queued for engine work.
 a fixed 250 ms grace; expiry abandons the round, discards the pending
 result, and returns to PREFILLED — the verifier never holds an uncommitted
 round for a vanished coordinator. **Post-expiry commits are stale rounds,
-not violations (Security advisory A1, ruled at revision 4).** A
-`PrefixCommit` arriving for a round already abandoned — `round` handled
-but uncommitted, no outstanding result left to reproduce against — is
-rejected `CancelRound(reason="round_mismatch")` with no state change and
-NO violation-counter increment: whether such a commit would have
-reproduced is UNKNOWABLE after the RC-5(b) discard, and an unknowable fact
-must never be charged as a protocol violation — two late commits from an
-honest-but-slow coordinator must not tear the session down. The commit is
-never applied (an unverifiable commit never advances the chain; I2), and
-the coordinator learns of the abandonment honestly — through this
-stale-round reject or the next round's `parent_mismatch` (the G5 no-resync
-limitation stands). The exemption is scoped exactly: a commit failing RC-4
-reproduction while the round's result is outstanding remains a
-`commit_mismatch` violation toward threshold-two teardown, as before; the
+not violations (Security advisory A1, ruled at revision 4; wording
+clarified at revision 5).** A `PrefixCommit` arriving for a round already
+abandoned — `round` handled but uncommitted, and NO round outstanding
+anywhere in the session — is rejected `CancelRound(reason="round_mismatch")`
+with no state change and NO violation-counter increment: whether such a
+commit would have reproduced is UNKNOWABLE after the RC-5(b) discard, and
+an unknowable fact must never be charged as a protocol violation — two
+late commits from an honest-but-slow coordinator must not tear the session
+down. The commit is never applied (an unverifiable commit never advances
+the chain; I2), and the coordinator learns of the abandonment honestly —
+through this stale-round reject or the next round's `parent_mismatch` (the
+G5 no-resync limitation stands). **The exemption is OUTSTANDING-GATED, not
+round-scoped (revision 5 clarification).** The precondition "no
+outstanding result left to reproduce against" is evaluated against the
+SESSION's outstanding state at the instant the commit is admitted — the
+clock-free operational fact the gate implements — NOT against the commit's
+target round. Consequence, decided: a stale commit for an abandoned OLDER
+round that arrives while a NEWER round is outstanding does NOT hit the
+exempt branch; with a chain-valid parent it falls to the RC-4 check
+against the CURRENT outstanding result, is charged
+`CancelRound(reason="commit_mismatch")` as one violation toward
+threshold-two teardown, and the abandonment it triggers also discards the
+newer round's outstanding result (the stale commit itself is never
+applied; I2 holds throughout). Reachability, both seats on record:
+Security (`c1fb927`, advisory A-1) held the corner unreachable for honest
+coordinators — the shipped client commits round n inside `round()` before
+it can request any later round, and both venues are single ordered
+streams per session — while Test and Release (`e4eb851`, advisory 1)
+dissented that an honest-but-slow coordinator reaches it: round n's commit
+in flight, RC-5(b) expiry at the verifier, an RC-5(c) gap-forward to round
+n+k admitted by the verifier, and the delayed round-n commit landing while
+round n+k is outstanding — narrow, but nonzero. RULING: the corner is
+treated as reachable-by-design; the protocol must not depend on the
+coordinator's frame discipline or on transport transit-order arguments,
+and the classification fails closed under either seat's reachability
+model (the corner charges strictly MORE, never less; threshold-two still
+governs teardown; I2 is unaffected either way — the dissents agreed on
+this much). The charge is normatively coherent, not merely conservative:
+while a round is outstanding, a non-reproducing commit disturbs a LIVE
+verification — the discard of the newer round's result is real,
+attributable harm caused by that sender's frame — so the unknowability
+rationale exempts only when the gate holds nothing live. Recommended
+coordinator discipline (non-normative): a conforming sequential
+coordinator sends round n's commit before requesting round n+k, which
+makes the corner unreachable on ordered streams. Both pins stand unchanged
+and freeze this semantics
+(`pin_verifier_late_commit_after_expiry_is_exempt_stale_round_mismatch`;
+`pin_stale_commit_for_older_round_while_newer_outstanding_is_charged`).
+Two boundary notes complete the definition. First, "already abandoned" is
+the outstanding-state operational fact, so a commit arriving in the
+instant between grace expiry and the next serve-loop poll is classified
+by whether the expiry has been APPLIED — a reproducing commit applies
+slightly past grace (I2-safe), a non-reproducing one is `commit_mismatch`
+(T/R advisory 2; pre-existing poll granularity, recorded). Second, a
+commit failing RC-4 reproduction while the round's result is outstanding
+remains a `commit_mismatch` violation toward threshold-two teardown, as
+before (`pin_commit_mismatch_while_result_outstanding_still_violates`),
+and the profile check precedes the stale branch, so profile-mismatch
+commits still tear down even post-expiry (profile equality at commit time
+is knowable — the §8 commit-time equality enforcement authority). The
 pre-revision-4 classification (post-expiry reproductions counted) is
 superseded and the Security review's pin is amended to freeze this
 semantics. (c) Round numbers are strictly monotone per session; a round

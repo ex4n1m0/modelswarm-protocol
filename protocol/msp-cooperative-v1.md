@@ -33,6 +33,18 @@ owner decision (option B); implementation is authorized under its §7 gates
 and gated on ADR-031 productionization — this note records the dependency
 and does not itself extend the frozen §2 field set.
 
+**ADR-032 revision-5 freeze record (2026-10-12):** the family's
+session-open lease carrier is `{"lease": "<wire token>"}` — coordinator →
+serving peer, immediately before the `SessionOffer`, a strict
+single-field schema carrying the unchanged `EligibilityLease::to_wire`
+token, validated roster-first against the full ADR-026 binding set (the
+complete discipline, and the serving side's prefill-pinning seam record,
+live in ADR-032 §2 revision 5; the pin's product contract is ADR-034). An
+offer without a preceding carrier remains valid. The discriminant key
+`lease` is a family discriminant key under ADR-032 §2 rule (i). This note
+records frozen vocabulary under ADR-032 revision 5's authority and adds no
+new fields to the §2 offer below.
+
 ## 2. SessionOffer (the only wire addition authorized by ADR-029)
 
 Sent by the requester at cooperative session open, before any cooperative

@@ -4,16 +4,19 @@
 //! staging — raw-JSON passthrough frames over a handshake-authenticated
 //! session — and the remote PeerId must be TRANSPORT-authenticated (msp-v1
 //! §6.6; security review RC-1). This module defines that surface as the
-//! [`VerifyDraftsWire`] port plus one concrete implementation over the
-//! staged TCP backend ([`modelswarm_transport::SignedFrameTransport`]),
-//! which is today the only transport carrying the passthrough.
+//! [`VerifyDraftsWire`] port plus two concrete implementations:
 //!
-//! **QUIC gap (honest):** [`modelswarm_transport::libp2p_backend::
-//! Libp2pSession`] has no `send_json`/`recv_json` — it speaks typed
-//! `WireMessage` frames only — so no QUIC adapter can exist until the
-//! Network Engineer adds the passthrough there. The exact signatures are
-//! recorded in the light-up handoff; the port is shaped so that adapter is
-//! a drop-in (`Libp2pSession::remote_peer_id` already exists).
+//! - [`StagedVerifyWire`] over the staged TCP backend
+//!   ([`modelswarm_transport::SignedFrameTransport`]) — the CI venue with
+//!   the staged §6.1 handshake;
+//! - [`QuicVerifyWire`] over the REAL libp2p QUIC backend
+//!   ([`modelswarm_transport::libp2p_backend::Libp2pSession`]) — the
+//!   production venue. The 2026-10-12 transport passthrough
+//!   (`Libp2pSession::send_json`/`recv_json`, same stash discipline as the
+//!   staged `Session`) closed the light-up handoff's G1 gap, and the QUIC
+//!   handshake authenticates the remote PeerId cryptographically (the
+//!   staged adapter's address/key pinning was the staging approximation of
+//!   exactly that binding).
 //!
 //! The staged adapter owns one pump task per session: `recv_json` on the
 //! staged `Session` closes the session on deadline expiry, which would make
@@ -21,6 +24,11 @@
 //! session behind channels, so a caller-side `recv` timeout is a pure
 //! wake-up — the session stays open and no frame is lost (`mpsc` recv is
 //! cancel-safe, and the pump's `select!` never drops a completed arm).
+//!
+//! The QUIC adapter needs NO pump: a `Libp2pSession` recv timeout is
+//! non-destructive by construction (the backend keeps mid-frame bytes in a
+//! session-owned buffer, so a cancelled recv resumes the same frame), and
+//! the port's recv/send deadlines map straight through.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,6 +41,9 @@ use tokio::time::timeout;
 
 use modelswarm_identity::{peer_id_for, InstallationIdentity};
 use modelswarm_transport::ed25519_dalek::VerifyingKey;
+use modelswarm_transport::libp2p_backend::{
+    Libp2pListener, Libp2pSession, Libp2pTransport, PeerId,
+};
 use modelswarm_transport::{Handshake, Listener, Session, SignedFrameTransport, TransportError};
 
 /// Bounded channel depth between the pump and the caller (frames).
@@ -243,5 +254,127 @@ pub async fn dial_staged(
     Ok(StagedVerifyWire::over_session(
         session,
         peer_id_for(&expected_server.to_bytes()),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// QUIC venue (the production transport; the light-up handoff's G1 follow-up)
+// ---------------------------------------------------------------------------
+
+/// How long the wire's graceful teardown waits for the peer to drain the
+/// last frame before the underlying session drops (the msp-v1 bridge's
+/// `linger` bound; see [`Libp2pSession::close_graceful`]).
+const GRACEFUL_CLOSE_DRAIN: Duration = Duration::from_secs(1);
+
+/// QUIC adapter over [`Libp2pSession`]: the family's raw-JSON frames ride the
+/// libp2p backend's passthrough directly, and the remote PeerId is the
+/// QUIC-TLS-authenticated identity (ADR-020 derivation) — RC-1's
+/// transport-authenticated PeerId by construction, not a payload claim and
+/// not a resolver-directory approximation.
+///
+/// No pump task: a `Libp2pSession` recv timeout is a non-destructive
+/// wake-up (mid-frame bytes survive cancellation in the session's own
+/// buffer), so the serve loop can poll WAIT_COMMIT bounds straight through
+/// this adapter — the property the staged adapter needs its pump for.
+///
+/// Teardown is graceful BY CONSTRUCTION: dropping the wire FINs the stream
+/// and gives the peer a bounded drain window (spawned; see [`Drop`]), so a
+/// caller's last sent frame — e.g. the client's final `PrefixCommit` or the
+/// server's `SessionReject` — is delivered before the connection closes.
+/// A bare quinn drop would send CONNECTION_CLOSE immediately and could
+/// overtake queued frames (the race the transport's
+/// [`Libp2pSession::close_graceful`] exists for).
+pub struct QuicVerifyWire {
+    session: Option<Libp2pSession>,
+    peer_id: String,
+}
+
+impl QuicVerifyWire {
+    /// Wraps an accepted or dialled libp2p session; `remote_peer_id()` is
+    /// the QUIC-authenticated remote for the session's whole lifetime.
+    pub fn over_session(session: Libp2pSession) -> Self {
+        Self {
+            peer_id: session.remote_peer_id().to_string(),
+            session: Some(session),
+        }
+    }
+
+    fn session(&mut self) -> &mut Libp2pSession {
+        self.session
+            .as_mut()
+            .expect("the session is present until drop")
+    }
+}
+
+impl Drop for QuicVerifyWire {
+    fn drop(&mut self) {
+        let Some(mut session) = self.session.take() else {
+            return;
+        };
+        // Outside a runtime a graceful drain is impossible; the drop then
+        // keeps the plain (abrupt) semantics.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                session.close_graceful(GRACEFUL_CLOSE_DRAIN).await;
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl VerifyDraftsWire for QuicVerifyWire {
+    async fn send_json(&mut self, value: &Value, deadline: Duration) -> Result<(), WireError> {
+        self.session()
+            .send_json(value, deadline)
+            .await
+            .map_err(wire_error_of)
+    }
+
+    async fn recv_json(&mut self, deadline: Duration) -> Result<Value, WireError> {
+        self.session()
+            .recv_json(deadline)
+            .await
+            .map_err(wire_error_of)
+    }
+
+    fn remote_peer_id(&self) -> &str {
+        &self.peer_id
+    }
+}
+
+/// Accepts one cooperative session on a libp2p QUIC listener. There is no
+/// resolver directory to consult: the QUIC handshake itself authenticates
+/// the remote PeerId, which [`QuicVerifyWire`] reports and the serve loop
+/// pins the coordinator key from.
+pub async fn accept_quic(
+    listener: &mut Libp2pListener,
+    deadline: Duration,
+) -> Result<QuicVerifyWire, TransportError> {
+    Ok(QuicVerifyWire::over_session(
+        listener.accept(deadline).await?,
+    ))
+}
+
+/// Dials a cooperative peer over QUIC. The connected PeerId is verified
+/// against the pinned server key's ADR-020 derivation (an impostor fails
+/// the binding inside `dial`), and the returned wire reports that pinned
+/// derivation — never a payload claim.
+pub async fn dial_quic(
+    addr: &str,
+    identity: &InstallationIdentity,
+    expected_server: &VerifyingKey,
+    deadline: Duration,
+) -> Result<QuicVerifyWire, TransportError> {
+    let transport = Libp2pTransport::new(identity)?;
+    let expected: PeerId = peer_id_for(&expected_server.to_bytes())
+        .parse()
+        .map_err(|e| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("expected server key does not derive a valid peer id: {e}"),
+            ))
+        })?;
+    Ok(QuicVerifyWire::over_session(
+        transport.dial(addr, &expected, deadline).await?,
     ))
 }

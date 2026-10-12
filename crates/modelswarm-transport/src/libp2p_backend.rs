@@ -1,7 +1,11 @@
 //! F11 (Phase F): a minimal rust-libp2p backend behind the same surface
 //! [`crate::SignedFrameTransport`] exposes — QUIC (peer authentication is
 //! built into QUIC's libp2p TLS handshake), framed send/recv of the same
-//! JSON messages.
+//! JSON messages, plus the ADR-018 amended-staging raw-JSON passthrough
+//! ([`Libp2pSession::send_json`]/[`Libp2pSession::recv_json`]) with the
+//! same stash discipline as the staged backend's [`crate::Session`], so
+//! cooperative extension families (bare JSON frames, e.g. ADR-032
+//! VerifyDrafts) ride QUIC without joining the frozen §6 typed surface.
 //!
 //! Loopback-only listeners are STILL enforced (the ADR-018 honesty guard
 //! applies to every backend until the full Phase F ops set — public relay,
@@ -19,6 +23,7 @@
 //! This backend is experimental and feature-gated (`libp2p-backend`); the
 //! workspace stays green without it (ADR-018: the trait is the swap point).
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use futures::AsyncReadExt as _;
@@ -30,6 +35,7 @@ use libp2p::identity::Keypair;
 use libp2p::quic;
 use libp2p::{Multiaddr, Transport};
 use modelswarm_identity::InstallationIdentity;
+use serde_json::Value;
 
 use crate::error::{invalid_data, TransportError};
 use crate::frame::MAX_FRAME_BYTES;
@@ -56,6 +62,31 @@ pub use libp2p::PeerId;
 pub struct Libp2pSession {
     role: Role,
     peer_id: libp2p::PeerId,
+    /// Typed frames intercepted by [`Libp2pSession::recv_json`] while waiting
+    /// for a raw passthrough frame (delivered by the next
+    /// [`Libp2pSession::recv`]).
+    stashed_typed: VecDeque<WireMessage>,
+    /// Raw passthrough frames intercepted by [`Libp2pSession::recv`] while
+    /// waiting for a typed message (delivered by the next
+    /// [`Libp2pSession::recv_json`]).
+    stashed_raw: VecDeque<Value>,
+    /// Bytes already pulled off the QUIC stream toward the NEXT frame but not
+    /// yet reassembled into one (prefix + body share the buffer; the u32-BE
+    /// prefix is the first 4 bytes). Recv deadlines on this backend are
+    /// WAKE-UPS (polling loops depend on it), so `futures`' `read_exact` —
+    /// which silently loses partially-read bytes when its future is dropped —
+    /// cannot be used: a timeout mid-frame keeps these bytes and the next
+    /// recv continues the same frame instead of desynchronizing the stream.
+    partial: Vec<u8>,
+}
+
+/// One decoded inbound frame: a typed [`WireMessage`] or, when the payload is
+/// valid JSON but not a typed message, the raw passthrough value delivered to
+/// [`Libp2pSession::recv_json`] (extension namespaces, ADR-018 amended
+/// staging — mirrors the staged backend's reader task).
+enum InboundFrame {
+    Typed(WireMessage),
+    Raw(Value),
 }
 
 enum Role {
@@ -84,6 +115,9 @@ impl Libp2pSession {
         Self {
             role: Role::Client { stream },
             peer_id,
+            stashed_typed: VecDeque::new(),
+            stashed_raw: VecDeque::new(),
+            partial: Vec::new(),
         }
     }
 
@@ -94,6 +128,9 @@ impl Libp2pSession {
                 stream: None,
             },
             peer_id,
+            stashed_typed: VecDeque::new(),
+            stashed_raw: VecDeque::new(),
+            partial: Vec::new(),
         }
     }
 
@@ -128,9 +165,45 @@ impl Libp2pSession {
     ) -> Result<(), TransportError> {
         let payload = serde_json::to_vec(msg)
             .map_err(|e| TransportError::Io(invalid_data("frame encode", e)))?;
+        self.write_framed(&payload, deadline).await
+    }
+
+    /// Sends one raw JSON value as a frame (extension-namespace passthrough;
+    /// ADR-018 amended staging — the same surface as the staged backend's
+    /// [`crate::Session::send_json`]).
+    ///
+    /// The value is framed exactly as serialized — it is NOT wrapped in a
+    /// typed [`WireMessage`], so only a peer using
+    /// [`Libp2pSession::recv_json`] can read it. ONE JSON document per frame,
+    /// under the same 256 KiB cap (msp-v1 §6.4), refused before any socket
+    /// write. A timeout here, as everywhere on this backend, leaves the
+    /// session open.
+    pub async fn send_json(
+        &mut self,
+        value: &Value,
+        deadline: Duration,
+    ) -> Result<(), TransportError> {
+        let payload = serde_json::to_vec(value)
+            .map_err(|e| TransportError::Io(invalid_data("frame encode", e)))?;
+        self.write_framed(&payload, deadline).await
+    }
+
+    /// Shared framed write: u32-BE length prefix + payload, deadline-bounded.
+    /// Payloads above [`MAX_FRAME_BYTES`] are refused BEFORE any socket
+    /// write — the same rule the staged backend's writer task enforces (a
+    /// peer's `recv` would reject the prefix anyway; failing locally is the
+    /// honest error).
+    async fn write_framed(
+        &mut self,
+        payload: &[u8],
+        deadline: Duration,
+    ) -> Result<(), TransportError> {
+        if payload.len() > u32::MAX as usize || payload.len() > MAX_FRAME_BYTES {
+            return Err(TransportError::TooLarge);
+        }
         let mut framed = Vec::with_capacity(4 + payload.len());
         framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        framed.extend_from_slice(&payload);
+        framed.extend_from_slice(payload);
         let mut stream = self.stream_pin(deadline).await?;
         let mut write = stream.write_all(&framed);
         tokio::time::timeout(deadline, &mut write)
@@ -149,24 +222,74 @@ impl Libp2pSession {
     /// Pongs and every other frame are delivered. The deadline bounds the
     /// WHOLE call including any ping answering: a ping flood cannot extend
     /// a caller's wait beyond what it asked for.
+    ///
+    /// Raw JSON passthrough frames (see [`Libp2pSession::send_json`]) are
+    /// stashed for [`Libp2pSession::recv_json`] instead of surfacing here
+    /// (the same stash discipline as the staged backend's `Session`), and a
+    /// deadline expiry is a WAKE-UP: the session stays open, already-read
+    /// frame bytes are kept, and no frame is lost.
     pub async fn recv(&mut self, deadline: Duration) -> Result<WireMessage, TransportError> {
         let started = Instant::now();
         loop {
+            // Stash first: a frame already received is never hidden behind an
+            // expired deadline.
+            if let Some(msg) = self.stashed_typed.pop_front() {
+                return Ok(msg);
+            }
             let remaining = deadline
                 .checked_sub(started.elapsed())
                 .unwrap_or(Duration::ZERO);
             if remaining.is_zero() {
                 return Err(TransportError::Timeout);
             }
-            let frame = self.recv_frame(remaining).await?;
-            if let WireMessage::Control(control) = &frame {
-                if control.kind == Control::PING {
+            match self.recv_frame(remaining).await? {
+                InboundFrame::Typed(WireMessage::Control(control))
+                    if control.kind == Control::PING =>
+                {
                     let pong = Control::pong(&control.nonce);
                     self.send(&WireMessage::Control(pong), remaining).await?;
                     continue;
                 }
+                InboundFrame::Typed(msg) => return Ok(msg),
+                InboundFrame::Raw(value) => self.stashed_raw.push_back(value),
             }
-            return Ok(frame);
+        }
+    }
+
+    /// Receives the next raw JSON passthrough frame (see
+    /// [`Libp2pSession::send_json`]) — the ADR-018 amended-staging surface
+    /// the staged backend's [`crate::Session::recv_json`] defines.
+    ///
+    /// Typed [`WireMessage`] frames that arrive meanwhile are stashed and
+    /// delivered by the next [`Libp2pSession::recv`]. Control PINGs are
+    /// answered transparently in-band, never delivered. Deadline policy
+    /// mirrors this backend's `recv`: expiry is a WAKE-UP, not a session
+    /// failure — the session stays open and mid-frame bytes are reassembled
+    /// from the session's partial buffer on the next call — so polling loops
+    /// (e.g. a WAIT_COMMIT bound) never lose frames.
+    pub async fn recv_json(&mut self, deadline: Duration) -> Result<Value, TransportError> {
+        let started = Instant::now();
+        loop {
+            if let Some(value) = self.stashed_raw.pop_front() {
+                return Ok(value);
+            }
+            let remaining = deadline
+                .checked_sub(started.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                return Err(TransportError::Timeout);
+            }
+            match self.recv_frame(remaining).await? {
+                InboundFrame::Typed(WireMessage::Control(control))
+                    if control.kind == Control::PING =>
+                {
+                    let pong = Control::pong(&control.nonce);
+                    self.send(&WireMessage::Control(pong), remaining).await?;
+                    continue;
+                }
+                InboundFrame::Typed(msg) => self.stashed_typed.push_back(msg),
+                InboundFrame::Raw(value) => return Ok(value),
+            }
         }
     }
 
@@ -208,14 +331,22 @@ impl Libp2pSession {
 
     /// One raw frame off the stream: length prefix validated against
     /// [`MAX_FRAME_BYTES`] BEFORE the body is read or allocated (same rule
-    /// as the staged frame codec).
-    async fn recv_frame(&mut self, deadline: Duration) -> Result<WireMessage, TransportError> {
-        let mut stream = self.stream_pin(deadline).await?;
-        let mut prefix = [0u8; 4];
-        let mut read = stream.read_exact(&mut prefix);
-        tokio::time::timeout(deadline, &mut read)
-            .await
-            .map_err(|_| TransportError::Timeout)??;
+    /// as the staged frame codec). The payload decodes as a typed
+    /// [`WireMessage`] when it is one, and as a raw JSON value otherwise
+    /// (the extension-namespace passthrough); only a payload that is not
+    /// valid JSON at all corrupts the session.
+    ///
+    /// Reads go through the session's cancel-safe partial buffer
+    /// (see [`Libp2pSession::partial`]): a deadline expiry mid-frame keeps
+    /// the already-read bytes for the next call.
+    async fn recv_frame(&mut self, deadline: Duration) -> Result<InboundFrame, TransportError> {
+        self.fill_frame_bytes(4, deadline).await?;
+        let prefix = [
+            self.partial[0],
+            self.partial[1],
+            self.partial[2],
+            self.partial[3],
+        ];
         let len = u32::from_be_bytes(prefix) as usize;
         if len == 0 || len > MAX_FRAME_BYTES {
             return Err(TransportError::Io(invalid_data(
@@ -223,14 +354,91 @@ impl Libp2pSession {
                 "length prefix outside 1..=256 KiB",
             )));
         }
-        let mut body = vec![0u8; len];
-        let mut stream = self.stream_pin(deadline).await?;
-        let mut read = stream.read_exact(&mut body);
-        tokio::time::timeout(deadline, &mut read)
-            .await
-            .map_err(|_| TransportError::Timeout)??;
-        serde_json::from_slice(&body)
-            .map_err(|e| TransportError::Io(invalid_data("frame decode", e)))
+        self.fill_frame_bytes(4 + len, deadline).await?;
+        self.partial.drain(..4);
+        // Exactly `len` body bytes belong to THIS frame; anything a single
+        // chunk read pulled past it is the START of the next frame and stays
+        // buffered (QUIC may coalesce multiple frames into one read).
+        let tail = self.partial.split_off(len);
+        let body = std::mem::replace(&mut self.partial, tail);
+        match serde_json::from_slice::<WireMessage>(&body) {
+            Ok(msg) => Ok(InboundFrame::Typed(msg)),
+            Err(_) => match serde_json::from_slice::<Value>(&body) {
+                Ok(value) => Ok(InboundFrame::Raw(value)),
+                Err(e) => Err(TransportError::Io(invalid_data("frame decode", e))),
+            },
+        }
+    }
+
+    /// Cancel-safe frame re-assembly: pulls bytes into the session's partial
+    /// buffer until it holds `want` bytes of the current frame. Each single
+    /// quinn read is cancel-safe (a `Pending` poll consumes nothing), so a
+    /// deadline expiry loses nothing — unlike `read_exact`, whose future
+    /// would silently drop partially-read bytes when dropped.
+    async fn fill_frame_bytes(
+        &mut self,
+        want: usize,
+        deadline: Duration,
+    ) -> Result<(), TransportError> {
+        while self.partial.len() < want {
+            let mut chunk = [0u8; 8192];
+            let mut stream = self.stream_pin(deadline).await?;
+            let read = stream.read(&mut chunk);
+            match tokio::time::timeout(deadline, read).await {
+                Ok(Ok(0)) => {
+                    // EOF at a frame boundary is the peer's clean FIN;
+                    // mid-frame it is truncation.
+                    return Err(if self.partial.is_empty() {
+                        TransportError::Closed
+                    } else {
+                        TransportError::Io(invalid_data(
+                            "libp2p stream read",
+                            "stream ended mid-frame",
+                        ))
+                    });
+                }
+                Ok(Ok(n)) => self.partial.extend_from_slice(&chunk[..n]),
+                Ok(Err(e)) => return Err(io_err("libp2p stream read", e)),
+                Err(_) => return Err(TransportError::Timeout),
+            }
+        }
+        Ok(())
+    }
+
+    /// Graceful session teardown — the QUIC analogue of the OS-level close
+    /// the staged TCP backend gets for free. FINs the stream (the FIN is
+    /// stream-ordered AFTER every frame written so far, so its delivery
+    /// implies their delivery), then waits — bounded by `drain` — for the
+    /// peer to observe the end (its own FIN/EOF, a stream error, or the
+    /// bound).
+    ///
+    /// Plain DROP has no such guarantee: quinn's implicit close on the last
+    /// handle drop sends CONNECTION_CLOSE immediately, which can overtake
+    /// queued stream data and lose the LAST sent frame(s) — the reason the
+    /// msp-v1 serving bridge `linger`s after its final frame before
+    /// dropping (`modelswarm-node/src/serving.rs`). Callers that cannot
+    /// await (a bare `Drop`) either keep this method's contract via a
+    /// spawned task or accept the abrupt-drop semantics.
+    pub async fn close_graceful(&mut self, drain: Duration) {
+        // FIN the send half: instant (quinn's finish only marks the FIN).
+        if let Ok(mut stream) = self.stream_pin(Duration::from_millis(500)).await {
+            let _ = stream.close().await;
+        }
+        // Bounded drain: read until the peer's FIN/EOF, a stream error, or
+        // the deadline. Bytes read here are discarded (the caller is done).
+        let _ = tokio::time::timeout(drain, async {
+            let mut scratch = [0u8; 256];
+            loop {
+                let Ok(mut stream) = self.stream_pin(Duration::from_millis(500)).await else {
+                    return;
+                };
+                match stream.read(&mut scratch).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
     }
 }
 
@@ -543,6 +751,208 @@ mod tests {
                 msg
             );
         }
+    }
+
+    /// ADR-018 amended staging on QUIC: raw-JSON passthrough frames and typed
+    /// `WireMessage` frames interleave on ONE session without confusing
+    /// either side — `recv` hands over exactly the typed frames (raw ones
+    /// stashed) and `recv_json` exactly the raw ones (typed stashed), in
+    /// order, both directions.
+    #[tokio::test]
+    async fn libp2p_json_passthrough_interleaves_with_typed_frames() {
+        let server_identity = InstallationIdentity::from_bytes(&[41u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[42u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let client = Libp2pTransport::new(&client_identity).unwrap();
+        let mut listener = server.listen("127.0.0.1:0").await.unwrap();
+
+        let bound = listener.bound_addr().clone();
+        let expected = server.peer_id();
+        let dialing = tokio::spawn(async move {
+            client
+                .dial(
+                    bound.to_string().as_str(),
+                    &expected,
+                    Duration::from_secs(10),
+                )
+                .await
+        });
+        let mut peer_server = listener.accept(Duration::from_secs(10)).await.unwrap();
+        let mut peer_client = dialing.await.unwrap().unwrap();
+
+        // Client sends raw, typed, raw; server asks in a DIFFERENT order —
+        // the stash discipline must keep every frame exactly once.
+        let raw1 = serde_json::json!({"window_tokens": [1, 2, 3]});
+        let typed = WireMessage::Control(Control::pong("interleave"));
+        let raw2 = serde_json::json!({"accepted_token_ids": [7], "round": 2});
+        peer_client
+            .send_json(&raw1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        peer_client
+            .send(&typed, Duration::from_secs(5))
+            .await
+            .unwrap();
+        peer_client
+            .send_json(&raw2, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // recv (typed) first: it must stash BOTH raw frames and still return
+        // the one typed frame.
+        assert_eq!(
+            peer_server.recv(Duration::from_secs(5)).await.unwrap(),
+            typed
+        );
+        // Then the raw frames, in order, via recv_json.
+        assert_eq!(
+            peer_server.recv_json(Duration::from_secs(5)).await.unwrap(),
+            raw1
+        );
+        assert_eq!(
+            peer_server.recv_json(Duration::from_secs(5)).await.unwrap(),
+            raw2
+        );
+
+        // Reverse direction: server sends typed-then-raw; client's recv_json
+        // stashes the typed frame and returns the raw one.
+        peer_server
+            .send(&typed, Duration::from_secs(5))
+            .await
+            .unwrap();
+        peer_server
+            .send_json(&raw1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            peer_client.recv_json(Duration::from_secs(5)).await.unwrap(),
+            raw1
+        );
+        assert_eq!(
+            peer_client.recv(Duration::from_secs(5)).await.unwrap(),
+            typed
+        );
+    }
+
+    /// The deadline contract the ADR-032 serve loop depends on: a `recv_json`
+    /// timeout is a pure WAKE-UP. The session survives, a frame that arrives
+    /// afterwards is received intact — even a large frame whose delivery
+    /// spans several timeout cycles mid-body (the cancel-safe partial buffer
+    /// re-assembles it; `read_exact` cancellation would desync the stream).
+    #[tokio::test]
+    async fn libp2p_recv_json_timeouts_are_wakeups_and_lose_no_bytes() {
+        let server_identity = InstallationIdentity::from_bytes(&[43u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[44u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let client = Libp2pTransport::new(&client_identity).unwrap();
+        let mut listener = server.listen("127.0.0.1:0").await.unwrap();
+
+        let bound = listener.bound_addr().clone();
+        let expected = server.peer_id();
+        let dialing = tokio::spawn(async move {
+            client
+                .dial(
+                    bound.to_string().as_str(),
+                    &expected,
+                    Duration::from_secs(10),
+                )
+                .await
+        });
+        let mut peer_server = listener.accept(Duration::from_secs(10)).await.unwrap();
+        let mut peer_client = dialing.await.unwrap().unwrap();
+
+        // Nothing in flight yet: a short deadline must elapse (a wake-up),
+        // not fail the session.
+        assert!(matches!(
+            peer_server.recv_json(Duration::from_millis(20)).await,
+            Err(TransportError::Timeout)
+        ));
+
+        // A ~240 KiB JSON document (multi-packet on QUIC): the server spins
+        // through several 1 ms wake-ups while it may be mid-body. Whichever
+        // call finally completes the frame — a short one mid-flight or the
+        // generous one after — the frame must be INTACT (partial bytes
+        // survived every cancellation).
+        let big = serde_json::json!({"blob": "x".repeat(240_000), "round": 1});
+        peer_client
+            .send_json(&big, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let mut received = false;
+        for _ in 0..16 {
+            if let Ok(value) = peer_server.recv_json(Duration::from_millis(1)).await {
+                assert_eq!(value, big, "no byte may be lost to a cancelled recv");
+                received = true;
+                break;
+            }
+            // Every elapsed deadline was a wake-up: liveness is the loop.
+        }
+        if !received {
+            assert_eq!(
+                peer_server
+                    .recv_json(Duration::from_secs(10))
+                    .await
+                    .unwrap(),
+                big,
+                "the frame must arrive intact across the wake-up cycles"
+            );
+        }
+
+        // The session still carries a follow-up frame in both directions.
+        let follow_up = serde_json::json!({"accepted_token_ids": [9]});
+        peer_client
+            .send_json(&follow_up, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            peer_server.recv_json(Duration::from_secs(5)).await.unwrap(),
+            follow_up
+        );
+    }
+
+    /// msp-v1 §6.4 on the passthrough: payloads above the 256 KiB frame cap
+    /// are refused BEFORE any socket write (the receiving side would reject
+    /// the length prefix anyway), and the refusal leaves the session usable.
+    #[tokio::test]
+    async fn libp2p_send_json_refuses_oversized_payload_before_writing() {
+        let server_identity = InstallationIdentity::from_bytes(&[45u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[46u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let client = Libp2pTransport::new(&client_identity).unwrap();
+        let mut listener = server.listen("127.0.0.1:0").await.unwrap();
+
+        let bound = listener.bound_addr().clone();
+        let expected = server.peer_id();
+        let dialing = tokio::spawn(async move {
+            client
+                .dial(
+                    bound.to_string().as_str(),
+                    &expected,
+                    Duration::from_secs(10),
+                )
+                .await
+        });
+        let mut peer_server = listener.accept(Duration::from_secs(10)).await.unwrap();
+        let mut peer_client = dialing.await.unwrap().unwrap();
+
+        let oversized = serde_json::json!({"blob": "x".repeat(300_000)});
+        assert!(matches!(
+            peer_client
+                .send_json(&oversized, Duration::from_secs(5))
+                .await,
+            Err(TransportError::TooLarge)
+        ));
+
+        // Nothing was written: the next frame is frame #1 on the stream.
+        let small = serde_json::json!({"round": 1});
+        peer_client
+            .send_json(&small, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            peer_server.recv_json(Duration::from_secs(5)).await.unwrap(),
+            small
+        );
     }
 
     /// F15: `measure_rtt` over real loopback QUIC. The dialer probes; the

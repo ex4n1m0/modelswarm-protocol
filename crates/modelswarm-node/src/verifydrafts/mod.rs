@@ -23,20 +23,25 @@
 //!   `RejectionFrame`/`CancelRoundFrame` (codes, counts, and hashes ONLY —
 //!   token ids never appear in frames or logs, ADR-032 §2 privacy rule).
 //!
-//! # Transport venue (honest limitation, 2026-10-12)
+//! # Transport venues (2026-10-12 update)
 //!
 //! The family's frames are bare JSON objects riding the ADR-018 amended
-//! staging (`Session::send_json`/`recv_json`). The staged TCP backend
-//! implements that passthrough; the QUIC
-//! [`modelswarm_transport::libp2p_backend::Libp2pSession`] does NOT (typed
-//! `WireMessage` frames only), so the QUIC `serve_sessions` bridge cannot
-//! yet demux a VerifyDrafts session — the exact missing signatures are
-//! recorded in
-//! `docs/reviews/handoff-windows-product-verifydrafts-wiring-2026-10-11.md`
-//! (Network Engineer's crate; not editable from this tier). Until the
-//! passthrough lands, the wiring runs over the staged backend through the
-//! [`wire::VerifyDraftsWire`] port, and the tests exercise REAL sockets,
-//! REAL framing, and the REAL Ed25519 §6.1 handshake.
+//! staging (raw-JSON passthrough frames). BOTH backends now carry it:
+//!
+//! - the staged TCP backend (`Session::send_json`/`recv_json`) through
+//!   [`wire::StagedVerifyWire`] — the CI venue with the staged §6.1
+//!   handshake (real sockets, real framing, real signatures);
+//! - the REAL libp2p QUIC backend through [`wire::QuicVerifyWire`] — the
+//!   production venue, unblocked by the transport crate's 2026-10-12
+//!   `Libp2pSession::send_json`/`recv_json` passthrough (the light-up
+//!   handoff's G1 gap, closed by the Network Engineer). The QUIC handshake
+//!   authenticates the remote PeerId, so RC-1's transport-authenticated
+//!   identity holds cryptographically on this venue.
+//!
+//! [`serve::serve_verifydrafts_quic`] is the QUIC accept loop (the
+//! `serve_sessions`-shaped venue the msp-v1 bridge demuxes to when the
+//! family goes live); the QUIC loopback tests live in
+//! `tests/verifydrafts_quic.rs`.
 
 pub mod client;
 pub mod serve;
@@ -46,9 +51,13 @@ pub use client::{
     ClientOpenError, RoundFailure, RoundOutcome, VerifyDraftsClient, VerifyDraftsClientConfig,
 };
 pub use serve::{
-    serve_verifydrafts_session, ServeEndReason, VerifyDraftsServeConfig, VerifyDraftsServeReport,
+    serve_verifydrafts_quic, serve_verifydrafts_session, ServeEndReason, VerifyDraftsServeConfig,
+    VerifyDraftsServeReport,
 };
-pub use wire::{accept_staged, dial_staged, StagedVerifyWire, VerifyDraftsWire, WireError};
+pub use wire::{
+    accept_quic, accept_staged, dial_quic, dial_staged, QuicVerifyWire, StagedVerifyWire,
+    VerifyDraftsWire, WireError,
+};
 
 use modelswarm_session::negotiation::{Backend, EngineDisclosure, Preset, SessionBudget};
 use modelswarm_session::verifydrafts::VerifyTelemetry;

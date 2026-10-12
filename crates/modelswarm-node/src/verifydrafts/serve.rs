@@ -42,6 +42,7 @@ use modelswarm_session::verifydrafts::{
 use modelswarm_session::{CommitPrefix, GENESIS_PREFIX_HASH};
 use modelswarm_telemetry::Telemetry;
 use modelswarm_transport::ed25519_dalek::VerifyingKey;
+use modelswarm_transport::libp2p_backend::Libp2pListener;
 
 use super::wire::{VerifyDraftsWire, WireError};
 use super::{
@@ -616,6 +617,71 @@ pub async fn serve_verifydrafts_session<W: VerifyDraftsWire>(
     );
     report.ended_by = ended_by;
     report
+}
+
+/// The QUIC venue for the family (the light-up handoff's G1 follow-up):
+/// accepts VerifyDrafts sessions on a REAL libp2p QUIC listener and serves
+/// each to its end — the parallel of the msp-v1 bridge's `serve_sessions`
+/// (`crate::serving`, untouched by design; when the family goes live the
+/// composed daemon demuxes there). The lifecycle contract mirrors that
+/// bridge exactly: stop when `shutdown` flips true OR its watch sender is
+/// dropped.
+///
+/// Admission note (honest limitation): the msp-v1 bridge's session/per-peer
+/// `Admission` lives behind the node `libp2p-backend` feature and is not
+/// reused here; per-connection admission control for this venue belongs to
+/// the composed daemon wiring.
+pub async fn serve_verifydrafts_quic(
+    mut listener: Libp2pListener,
+    config: VerifyDraftsServeConfig,
+    engine: Arc<dyn BatchVerifyEngine>,
+    telemetry: Arc<Telemetry>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let session = tokio::select! {
+            // The same semantics as the msp-v1 bridge: a CLOSED watch channel
+            // (every Sender dropped) must ALSO stop serving — nobody can ever
+            // signal stop otherwise, and a permanently-ready branch would
+            // cancel every in-flight accept.
+            changed = shutdown.changed() => match changed {
+                Err(_) => {
+                    telemetry.warn(
+                        "verifydrafts.serve_stopped",
+                        &[("reason", "shutdown_sender_dropped")],
+                    );
+                    return;
+                }
+                Ok(()) => {
+                    if *shutdown.borrow() {
+                        telemetry
+                            .info("verifydrafts.serve_stopped", &[("reason", "shutdown_signal")]);
+                        return;
+                    }
+                    continue;
+                }
+            },
+            accepted = listener.accept(Duration::from_secs(1)) => match accepted {
+                Ok(s) => s,
+                Err(_) => continue, // timeout/accept miss: keep serving
+            },
+        };
+        let session_config = config.clone();
+        let session_engine = Arc::clone(&engine);
+        let session_telemetry = Arc::clone(&telemetry);
+        tokio::spawn(async move {
+            let wire = super::wire::QuicVerifyWire::over_session(session);
+            // The report's end reason is telemetered inside the serve loop
+            // (`verifydrafts.session_ended`); per-session counts stay local.
+            let _report = serve_verifydrafts_session(
+                wire,
+                session_config,
+                session_engine,
+                &session_telemetry,
+            )
+            .await;
+        });
+    }
 }
 
 /// Per-round operational context for [`handle_request`] (the §8

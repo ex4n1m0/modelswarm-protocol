@@ -15,9 +15,9 @@ libp2p-backend = ["dep:modelswarm-transport", "dep:modelswarm-eligibility", "dep
 # housekeeping). OFF by default — default builds are behavior-identical to
 # the pre-feature state; the family rides the ADR-018 amended staging
 # (raw-JSON frames over the handshake-authenticated transport) through the
-# `VerifyDraftsWire` port. The QUIC `Libp2pSession` integration is BLOCKED
-# on the transport-crate JSON-passthrough gap recorded in
-# docs/reviews/handoff-windows-product-verifydrafts-wiring-2026-10-11.md.
+# `VerifyDraftsWire` port, on BOTH venues since 2026-10-12: the staged TCP
+# backend and the REAL libp2p QUIC backend (transport-crate passthrough
+# landed; see docs/reviews/handoff-network-verifydrafts-quic-2026-10-11.md).
 verifydrafts = ["dep:modelswarm-transport", "dep:modelswarm-session", "dep:bs58"]
 # Self-test path (ADR-019): turns on the TEST-ONLY mock runtime and the
 # `self-test` CLI subcommand. OFF by default — production node builds never

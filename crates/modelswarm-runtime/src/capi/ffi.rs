@@ -902,7 +902,16 @@ fn load_library(path: &Path) -> Result<libloading::Library, libloading::Error> {
 
 #[cfg(not(windows))]
 fn load_library(path: &Path) -> Result<libloading::Library, libloading::Error> {
-    libloading::Library::new(path)
+    // Safety: identical acceptance to the Windows branch above — `path` is
+    // the canonicalized `libllama.so`/`libllama.dylib` inside the sha256-
+    // verified engine bundle of `runtime-pins.json`, and we accept that
+    // dlopen runs the library's constructors (libloading 0.8.9 marks
+    // `Library::new` unsafe for exactly that reason; the Windows
+    // `load_with_flags` call takes the same risk under its own unsafe
+    // block). Found by the 0.2.21 desktop-installer matrix: this branch
+    // compiles nowhere else in CI (check job is windows-latest, where it
+    // is cfg'd out).
+    unsafe { libloading::Library::new(path) }
 }
 
 /// `Send`/`Sync` for the engine core declared in `super`: its only raw

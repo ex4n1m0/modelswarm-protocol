@@ -89,6 +89,36 @@ jobs:
           TAURI_CONFIG: '{"bundle":{"resources":[]}}'
         run: cargo test -p modelswarm-desktop --features tauri-shell
 
+  # NON-WINDOWS compile gate for the workspace's unsafe surface (added at
+  # the 0.2.21 release train, third strike of the windows-only-CI blind
+  # spot: wire bugs -> feature unification -> OS). ffi.rs's
+  # cfg(not(windows)) branch compiled NOWHERE in CI until the light-up
+  # chained tauri-shell -> capi-adapter into desktop-installer: the check
+  # job above runs on windows-latest (where the branch is cfg'd out) and
+  # desktop-installer only triggers on desktop/node path changes, so a
+  # runtime-only change shipped a red 3-OS matrix unnoticed (run
+  # 38238154483: E0133 libloading::Library::new on ubuntu+macos). This
+  # job compiles every crate + the capi-adapter feature on Linux for every
+  # push that touches the rust paths. Compile-only: no engine staging, no
+  # test execution — engine-verified Linux behavior stays with the
+  # installer matrix and the manual-dispatch real-model tier.
+  check-nonwindows-capi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Same TAURI_CONFIG overlay as the check job's desktop steps: clippy
+      # executes build scripts, and the desktop build script requires the
+      # gitignored engine dirs unless resources are stripped.
+      - name: Clippy (workspace, capi-adapter, non-Windows)
+        env:
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
+        run: cargo clippy --workspace --all-targets --features modelswarm-runtime/capi-adapter -- -D warnings
+
   # Release hygiene guards: the product version is single-sourced in the
   # workspace Cargo.toml (tauri.conf.json must NOT carry its own), and no
   # binary artifact may ever be committed (installers ship via the

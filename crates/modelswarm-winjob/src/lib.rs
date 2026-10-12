@@ -252,6 +252,12 @@ mod tests {
     /// `close_one_retained_job_for_test` pops LIFO: if they interleaved,
     /// one test's close could pop (and kill) the OTHER test's child. This
     /// lock serializes them for the whole assign→assert→cleanup span.
+    /// cfg(windows): every caller is a windows-only test — un-gated, the
+    /// helper is dead code in the non-Windows lib-test compile and fails
+    /// the check-nonwindows-capi -D warnings gate (found by that gate on
+    /// the 0.2.22 train; every run since ea47032 had been cancelled by
+    /// the next push before this job finished, so it shipped unnoticed).
+    #[cfg(windows)]
     fn job_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -1,11 +1,18 @@
 # ADR-033: The advisory plane — an owner-funded cloud reasoning endpoint as a non-authoritative management brain
 
-Status: **Accepted (2026-10-12, owner decision — option B).** The owner
-accepted with the same message that reported the first live two-peer swarm
-on v0.2.21. Security and Test and Release reviews (§9.1/§9.2) remain the
-implementation gate; the §3.5 key rotation is a precondition for the first
-production digest cycle. Owner: Protocol Architect (contract);
-implementation routing per §9.4.
+Status: **Accepted (revision 2, 2026-10-12; originally accepted 2026-10-12
+— owner decision, option B).** The owner accepted with the same message
+that reported the first live two-peer swarm on v0.2.21. Both gate reviews
+returned approve-with-required-changes and every required change is folded
+into revision 2 (amendment note below): Security RC-1..RC-11
+(`docs/reviews/review-adr-033-security-2026-10-12.md`, `86c6c77`) and
+Test and Release TR-RC-1..TR-RC-10
+(`docs/reviews/review-adr-033-testrelease-2026-10-12.md`, `8bb2e91`) —
+the implementation gate is OPEN. The §3.5 key rotation, evidenced per
+§9.2(9) under `docs/verification/`, remains a precondition for the first
+production digest cycle and for any tagged release carrying advisory
+wiring. Owner: Protocol Architect (contract); implementation routing per
+§9.4.
 
 **Decision record (2026-10-12).** The owner approved the direction and funded
 it with a provider key: "a cloud API that I pay not to be part of the
@@ -23,6 +30,80 @@ provider, model, or deployment class re-opens the owner gate.
 
 This ADR is amendment-ready in the ADR-032 style: revision notes append here;
 normative text changes only through a recorded amendment.
+
+**Amendment note (revision 2, 2026-10-12).** Folds both implementation-gate
+reviews: `docs/reviews/review-adr-033-security-2026-10-12.md` (commit
+`86c6c77`: 0 blockers, required changes RC-1..RC-11, advisories AD-1..AD-5)
+and `docs/reviews/review-adr-033-testrelease-2026-10-12.md` (commit
+`8bb2e91`: 0 blockers, required changes TR-RC-1..TR-RC-10, advisories
+TR-AD-1..TR-AD-5). Both seats ruled approve-with-required-changes with this
+amendment as the landing condition; with it recorded, both approvals stand.
+Nothing here reopens the owner's option-B decision or any §1 invariant —
+the four invariants are unchanged; this revision tightens mechanics only.
+Changed from revision 1: §3.2 is rewritten around ONE value-typed content
+gate with the `Redactor` as a secondary scrub net, pinned peer/profile
+reference rendering (SHA-256 16-hex, RC-1), a frozen in-repo vocabulary
+artifact `protocol/advisory-egress-v1.json` carrying the full
+stringly-field reduction table (RC-2, RC-11), and typed in-process
+accumulators as the only aggregation source (RC-4); §3.3 pins https-only,
+no-redirect, hostname-displayed transport (RC-9); §4 gains the
+post-serialization re-scan before CALL (RC-3), the pure injectable-core
+precondition (TR-RC-4, TR-AD-2), the dedicated `advisory.json` config file
+with corrected citations (TR-RC-8), the rationale rendering contract
+(RC-5, AD-3), the frozen per-target clamp table with absent-target
+`requires_adr` (RC-7), the `cycle_id` echo check and generator pin (RC-8),
+the non-finite-hint classification (TR-AD-1), and re-pinned A2/A3
+invariants (TR-RC-1, TR-RC-2); §5 is rewritten with the trace-keyed join
+shape and (trace, hint) event cardinality (TR-RC-5), explicit
+dual-execution outcome measurement (RC-6), the machine-readable promotion
+verdict artifact with provenance, dispersion, worst-cell, and
+fastest-single-baseline requirements plus CI replay (TR-RC-6), and
+promotion-evidence integrity preconditions (TR-RC-10); §6 pins the `late`
+gap firing condition and failed-call cap accounting (TR-RC-4); §9.2 is
+rewritten as items (1)–(9) with the frozen fixture inventory and
+completeness tie (TR-RC-3), the verbatim A2 mechanism (TR-RC-1), the A3
+carve-out and shipped corpora (TR-RC-2), and the execution-venue matrix
+whose standing statement is that the provider round-trip NEVER runs in CI
+(TR-RC-7, TR-AD-4); §9.3 records the gate outcome; §9.4 records the added
+routing obligations. Review interactions are reconciled as ONE mechanism
+each, recorded here: **(R-1)** Security RC-2's vocabulary artifact and
+TR-RC-3's fixture inventory are one two-sided mechanism — the contract
+artifact `protocol/advisory-egress-v1.json` (Protocol Architect) is the
+allowlist's vocabulary of record, the committed fixture inventory under
+`tests/fixtures/advisory-egress/` (Test and Release) is its test mirror,
+and the guards completeness tie diffs the source emit-site vocabulary
+against BOTH — a new event name without both a manifest row and a
+vocabulary row is a red build. **(R-2)** Security RC-7's clamp table,
+TR-RC-6's promise-metric pin, and TR-RC-4's item-(4) sequencing are one
+artifact — `protocol/advisory-clamp-table-v1.json`, rows
+`target → [min, max] → source of truth → {promise_metric, direction}`,
+pinned in §4; §9.2(4) is written against it and sequenced after it.
+**(R-3)** Security RC-6 rules HOW advisory-arm outcomes are measured
+(explicit dual execution, never attribution of realized deterministic-arm
+outcomes) and TR-RC-6 rules WHAT the checker computes from; both land in
+the single §5 rewrite. **(R-4)** Security AD-2's emitter escaping fix
+(Integrator-owned `modelswarm-telemetry`) is NOT a precondition for
+advisory egress — RC-4's typed accumulators remove JSONL from the digest
+path entirely — but IS a precondition for any promotion decision, whose
+evidence is built from telemetry files (TR-RC-10); both routings are in
+§9.4. **(R-5)** Security RC-9's transport contract is CI-tested through
+mock-transport doubles per push (TR-RC-7 venue matrix) and confirmed
+against the live endpoint only in the owner-local venue. **(R-6)** the
+ADR-internal `late`-vs-`timeout` contradiction TR-RC-4 found is resolved
+in §6: `late` is a diagnostic-only gap fired at discard time, permitted
+only after a `timeout` gap for the same cycle. Advisories folded into
+normative text: AD-3 (display pairing) and the RC-8 generator ride §4;
+TR-AD-1 rides §4's malformed table; TR-AD-3 rides §9.2(2); TR-AD-4 and
+TR-AD-5 ride §9.2's standing statements and the release checklist.
+Advisories routed, not folded: AD-1 (guards pattern breadth — Test and
+Release widens the CI pattern or the owner verifies the exact key shape
+at §3.5 rotation) and AD-4 (provider retention terms — the owner records
+the check before the first production digest cycle); AD-2 routes per
+(R-4). The frozen protocol surfaces (`protocol/msp-v1.md`,
+`protocol/messages.proto`, `catalog/schema.json`, `protocol/vectors/`)
+remain byte-identical; the two new `protocol/*.json` artifacts are
+advisory-plane contract files, not wire surface, and the wire-compat CI
+job is unaffected.
 
 Evidence base (all committed): ADR-032 (the shadow/advisory precedent set —
 honest negatives, measured-before-trusted, untrusted-input wording) · the
@@ -78,8 +159,10 @@ token ids are completion content in encoded form (the ADR-032 §2 discipline).
 This extends AGENTS.md hard constraint 5 from storage and logs to the
 advisory egress channel, and it is enforced **structurally, not by policy**:
 every field leaving the process for the advisory endpoint passes the §3.2
-allowlist plus the shipped `Redactor`; a field failing either gate is dropped
-and counted, never sent.
+value-typed allowlist — the content gate — followed by the shipped
+`Redactor` as a secondary scrub net (not itself a content gate: free text
+under an allowed name passes it truncated — revision 2, RC-2's ruling); a
+field failing the allowlist is dropped and counted, never sent.
 
 **(b) ADVISORY-ONLY, NO AUTHORITY.** The plane may suggest: de-rank hints,
 tuning proposals, triage summaries, catalog curation proposals. Leases,
@@ -121,11 +204,20 @@ catalog_note | digest`.
    (§5). Hints may target only parameters that are runtime-tunable or
    config-recorded today; a hint naming a frozen constant is recorded with
    `requires_adr: true` and can never be applied by config alone.
-3. **Catalog curation proposals** (`catalog_note`): summaries of the ADR-023
-   request queue and the `catalog/candidate-profiles/` review rows, proposed
-   for owner review. The plane never writes to the tracker, the catalog
-   envelope, or any signed surface; the owner uses the existing §3.5 admin
-   flow.
+3. **Catalog curation proposals** (`catalog_note` — revision 2, RC-11):
+   `catalog_note` digests carry structured fields only — request counts,
+   dedupe-cluster sizes keyed by `artifact_sha256` prefixes, quant enums,
+   byte histograms — plus `display_name` values drawn ONLY from the SIGNED
+   catalog and candidate rows already pinned in-repo (owner-controlled
+   strings). The ADR-023 community `note` field, free-text `display_name`
+   from the request queue, and URLs (`licenseEvidenceUrl` included) never
+   enter any digest under any future revision without a new ADR. (If
+   structured triage later needs to name a repo, a typed bounded identifier
+   `hf_repo` — charset `[A-Za-z0-9._/-]{1,100}` — may be added to the §3.2
+   vocabulary artifact by amendment; the 280-char `note` and URLs stay
+   excluded either way.) Proposed for owner review. The plane never writes
+   to the tracker, the catalog envelope, or any signed surface; the owner
+   uses the existing §3.5 admin flow.
 4. **Operator management digests** (`digest`): fleet health, roster
    composition, and honest-negative summaries. Display-only.
 
@@ -150,30 +242,74 @@ metadata egressing to the operator's own paid provider, over TLS. Extending
 advisory inputs to non-operator peers' telemetry is a future revision with
 its own ADR and owner gate.
 
-**3.2 Request shape (the redacted metadata digest).** A cycle aggregates
-local telemetry accumulated since the last successful cycle into aggregates
-only — counts, min/median/max ms, EWMA snapshots, verdict tallies, roster
-health rolls. Each emitted `(name, value)` field must pass BOTH gates:
+**3.2 Request shape (the redacted metadata digest) — revision 2.** A cycle
+aggregates **typed in-process accumulators only** — counters, histograms,
+and snapshot structs updated at emit time in the producing components; log
+sinks (JSONL or otherwise) are NEVER parsed as advisory input (RC-4: the
+emitter escapes only `\` and `"` today,
+`crates/modelswarm-telemetry/src/lib.rs:203-205`, so a forged log line
+could otherwise skew counts, timings, and verdict tallies). The
+aggregation input set is itself an enumerated event-type allowlist that
+EXCLUDES `advisory.*` rows — the plane's own telemetry never feeds the
+next cycle's digest. Accumulated state reduces to aggregates only: counts,
+integer min/median/max ms, EWMA snapshots rendered as integers (rounded
+ms), verdict tallies, roster health rolls; the honest sentinels
+`none`/`unmeasured`/`unknown` map to null on every timing field.
 
-- a **positive type allowlist**: integers, booleans, ISO-8601 UTC timestamps,
-  enum strings drawn only from frozen vocabularies (the effective §6.5
-  registry, `CancelRound` reasons, `served_by` values, verdict enums), and
-  hex digest prefixes of exactly 16 lowercase hex characters (peer ids and
-  profile ids render truncated to 16 chars — correlation aids, not integrity
-  anchors; integrity stays local and cryptographic); and
-- the shipped **`Redactor`** (`crates/modelswarm-telemetry/src/redact.rs`):
-  forbidden field names drop the value, `scrub_content` removes `sk-` keys,
-  JWTs, Bearer headers, and hex runs ≥ 32, and values are capped at 256
-  chars.
+**The content gate is ONE gate: the positive value-typed allowlist.** The
+shipped `Redactor` is a secondary scrub net, not a content gate — free
+text under an allowed name passes it truncated (`redact.rs`'s own test
+`prompt_smuggled_under_allowed_name_is_truncated_not_dropped`);
+content-blindness therefore rests on the allowlist being value-typed and
+exhaustive over what the node emits, and §9.2(1) enforces exactly that.
+Each emitted `(name, value)` field must match one of:
 
-A field failing either gate is dropped and counted; a request with zero
-surviving fields is not sent (gap `empty_after_redaction`). Free-form text is
-never emitted: attacker-influenceable strings (error messages, filenames)
-reduce to frozen-vocabulary codes before they can reach the digest. The
-request body is bounded by `advisory.max_request_bytes`. The system prompt is
-a fixed, repo-versioned template (no secrets, no user content) that itself
-states the metadata-only contract; the redaction gate runs regardless of the
-prompt — the structural gate, not prompt compliance, is the defense.
+- integers and booleans;
+- ISO-8601 UTC timestamps;
+- enum strings VALUE-matched against `protocol/advisory-egress-v1.json` —
+  the frozen in-repo vocabulary artifact (revision 2; Protocol-owned;
+  changed only by ADR-033 amendment). Its initial content is the committed
+  vocabularies verbatim — the effective msp-v1 §6.5 registry as amended by
+  ADR-028 §5, `CancelRound` reasons and `served_by`/verdict enums from the
+  cooperative namespace, `finishReason` values, the §6 gap vocabulary, the
+  §2 suggestion types and confidence levels, and the per-site reduction
+  code sets below — COPIED, not referenced: drift in the source documents
+  never changes the egress vocabulary, and vice versa;
+- peer and profile references, rendered as exactly 16 lowercase hex
+  characters: peer references are the first 16 hex characters of SHA-256
+  over the full base58btc PeerId string; profile references are the 16 hex
+  characters following the `msp1:` prefix; the raw base58 PeerId string is
+  never emitted (RC-1 — hash-truncation keeps the emitted form uniform,
+  charset-constrained, and uncraftable as another type; 16 hex is a
+  correlation aid, not an integrity anchor — integrity stays local and
+  cryptographic).
+
+Every stringly field the node emits today has a pinned reduction rule
+(RC-2; the artifact carries this table mechanically):
+
+| Emitted field (site) | Shape today | Reduction rule for the digest |
+|---|---|---|
+| `error`, `detail` (gateway/engine/executor/family/chat.swarm/net.metrics sites) | `e.to_string()` — OS/HTTP text, can embed file paths | drop by default; a site's errors enter only via a per-site frozen code set mapped before aggregation |
+| `code` on `serving.session_ended` (`crates/modelswarm-node/src/serving.rs:114`) | composite despite the code comment: `recv: {transport-error}` (`:314`), `invalid_lease: {why}` (`:366`; `why` can carry serde fragments of a crafted `capability_token`) | match the prefix before the first `:` against a frozen code set; no match ⇒ drop+count |
+| `deadline_ms`/`max_tokens` on `serving.clamped` (`serving.rs:381-396`) | composite `"X->Y"` | decompose into `*_requested`/`*_clamped` integer pairs, or drop |
+| float-formatted timings (`probe_p50_ms`, `ttft_ewma_ms`, `total_ewma_ms`, `pick_predicted_ms`) | `"{:.1}"/"{:.3}"` strings | accumulators emit integers (rounded ms); sentinels → null |
+| `decision` on `sched.shadow.decision` | stringified JSON blob | decompose or drop |
+| `session` (`verifydrafts.*`) | opaque requester-generated string (peer-chosen bytes) | drop (correlate by peer reference + integer round) |
+| `addr` (`chat.swarm`, `listener.bound`) | peer-registered multiaddr | drop |
+| local constants (`backend`, `base`, `file`, `port`, `gateway_addr`, `version`, `name`, `preset`) | local disclosure strings | drop, or a tiny pinned per-field vocabulary in the artifact |
+
+After the allowlist, the shipped `Redactor`
+(`crates/modelswarm-telemetry/src/redact.rs`) runs as the secondary net:
+forbidden field names drop the value, `scrub_content` removes `sk-` runs,
+JWTs, Bearer headers, and hex runs ≥ 32, and values are capped at 256
+chars. A field failing the allowlist is dropped and counted; a request
+with zero surviving fields is not sent (gap `empty_after_redaction`). The
+request body is bounded by `advisory.max_request_bytes`. Free-form text
+never reaches the digest: attacker-influenceable strings reduce to the
+frozen codes above before aggregation. The system prompt remains a fixed,
+repo-versioned template (no secrets, no user content) that itself states
+the metadata-only contract; the allowlist runs regardless of the prompt —
+the structural gate, not prompt compliance, is the defense.
 
 **3.3 Provider pinning.** Endpoint URL and model id are recorded in local
 config at setup time from the provider console (`advisory.endpoint_url`,
@@ -181,6 +317,14 @@ config at setup time from the provider console (`advisory.endpoint_url`,
 at setup). Neither is hardcoded in source; provider model ids are not frozen
 by this ADR and may be changed in config without an ADR. A config with either
 missing is inert (gap `no_config`).
+
+**Transport pinning (revision 2, RC-9).** The client rejects any
+`advisory.endpoint_url` that is not `https://` (gap `no_config`); the HTTP
+client does not follow redirects — a 3xx response is `http_error`, and the
+request (including the Authorization header) is never re-sent to any other
+host; the configured hostname is shown in the operator UI at every cycle.
+Mock-transport coverage of these behaviors is per-push CI (§9.2 venue
+matrix); live-endpoint confirmation is owner-local only.
 
 **3.4 Key handling.** The key is read from a local file whose path resolves
 env-first (`MSP_ADVISORY_KEY_FILE`), then config (`advisory.key_file`), then
@@ -254,9 +398,35 @@ Cycles are **timer-driven only** — no call site exists in any request,
 serving, scheduling, negotiation, or gateway path (invariant A5). There is no
 in-cycle retry; the next cycle is the retry.
 
-**Config (local `config.json` alongside the existing per-install config,
-`crates/modelswarm-node/src/lib.rs:146-186` layout; defaults frozen by this
-ADR, tunable without an ADR):**
+**One egress choke point (revision 2, RC-3).** Exactly one function
+constructs the request body, and before CALL the FINAL serialized body is
+re-verified: it is re-parsed and every value must re-match the §3.2
+allowlist, and the body bytes pass `scrub_content`. Any failure ⇒ gap
+`empty_after_redaction`; nothing is sent. §9.2(1) attacks this single seam.
+
+**Pure injectable core (revision 2, TR-RC-4/TR-AD-2 — a design
+precondition, not an implementation detail).** The state machine is
+implemented as a pure `step(state, input) -> (state, effects)` over an
+injected clock and an injected transport double; §9.2 items (2)/(3) and
+the RC-9 mock tests are unrunnable without them.
+
+**Cap accounting and window (revision 2, TR-RC-4).** Every CALL transition
+consumes one unit of `max_calls_per_day` regardless of outcome — caps count
+calls initiated, not successes, so a flapping endpoint cannot retry toward
+the cap for free. The daily window is the UTC calendar day: a flood
+straddling midnight UTC legally earns a fresh allowance — intended, and
+pinned by test, not discovered by it.
+
+**Config (revision 2, TR-RC-8: a dedicated local file
+`<data_dir>/advisory.json` — NOT `config.json`, whose two-field desktop
+writer (`crates/modelswarm-desktop/src/app.rs:222-227` parse,
+`:617-625`/`:905-913` wholesale rewrite) silently deletes unknown keys on
+every tracker/profile change; the cited `lib.rs:146-186` range is
+`default_data_dir` plus the migration list — `crates/modelswarm-node/src/lib.rs:154-164`
+— not a config parser. The client reads `advisory.json` and never writes
+it; the JSON form is one flat object whose keys are the table's dotted
+suffixes (`enabled`, `endpoint_url`, …); unknown keys are tolerated on
+read. Defaults frozen by this ADR, tunable without an ADR):**
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -281,58 +451,145 @@ prefix | \"fleet\">","hint":{…existing tunable/clamped parameters only…},
 never parsed>"}]}`. `rationale` is rendered to the operator with a visible
 "advisory — untrusted, metadata-derived" provenance label and is NEVER
 interpreted as instructions — the prompt-injection posture for §9.1.
+`cycle_id` is generated as the first 16 hex characters of a fresh
+`identity::new_nonce()` (32-hex output,
+`crates/modelswarm-identity/src/timestamp.rs:32-41` — RC-8's generator
+pin), and a response whose `cycle_id` does not echo the in-flight cycle's
+is discarded whole (malformed-handling table). `rationale` renders as
+plain text only: no markdown or HTML interpretation, no clickable or
+auto-linkable URLs, a per-suggestion display cap of 2,000 characters, and
+the untrusted-provenance label rendered adjacent to the text, always
+(RC-5). The display renderer pairs any peer-naming advisory claim with
+the local tallies it claims to summarize, so provider fabrication is
+visible at a glance (AD-3).
 
 **Malformed/adversarial response handling (fail-closed, first-failure-wins):**
 
 | Injected condition | Outcome |
 |---|---|
 | transport error / HTTP non-2xx | gap `http_error`, no retry this cycle |
-| deadline exceeded | gap `timeout`; a late response is a no-op discard |
+| deadline exceeded | gap `timeout`; a late response is a no-op discard that additionally records the diagnostic gap `late` (§6 firing condition — TR-RC-4) |
 | response > `max_response_bytes` | gap `response_oversized` |
 | invalid JSON / unknown `schema` | gap `schema`, whole body discarded |
 | unknown suggestion `type` | that suggestion discarded and counted; siblings parse |
-| numeric hint out of range | clamped to the existing config range (msp-v1 §6.4 clamp discipline); `clamped=true` recorded |
+| numeric hint out of range | clamped to the per-target range recorded in the frozen clamp table (`protocol/advisory-clamp-table-v1.json`, §4 — RC-7); a target absent from the table is treated as `requires_adr=true` — no improvised ranges at implementation time; `clamped=true` recorded |
 | hint names a frozen constant | recorded `requires_adr=true`; never applicable by config |
 | rationale contains instruction-like text | display-only by construction; no parse path exists |
+| response `cycle_id` ≠ current cycle | gap `schema`, whole body discarded (RC-8) |
+| non-finite hint value (NaN/Inf, however encoded) | that suggestion discarded and counted; siblings parse (TR-AD-1 — JSON cannot carry non-finites; the parser is strict) |
 | duplicate `cycle_id` / response after cycle closed | no-op discard (gap already recorded) |
 
+**The frozen clamp table (revision 2, RC-7 + TR-RC-6/R-2).**
+`protocol/advisory-clamp-table-v1.json` ships with exactly these rows; any
+other hint target is `requires_adr=true`:
+
+| target | [min, max] | source of truth | promise_metric (direction) |
+|---|---|---|---|
+| `MSP_SHADOW_QUEUE_ADVERTISED_WEIGHT` | [0.0, 1.0] | `crates/modelswarm-scheduler/src/shadow.rs:77-82` (module contract: weights clamped to [0, 1]) | `ttft_p50_ms` (down) |
+| `MSP_SHADOW_QUEUE_MEASURED_WEIGHT` | [0.0, 1.0] | `crates/modelswarm-scheduler/src/shadow.rs:80-85` | `ttft_p50_ms` (down) |
+| `MSP_SHADOW_QUEUE_CAP_MS` | [1000, 120000] | default 120 000 mirrors the msp-v1 §6.4 `deadlineMs` ceiling; the floor mirrors its 1 000 ms minimum (`shadow.rs:83-85`) | `ttft_p50_ms` (down) |
+
 **Invariants (test obligations attach in §9.2):**
-**(A1)** content-blind egress (§3.2, structural); **(A2)** no authority —
-structurally, the suggestion type is not a dependency of any production
-decision crate (dependency-graph test); **(A3)** full function without it —
-disabled/absent/errored plane leaves every production decision byte-identical;
-**(A4)** measured-before-trusted + disclosed (§5, §3.6); **(A5)** bounded
-cadence and cost — caps/interval/threshold enforced pre-call, fail-closed to
-DORMANT, timer-driven only; **(A6)** key hygiene (§3.4).
+**(A1)** content-blind egress (§3.2, structural — one value-typed
+allowlist, exhaustively tied to the emit-site inventory); **(A2)** no
+authority — structurally, the suggestion type is not a dependency of any
+production decision crate, enforced by the three-layer mechanism of §9.2(6)
+(cargo-metadata graph over the frozen nine-crate decision set, source-scope
+grep allowlist, shared-schema exclusion via `types` in the set — TR-RC-1);
+because §9.4 hosts the client in node/desktop, the node seam is covered by
+the grep allowlist unless the client lands as a dedicated crate or a
+`modelswarm-node::advisory` module, which layer 1 then guards directly;
+**(A3)** full function without it — a disabled/absent/errored plane leaves
+every production DECISION output byte-identical, and the telemetry stream
+byte-identical after filtering out events whose name starts with
+`advisory.` (the carve-out §6 itself requires — TR-RC-2); **(A4)**
+measured-before-trusted + disclosed (§5, §3.6); **(A5)** bounded cadence
+and cost — caps/interval/threshold enforced pre-call, fail-closed to
+DORMANT, timer-driven only, UTC-day window, failed calls consume cap
+budget; **(A6)** key hygiene (§3.4) plus the §3.3 transport pinning
+(https-only, no redirects — RC-9).
 
 ### 5. The measurement harness (shadow-layer extension)
 
-- **Shadow rows.** For every realized decision point in a cycle's window
-  where a `tuning_hint` or de-rank hint was live, the client emits a
-  `sched.shadow.advisory` telemetry row: `trace`, `deterministic_pick`,
-  `advisory_pick` (the counterfactual the pure planner would choose under
-  the CLAMPED hint — computable locally, no network), `agree`, `hint_type`,
-  `clamped`, `requires_adr`. The join extension follows the shipped
-  LEFT-join-on-realized discipline of `shadow_join.rs` exactly: every
-  realized row survives, decision-only rows are counted and visibly
-  reported as dropped, correlation is by `trace`/`cycle_id`, and the
-  honest sentinels (`none`/`unmeasured`/`unknown`) map to null.
+- **Shadow rows and the join shape (revision 2, TR-RC-5).** For every
+  realized decision point in a cycle's window where a `tuning_hint` or
+  de-rank hint was live, the client emits a `sched.shadow.advisory`
+  telemetry row: `trace`, `deterministic_pick`, `advisory_pick` (the
+  counterfactual the pure planner would choose under the CLAMPED hint —
+  computable locally, no network), `agree`, `hint_type`, `clamped`,
+  `requires_adr`, `cycle_id`. The join is BY `trace` ALONE, exactly as
+  `shadow_join.rs` implements it (one decision per trace); `cycle_id` is
+  grouping metadata that buckets joined rows into cycles for the promotion
+  artifact — never a join key. Cardinality: advisory contexts attach as a
+  Vec per trace (two hints may be live in one cycle; one hint spans many
+  traces), and ONE EVENT = ONE (trace, hint) PAIR — the promotion
+  denominator counts pairs, never traces, so hint multiplicity cannot
+  inflate it. The LEFT-join-on-realized discipline extends verbatim:
+  every realized row survives; decision-only rows are counted and visibly
+  reported as dropped; ADVISORY-only rows (a hint was live, the trace
+  never realized) are counted and visibly reported as dropped (new stat
+  `advisory_only_dropped`); the honest sentinels map to null
+  (`advisory_pick=none` → null, `agree=unknown` → null); and null-pick
+  rows are EXCLUDED from the promotion denominator — "differ" requires
+  both arms non-null.
+- **Outcome measurement (revision 2, RC-6).** A non-applied hint has no
+  realized outcomes. The advisory arm's outcomes are measured by EXPLICIT
+  DUAL-EXECUTION under this harness — never by attributing realized
+  deterministic-arm outcomes to differing advisory picks (an attribution a
+  patient hostile peer can spoof by behaving-while-measured on the steered
+  arm). The evidence records the measurement window with its adversarial
+  caveat: a peer measured while behaving may not behave after promotion —
+  the deterministic local policy (EWMAs, engage gate, divergence ledger)
+  remains the runtime defense after any promotion.
 - **Promotion criteria (normative).** `triage_summary`, `digest`, and
   `catalog_note` NEVER influence behavior — display-only forever.
-  `tuning_hint` may influence production ONLY through an owner-edited config
-  change (runtime-tunable parameters) or an ADR (frozen constants), and only
-  after published measurement: at least **100 joined realized events where
-  the advisory arm and the deterministic arm differ**, a **strict-majority
-  win for the advisory arm on the pinned promise metric** (versus the
-  fastest eligible single — never an average baseline, per the competitive
-  revision plan), and a **non-regressing worst-cell median**; medians alone
-  never suffice and the worst cells are reported as visibly as the wins. If
-  the evidence does not meet the bar, the honest negative is published in
-  the harness artifacts under the same discipline as ADR-032's 9.6 records.
+  `tuning_hint` may influence production ONLY through an owner-edited
+  recorded config change (runtime-tunable parameters, landing as file
+  state — never unrecorded environment state, TR-RC-8) or an ADR (frozen
+  constants), and only after published measurement: at least **100 joined
+  differing events** ((trace, hint) pairs where both arms are non-null and
+  the picks differ), a **strict-majority win for the advisory arm on the
+  target's pinned promise metric** (the `promise_metric` + `direction`
+  recorded per target in `protocol/advisory-clamp-table-v1.json`,
+  TR-RC-6), measured against the **fastest eligible single host at that
+  moment** — which host was fastest and its measured value are recorded
+  per window, baseline-selection method named, never an average — and a
+  **non-regressing worst-cell median**, where a CELL is (profile ×
+  capacity class); medians alone never suffice, single-run windows never
+  suffice, and the worst cells are reported as visibly as the wins. If the
+  evidence does not meet the bar, the honest negative is published in the
+  harness artifacts under the same discipline as ADR-032's 9.6 records.
+- **The promotion verdict artifact (revision 2, TR-RC-6).** The promotion
+  checker is a `modelswarm-bench` component (Scheduler, §9.4) consuming
+  the joined shadow rows and the dual-execution outcome records, emitting
+  a machine-readable verdict JSON — `{windows[], differing_events,
+  per_metric{wins,losses}, majority, worst_cells[{cell, n, median_delta,
+  dispersion}], provenance{…}}` — COMMITTED under `docs/verification/`
+  with the promotion entry (metadata-only, already redacted). The
+  provenance block records the full standing release set: hardware, model
+  profile, runtime build, prompt corpus, network conditions,
+  baseline-selection method, repetitions, variance (per-cell n, median,
+  and a dispersion measure — MAD or p10/p90). A per-push CI test re-runs
+  the checker over the committed artifact and asserts the recorded
+  verdict.
+- **Promotion-evidence integrity (revision 2, TR-RC-10).** The telemetry
+  emitter's control-character escaping fix (Security AD-2, routed to the
+  Integrator in §9.4) is a PRECONDITION for any promotion decision — the
+  join parses telemetry JSONL, and forged lines inflate the advisory arm's
+  win count. Every contributing window's join stats are disclosed in the
+  verdict artifact; an `unparsable_lines > 0` window is visibly flagged
+  and disqualifying unless justified in the entry; the promotion entry
+  pins the SHA-256 of each source telemetry file it was computed from.
 - **No automatic promotion path may exist in code.** The advisory output's
-  only consumers are the shadow ledger and the display renderer; promotion
-  is a human edit with a `docs/verification/` entry recording the measured
-  evidence. This is invariant A4's structural form.
+  only consumers are the shadow ledger and the display renderer; the
+  suggestion payload's `hint` map is not publicly readable outside its
+  sanctioned consumers — the advisory module exposes only (i) a
+  Display-rendered summary type (operator UI, the RC-5 rendering contract)
+  and (ii) a ledger-record type whose fields are the already-clamped,
+  already-typed values (TR-RC-9's compiler layer: production code has no
+  API through which to read a hint value to apply). Promotion is a human
+  edit with a `docs/verification/` entry recording the measured evidence.
+  This is invariant A4's structural form.
 
 ### 6. Failure, degradation, and cost bounding
 
@@ -341,7 +598,13 @@ way: the advice for that cycle is silently absent from the operator's view,
 a `advisory.cycle.gap` telemetry event records the reason (frozen vocabulary:
 `disabled | no_key | no_config | cap_reached | interval |
 empty_after_redaction | timeout | http_error | quota | response_oversized |
-schema | late`), and NOTHING else changes — invariant (c) in operation. Cost
+schema | late`), and NOTHING else changes — invariant (c) in operation.
+
+Revision 2 (TR-RC-4) pins the firing condition of the twelfth value:
+`late` fires exactly at the discard of a response arriving after its cycle
+closed — a diagnostic-only event permitted only following a `timeout` gap
+for the same cycle; every failure edge produces exactly one primary gap.
+Failed calls consume daily-cap budget (§4). Cost
 is bounded by the §4 config caps (`max_calls_per_day` default 24, byte caps,
 `max_completion_tokens` 2048); the caps are enforced locally before every
 call and fail closed to DORMANT. The owner pays; the AGENTS.md stop-point on
@@ -405,28 +668,154 @@ provider sees the digest by design; that is the named, disclosed service.
 The Security review must reproduce the injection sketches against the
 allowlist gate and sign off the rotation-rule execution (§3.5).
 
-**9.2 Test and Release Engineer — the shadow-promotion and degradation
-gates.** (1) Redaction property suite: for every telemetry event type the
-node emits, prompt-shaped payloads injected into every field never appear in
-the serialized request; forbidden names drop; `sk-`/JWT/Bearer/hex-blob
-values scrub. (2) State-machine property: every failure edge in §4 lands in
-DORMANT with exactly one gap event and zero decision diff. (3) Cadence/cap
-property: adversarial trigger floods never exceed `max_calls_per_day` or
-`min_interval_ms`. (4) Suggestion-clamp property: every numeric hint is
-recorded clamped into the existing range; `requires_adr` flags frozen
-constants. (5) Shadow-join extension golden rows in the `shadow_join.rs`
-test style (LEFT join, visible drops, sentinel mapping). (6) The
-dependency-graph test for A2: no production decision crate depends on the
-suggestion type; the advisory output's only consumers are the shadow ledger
-and the display renderer. (7) The A3 proof: decision functions with the
-plane enabled-but-erroring versus disabled produce identical outputs across
-the property corpus. (8) The promotion-gate test: no code path applies a
-`tuning_hint` — promotion is a human config edit with a
-`docs/verification/` entry.
+**Review outcome (2026-10-12, revision 2).** Completed as
+`docs/reviews/review-adr-033-security-2026-10-12.md` (`86c6c77`): APPROVE
+WITH REQUIRED CHANGES — 0 blockers, RC-1..RC-11, advisories AD-1..AD-5 —
+all required changes folded by revision 2. The rotation-rule sign-off on
+the RULE stands; the EXECUTION sign-off is deferred to the RC-10 evidence
+artifact (§9.2(9)); until that entry exists, the first production digest
+cycle must not run.
 
-**9.3 Owner acceptance.** This ADR is Proposed; the owner accepts or rejects
-option B. The funded-key authorization covers bring-up; the §3.5 rotation is
-a precondition for the first production digest cycle.
+**9.2 Test and Release Engineer — the shadow-promotion and degradation
+gates (revision 2; folds TR-RC-1..TR-RC-10, TR-AD-1..TR-AD-5, and the
+Security review's derived test obligations).** The enumeration:
+
+(1) **Redaction property suite** over a frozen, committed, versioned
+    fixture inventory — `tests/fixtures/advisory-egress/` with one fixture
+    row set per emitted event type (every field carrying an adversarial
+    value) plus the manifest `advisory-egress-inventory.json` of
+    `{event, field, type}` triples (TR-RC-3). The adversarial value set is
+    enumerated and frozen: prompt-shaped text; control characters incl.
+    newline/CR/tab; base58 PeerIds; serde parse-error fragments via a
+    crafted `capability_token`; composite `"X->Y"` clamp strings;
+    float-formatted timings; `sk-`/JWT/Bearer/hex blobs; overlong strings;
+    unicode/RTL; NaN/Inf where numeric parsing occurs. The suite asserts:
+    the serialized digest never contains the raw adversarial bytes; no
+    emitted field contains a base58 PeerId (peer references are exactly
+    `^[0-9a-f]{16}$` SHA-256 prefixes — RC-1); the serde-fragment vector
+    never appears and the frozen-code reduction fires (RC-2); corrupting
+    one field post-gate in a test double stops the request (RC-3); a
+    forged extra JSONL line injected into the log sink leaves digest
+    contents unchanged (RC-4); the rationale renderer renders markdown, a
+    URL, and 10 000 chars as plain, unlinked, capped text (RC-5). The
+    inventory walks the accumulator→digest seam per §3.2 (typed
+    accumulators, never parsed JSONL as input).
+(2) **State-machine property**: a golden edge→gap-value mapping plus a
+    property sweep over the pure injected-core `step()` (§4) — every
+    failure edge lands in DORMANT with exactly one PRIMARY gap event and
+    zero decision diff; `late` appears only in the timeout-then-late
+    sequence and is counted separately; a well-formed response with a
+    foreign `cycle_id` is discarded whole (RC-8). A golden enum test pins
+    the 12-value gap vocabulary — a new gap value without an amendment
+    note is a red build (TR-AD-3).
+(3) **Cadence/cap property** on the virtual clock: for any adversarial
+    event-arrival schedule, calls ≤ `max_calls_per_day` per UTC calendar
+    day (midnight rollover pinned as intended) and inter-call spacing ≥
+    `min_interval_ms`; failed calls consume budget; newline-forged
+    telemetry floods never move digest cadence past the caps.
+(4) **Suggestion-clamp property** written against
+    `protocol/advisory-clamp-table-v1.json` (sequenced after that artifact
+    lands — TR-RC-4's dependency ruling): for every target t in the table,
+    for every numeric v (negative, zero, huge, NaN, Inf): the recorded
+    value lies in [min_t, max_t] with `clamped=true` when v is out of
+    range; t absent from the table implies `requires_adr=true` and never
+    an improvised bound; non-finite values are discarded per the §4
+    malformed table (TR-AD-1).
+(5) **Shadow-join golden rows** in the `shadow_join.rs` test style
+    (deterministic in-crate string fixtures), extended with: two hints
+    live on one trace; a hint live but not applicable
+    (`advisory_pick=none` → null, excluded from the denominator); an
+    advisory row whose trace never realized (counted and visibly dropped
+    as `advisory_only_dropped`).
+(6) **Dependency-graph test for A2** — the three-layer mechanism
+    (TR-RC-1), verbatim. Layer 1 (graph; a new step in the `guards` job —
+    `cargo metadata --no-deps` compiles nothing and takes seconds; jq is
+    already a guards dependency): assert that no member of the frozen
+    decision-crate set (`modelswarm-{scheduler, session, eligibility,
+    gateway, runtime, transport, tracker-api, store, types}` — `types`
+    included deliberately: the shared-schema crate is the sneaky path to
+    universal visibility; `bench` exempt as the sanctioned shadow-ledger
+    consumer; node/desktop host the client and are covered by layer 2)
+    declares a normal dependency on an advisory crate, via
+    `cargo metadata --format-version 1 --no-deps` piped through jq
+    selecting packages by name test and checking `.dependencies[].name`.
+    Dev-dependencies are tolerated for test-fixture reuse only and
+    recommended against in scheduler/session. Layer 2 (source scope): the
+    suggestion type name (`AdvisorySuggestion`) may appear only in the
+    advisory module, `modelswarm-bench`, the desktop display renderer, and
+    `*/tests/` — enforced by a grep over `crates/ apps/ --include='*.rs'`
+    filtered against that allowlist, erroring on any hit outside it. Layer
+    2 also catches a re-declared lookalike type inside a decision crate,
+    which the dep graph cannot see. Layer 3 (schema) is covered by layer 1
+    including `types`.
+(7) **The A3 proof**: identical outputs defined as (i) decision outputs
+    byte-identical AND (ii) the telemetry stream byte-identical after
+    filtering out events whose name starts with `advisory.` (the carve-out
+    §6 itself requires — TR-RC-2). The corpus is the SHIPPED one, not a
+    new one: (a) the scheduler/shadow decision property inputs; (b) the
+    seeded session admission + coordinator suites
+    (`crates/modelswarm-session/tests/`, the
+    `verifydrafts_admission_properties.rs` fixture discipline); (c)
+    `apps/modelswarm-sim` mixed-swarm pinned-verdict scenarios (the
+    ADR-032 §7 item-4b per-push precedent); (d) the bench corpora
+    (`corpus.rs`, `engage_gate.rs`, `divergence.rs`); (e) the item-(1)
+    fixture corpus as the accumulation layer's input distribution.
+    Mechanics: run each corpus twice — plane absent vs plane enabled with
+    an always-erroring transport double — and assert both (i) and (ii);
+    seeds recorded per the ADR-032 fixture discipline.
+(8) **The promotion-gate test** as a layered mechanism (TR-RC-9): the
+    compiler layer (§5's opaque hint payload — Display summary +
+    clamped/typed ledger-record only), the link layer (item 6), and the
+    drift layer — a per-push golden test pins (i) the eleven §4 config
+    defaults to the ADR-table values and (ii) the frozen clamp-table
+    contents, so any value change without an ADR-033 amendment is a red
+    build (the only green path to a changed tunable is the recorded
+    amendment plus the promotion entry with its verdict artifact).
+(9) **Rotation evidence** (RC-10): a `docs/verification/` entry records
+    the §3.5 key rotation as executed (date, provider console action, new
+    key entered directly into the local key file; no key material or
+    derivation), cross-referenced from the ADR-033 status line; the first
+    production digest cycle and any tagged release carrying advisory
+    wiring require this entry (TR-AD-5 release checklist).
+
+**Execution-venue matrix (revision 2, TR-RC-7 — the ADR-032 §7 B4 style):**
+
+| §9.2 item | Venue | Mechanism | Gated on |
+|---|---|---|---|
+| (1) redaction property suite | per-push, `rust.yml` check job | frozen fixture inventory + inventory-walking unit tests; no network | this revision |
+| (2) state-machine property | per-push | pure `step()` core, injected failure doubles, virtual clock | this revision |
+| (3) cadence/cap property | per-push | virtual clock, adversarial arrival schedules | this revision |
+| (4) clamp property | per-push | property sweep over the frozen clamp table | `protocol/advisory-clamp-table-v1.json` |
+| (5) join golden rows | per-push, `modelswarm-bench` | in-crate string fixtures, `shadow_join.rs` test style | this revision |
+| (6) dependency-graph (A2) | per-push, `guards` job (new steps) | `cargo metadata` + jq + grep allowlist (item 6) | this revision |
+| (7) A3 proof | per-push | double-run of shipped corpora + `advisory.*`-filtered telemetry diff | this revision |
+| (8) promotion-gate | per-push | golden-pinned defaults/clamp table + opaque-payload compile discipline + (6) | this revision |
+| promotion verdict replay | per-push, `modelswarm-bench` (once any verdict artifact exists) | checker re-derives the committed verdict | first promotion decision |
+| provider round-trip (real DeepSeek HTTPS call: build → send → parse → record, incl. the §3.3 https-only/no-redirect behavior against the live endpoint) | **OWNER-LOCAL ONLY — never CI, never manual-dispatch-with-key** | `#[ignore]`d tests gated on `MSP_ADVISORY_E2E=1` AND the key file present (`MSP_ADVISORY_KEY_FILE` / platform default); evidence = `docs/verification/` entry | §3.5 rotation evidence (item 9) |
+
+Standing statements: **the provider round-trip never runs in CI** — (a)
+the key's custody scope is local client config only (§3.4); a CI secret is
+a second custody location the owner authorization does not cover, and the
+provider key is NEVER added as a CI secret, even "for one smoke test"
+(TR-AD-4); (b) a per-push external-SaaS call puts a third party's latency
+and uptime inside the release gate; (c) it spends owner money on every
+push. A green CI badge therefore implies nothing about live provider
+interop; that evidence lives exclusively in owner-local
+`docs/verification/` records (the ADR-032 §7 item-2 and
+`MSP_LIVE=1`/`MSP_REAL_GGUF` ignored-test precedents). Mock-transport
+coverage of §3.3 (https-only, no redirect, no Authorization on redirect)
+IS per-push CI and MUST be. An unauthenticated manual-dispatch
+reachability probe is permissible CI-side without the key but is optional,
+not a gate.
+
+**9.3 Owner acceptance (recorded).** The owner accepted option B on
+2026-10-12 (decision record above) — the stale "is Proposed" wording is
+corrected by this revision. Both §9.1/§9.2 gate reviews returned
+approve-with-required-changes on 2026-10-12 and every required change is
+folded by revision 2 — the implementation gate is OPEN. The funded-key
+authorization covers bring-up; the §3.5 rotation, with the §9.2(9)
+evidence entry, remains a precondition for the first production digest
+cycle and for any tagged release carrying advisory wiring.
 
 **9.4 Implementation routing (ownership map).** Contract and this ADR:
 Protocol Architect. Shadow join extension + promotion analysis
@@ -438,6 +827,24 @@ Redactor is reused read-only from `modelswarm-telemetry` (Integrator-owned;
 no changes required). All hands run the standard `cargo fmt --check`,
 `clippy -D warnings`, `test --workspace` gate before handoff.
 
+
+Revision-2 routing additions: the frozen contract artifacts
+`protocol/advisory-egress-v1.json` and
+`protocol/advisory-clamp-table-v1.json` are Protocol-Architect-owned,
+created by the first advisory implementation session under this revision's
+authority, then frozen (changes only by ADR-033 amendment). The
+`tests/fixtures/advisory-egress/` inventory, the guards completeness-tie
+step, the item-(6) A2 steps, and the optional frozen-surface hash-pinning
+in guards (TR-AD-5) are Test and Release. The advisory client lands as a
+pure injectable core (clock + transport doubles — TR-AD-2) in
+`crates/modelswarm-node::advisory` or a dedicated crate (Integrator
+sign-off for the latter), reading `<data_dir>/advisory.json` only
+(TR-RC-8); the desktop `config.json` writer is untouched. The telemetry
+emitter control-character escaping fix (Security AD-2) is routed to the
+Integrator (`modelswarm-telemetry`) — a promotion-decision precondition
+(§5), not an advisory-egress precondition (§3.2 typed accumulators). The
+promotion checker and verdict artifact are Scheduler
+(`crates/modelswarm-bench`), with Protocol and T/R review.
 ## Consequences
 
 + The operator gets token-cheap triage, tuning proposals, curation

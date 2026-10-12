@@ -19,6 +19,16 @@
 //! - a failed download/install leaves the running version intact (the
 //!   plugin installs only after signature verification succeeded, and the
 //!   NSIS updater runs as a separate process);
+//! - the download phase itself is BOUNDED (A-1, update-chain security
+//!   review 2026-10-13): the plugin buffers the whole package in RAM
+//!   before verifying, and its `on_chunk` cannot cancel — so without a
+//!   bound a compromised origin could OOM-crash the client with an
+//!   unbounded stream. The whole phase lives under a wall-clock timeout
+//!   ([`DOWNLOAD_TIMEOUT`]) and every chunk is counted against a byte cap
+//!   ([`DOWNLOAD_BYTE_CAP`]); a breach abandons the download MID-STREAM
+//!   (dropping the download future is the cancel) with "update failed —
+//!   this version keeps running (download timeout)" / "(download
+//!   exceeded the 512 MiB cap)" — never a crash, never a restart loop;
 //! - `MSP_NO_AUTOUPDATE=1` (dev opt-out) skips every check, stated
 //!   honestly as "updates: off";
 //! - on Windows the plugin's `install()` EXITS THE PROCESS right after
@@ -34,6 +44,8 @@
 //! not by unit tests; what IS unit-tested here is the status machine, its
 //! failure edges, and the pinned update-channel config.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -44,6 +56,28 @@ use super::{log_event, DesktopState};
 
 /// One check on start, then every 6h (spec: "on app start + every 6h").
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// A-1 (update-chain security review 2026-10-13): the wall-clock bound on
+/// the WHOLE download phase — connect, stream, and buffering — after which
+/// the attempt is abandoned honestly as "download timeout". The plugin's
+/// `on_chunk` cannot cancel, so this clock is the bound that ALWAYS bites:
+/// even a drip-feed origin that stays under the byte cap can neither hold
+/// a download open nor grow its buffer past this. Any legitimate package
+/// (≤ [`DOWNLOAD_BYTE_CAP`]) finishes inside 10 minutes on any link
+/// sustaining ≥ ~0.9 MiB/s; slower than that is a failed update, stated
+/// as such, with the running version still running.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// A-1: the hard cap on bytes accepted from ONE update package before
+/// verification. The plugin buffers the entire package in memory before
+/// verifying the signature, so without a cap a compromised origin can
+/// OOM-crash the client; 512 MiB sits far above any installer the train
+/// ships (engines included) and is enforced MID-STREAM, not after the
+/// fact — the chunk that crosses it aborts the download.
+const DOWNLOAD_BYTE_CAP: u64 = 512 * 1024 * 1024;
+
+/// [`DOWNLOAD_BYTE_CAP`] in whole MiB, for the honest status line.
+const DOWNLOAD_BYTE_CAP_MIB: u64 = DOWNLOAD_BYTE_CAP / (1024 * 1024);
 
 /// The update channel's minisign PUBLIC key (public by design; the
 /// private half lives outside the repo). Test-only: it exists to pin
@@ -341,22 +375,22 @@ async fn run_cycle(handle: &tauri::AppHandle) {
             apply_event(handle, UpdaterEvent::UpdateFound(version.clone())).await;
             // download() verifies the package signature against the
             // embedded public key before returning Ok — a bad signature
-            // surfaces here as an error, and install() never runs.
+            // surfaces here as an error, and install() never runs. The
+            // same is true of the A-1 bounds: a download that outlives
+            // DOWNLOAD_TIMEOUT or exceeds DOWNLOAD_BYTE_CAP is abandoned
+            // mid-stream and lands in this arm — honest failure, no
+            // install, running version intact.
             let bytes = match download_with_progress(handle, &update).await {
                 Ok(bytes) => bytes,
-                Err(e) => {
-                    let reason = short_reason(&e);
+                Err(failure) => {
+                    let detail = failure.telemetry_detail();
                     log_event(
                         &telemetry,
                         "warn",
                         "updater.download",
-                        &[("version", &version), ("detail", &reason)],
+                        &[("version", &version), ("detail", &detail)],
                     );
-                    apply_event(
-                        handle,
-                        UpdaterEvent::InstallFailed(format!("download: {reason}")),
-                    )
-                    .await;
+                    apply_event(handle, UpdaterEvent::InstallFailed(failure.reason())).await;
                     return;
                 }
             };
@@ -398,41 +432,181 @@ async fn run_cycle(handle: &tauri::AppHandle) {
     }
 }
 
-/// `update.download` with honest, throttled progress: chunks arrive far
-/// faster than the UI polls, so a status write goes out only on integer
-/// percent boundaries (every 8 MiB when the length is unknown) — never
-/// per chunk.
+/// Why the download phase ended without verified bytes: the plugin's own
+/// error, or one of the two A-1 bounds tripping. The bounds are part of
+/// the honest-status contract — their reason strings are pinned by tests.
+#[derive(Debug)]
+enum DownloadFailure {
+    Plugin(String),
+    Timeout,
+    OverCap { received: u64 },
+}
+
+impl DownloadFailure {
+    /// The exact reason for the `InstallFailed` status line (the text
+    /// inside "update failed — this version keeps running (…)").
+    fn reason(&self) -> String {
+        match self {
+            Self::Plugin(detail) => format!("download: {detail}"),
+            Self::Timeout => "download timeout".into(),
+            Self::OverCap { .. } => {
+                format!("download exceeded the {DOWNLOAD_BYTE_CAP_MIB} MiB cap")
+            }
+        }
+    }
+
+    /// Telemetry detail: the reason plus, for a cap breach, the byte count
+    /// at which the stream was abandoned.
+    fn telemetry_detail(&self) -> String {
+        match self {
+            Self::OverCap { received } => {
+                let reason = self.reason();
+                format!("{reason} ({received} bytes received)")
+            }
+            _ => self.reason(),
+        }
+    }
+}
+
+/// The sync half of one bounded download, held by the chunk closure the
+/// plugin calls: counts bytes against [`DOWNLOAD_BYTE_CAP`], signals the
+/// first breach, and relays throttled progress. `observe` never panics
+/// and never blocks — it cannot cancel (the plugin's `on_chunk` has no
+/// cancel path); it SIGNALS, and [`drive_bounded_download`] performs the
+/// abort by dropping the download future.
+struct ChunkIngress {
+    received: Arc<AtomicU64>,
+    breach: Option<tokio::sync::oneshot::Sender<u64>>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<(u64, Option<u64>)>>,
+    last_boundary: Option<u64>,
+}
+
+impl ChunkIngress {
+    fn new(
+        received: Arc<AtomicU64>,
+        breach: tokio::sync::oneshot::Sender<u64>,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<(u64, Option<u64>)>>,
+    ) -> Self {
+        Self {
+            received,
+            breach: Some(breach),
+            progress,
+            last_boundary: None,
+        }
+    }
+
+    /// One chunk arriving from the origin. Honest, throttled progress
+    /// while under the cap; the first byte past the cap fires the
+    /// one-shot (later chunks find it spent) and no progress is ever
+    /// claimed past it.
+    fn observe(&mut self, chunk_len: usize, total: Option<u64>) {
+        let done = self.received.fetch_add(chunk_len as u64, Ordering::Relaxed) + chunk_len as u64;
+        if done > DOWNLOAD_BYTE_CAP {
+            if let Some(tx) = self.breach.take() {
+                let _ = tx.send(done);
+            }
+            return;
+        }
+        let boundary = match total {
+            Some(total) if total > 0 => Some(done * 100 / total),
+            _ => Some(done / (8 * 1024 * 1024)),
+        };
+        if boundary != self.last_boundary {
+            self.last_boundary = boundary;
+            if let Some(tx) = &self.progress {
+                let _ = tx.send((done, total));
+            }
+        }
+    }
+}
+
+/// Runs one download future under both A-1 bounds: a wall-clock
+/// [`tokio::time::timeout`] over the whole phase, and abandonment the
+/// moment the byte cap is breached. Dropping the download future IS the
+/// cancel `on_chunk` cannot provide — the drop closes the plugin's
+/// response stream and frees the partial buffer mid-download. Generic
+/// over the future and its error type so tests inject stand-in streams
+/// the plugin cannot construct.
+async fn drive_bounded_download<F, E>(
+    download: F,
+    received: Arc<AtomicU64>,
+    breach_rx: tokio::sync::oneshot::Receiver<u64>,
+    timeout: Duration,
+) -> Result<Vec<u8>, DownloadFailure>
+where
+    F: std::future::Future<Output = Result<Vec<u8>, E>>,
+    E: std::fmt::Display,
+{
+    let bounded = tokio::time::timeout(timeout, async {
+        tokio::select! {
+            result = download => result.map_err(|e| DownloadFailure::Plugin(short_reason(&e))),
+            received = async {
+                match breach_rx.await {
+                    Ok(received) => received,
+                    // The sender lives inside the download future, so a
+                    // closed channel means that future already resolved
+                    // and the other branch has won — park rather than
+                    // ever fabricate a breach.
+                    Err(_) => std::future::pending::<u64>().await,
+                }
+            } => Err(DownloadFailure::OverCap { received }),
+        }
+    })
+    .await;
+    match bounded {
+        Err(_elapsed) => Err(DownloadFailure::Timeout),
+        // The select already reported the breach: keep the exact
+        // at-the-breaching-chunk count. (The counter itself may have
+        // advanced one chunk further before the download future was
+        // actually dropped — the drop frees the buffer, but the honest
+        // report is the count when the cap was crossed.)
+        Ok(failure @ Err(DownloadFailure::OverCap { .. })) => failure,
+        Ok(result) => {
+            // Close the tail race from the other side: a stream that
+            // pushed past the cap and RESOLVED in the same poll must
+            // still read as abandoned, not as bytes worth verifying.
+            let total = received.load(Ordering::Relaxed);
+            if total > DOWNLOAD_BYTE_CAP {
+                Err(DownloadFailure::OverCap { received: total })
+            } else {
+                result
+            }
+        }
+    }
+}
+
+/// `update.download` under the A-1 bounds, with honest, throttled
+/// progress: chunks arrive far faster than the UI polls, so a status
+/// write goes out only on integer percent boundaries (every 8 MiB when
+/// the length is unknown) — never per chunk. The whole phase is bounded
+/// by [`DOWNLOAD_TIMEOUT`]; every chunk is counted against
+/// [`DOWNLOAD_BYTE_CAP`], and a breach aborts the download mid-stream
+/// (see [`drive_bounded_download`]).
 async fn download_with_progress(
     handle: &tauri::AppHandle,
     update: &tauri_plugin_updater::Update,
-) -> Result<Vec<u8>, tauri_plugin_updater::Error> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
+) -> Result<Vec<u8>, DownloadFailure> {
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
     let drain_handle = handle.clone();
     let drain = tauri::async_runtime::spawn(async move {
-        while let Some((done, total)) = rx.recv().await {
+        while let Some((done, total)) = progress_rx.recv().await {
             apply_event(&drain_handle, UpdaterEvent::Progress { done, total }).await;
         }
     });
-    let mut done = 0u64;
-    let mut last_boundary: Option<u64> = None;
-    let result = update
-        .download(
-            move |chunk, total| {
-                done += chunk as u64;
-                let boundary = match total {
-                    Some(total) if total > 0 => Some(done * 100 / total),
-                    _ => Some(done / (8 * 1024 * 1024)),
-                };
-                if boundary != last_boundary {
-                    last_boundary = boundary;
-                    let _ = tx.send((done, total));
-                }
-            },
-            || {},
-        )
-        .await;
-    // The closure owning `tx` is dropped when download() returns, closing
-    // the channel; the drain task then ends on its own.
+    let received = Arc::new(AtomicU64::new(0));
+    let (breach_tx, breach_rx) = tokio::sync::oneshot::channel::<u64>();
+    let mut ingress = ChunkIngress::new(received.clone(), breach_tx, Some(progress_tx));
+    let result = drive_bounded_download(
+        update.download(move |chunk, total| ingress.observe(chunk, total), || {}),
+        received,
+        breach_rx,
+        DOWNLOAD_TIMEOUT,
+    )
+    .await;
+    // The closure owning the progress sender is dropped when download()
+    // resolves OR is abandoned — either way the channel closes and the
+    // drain task ends on its own.
     let _ = drain.await;
     result
 }
@@ -779,6 +953,190 @@ mod tests {
         assert_eq!(CHECK_INTERVAL, Duration::from_secs(6 * 60 * 60));
         let long = "x".repeat(500);
         assert!(short_reason(&long).chars().count() == 160);
+    }
+
+    /// An injected stand-in for the plugin's download future (which cannot
+    /// be constructed in a unit test): pushes chunks of the given byte
+    /// LENGTHS — no real buffering — through `ingress`, yielding between
+    /// chunks so the driver's select can observe a mid-stream breach,
+    /// then resolves with `bytes`.
+    async fn injected_download(
+        mut ingress: ChunkIngress,
+        chunk_lens: Vec<usize>,
+        total: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, &'static str> {
+        for len in chunk_lens {
+            tokio::task::yield_now().await;
+            ingress.observe(len, total);
+        }
+        Ok(bytes)
+    }
+
+    #[test]
+    fn download_bounds_are_the_reviewed_a1_constants() {
+        // A-1 closure: 10-minute whole-phase timeout, 512 MiB byte cap —
+        // drift here must be a deliberate re-review, not an accident.
+        assert_eq!(DOWNLOAD_TIMEOUT, Duration::from_secs(10 * 60));
+        assert_eq!(DOWNLOAD_BYTE_CAP, 512 * 1024 * 1024);
+        assert_eq!(DOWNLOAD_BYTE_CAP_MIB, 512);
+    }
+
+    #[test]
+    fn chunk_ingress_throttles_progress_and_signals_the_breach_once() {
+        let received = Arc::new(AtomicU64::new(0));
+        let (breach_tx, mut breach_rx) = tokio::sync::oneshot::channel();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ingress = ChunkIngress::new(received.clone(), breach_tx, Some(progress_tx));
+
+        // Known total → integer-percent boundaries; a chunk that does not
+        // move the boundary reports nothing (the throttle).
+        ingress.observe(10_000_000, Some(100_000_000)); // 10% — report
+        ingress.observe(500_000, Some(100_000_000)); // still 10% — silent
+        ingress.observe(500_000, Some(100_000_000)); // 11% — report
+        let mut seen = Vec::new();
+        while let Ok(report) = progress_rx.try_recv() {
+            seen.push(report);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (10_000_000, Some(100_000_000)),
+                (11_000_000, Some(100_000_000)),
+            ]
+        );
+
+        // Exactly AT the cap is still a legitimate package (512 MiB
+        // installer passes); unknown length reports on 8 MiB boundaries.
+        ingress.observe(
+            usize::try_from(DOWNLOAD_BYTE_CAP - 11_000_000).unwrap(),
+            None,
+        );
+        let at_cap_reports = std::iter::from_fn(|| progress_rx.try_recv().ok()).count();
+        assert_eq!(at_cap_reports, 1, "one boundary report, not one per chunk");
+
+        // One byte past: the breach is signalled exactly ONCE (the second
+        // past-cap chunk finds the one-shot spent) and no progress is
+        // ever claimed again — though the byte count itself keeps
+        // counting whatever still arrives.
+        ingress.observe(1, None);
+        ingress.observe(1, None);
+        assert_eq!(breach_rx.try_recv().ok(), Some(DOWNLOAD_BYTE_CAP + 1));
+        assert!(progress_rx.try_recv().is_err());
+        assert_eq!(received.load(Ordering::Relaxed), DOWNLOAD_BYTE_CAP + 2);
+    }
+
+    #[tokio::test]
+    async fn a1_byte_cap_aborts_the_stream_and_no_install_is_attempted() {
+        let received = Arc::new(AtomicU64::new(0));
+        let (breach_tx, breach_rx) = tokio::sync::oneshot::channel();
+        let ingress = ChunkIngress::new(received.clone(), breach_tx, None);
+        let mib = usize::try_from(64 * 1024 * 1024u64).unwrap();
+        // 12 × 64 MiB offered; the 9th chunk (576 MiB) crosses the 512 MiB
+        // cap and the download must be abandoned AT the breach — the last
+        // three chunks never arrive because the future is dropped.
+        let download = injected_download(ingress, vec![mib; 12], Some(12 * mib as u64), vec![7; 8]);
+        let failure =
+            drive_bounded_download(download, received, breach_rx, Duration::from_secs(60))
+                .await
+                .expect_err("a stream past the byte cap must be abandoned");
+        match failure {
+            DownloadFailure::OverCap { received } => assert_eq!(
+                received,
+                9 * 64 * 1024 * 1024,
+                "abandoned AT the breaching chunk, not after buffering the rest"
+            ),
+            other => panic!("expected OverCap, got {other:?}"),
+        }
+        assert_eq!(failure.reason(), "download exceeded the 512 MiB cap");
+        // The honest terminal status, rendered exactly:
+        let status = step(
+            &UpdaterStatus::Available {
+                version: "0.2.23".into(),
+            },
+            UpdaterEvent::InstallFailed(failure.reason()),
+        );
+        assert_eq!(
+            status.line(),
+            "update failed — this version keeps running (download exceeded the 512 MiB cap)"
+        );
+        // No install is attempted after the abandonment…
+        assert_eq!(
+            step(&status, UpdaterEvent::InstallBegin),
+            status,
+            "install must never begin from an abandoned download"
+        );
+        // …and the 6h timer still starts the next cycle (no crash loop).
+        assert_eq!(
+            step(&status, UpdaterEvent::CheckStarted),
+            UpdaterStatus::Checking
+        );
+    }
+
+    #[tokio::test]
+    async fn a1_wall_clock_timeout_aborts_a_slow_stream_and_no_install_is_attempted() {
+        let received = Arc::new(AtomicU64::new(0));
+        let (breach_tx, breach_rx) = tokio::sync::oneshot::channel();
+        let mut ingress = ChunkIngress::new(received.clone(), breach_tx, None);
+        // The drip-feed origin: one honest 8 MiB chunk, then silence —
+        // under the byte cap forever, so ONLY the wall clock can end it.
+        let download = async move {
+            ingress.observe(8 * 1024 * 1024, None);
+            std::future::pending::<()>().await;
+            Ok::<Vec<u8>, &'static str>(Vec::new())
+        };
+        let failure =
+            drive_bounded_download(download, received, breach_rx, Duration::from_millis(50))
+                .await
+                .expect_err("a download that outlives the timeout must be abandoned");
+        assert!(matches!(failure, DownloadFailure::Timeout));
+        assert_eq!(failure.reason(), "download timeout");
+        let status = step(
+            &UpdaterStatus::Downloading {
+                version: "0.2.23".into(),
+                done: 8 * 1024 * 1024,
+                total: None,
+            },
+            UpdaterEvent::InstallFailed(failure.reason()),
+        );
+        assert_eq!(
+            status.line(),
+            "update failed — this version keeps running (download timeout)"
+        );
+        // No install, and the next 6h cycle still runs — the running
+        // version keeps running, never a crash, never a loop.
+        assert_eq!(step(&status, UpdaterEvent::InstallBegin), status);
+        assert_eq!(
+            step(&status, UpdaterEvent::CheckStarted),
+            UpdaterStatus::Checking
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_within_both_bounds_completes_untouched_and_reaches_ready() {
+        let received = Arc::new(AtomicU64::new(0));
+        let (breach_tx, breach_rx) = tokio::sync::oneshot::channel();
+        let ingress = ChunkIngress::new(received.clone(), breach_tx, None);
+        let mib = usize::try_from(64 * 1024 * 1024u64).unwrap();
+        // Exactly the cap (8 × 64 MiB = 512 MiB): a legitimate installer
+        // of precisely the cap size must NOT be rejected.
+        let download = injected_download(ingress, vec![mib; 8], Some(8 * mib as u64), vec![7; 8]);
+        let bytes = drive_bounded_download(download, received, breach_rx, Duration::from_secs(60))
+            .await
+            .expect("a download inside both bounds completes");
+        assert_eq!(bytes, vec![7u8; 8], "verified bytes pass through untouched");
+        // And only such a download reaches the install phase:
+        assert_eq!(
+            step(
+                &UpdaterStatus::Available {
+                    version: "0.2.23".into()
+                },
+                UpdaterEvent::InstallBegin,
+            ),
+            UpdaterStatus::Ready {
+                version: "0.2.23".into()
+            }
+        );
     }
 
     /// The update channel is config, and config drifts — pin the exact

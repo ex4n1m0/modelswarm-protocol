@@ -261,23 +261,63 @@ impl Admission {
 }
 
 async fn serve_one(
-    mut session: Libp2pSession,
+    session: Libp2pSession,
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: &LeasePolicy,
     admission: &Admission,
     telemetry: &Telemetry,
 ) -> Result<(), String> {
+    serve_one_seeded(
+        session,
+        executor,
+        profile_id,
+        lease_policy,
+        admission,
+        telemetry,
+        None,
+    )
+    .await
+}
+
+/// The msp-v1 per-session loop, optionally seeded with an already-read
+/// first frame: the composed demux (`verifydrafts::composed`) classifies a
+/// session by its FIRST frame and hands it here pre-read, so the frame is
+/// never decoded twice. `None` (the [`serve_one`] path) reads the first
+/// frame below — behavior-identical to the pre-composition loop.
+pub(crate) async fn serve_one_seeded(
+    mut session: Libp2pSession,
+    executor: Arc<dyn InferenceExecutor>,
+    profile_id: String,
+    lease_policy: &LeasePolicy,
+    admission: &Admission,
+    telemetry: &Telemetry,
+    first: Option<WireMessage>,
+) -> Result<(), String> {
     let peer_id = session.remote_peer_id().to_string();
     // One QUIC session, many sequential requests (connection reuse): the
     // loop waits for the next request until the client closes. The
-    // between-requests wait is generous (chat gaps); a recv error ends
-    // the session and the client re-dials self-healingly.
+    // between-requests wait is generous (chat gaps); a recv error ends the
+    // session and the client re-dials self-healingly.
     const BETWEEN_REQUESTS: Duration = Duration::from_secs(300);
+    let mut seeded = first;
     loop {
-        let request = match session.recv(BETWEEN_REQUESTS).await {
-            Ok(WireMessage::InferenceRequest(r)) => r,
-            Ok(other) => {
+        let frame = match seeded.take() {
+            Some(frame) => frame,
+            None => match session.recv(BETWEEN_REQUESTS).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    // Transport errors are our own diagnostics text; the peer
+                    // sees the code, the log keeps the detail short.
+                    send_error(&mut session, "bad_frame", "frame receive failed").await;
+                    linger(&mut session).await;
+                    return Err(format!("recv: {e}"));
+                }
+            },
+        };
+        let request = match frame {
+            WireMessage::InferenceRequest(r) => r,
+            other => {
                 // Variant name only — the payload is peer-controlled text.
                 let code = format!("expected InferenceRequest, got {}", wire_kind(&other));
                 send_error(
@@ -288,13 +328,6 @@ async fn serve_one(
                 .await;
                 linger(&mut session).await;
                 return Err(code);
-            }
-            Err(e) => {
-                // Transport errors are our own diagnostics text; the peer
-                // sees the code, the log keeps the detail short.
-                send_error(&mut session, "bad_frame", "frame receive failed").await;
-                linger(&mut session).await;
-                return Err(format!("recv: {e}"));
             }
         };
         if request.profile_id != profile_id {
@@ -438,7 +471,10 @@ async fn linger(session: &mut Libp2pSession) {
     let _ = tokio::time::timeout(Duration::from_secs(1), session.recv(IO_DEADLINE)).await;
 }
 
-async fn send_error(session: &mut Libp2pSession, code: &str, detail: &str) {
+/// Sends a best-effort `StreamError` frame (the composed demux reuses this
+/// for its admission refusals — the only msp-v1 frame that exists for
+/// them).
+pub(crate) async fn send_error(session: &mut Libp2pSession, code: &str, detail: &str) {
     let _ = session
         .send(
             &WireMessage::StreamError(StreamError {

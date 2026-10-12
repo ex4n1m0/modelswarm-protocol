@@ -629,8 +629,10 @@ pub async fn serve_verifydrafts_session<W: VerifyDraftsWire>(
 ///
 /// Admission note (honest limitation): the msp-v1 bridge's session/per-peer
 /// `Admission` lives behind the node `libp2p-backend` feature and is not
-/// reused here; per-connection admission control for this venue belongs to
-/// the composed daemon wiring.
+/// reused here; per-connection admission control for this venue lives in
+/// the composed daemon wiring (`super::composed::serve_sessions_composed`
+/// — one listener, both vocabularies, one admission gate, the ADR-026
+/// lease seam applied to both paths).
 pub async fn serve_verifydrafts_quic(
     mut listener: Libp2pListener,
     config: VerifyDraftsServeConfig,

@@ -42,14 +42,42 @@
 //! `serve_sessions`-shaped venue the msp-v1 bridge demuxes to when the
 //! family goes live); the QUIC loopback tests live in
 //! `tests/verifydrafts_quic.rs`.
+//!
+//! # Composed daemon + the engine seam (2026-10-12)
+//!
+//! - [`composed::serve_sessions_composed`] (needs `libp2p-backend` too):
+//!   ONE listener serving BOTH vocabularies — the msp-v1 bridge and this
+//!   family — behind ONE `Admission` gate and ONE ADR-026 lease
+//!   discipline (the lease seam: [`composed::FamilyLeaseSource`],
+//!   fail-closed at family session open).
+//! - [`engine_source::FamilyEngineSource`]: the injection seam — a
+//!   mock/stub engine, or the production C-API engine under the
+//!   `verifydrafts-capi` feature ([`engine_bridge`], the G4 bridge that
+//!   hosts the architect's `BatchVerifyEngine` for Runtime's
+//!   `CapiVerifyEngine` — the trait-cycle resolution, Runtime's
+//!   `tests/capi_verify.rs` pattern hosted in the crate that depends on
+//!   both).
 
 pub mod client;
+#[cfg(all(feature = "verifydrafts", feature = "libp2p-backend"))]
+pub mod composed;
+#[cfg(feature = "verifydrafts-capi")]
+pub mod engine_bridge;
+pub mod engine_source;
 pub mod serve;
 pub mod wire;
 
 pub use client::{
     ClientOpenError, RoundFailure, RoundOutcome, VerifyDraftsClient, VerifyDraftsClientConfig,
 };
+#[cfg(all(feature = "verifydrafts", feature = "libp2p-backend"))]
+pub use composed::{
+    serve_sessions_composed, FamilyLeaseSource, FamilyServing, RefuseFamilyLeases,
+    StaticLeaseExpiry,
+};
+#[cfg(feature = "verifydrafts-capi")]
+pub use engine_bridge::{capi_disclosure, CapiBatchVerifyEngine};
+pub use engine_source::FamilyEngineSource;
 pub use serve::{
     serve_verifydrafts_quic, serve_verifydrafts_session, ServeEndReason, VerifyDraftsServeConfig,
     VerifyDraftsServeReport,

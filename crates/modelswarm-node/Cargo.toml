@@ -19,6 +19,15 @@ libp2p-backend = ["dep:modelswarm-transport", "dep:modelswarm-eligibility", "dep
 # backend and the REAL libp2p QUIC backend (transport-crate passthrough
 # landed; see docs/reviews/handoff-network-verifydrafts-quic-2026-10-11.md).
 verifydrafts = ["dep:modelswarm-transport", "dep:modelswarm-session", "dep:bs58"]
+# The G4 engine bridge: hosts the architect's `BatchVerifyEngine` impl for
+# Runtime's production `CapiVerifyEngine` (the trait-cycle resolution —
+# modelswarm-session depends on modelswarm-runtime, so the impl lives in
+# THIS crate, which depends on both) and wires the real engine into the
+# family's engine seam (`verifydrafts::engine_source`). Enabling this one
+# flag turns on `verifydrafts` AND Runtime's `capi-adapter`; OFF by
+# default — the adapter flag itself stays off until the family's light-up
+# gates (incl. item-2 exactness reruns) pass.
+verifydrafts-capi = ["verifydrafts", "modelswarm-runtime/capi-adapter"]
 # Self-test path (ADR-019): turns on the TEST-ONLY mock runtime and the
 # `self-test` CLI subcommand. OFF by default — production node builds never
 # enable the mock runtime. `cargo test -p modelswarm-node` gets the same

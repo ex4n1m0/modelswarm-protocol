@@ -1,8 +1,11 @@
 # ADR-033: The advisory plane — an owner-funded cloud reasoning endpoint as a non-authoritative management brain
 
-Status: **Proposed (2026-10-12) — the owner decision to accept follows; Security
-and Test and Release reviews are required before any implementation lands
-(§9).** Owner: Protocol Architect (contract); implementation routing per §9.4.
+Status: **Accepted (2026-10-12, owner decision — option B).** The owner
+accepted with the same message that reported the first live two-peer swarm
+on v0.2.21. Security and Test and Release reviews (§9.1/§9.2) remain the
+implementation gate; the §3.5 key rotation is a precondition for the first
+production digest cycle. Owner: Protocol Architect (contract);
+implementation routing per §9.4.
 
 **Decision record (2026-10-12).** The owner approved the direction and funded
 it with a provider key: "a cloud API that I pay not to be part of the

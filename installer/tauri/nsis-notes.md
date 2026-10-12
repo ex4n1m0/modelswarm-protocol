@@ -12,9 +12,19 @@ No installer is built in Phase G. Two hard stops apply:
    decision is to not produce even those until the Tauri shell (`tauri-shell`
    feature, `crates/modelswarm-desktop`) and the node daemon lifecycle are
    wired, so the bundle would ship a stub. Recorded, not attempted.
-2. The Tauri **updater stays disabled** until signed artifacts + key
-   management exist (ADR-008: its signature verification cannot be disabled —
-   treated as correct behavior).
+2. The Tauri **updater is enabled as of 2026-10-12** (owner request: "clients
+   update and restart when we ship a new client") — under a settled design
+   that does NOT need the code-signing certificate above: the installers
+   stay UNSIGNED, and each update PACKAGE carries its own minisign-class
+   signature (owner-generated keypair; the PUBLIC key is embedded in
+   `tauri.conf.json` `plugins.updater.pubkey`, the private key lives
+   outside the repo at local release staging only). Signature verification
+   cannot be disabled — still treated as correct behavior. Windows
+   installs run passive (`installMode: "passive"`: progress bar only, no
+   wizard) with the app restarted by the NSIS `/UPDATE /R` flow; the
+   desktop renders its own honest status line (`ui/index.html`
+   `#update-note`). See `docs/reviews/handoff-windows-product-updater-2026-10-13.md`
+   for the exact release-train signing/manifest steps.
 
 ## Exact bundling command (when the stop clears)
 

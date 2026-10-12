@@ -91,6 +91,7 @@
     <span class="build-tag" id="version-tag" role="note" aria-label="Client version">v…</span>
     <span class="build-tag" role="note" aria-label="Build label">INTERNAL TEST BUILD — UNSIGNED</span>
     <span class="note" id="conn-note" role="status">connecting…</span>
+    <span class="note" id="update-note" role="status" aria-label="Update status">update: …</span>
   </header>
 
   <main>
@@ -417,6 +418,13 @@
       $("tracker-url").value = s.tracker;
       $("version-tag").textContent = "v" + s.version;
       $("foot-version").textContent = "v" + s.version + " ";
+      // Auto-update status (owner request 2026-10-12): the daemon's honest
+      // line, rendered VERBATIM — "update available → v…", "downloading
+      // v… N%", "v… ready, restarting…", or the exact failure ("update
+      // check failed — …" / "update failed — this version keeps running
+      // (…)"). A failed check NEVER blocks the app: this is a status line,
+      // nothing more. No mirror logic here — the daemon owns the wording.
+      if (s.updater && s.updater.line) $("update-note").textContent = s.updater.line;
       $("engine-line").textContent = s.engine_available
         ? "pinned llama.cpp — present"
         : "MISSING — expected at " + s.engine_path;

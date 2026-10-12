@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MSP header — auto-update status line stub harness</title>
+  <style>
+    body { font: 13px/1.5 system-ui, sans-serif; color: #e8edf7; background: #10141c; margin: 1.5rem; }
+    h1 { font-size: 16px; } h2 { font-size: 13px; color: #9aa7bf; text-transform: uppercase; }
+    .pass { color: #43c78f; } .fail { color: #e06565; }
+    td, th { text-align: left; padding: 3px 10px 3px 0; border-bottom: 1px solid #2c3850; }
+    code { color: #a855f7; }
+  </style>
+</head>
+<body>
+  <h1>Auto-update status line stub harness</h1>
+  <p>Loads the REAL <code>../ui/index.html</code> into a same-origin 1152×648 iframe with a
+  stubbed <code>window.__TAURI__</code> bridge, then checks the header's update status note
+  (owner request 2026-10-12: "clients update and restart when we ship a new client"): the
+  daemon-provided <code>updater.line</code> renders <strong>VERBATIM</strong> in every phase —
+  available → downloading → ready/restarting, the two failure edges (check failed / install
+  failed with the running version intact), and the dev opt-out — a missing payload degrades to
+  the placeholder without breaking the rest of the header, and the extra note never overflows
+  the header at the app's default window width. The status machine itself (transitions,
+  terminal Ready, ignored stale events, env opt-out) is pinned by the Rust unit tests in
+  <code>src/app/updater.rs</code>; this harness pins the render contract.</p>
+  <p><strong>Run:</strong> serve the crate root over http — e.g.
+  <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> —
+  then open <code>http://127.0.0.1:4817/ui-harness/updater.html</code>.
+  Opening from <code>file://</code> cannot work (the harness fetches the UI same-origin).</p>
+  <h2>Results</h2>
+  <div id="results">running…</div>
+  <script>
+    // One get_status payload per phase; `updater.line` values are exactly
+    // what UpdaterStatus::line() emits (the daemon owns the wording — the
+    // field names match src/app/updater.rs view() verbatim).
+    const PHASES = [
+      { label: "idle",        updater: { phase: "idle", version: null, progress: null, reason: null, line: "update: not checked yet" } },
+      { label: "available",   updater: { phase: "available", version: "0.2.22", progress: null, reason: null, line: "update available → v0.2.22" } },
+      { label: "downloading", updater: { phase: "downloading", version: "0.2.22", progress: "42.0 / 100.0 MB", reason: null, line: "downloading v0.2.22… 42%" } },
+      { label: "ready",       updater: { phase: "ready", version: "0.2.22", progress: null, reason: null, line: "v0.2.22 ready, restarting…" } },
+      { label: "check_failed", updater: { phase: "check_failed", version: null, progress: null, reason: "dns lookup failed", line: "update check failed — dns lookup failed" } },
+      { label: "install_failed", updater: { phase: "install_failed", version: null, progress: null, reason: "download: signature verification failed", line: "update failed — this version keeps running (download: signature verification failed)" } },
+      { label: "up_to_date",  updater: { phase: "up_to_date", version: null, progress: null, reason: null, line: "up to date" } },
+      { label: "disabled",    updater: { phase: "disabled", version: null, progress: null, reason: null, line: "updates: off (MSP_NO_AUTOUPDATE)" } },
+    ];
+
+    window.__updater = PHASES[0].updater;
+    const STATUS = {
+      version: "0.0.0-harness", tracker: "https://stub.local", data_dir: "C:/stub",
+      engine_available: true, engine_path: "C:/stub/engine/llama-server.exe",
+      gpu_engine_available: false, license_accepted: true, profile_id: null, artifact: null,
+      node: { running: false, hosting: false, gateway_addr: null, installation_id: null,
+              engine_port: null, engine_backend: null, listener_addr: null, enrollment: null },
+      family: null, chat_turns: 0,
+    };
+    window.__stubInvoke = async (cmd) => {
+      switch (cmd) {
+        case "get_status": return { ...STATUS, updater: window.__updater };
+        case "analyze_hardware": return { ram_mb: 32000, cpu_cores: 12, gpu: { name: "RTX 3080", vram_mb: 9216 } };
+        case "list_models": return [];
+        default: return {};
+      }
+    };
+    const STUB = '<scr' + 'ipt>window.__TAURI__ = { core: { invoke: (cmd, args) => parent.__stubInvoke(cmd, args) }, event: { listen: async () => {} } };</scr' + 'ipt>';
+
+    // Loads the UI with the given updater payload and waits for the first
+    // refresh() render of the note (the stub resolves in a microtask; the
+    // placeholder text "update: …" is the not-yet-rendered marker).
+    async function scenario(ui, updater) {
+      window.__updater = updater;
+      const frame = document.createElement("iframe");
+      frame.setAttribute("aria-hidden", "true");
+      frame.style.cssText = "width:1152px;height:648px;border:0;position:absolute;left:-12000px;top:0;";
+      document.body.appendChild(frame);
+      frame.srcdoc = ui.replace("<head>", "<head>" + STUB);
+      let doc = null;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        await new Promise((r) => setTimeout(r, 100));
+        doc = frame.contentDocument;
+        // Rendered when the note moves off the "update: …" placeholder
+        // (some real lines legitimately contain "…", so compare exactly).
+        if (doc && doc.getElementById("update-note").textContent !== "update: …") break;
+        if (doc && updater === null && doc.getElementById("conn-note").textContent === "live") break;
+      }
+      const note = doc.getElementById("update-note");
+      const header = note.closest("header");
+      const out = {
+        text: note.textContent,
+        role: note.getAttribute("role"),
+        // The extra header note must not force horizontal overflow at the
+        // app's default 1152px window.
+        headerFits: header.scrollWidth <= header.clientWidth + 1,
+        connStillLive: doc.getElementById("conn-note").textContent === "live",
+      };
+      frame.remove();
+      return out;
+    }
+
+    function render(rows) {
+      const table = document.createElement("table");
+      for (const { label, pass, detail } of rows) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td class="${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</td><td>${label}</td><td><code>${detail ?? ""}</code></td>`;
+        table.appendChild(tr);
+      }
+      const all = rows.every((r) => r.pass);
+      const summary = document.createElement("p");
+      summary.innerHTML = `<strong class="${all ? "pass" : "fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
+      document.getElementById("results").replaceChildren(summary, table);
+      window.__harnessResults = { all, rows };
+    }
+
+    (async () => {
+      const ui = await (await fetch("../ui/index.html")).text();
+      const rows = [];
+      for (const phase of PHASES) {
+        const out = await scenario(ui, phase.updater);
+        rows.push({
+          label: `${phase.label}: line renders verbatim in the header status note`,
+          pass: out.text === phase.updater.line && out.role === "status",
+          detail: out.text,
+        });
+        rows.push({
+          label: `${phase.label}: header fits 1152px and the connection note stays live (a failure never blocks the app)`,
+          pass: out.headerFits && out.connStillLive,
+          detail: `fits=${out.headerFits} conn=${out.connStillLive}`,
+        });
+      }
+      // No updater payload yet (e.g. first poll before the supervisor's
+      // first write): the placeholder stays, nothing breaks.
+      const none = await scenario(ui, null);
+      rows.push({
+        label: "missing updater payload: placeholder kept, header healthy",
+        pass: none.text === "update: …" && none.connStillLive && none.headerFits,
+        detail: none.text,
+      });
+      render(rows);
+    })().catch((e) => {
+      document.getElementById("results").innerHTML =
+        `<span class="fail">harness error: ${e}<br>(did you open this over http? file:// cannot fetch the UI)</span>`;
+    });
+  </script>
+</body>
+</html>

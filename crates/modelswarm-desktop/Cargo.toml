@@ -22,6 +22,7 @@ tauri-shell = [
     "dep:tauri",
     "dep:tauri-plugin-opener",
     "dep:tauri-plugin-single-instance",
+    "dep:tauri-plugin-updater",
     "dep:tauri-build",
     "dep:modelswarm-node",
     "dep:modelswarm-tracker-api",
@@ -61,6 +62,14 @@ modelswarm-transport = { path = "../modelswarm-transport", features = ["libp2p-b
 tauri = { version = "2", optional = true, default-features = false, features = ["wry"] }
 tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
+# The auto-update engine (owner request 2026-10-12: "clients update and
+# restart when we ship a new client"). Tauri 2's updater is a plugin — it
+# verifies update packages against the minisign public key embedded in
+# tauri.conf.json (plugins.updater.pubkey) and cannot be turned off at
+# runtime. Windows installers stay unsigned (code-signing is a separate,
+# unpaid stop per ADR-008/G6): the update PACKAGE carries its own
+# minisign-class signature that the client verifies before install.
+tauri-plugin-updater = { version = "2", optional = true }
 modelswarm-node = { path = "../modelswarm-node", optional = true, features = ["libp2p-backend"] }
 modelswarm-tracker-api = { path = "../modelswarm-tracker-api", optional = true }
 modelswarm-store = { path = "../modelswarm-store", optional = true }

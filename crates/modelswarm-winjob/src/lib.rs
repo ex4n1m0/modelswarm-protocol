@@ -150,6 +150,32 @@ mod imp {
         unsafe { CloseHandle(job) as usize }
     }
 
+    /// Update-restart seam (auto-update owner request 2026-10-12): closes
+    /// EVERY retained kill-on-close job handle now, terminating all
+    /// supervised engine children synchronously with the call. The updater
+    /// runs this in its `on_before_exit` hook — AFTER the update package's
+    /// signature verified, BEFORE the NSIS installer is spawned — so the
+    /// installer never races a live engine binary it is about to replace
+    /// (the plain process-death path needs no call: handle close on exit
+    /// does the same implicitly, however the process dies). Returns the
+    /// number of jobs closed.
+    pub fn close_all_retained_jobs() -> usize {
+        let jobs = match retained_jobs().lock() {
+            Ok(mut jobs) => std::mem::take(&mut *jobs),
+            Err(_) => return 0,
+        };
+        let mut closed = 0;
+        for JobHandle(job) in jobs {
+            // SAFETY: the handle came from CreateJobObjectW and is owned by
+            // the retained list (never closed elsewhere; the test hook above
+            // pops from the same list, so no double close).
+            if unsafe { CloseHandle(job) } != 0 {
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     /// PIDs currently assigned to this process's retained kill-on-close
     /// jobs — job-object MEMBERSHIP, i.e. exactly the supervised engine
     /// set (children inherit job membership on creation, so anything an
@@ -216,7 +242,8 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{
-    assign_child, close_one_retained_job_for_test, supervised_process_ids, total_ram_bytes,
+    assign_child, close_all_retained_jobs, close_one_retained_job_for_test, supervised_process_ids,
+    total_ram_bytes,
 };
 
 #[cfg(test)]
@@ -294,5 +321,51 @@ mod tests {
         assert_eq!(ids, sorted, "membership is sorted + deduped");
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// The updater's pre-install kill seam (auto-update owner request
+    /// 2026-10-12): `close_all_retained_jobs` terminates EVERY supervised
+    /// child at once — the state the NSIS installer requires before it may
+    /// replace the engine files. Two children, one call, both dead, and
+    /// the retained list is empty afterwards (idempotent second call).
+    #[test]
+    #[cfg(windows)]
+    fn close_all_retained_jobs_kills_every_supervised_child() {
+        use std::process::Stdio;
+        let _guard = job_test_lock();
+        let spawn = || {
+            std::process::Command::new("ping")
+                .args(["-n", "60", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn ping")
+        };
+        let mut a = spawn();
+        let mut b = spawn();
+        super::assign_child(a.id()).expect("assign job a");
+        super::assign_child(b.id()).expect("assign job b");
+        assert_eq!(super::supervised_process_ids().len(), 2);
+
+        assert_eq!(super::close_all_retained_jobs(), 2);
+        // Idempotent: the retained list was drained, not just marked.
+        assert_eq!(super::close_all_retained_jobs(), 0);
+
+        let alive = |pid: u32| {
+            let pid_bytes = pid.to_string().into_bytes();
+            std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}")])
+                .output()
+                .unwrap()
+                .stdout
+                .windows(pid_bytes.len())
+                .any(|w| w == &pid_bytes[..])
+        };
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(!alive(a.id()), "closing all jobs must kill child a");
+        assert!(!alive(b.id()), "closing all jobs must kill child b");
+        // Reap both so the test leaves no zombies behind.
+        let _ = a.wait();
+        let _ = b.wait();
     }
 }

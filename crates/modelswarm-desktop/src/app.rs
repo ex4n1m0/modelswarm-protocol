@@ -41,6 +41,13 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
+/// The client half of the auto-update engine (owner request 2026-10-12):
+/// the honest updater status machine + the 6h check supervisor. Tauri 2's
+/// updater plugin verifies every update package against the minisign
+/// public key embedded in tauri.conf.json before installing; the desktop
+/// renders one status line from it and nothing else.
+mod updater;
+
 /// The registered no-listener-yet multiaddr: present in the roster, fails
 /// direct-connect honestly for every remote peer (beta boundary).
 const ADDR_NO_LISTENER: &str = "/ip4/0.0.0.0/tcp/0";
@@ -106,6 +113,11 @@ struct Inner {
     /// must show honestly — on (both vocabularies, behind the RC-L1
     /// lease gate) vs off with the exact reason. None while not hosting.
     family: Option<FamilyStatus>,
+    /// The auto-update status machine's current state (owner request
+    /// 2026-10-12): written only by the updater supervisor, read only for
+    /// `get_status`. A failure here is a status line, never a block on
+    /// app usage.
+    updater: updater::UpdaterStatus,
 }
 
 /// The composed daemon's family half, reported to the UI exactly as the
@@ -217,6 +229,7 @@ impl DesktopState {
                 peer_metrics: None,
                 listener_addr: None,
                 family: None,
+                updater: updater::UpdaterStatus::Idle,
             }),
         }
     }
@@ -1191,6 +1204,10 @@ async fn get_status(
         // with the real engine geometry / off with the reason); null
         // while not hosting. Never a static label.
         "family": serde_json::to_value(&inner.family).unwrap_or(serde_json::Value::Null),
+        // The auto-update status machine's honest current state; `line`
+        // inside is rendered VERBATIM by the header status note (owner
+        // request 2026-10-12). Never a block on app usage.
+        "updater": inner.updater.view(),
         "chat_turns": inner.chat_log.len(),
     }))
 }
@@ -3986,12 +4003,23 @@ pub fn run() {
         // Opens the device-approval page in the system browser (capability
         // scopes it to the tracker origin only).
         .plugin(tauri_plugin_opener::init())
+        // The auto-update engine (owner request 2026-10-12: "clients
+        // update and restart when we ship a new client"). Config lives in
+        // tauri.conf.json plugins.updater (public key + endpoint +
+        // requireSignedVersion + passive installs); this registration adds
+        // no webview capability — the supervisor below drives it from
+        // Rust, and only status LINES cross into the UI.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
+            let for_supervisor = handle.clone();
             tauri::async_runtime::block_on(async move {
                 let state = DesktopState::new().await;
                 handle.manage(state);
             });
+            // One check on start, then every 6h; every failure degrades to
+            // an honest status line. Dev opt-out: MSP_NO_AUTOUPDATE=1.
+            updater::spawn_supervisor(for_supervisor);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4907,6 +4935,7 @@ mod tests {
             chat_log: Vec::new(),
             listener_addr: None,
             family: None,
+            updater: updater::UpdaterStatus::Idle,
         }
     }
 

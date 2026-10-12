@@ -3540,6 +3540,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "modelswarm-resource"
+version = "0.1.0"
+dependencies = [
+ "modelswarm-winjob",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "modelswarm-runtime"
 version = "0.2.21"
 dependencies = [

@@ -1,0 +1,20 @@
+# Standalone release-train tool (Test and Release owned; excluded from
+# the workspace below the root Cargo.toml `exclude` list). NOT part of
+# the product, never compiled by CI guards — it exists to replay, at
+# every release staging, the EXACT verification chain the shipped
+# updater performs over the staged manifest (docs/reviews/
+# review-updater-security-2026-10-13.md §2 + the RC-1 standing
+# obligation). Pinning minisign-verify to =0.3.0 keeps the verifier on
+# the same crate version tauri-plugin-updater 2.13.3 verifies with
+# (Cargo.lock); bump this pin only together with that lock entry.
+[package]
+name = "updater-manifest-verify"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+minisign-verify = "=0.3.0"
+serde_json = "1"

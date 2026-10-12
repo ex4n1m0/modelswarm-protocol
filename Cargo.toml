@@ -21,12 +21,17 @@ members = [
     "crates/modelswarm-desktop",
     "apps/modelswarm-sim",
 ]
+# Release-train tooling lives under tests/ (T/R-owned) OUTSIDE the
+# product workspace: it is never compiled by CI guards or the product
+# build. tests/updater-manifest-verify replays the shipped updater's
+# minisign verification over the staged manifest at every release.
+exclude = ["tests/updater-manifest-verify"]
 
 # Single source of the product version: tauri.conf.json omits its
 # `version` (Tauri falls back to this package version), so desktop,
 # node --version, and the UI all report the same number. Bump HERE only.
 [workspace.package]
-version = "0.2.21"
+version = "0.2.22"
 edition = "2021"
 license = "Proprietary"
 repository = "modelswarm"

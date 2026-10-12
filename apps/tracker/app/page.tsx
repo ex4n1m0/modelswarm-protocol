@@ -9,6 +9,9 @@
 // - copy never names the inference engine or model-file format — the H2 meta
 //   test's source scan covers app/ marketing copy too
 // - installers remain available at their direct /api/download/<file> URLs
+//   (2026-10-12 revision, owner directive "release to the website, I will
+//   get people to test it": a minimal honest download section is restored
+//   below — same copy rules apply: no engine/format names, honest tense)
 
 // Protocol-level execution presets (ADR-029 §1; master prompt §3).
 const PRESETS: Array<{ name: string; allows: string; correctness: string }> = [
@@ -144,6 +147,40 @@ export default function Home() {
             (better answers, even when slower) and mixed-model work stay
             behind their own correctness gates.
           </p>
+        </section>
+
+        <section aria-labelledby="get-heading">
+          <h2 id="get-heading">Desktop app</h2>
+          <div className="rule">
+            <b>v0.2.21</b> — test builds, unsigned. Same-model cooperation
+            (faster or verified-accurate answers, never worse than the
+            fastest single host) works between two peers on a direct or LAN
+            network; the app reports honest status for anything not engaged.
+            <ul style={{ margin: "0.8rem 0 0", padding: "0 0 0 1.1rem" }}>
+              <li>
+                <a href="/api/download/ModelSwarm-Setup-0.2.21-windows-x64.exe">
+                  Windows installer (.exe)
+                </a>
+              </li>
+              <li>
+                <a href="/api/download/ModelSwarm-0.2.21-linux-amd64.deb">Linux (.deb)</a>
+                {" · "}
+                <a href="/api/download/ModelSwarm-0.2.21-linux-amd64.AppImage">
+                  AppImage
+                </a>
+              </li>
+              <li>
+                <a href="/api/download/ModelSwarm-0.2.21-macos-arm64.dmg">
+                  macOS (Apple Silicon, .dmg)
+                </a>
+              </li>
+            </ul>
+            <p className="note" style={{ marginTop: "0.6rem" }}>
+              First hosting start enrolls the device (auto-approved under
+              the test cap) and downloads the chosen model from its original
+              source. Checksums: /downloads/SHA256SUMS.txt.
+            </p>
+          </div>
         </section>
 
         <section aria-labelledby="api-heading">

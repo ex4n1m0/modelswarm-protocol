@@ -202,18 +202,57 @@ export default function Home() {
           </table>
         </section>
 
+        <section aria-labelledby="census-heading">
+          <h2 id="census-heading">Live swarm census</h2>
+          <div className="rule">
+            <span id="census-body" style={{ fontSize: "0.95rem" }}>
+              loading…
+            </span>
+            <p className="note" style={{ marginTop: "0.5rem" }}>
+              Models other peers are hosting right now — picking one of
+              these means the swarm can cooperate from your first session.
+            </p>
+          </div>
+        </section>
+
           <script
           dangerouslySetInnerHTML={{
             __html: `
 (async () => {
   const badge = document.getElementById('online-badge');
+  const census = document.getElementById('census-body');
   const update = async () => {
+    let peersOnline;
     try {
       const r = await fetch('/api/v1/stats');
       if (!r.ok) throw 0;
-      const { peersOnline } = await r.json();
+      ({ peersOnline } = await r.json());
       badge.textContent = peersOnline + (peersOnline === 1 ? ' peer online' : ' peers online');
     } catch { badge.textContent = '— online'; }
+    try {
+      const [s, c] = await Promise.all([fetch('/api/v1/stats'), fetch('/api/v1/catalog')]);
+      if (!s.ok || !c.ok) throw 0;
+      const stats = await s.json();
+      const cat = await c.json();
+      const names = new Map(
+        (cat.models || cat.profiles || []).map((m) => [m.profile_id, m.display_name]),
+      );
+      const rows = (stats.models || [])
+        .map((row) => ({ name: names.get(row.profileId) || row.profileId.slice(0, 18) + '…', peers: row.peers }))
+        .sort((a, b) => b.peers - a.peers || a.name.localeCompare(b.name));
+      if (!rows.length) {
+        census.textContent = 'No peers hosting yet — install the app and start hosting to be the first.';
+      } else {
+        census.replaceChildren(
+          ...rows.map((row) => {
+            const el = document.createElement('span');
+            el.textContent = row.name + ' · ' + row.peers + (row.peers === 1 ? ' peer' : ' peers');
+            el.style.cssText = 'display:inline-block;margin:0 0.6rem 0.4rem 0;padding:0.15rem 0.6rem;border:1px solid #ffffff22;border-radius:999px;font-size:0.9rem;white-space:nowrap;';
+            return el;
+          }),
+        );
+      }
+    } catch { census.textContent = 'census unavailable'; }
   };
   await update(); setInterval(update, 30000);
 })();`,

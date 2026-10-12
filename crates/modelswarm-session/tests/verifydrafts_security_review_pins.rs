@@ -482,11 +482,123 @@ fn remote_peer_mismatch_fails_closed_before_stages() {
     );
 }
 
+/// The RC-5(b) stale-exemption's OUTSTANDING-GATED CORNER (light-up
+/// disposition review, 2026-10-12; ADR-032 revision 4 §8 RC-5(b)). The
+/// landed stale condition is `outstanding.is_none() && round <=
+/// last_handled && round > last_committed`: a late commit for an OLDER
+/// abandoned round that arrives while a NEWER round is outstanding does
+/// NOT hit the exempt path — the outstanding result is for the NEWER
+/// round, so reproduction fails and the commit is charged
+/// `commit_mismatch` (a violation), and the abandonment it triggers also
+/// discards the NEWER round's outstanding result. Read against the ADR
+/// letter ("a round already abandoned — handled but uncommitted, no
+/// outstanding result left to reproduce against" — round-scoped), this
+/// corner is STRICTER than the letter: the older round's result is gone,
+/// so the letter would classify it as an exempt stale no-op.
+/// Reachability: NOT reachable by an honest coordinator on one ordered
+/// session stream (the shipped client commits round n before requesting
+/// round n+k; QUIC/staged frames are ordered, so a delayed commit cannot
+/// arrive after a later request it preceded) — only a coordinator that
+/// deliberately sends a commit for a round it already abandoned after
+/// starting a newer round hits it, and the charge lands on that sender.
+/// This pin freezes the CURRENT classification so any move to the
+/// round-scoped letter (or an ADR amendment) is a deliberate,
+/// review-visible change; it also pins the side effect (the newer
+/// outstanding round is abandoned by the mismatch path).
+#[tokio::test]
+async fn pin_stale_commit_for_older_round_while_newer_outstanding_is_charged() {
+    let coordinator = fixture_id(0x51);
+    let engine = MockEngine {
+        calls: AtomicUsize::new(0),
+    };
+    let mut gate = gate(&coordinator);
+    gate.seed_pre_state(modelswarm_session::verifydrafts::GatePreStateSeed {
+        last_seq: vec![(coordinator.installation_id(), 12)],
+        last_handled_round: Some(1),
+        ..Default::default()
+    });
+
+    // Round 3 admitted, dispatched, then EXPIRED (abandoned; result
+    // discarded — the RC-5(b) discard).
+    let frame3 = build_request(&coordinator, 13, 3, "corner-round-3");
+    let AdmissionDecision::Admitted {
+        deadline_expires_at_ms,
+        ..
+    } = gate.admit_verify_drafts(
+        &serde_json::to_value(&frame3).unwrap(),
+        NOW,
+        NOW,
+        &peer_of(&coordinator),
+    )
+    else {
+        panic!("round 3 must admit");
+    };
+    assert!(matches!(
+        gate.dispatch_outstanding(&engine, NOW, NOW + 35).await,
+        DispatchOutcome::Dispatched(_)
+    ));
+    assert!(gate.expire_wait_commit_if_due(deadline_expires_at_ms + 250));
+    assert_eq!(gate.outstanding_round(), None);
+
+    // Round 5 gaps forward (RC-5(c)) and is dispatched — its result is
+    // now the OUTSTANDING one.
+    let frame5 = build_request(&coordinator, 14, 5, "corner-round-5");
+    assert!(matches!(
+        gate.admit_verify_drafts(
+            &serde_json::to_value(&frame5).unwrap(),
+            NOW,
+            NOW,
+            &peer_of(&coordinator),
+        ),
+        AdmissionDecision::Admitted { .. }
+    ));
+    assert!(matches!(
+        gate.dispatch_outstanding(&engine, NOW, NOW + 35).await,
+        DispatchOutcome::Dispatched(_)
+    ));
+    assert_eq!(gate.outstanding_round(), Some(5));
+
+    // A late REPRODUCING-AS-OF-ROUND-3 commit (parent = genesis = the
+    // committed hash) while round 5 is outstanding: the outstanding-gated
+    // stale exemption does NOT fire — charged commit_mismatch with ONE
+    // violation, never applied, and round 5's outstanding result is
+    // discarded by the abandonment.
+    let mut committed3 = frame3.window_tokens.to_vec();
+    committed3.push(999);
+    let late3 = CommitPrefix {
+        session_id: SESSION.to_string(),
+        round: 3,
+        previous_prefix_hash: GENESIS_PREFIX_HASH.to_string(),
+        accepted_token_ids: committed3.clone(),
+        new_prefix_hash: compute_prefix_hash(GENESIS_PREFIX_HASH, &committed3).unwrap(),
+        model_profile_id: profile(),
+        generation_params_hash: params_hash(),
+        sender: coordinator.installation_id(),
+    };
+    assert_eq!(
+        gate.apply_prefix_commit(&late3),
+        CommitApplyOutcome::CancelRound(CancelRoundFrame {
+            session_id: SESSION.to_string(),
+            round: 3,
+            reason: CancelRoundReason::CommitMismatch,
+        })
+    );
+    assert_eq!(gate.violations_of(&coordinator.installation_id()), 1);
+    assert_eq!(gate.committed_prefix_hash(), GENESIS_PREFIX_HASH);
+    assert_eq!(gate.last_committed_round(), 0);
+    assert_eq!(
+        gate.outstanding_round(),
+        None,
+        "the mismatch path also abandons the NEWER outstanding round"
+    );
+    assert!(!gate.is_torn_down(), "the first violation never tears down");
+}
+
 /// The §2 `PrefixCommit` carrier sender check (ADR-032 revision 4
-/// §2/G2): the carrier carries NO signature — its `sender` MUST equal
-/// the installation id pinned from the authenticated channel (the same
-/// pinned coordinator key that authenticates every `VerifyDrafts`), and
-/// a mismatch is `bad_frame` BEFORE any state is touched (no violation
+/// §2/G2): the carrier carries NO signature — its `sender` MUST equal the
+/// installation id pinned from the authenticated channel (the same pinned
+/// coordinator key that authenticates every `VerifyDrafts`), and a
+/// mismatch is `bad_frame` BEFORE any state is touched (no violation
 /// counter, no teardown, nothing consumed).
 #[tokio::test]
 async fn pin_carrier_sender_mismatch_is_bad_frame_before_state() {

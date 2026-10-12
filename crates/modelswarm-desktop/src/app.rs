@@ -913,13 +913,22 @@ async fn resolve_profile(
 }
 
 fn persist_config(inner: &Inner) -> Result<(), String> {
+    // TR-RC-8 (ADR-033 §9.2 review): READ-MODIFY-WRITE the FULL JSON
+    // object. The daemon owns exactly two keys (`tracker`, `profile_id`);
+    // every other key in config.json — another subsystem's config surface
+    // that later moves in here — is preserved verbatim. (The previous
+    // struct-rewrite serialized only the two known fields and SILENTLY
+    // DELETED everything else on every tracker/profile change.)
+    let path = inner.data_dir.join("config.json");
+    let mut root: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    root.insert("tracker".into(), serde_json::json!(inner.tracker_url));
+    root.insert("profile_id".into(), serde_json::json!(inner.profile_id));
     std::fs::write(
-        inner.data_dir.join("config.json"),
-        serde_json::to_string_pretty(&PersistedConfig {
-            tracker: inner.tracker_url.clone(),
-            profile_id: inner.profile_id.clone(),
-        })
-        .map_err(|e| e.to_string())?,
+        &path,
+        serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
 }
@@ -1197,15 +1206,9 @@ async fn set_tracker(state: tauri::State<'_, DesktopState>, url: String) -> Resu
         return Err("tracker URL must start with http:// or https://".into());
     }
     inner.tracker_url = url.to_string();
-    let config = PersistedConfig {
-        tracker: inner.tracker_url.clone(),
-        profile_id: inner.profile_id.clone(),
-    };
-    std::fs::write(
-        inner.data_dir.join("config.json"),
-        serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())
+    // The same round-trip-preserving writer as every other config change
+    // (TR-RC-8): unknown keys in config.json survive a tracker change.
+    persist_config(&inner)
 }
 
 #[tauri::command]
@@ -4884,5 +4887,93 @@ mod tests {
                 "gpu_vram_used_bytes": null,
             })
         );
+    }
+
+    // ---- config.json writer (TR-RC-8: round-trip preservation) ---------
+
+    fn test_inner(data_dir: &Path, tracker: &str, profile: Option<&str>) -> Inner {
+        Inner {
+            data_dir: data_dir.to_path_buf(),
+            tracker_url: tracker.to_string(),
+            profile_id: profile.map(str::to_string),
+            size_cache: Default::default(),
+            census_counts: None,
+            swarm_lease: None,
+            swarm_executor: None,
+            peer_metrics: None,
+            license_accepted: true,
+            artifact: None,
+            node: None,
+            chat_log: Vec::new(),
+            listener_addr: None,
+            family: None,
+        }
+    }
+
+    /// TR-RC-8's pin: a tracker/profile change rewrites config.json via
+    /// read-modify-write — the daemon's two keys update and EVERY unknown
+    /// key survives verbatim (the old two-field struct rewrite silently
+    /// deleted them; both write sites — `persist_config` and
+    /// `set_tracker`'s delegation to it — share this writer).
+    #[test]
+    fn config_rewrite_preserves_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"tracker":"https://old.example","profile_id":"msp1:aa","advisory":{"cadence":"daily","caps":{"callsPerDay":24}},"window_state":{"x":42,"maximized":false}}"#,
+        )
+        .unwrap();
+        // A tracker change (set_tracker's path)…
+        persist_config(&test_inner(
+            dir.path(),
+            "https://new.example",
+            Some("msp1:aa"),
+        ))
+        .unwrap();
+        // …then a profile change (select_model's path).
+        persist_config(&test_inner(
+            dir.path(),
+            "https://new.example",
+            Some("msp1:bb"),
+        ))
+        .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["tracker"], "https://new.example",
+            "daemon key updates"
+        );
+        assert_eq!(saved["profile_id"], "msp1:bb", "daemon key updates");
+        assert_eq!(
+            saved["advisory"]["cadence"], "daily",
+            "unknown subtree survives BOTH rewrites"
+        );
+        assert_eq!(saved["advisory"]["caps"]["callsPerDay"], 24);
+        assert_eq!(saved["window_state"]["x"], 42);
+        assert_eq!(saved["window_state"]["maximized"], false);
+    }
+
+    /// Fresh-install shapes: a missing file starts from `{}` (the two
+    /// daemon keys land, nothing else), and a `null` profile round-trips
+    /// as `null` exactly as the previous writer emitted it.
+    #[test]
+    fn config_write_fresh_file_and_null_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        persist_config(&test_inner(dir.path(), "https://t.example", None)).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["tracker"], "https://t.example");
+        assert_eq!(saved["profile_id"], serde_json::Value::Null);
+        assert_eq!(
+            saved.as_object().unwrap().len(),
+            2,
+            "a fresh file carries exactly the daemon's keys"
+        );
+        // Round-trips: read_config still reads the tolerant two fields.
+        let config = read_config(dir.path());
+        assert_eq!(config.tracker, "https://t.example");
+        assert_eq!(config.profile_id, None);
     }
 }

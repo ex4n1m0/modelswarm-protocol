@@ -412,7 +412,11 @@ fn launch(
     spec: &EngineSpec,
     port: u16,
     bearer: &str,
-    telemetry: &modelswarm_telemetry::Telemetry,
+    // `_`-prefixed: the ONLY use is the Windows kill-on-close job-object
+    // warning below — on non-Windows the parameter is intentionally unused
+    // (found by the per-push non-Windows compile gate added at the 0.2.21
+    // release train; underscore keeps the binding usable on Windows).
+    _telemetry: &modelswarm_telemetry::Telemetry,
 ) -> Result<Child, EngineError> {
     let mut command = Command::new(&spec.exe);
     command
@@ -439,7 +443,7 @@ fn launch(
         // graceful shutdown path (watch channel) already kills the child.
         if let Some(pid) = child.id() {
             if let Err(e) = modelswarm_winjob::assign_child(pid) {
-                telemetry.warn(
+                _telemetry.warn(
                     "engine.job_assign_failed",
                     &[("pid", &pid.to_string()), ("detail", &e.to_string())],
                 );

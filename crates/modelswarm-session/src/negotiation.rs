@@ -253,6 +253,176 @@ pub struct SessionReject {
     pub reason: SessionRejectReason,
 }
 
+/// The ADR-036 user-content session-open PIN CARRIER: the coordinator →
+/// serving-peer frame that carries an ELECTED family-verified chat's
+/// conversation as token ids plus the rule-3 commitment, sent after the
+/// `lease` carrier (when presented) and immediately BEFORE the
+/// `SessionOffer` (the fixed open sequence; the lease precedes it so
+/// lease refusal happens before the conversation is sent). STRICT bare
+/// object (`deny_unknown_fields` — it is content-bearing, so the schema
+/// is closed); canonical JSON per msp-v1 §2.2; Ed25519 signature over
+/// the canonical form with `signature` omitted entirely (§1 rule 4 —
+/// use [`crate::verifydrafts::sign_pin_carrier`] / `signing_preimage`).
+///
+/// `pin_commitment = hex(sha256(prompt_tokens as little-endian u32
+/// each))` — the ADR-034 rule-3 pin identity, NO parent: the prefix-hash
+/// chain still starts at `GENESIS_PREFIX_HASH`; the commitment binds the
+/// ENGINE ROOT (the per-session prefill), never a round's
+/// `parent_prefix_hash`.
+///
+/// Hygiene (ADR-036 §3.2, binding): `prompt_tokens` are content — never
+/// logged, telemetered, echoed in rejections, or carried in receipts;
+/// the commitment is content-derived and stays OUT of telemetry (local
+/// status/diagnostics only, unlike the public neutral pin hash per
+/// ADR-034 rule 7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WirePinCarrier {
+    /// MUST equal the subsequent `SessionOffer`'s (mismatch `bad_frame`);
+    /// echoed by accept/reject.
+    pub session_id: String,
+    /// Always `"msp-cooperative-v1"` (binds the namespace version).
+    pub protocol_version: String,
+    /// The coordinator's per-(session, sender) counter (RC-7): the
+    /// carrier ESTABLISHES the baseline; every later coordinator
+    /// `VerifyDrafts` carries `seq` strictly greater.
+    pub seq: u64,
+    /// Always `0` — the reserved session-open phase marker; in carrier
+    /// sessions every `VerifyDrafts` round is ≥ 1.
+    pub round: u32,
+    /// The coordinator's pinned exact profile (`msp1:<64 hex>`); MUST
+    /// equal the offer's; the serving side compares against its pinned
+    /// profile (`profile_mismatch` at the carrier — the honest-early
+    /// G3 close).
+    pub profile_id: String,
+    /// The coordinator's pinned sampling params hash (bare 64-hex); MUST
+    /// equal the offer's; compared against the serving side's pinned
+    /// params (`params_mismatch`).
+    pub generation_params_hash: String,
+    /// The user's conversation rendered through the profile's pinned chat
+    /// template (ADR-025 application point) and pinned tokenizer, as
+    /// token ids, length ≥ 1, bounded by the msp-v1 §6.4 256 KiB frame
+    /// limit. The serving side does NOT re-derive — the ids ARE the
+    /// contract. Content: see the hygiene note above.
+    pub prompt_tokens: Vec<u32>,
+    /// `hex(sha256(prompt_tokens LE-u32))` — see the type doc.
+    pub pin_commitment: String,
+    /// Single-use per session; enters the session nonce ledger.
+    pub nonce: String,
+    /// Open-phase deadline; the serving side clamps `[1000, 120000]` and
+    /// re-checks before prefill dispatch.
+    pub deadline_ms: u32,
+    /// The coordinator's installation id; MUST equal the id derived from
+    /// the signing key AND the QUIC-authenticated remote PeerId.
+    pub sender: String,
+    /// Base64 Ed25519 over the canonical JSON with this field omitted
+    /// entirely.
+    pub signature: String,
+}
+
+impl WirePinCarrier {
+    /// Validates the commitment against the payload:
+    /// `pin_commitment == pin_commitment_of(prompt_tokens)` (ADR-036
+    /// §3.2 — the `pin_mismatch` admission check's pure core).
+    pub fn commitment_matches(&self) -> bool {
+        self.pin_commitment == pin_commitment_of(&self.prompt_tokens)
+    }
+
+    /// The pure schema/shape validation core (ADR-036 §3.2 — the
+    /// `bad_frame`-class admission checks, first-failure-wins): the
+    /// frozen protocol version, the reserved session-open markers
+    /// (`round == 0`, `seq >= 1`), a non-empty token payload, bare
+    /// lowercase 64-hex hashes, and the commitment BINDING the payload.
+    /// Signature/sender verification and the deadline clamp live at the
+    /// transport-facing admission (node), not here.
+    pub fn validate(&self) -> Result<(), PinCarrierError> {
+        if self.protocol_version != COOPERATIVE_PROTOCOL_VERSION {
+            return Err(PinCarrierError::ProtocolVersion);
+        }
+        if self.round != 0 {
+            return Err(PinCarrierError::RoundNotSessionOpen);
+        }
+        if self.seq < 1 {
+            return Err(PinCarrierError::SeqBaseline);
+        }
+        if self.prompt_tokens.is_empty() {
+            return Err(PinCarrierError::EmptyPromptTokens);
+        }
+        if !is_bare_lower_hex_64(&self.generation_params_hash) {
+            return Err(PinCarrierError::ParamsHashForm);
+        }
+        if !is_bare_lower_hex_64(&self.pin_commitment) {
+            return Err(PinCarrierError::CommitmentForm);
+        }
+        if !self.commitment_matches() {
+            return Err(PinCarrierError::CommitmentMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The pure [`WirePinCarrier::validate`] failures (labels only — no
+/// content rides any error, per the ADR-036 hygiene rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinCarrierError {
+    /// `protocol_version` is not the frozen namespace constant.
+    ProtocolVersion,
+    /// `round` is not the reserved session-open marker `0`.
+    RoundNotSessionOpen,
+    /// `seq` does not establish a valid coordinator baseline (≥ 1).
+    SeqBaseline,
+    /// `prompt_tokens` is empty (length ≥ 1 is the contract).
+    EmptyPromptTokens,
+    /// `generation_params_hash` is not bare lowercase 64-hex.
+    ParamsHashForm,
+    /// `pin_commitment` is not bare lowercase 64-hex.
+    CommitmentForm,
+    /// The commitment does not bind the payload (`pin_mismatch`'s pure
+    /// core).
+    CommitmentMismatch,
+}
+
+impl PinCarrierError {
+    /// Stable label (telemetry/diagnostics vocabulary).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PinCarrierError::ProtocolVersion => "protocol_version",
+            PinCarrierError::RoundNotSessionOpen => "round_not_session_open",
+            PinCarrierError::SeqBaseline => "seq_baseline",
+            PinCarrierError::EmptyPromptTokens => "empty_prompt_tokens",
+            PinCarrierError::ParamsHashForm => "params_hash_form",
+            PinCarrierError::CommitmentForm => "commitment_form",
+            PinCarrierError::CommitmentMismatch => "commitment_mismatch",
+        }
+    }
+}
+
+impl std::fmt::Display for PinCarrierError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Bare lowercase 64-hex (the ADR-032 §1 hash form).
+fn is_bare_lower_hex_64(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The ADR-034 rule-3 / ADR-036 §3.2 commitment construction:
+/// `hex(sha256(tokens rendered as little-endian u32 each))`, NO parent
+/// (unlike the prefix-hash chain). Pure and public so both ends and the
+/// golden vectors share one definition.
+pub fn pin_commitment_of(prompt_tokens: &[u32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for token in prompt_tokens {
+        hasher.update(token.to_le_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 // ---------------------------------------------------------------------------
 // Frozen reason vocabularies
 // ---------------------------------------------------------------------------
@@ -288,6 +458,19 @@ pub enum SessionRejectReason {
     /// 4 (`bad_frame`) with no teardown and no discovery — the honest
     /// reject closes that fail-closed gap.
     ParamsMismatch,
+    /// ADR-036 §3.2 (rule 8's reserved reason, landing): the pin
+    /// carrier's `pin_commitment` does not equal
+    /// `sha256(prompt_tokens LE-u32)` — the commitment does not bind the
+    /// payload it rode with. The string is deliberately identical to the
+    /// frozen probe verdict label so one vocabulary names one fact.
+    PinMismatch,
+    /// ADR-036 §3.1/§3.2: this peer's user-content carriage setting is
+    /// OFF — it refuses to process other users' conversations through
+    /// family verification (default-on posture per the owner directive
+    /// 2026-10-13; the opt-OUT is honest and labeled, never a silent
+    /// drop, and never mislabeled as `pin_mismatch`: a refusal is not a
+    /// mismatch).
+    ContentCarriageRefused,
 }
 
 impl SessionRejectReason {
@@ -300,6 +483,8 @@ impl SessionRejectReason {
             SessionRejectReason::BudgetInfeasible => "budget_infeasible",
             SessionRejectReason::ProfileMismatch => "profile_mismatch",
             SessionRejectReason::ParamsMismatch => "params_mismatch",
+            SessionRejectReason::PinMismatch => "pin_mismatch",
+            SessionRejectReason::ContentCarriageRefused => "content_carriage_refused",
         }
     }
 }

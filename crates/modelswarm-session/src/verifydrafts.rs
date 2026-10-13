@@ -71,7 +71,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::negotiation::{
     CancelRoundReason, EngineDisclosure, FrameRejectReason, SessionAccept, SessionBudget,
-    SessionOffer, SessionRejectReason,
+    SessionOffer, SessionRejectReason, WirePinCarrier,
 };
 use crate::{
     compute_prefix_hash, CommitPrefix, SpecError, DUPLICATE_MEMORY_ROUNDS, GENESIS_PREFIX_HASH,
@@ -443,6 +443,44 @@ pub fn sign_verify_drafts(
     })?;
     let key = SigningKey::from_bytes(&signer.to_bytes());
     Ok(BASE64.encode(key.sign(preimage.as_bytes()).to_bytes()))
+}
+
+/// Signs the ADR-036 pin carrier (the same §1-rule-4 discipline: the
+/// canonical JSON with `signature` omitted entirely). The coordinator
+/// signs; `sender` must be set to the signer's installation id — the
+/// serving side enforces the sender binding against the authenticated
+/// PeerId at admission.
+pub fn sign_pin_carrier(
+    msg: &WirePinCarrier,
+    signer: &InstallationIdentity,
+) -> Result<String, SpecError> {
+    let preimage = signing_preimage(msg).map_err(|e| {
+        SpecError::Protocol(format!(
+            "pin_carrier payload rejected by canonical JSON: {e}"
+        ))
+    })?;
+    let key = SigningKey::from_bytes(&signer.to_bytes());
+    Ok(BASE64.encode(key.sign(preimage.as_bytes()).to_bytes()))
+}
+
+/// Verifies the ADR-036 pin carrier (§1 rule 5 + the
+/// `verify_commit_signature` discipline, same as the family messages):
+/// sender binding FIRST (`installation_id_for(expected_key) == sender`),
+/// then the Ed25519 signature over the signature-omitted canonical
+/// form. The QUIC-authenticated remote-PeerId equality stays with the
+/// serve loop (msp-v1 §6.6) — the only place that knows the stream's
+/// peer id.
+pub fn verify_pin_carrier_signature(
+    msg: &WirePinCarrier,
+    expected_key: &VerifyingKey,
+) -> Result<(), SpecError> {
+    verify_family_signature(
+        msg,
+        &msg.sender,
+        &msg.signature,
+        expected_key,
+        "pin_carrier",
+    )
 }
 
 /// Signs a [`VerifyDraftsResult`] (same discipline as

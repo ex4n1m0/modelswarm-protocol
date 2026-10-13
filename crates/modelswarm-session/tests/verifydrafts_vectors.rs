@@ -51,6 +51,8 @@ const SESSION_OFFER_3: &str = include_str!("../../../protocol/vectors/session-of
 const SESSION_ACCEPT_1: &str = include_str!("../../../protocol/vectors/session-accept-1.json");
 const SESSION_ACCEPT_2: &str = include_str!("../../../protocol/vectors/session-accept-2.json");
 const SESSION_REJECT_1: &str = include_str!("../../../protocol/vectors/session-reject-1.json");
+const PIN_CARRIER_1: &str = include_str!("../../../protocol/vectors/pin-carrier-1-accept.json");
+const PIN_CARRIER_2: &str = include_str!("../../../protocol/vectors/pin-carrier-2-mismatch.json");
 const COMMIT_CARRIER: &str =
     include_str!("../../../protocol/vectors/verifydrafts-5-commit-carrier.json");
 
@@ -1093,7 +1095,7 @@ fn golden_session_accept_2_engine_disclosure() {
 }
 
 #[test]
-fn golden_session_reject_1_all_six_reasons() {
+fn golden_session_reject_1_all_reasons() {
     let f = doc(SESSION_REJECT_1);
     assert_eq!(f["name"].as_str().unwrap(), "session-reject-1");
     let primary_fields = check_canonical_block(&f["primary"]);
@@ -1103,8 +1105,9 @@ fn golden_session_reject_1_all_six_reasons() {
     let reasons = f["reasons"].as_array().expect("reasons list");
     assert_eq!(
         reasons.len(),
-        6,
-        "all six frozen reasons are recorded (four pre-revision-4 + the two v3 reasons)"
+        8,
+        "the frozen ADR-032 six (four pre-revision-4 + the two v3 reasons) \
+         plus the two ADR-036 carrier reasons"
     );
     let mut seen: Vec<&str> = Vec::new();
     for block in reasons {
@@ -1120,11 +1123,14 @@ fn golden_session_reject_1_all_six_reasons() {
             "backend_mismatch",
             "batch_verify_unsupported",
             "budget_infeasible",
+            "content_carriage_refused",
             "params_mismatch",
+            "pin_mismatch",
             "preset_unavailable",
             "profile_mismatch"
         ],
-        "the frozen six-reason vocabulary (ADR-032 §3 / A-4 + revision 4 §3/G3)"
+        "the frozen vocabulary (ADR-032 §3 / A-4 + revision 4 §3/G3 + the \
+         ADR-036 §3.2 carrier reasons)"
     );
 }
 
@@ -1393,4 +1399,68 @@ fn golden_fixture_set_shares_one_anchor_and_keypair() {
         );
         assert_ne!(coord.to_bytes(), verif.to_bytes());
     }
+}
+
+/// The ADR-036 pin-carrier golden vectors: the ACCEPT case replays the
+/// strict bare-object canonical form, the signature-omitted preimage,
+/// the LE-u32 commitment, and the signature verification with the
+/// fixture key; the MISMATCH case pins the pure-core failure behind the
+/// `pin_mismatch` session reject.
+#[test]
+fn golden_pin_carrier_1_accept() {
+    use modelswarm_session::negotiation::{pin_commitment_of, WirePinCarrier};
+    use modelswarm_session::verifydrafts::{sign_pin_carrier, verify_pin_carrier_signature};
+    use modelswarm_transport::ed25519_dalek::SigningKey;
+
+    let f = doc(PIN_CARRIER_1);
+    assert_eq!(f["name"].as_str().unwrap(), "pin-carrier-1-accept");
+    let wire_fields = check_canonical_block(&f["wire"]);
+    let preimage_fields = check_canonical_block(&f["preimage"]);
+
+    // The preimage omits `signature` entirely; the wire carries it.
+    assert!(preimage_fields.get("signature").is_none());
+    assert!(wire_fields.get("signature").is_some());
+
+    let carrier: WirePinCarrier = serde_json::from_value(wire_fields.clone()).unwrap();
+    assert_eq!(carrier.round, 0, "the reserved session-open marker");
+    assert_eq!(carrier.seq, 1, "the coordinator baseline");
+    // The commitment is the rule-3 LE-u32 construction over the payload.
+    assert_eq!(
+        carrier.pin_commitment,
+        pin_commitment_of(&carrier.prompt_tokens)
+    );
+    assert_eq!(carrier.validate(), Ok(()));
+
+    // Fixture identity binding + signature verification (sender
+    // binding FIRST, then Ed25519 over the pinned preimage).
+    let seed: [u8; 32] = hex::decode(f["coordinator_seed_hex"].as_str().unwrap())
+        .expect("fixture seed hex")
+        .try_into()
+        .expect("32-byte seed");
+    let identity = InstallationIdentity::from_bytes(&seed);
+    assert_eq!(
+        carrier.sender,
+        f["coordinator_installation_id"].as_str().unwrap()
+    );
+    let verifying = SigningKey::from_bytes(&seed).verifying_key();
+    assert!(verify_pin_carrier_signature(&carrier, &verifying).is_ok());
+    // Determinism: re-signing the pinned carrier reproduces the pinned
+    // signature (canonical form + key discipline byte-stable).
+    let mut resigned = carrier.clone();
+    resigned.signature = sign_pin_carrier(&resigned, &identity).unwrap();
+    assert_eq!(resigned.signature, carrier.signature);
+}
+
+#[test]
+fn golden_pin_carrier_2_mismatch() {
+    use modelswarm_session::negotiation::{PinCarrierError, WirePinCarrier};
+
+    let f = doc(PIN_CARRIER_2);
+    assert_eq!(f["name"].as_str().unwrap(), "pin-carrier-2-mismatch");
+    let fields = check_canonical_block(&f);
+    let carrier: WirePinCarrier = serde_json::from_value(fields).unwrap();
+    // Well-formed 64-hex commitment that does NOT bind the payload: the
+    // pure core behind the serving side's `pin_mismatch` reject.
+    assert_eq!(carrier.validate(), Err(PinCarrierError::CommitmentMismatch));
+    assert_eq!(f["expected_reject"].as_str().unwrap(), "pin_mismatch");
 }

@@ -20,7 +20,8 @@
 use modelswarm_runtime::SamplingParams;
 use modelswarm_session::negotiation::{
     Backend, CancelRoundReason, EngineDisclosure, FrameRejectReason, Preset, SessionAccept,
-    SessionBudget, SessionOffer, SessionReject, SessionRejectReason, COOPERATIVE_PROTOCOL_VERSION,
+    SessionBudget, SessionOffer, SessionReject, SessionRejectReason, WirePinCarrier,
+    COOPERATIVE_PROTOCOL_VERSION,
 };
 use modelswarm_session::verifydrafts::{
     batch_generation_params_hash, CancelRoundFrame, RejectionFrame, VerifyDrafts,
@@ -30,15 +31,17 @@ use modelswarm_transport::message::WireMessage;
 use serde_json::Value;
 
 /// The family's discriminant keys, EXACTLY as ADR-032 revision 4 §2 rule
-/// (i) enumerates them: `window_tokens`, `accepted_token_ids`, plus the
+/// (i) enumerates them plus the two ADR-036 carrier keys
+/// (`pin_commitment`, `prompt_tokens` — §4 of that ADR joins them to the
+/// rule-(i) enumerated set): `window_tokens`, `accepted_token_ids`, the
 /// negotiation/result/reject keys (`preset`, `budget`,
-/// `verifier_backend`, `engine`, `reason`, `nonce_echo`, `code`). The
-/// `accepted_token_ids` entry is the §2 `PrefixCommit` carrier's
-/// discriminant — its field set is byte-pinned by the
-/// `verifydrafts-5-commit-carrier.json` golden vector (the node-side
-/// `WirePrefixCommit` mirror is feature-gated and not visible to
-/// default-feature tests).
-const FAMILY_DISCRIMINANT_KEYS: [&str; 9] = [
+/// `verifier_backend`, `engine`, `reason`, `nonce_echo`, `code`), and
+/// the pin-carrier's. The `accepted_token_ids` entry is the §2
+/// `PrefixCommit` carrier's discriminant — its field set is byte-pinned
+/// by the `verifydrafts-5-commit-carrier.json` golden vector (the
+/// node-side `WirePrefixCommit` mirror is feature-gated and not visible
+/// to default-feature tests).
+const FAMILY_DISCRIMINANT_KEYS: [&str; 11] = [
     "window_tokens",
     "accepted_token_ids",
     "preset",
@@ -48,6 +51,8 @@ const FAMILY_DISCRIMINANT_KEYS: [&str; 9] = [
     "reason",
     "nonce_echo",
     "code",
+    "pin_commitment",
+    "prompt_tokens",
 ];
 
 /// Extracts the LIVE set of `WireMessage` variant tags from serde's own
@@ -155,6 +160,23 @@ fn section6_tags_and_family_discriminant_keys_are_disjoint() {
         round: Some(1),
         prefix_hash: None,
     };
+    // The ADR-036 pin carrier — a real shape, so `pin_commitment` and
+    // `prompt_tokens` are live keys from the type itself (the strict
+    // `deny_unknown_fields` form is pinned by the pin-carrier vectors).
+    let pin_carrier = WirePinCarrier {
+        session_id: offer.session_id.clone(),
+        protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
+        seq: 1,
+        round: 0,
+        profile_id: offer.profile_id.clone(),
+        generation_params_hash: offer.generation_params_hash.clone(),
+        prompt_tokens: vec![11, 22, 33],
+        pin_commitment: modelswarm_session::negotiation::pin_commitment_of(&[11, 22, 33]),
+        nonce: "disjoint-carrier-nonce".to_string(),
+        deadline_ms: 2_500,
+        sender: "coordinator".to_string(),
+        signature: String::new(),
+    };
     let request = VerifyDrafts {
         session_id: offer.session_id.clone(),
         protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
@@ -192,6 +214,7 @@ fn section6_tags_and_family_discriminant_keys_are_disjoint() {
         serde_json::to_value(&frame_reject).unwrap(),
         serde_json::to_value(&request).unwrap(),
         serde_json::to_value(&result).unwrap(),
+        serde_json::to_value(&pin_carrier).unwrap(),
     ];
     let mut live_keys: Vec<&str> = Vec::new();
     for shape in &shapes {

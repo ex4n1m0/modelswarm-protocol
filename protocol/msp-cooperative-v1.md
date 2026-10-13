@@ -20,7 +20,11 @@ gap).
 
 Transport and framing inherit msp-v1 §6 (QUIC + Noise, request-scoped
 streams). This namespace carries no prompt or completion content beyond
-what the §6 stream already carries; the hub never sees any of it.
+what the §6 stream already carries, with ONE narrow exception (ADR-036):
+the user-content session-open pin carrier, which carries the requesting
+user's conversation as token ids to the verifying peers of an explicitly
+elected family session (serving-side carriage default-on); the hub never
+sees any of it — unconditionally.
 
 **ADR-032 cross-reference (Accepted 2026-10-11, revision 2):** ADR-032
 specifies the batched speculative-verification family (`VerifyDrafts` /
@@ -44,6 +48,24 @@ offer without a preceding carrier remains valid. The discriminant key
 `lease` is a family discriminant key under ADR-032 §2 rule (i). This note
 records frozen vocabulary under ADR-032 revision 5's authority and adds no
 new fields to the §2 offer below.
+
+**ADR-036 freeze record (2026-10-13):** family sessions may carry user
+conversation content as token ids via a session-open PIN CARRIER —
+coordinator → serving peer, after the `lease` carrier (when presented)
+and immediately before the `SessionOffer` — a strict bare object
+(`deny_unknown_fields`) binding the full ADR-032 §2 set (`session_id`,
+`protocol_version`, `seq`, `round: 0`, `profile_id`,
+`generation_params_hash`, `nonce`, `deadline_ms`, `sender`,
+`signature`) plus `prompt_tokens` and `pin_commitment`, where
+`pin_commitment = hex(sha256(prompt_tokens as little-endian u32 each))`
+(the ADR-034 rule-3 construction, no parent; the prefix chain still
+starts at `GENESIS_PREFIX_HASH`). The `SessionReject` reason vocabulary
+extends to `pin_mismatch | content_carriage_refused` (the G3 class).
+The discriminant keys `pin_commitment` and `prompt_tokens` join the
+ADR-032 §2 rule-(i) enumerated family discriminant keys. The carrier is
+consumed by the session-open reader before the serve loop and never
+reaches the frame router. Full contract, gates, and the owner directive
+live in ADR-036.
 
 ## 2. SessionOffer (the only wire addition authorized by ADR-029)
 
@@ -105,8 +127,10 @@ internals stay internal while every result stays explainable.
 - Overwriting the msp-v1 §7 receipt shape in place — forbidden; receipts v2
   is a NEW signed object with its own golden vectors.
 - Changing `JobResultSchema.intake` semantics on the tracker — forbidden.
-- Prompt/completion content anywhere in this namespace — forbidden
-  (content-blind).
+- Prompt/completion content anywhere in this namespace — forbidden,
+  with the ONE narrow exception of ADR-036's user-content session-open
+  pin carrier (explicitly elected, carriage-default-on; serving peers
+  refuse honestly when opted out). The hub-blind rule has NO exception.
 
 ## 6. Preset tier table (governed by ADR-029; mirrored for implementers)
 

@@ -227,3 +227,25 @@ out-of-band prompt file as the product boundary) · the disposition reviews
 risk 2) · ADR-025 (template application point), ADR-011/022 (profile
 immutability), ADR-026 (the lease gate the carrier rides), ADR-031 (the
 C-API adapter), E0 determinism.
+
+## Revision note (2026-10-13, ADR-036): the rule-8 carrier lands, in its owner-directed user-content form
+
+The owner directive of 2026-10-13 ("the idea of a swarm is that all
+agents work together, privacy is not a concern at this moment") selected
+Option 2 of `docs/reviews/adr034-rule8-options-2026-10-13.md`: ADR-036
+lands rule 8's reserved carrier as the USER-CONTENT pin carrier (the
+conversation as token ids plus the rule-3 commitment), with serving-side
+carriage DEFAULT ON, extending the `SessionReject` vocabulary with
+`pin_mismatch | content_carriage_refused`. Rule 5's closing statement is
+superseded for carrier sessions: family sessions MAY carry user
+conversation content via the ADR-036 carrier under its election and
+disclosure contract. Rules 1–5 stand UNCHANGED for carrier-less
+(neutral-root) sessions; the expert file continues to rule the neutral
+pin. Rule 6b's E0 caveat extends verbatim to carrier sessions: divergence
+labels mean context-or-backend divergence class, never proof that a
+specific peer lied. Rule 7's protocol-parameter analysis does NOT
+transfer to user-content commitments (content-derived: local
+status/diagnostics only, never telemetry). The `family.engage` label
+`blocked_content_contract` remains frozen vocabulary with a narrowed
+meaning: it fires when the user-content carrier path is not elected or
+not locally available, never as a blanket content block.

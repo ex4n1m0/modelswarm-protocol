@@ -864,3 +864,27 @@ promotion checker and verdict artifact are Scheduler
   against invariants (a)–(c) and must be treated as such.
 − Key hygiene is now a permanent operator obligation (rotation rule §3.5;
   the guards scan is the backstop, not the defense).
+
+## Revision note (2026-10-13, ADR-037): the assistant surface and the expanded advisory role
+
+The owner directive of 2026-10-13 ("…as long as the main rule of not
+responding chat questions is solid… make this api key talk to the user
+about the recommended model for his machine… take a more active role in
+the management… i will support these costs") extends the plane via
+ADR-037. Amended, exactly and only as follows. §2's non-goal "No
+user-facing chat" is superseded SOLELY by the creation of ADR-037's
+separate assistant channel under its chat wall (ADR-037 §3.1, W1–W6);
+the other half of that non-goal — the swarm chat box and every
+completion path never reaching this plane — is PERMANENT and now
+structurally pinned (ADR-037 §6). Invariant (a) gains one named
+exception: the user's own assistant-channel text, under ADR-037 §3.5's
+disclosure, sourcing (W3), and scrub rules; it is unchanged for every
+swarm/serving surface. The §2 suggestion vocabulary extends with
+`peer_pattern_note | catalog_presentation_hint` (display-only). The §4
+config table gains the nine `assistant.*` rows (ADR-037 §3.4);
+`max_calls_per_day` 24 remains the DIGEST-plane cap. The §6 gap
+vocabulary gains `rate_limited | request_oversized` (14 values). §9.2
+gains items (10)–(14) (ADR-037 §4.4). The four invariants (a)–(d), the
+§5 promotion bar, and the §3.2–§3.4 mechanics are otherwise unchanged;
+the §3.5 rotation is deferred by standing owner directive until the
+owner calls for it (ADR-037 §3.6 records the accepted risk).

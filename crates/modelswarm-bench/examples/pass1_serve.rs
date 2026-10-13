@@ -106,7 +106,9 @@ async fn main() {
     // LAN IP" — resolve it the way the desktop heartbeat does (UDP
     // connect picks the default-route source address), so the printed
     // multiaddr is dialable cross-machine. An explicit IP binds+advertises
-    // itself. Off-loopback listens need MSP_LISTENER=1 (set by the bat).
+    // itself. (The listener bind itself passes the explicit
+    // ListenOptions::allow_off_loopback() opt-in downstream — MSP_LISTENER
+    // is retired.)
     let advertised_ip = if bind_ip == "0.0.0.0" {
         let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("udp bind");
         sock.connect("8.8.8.8:80")
@@ -115,7 +117,6 @@ async fn main() {
     } else {
         bind_ip.clone()
     };
-    std::env::set_var("MSP_LISTENER", "1");
 
     println!(
         "# pass1-serve: {bridges} bridges (pool {pool}), inject {inject_ms} ms, profile {profile}, advertise {advertised_ip}"

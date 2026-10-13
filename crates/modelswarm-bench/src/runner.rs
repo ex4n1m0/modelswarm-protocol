@@ -347,7 +347,8 @@ pub struct BridgeConfig {
     /// Socket bind address for the serving listener. Defaults to
     /// `127.0.0.1` (loopback harness); the LAN serve side passes the
     /// machine's real LAN IP so the advertised multiaddr is dialable
-    /// cross-machine (off-loopback requires `MSP_LISTENER=1`).
+    /// cross-machine (off-loopback binds pass the explicit
+    /// `ListenOptions::allow_off_loopback()` opt-in).
     pub bind_addr: String,
 }
 
@@ -547,7 +548,10 @@ pub async fn spawn_bridge(
     )))
     .map_err(|e| format!("transport: {e}"))?;
     let listener = transport
-        .listen(&(config.bind_addr.clone() + ":0"))
+        .listen_with(
+            &(config.bind_addr.clone() + ":0"),
+            modelswarm_transport::libp2p_backend::ListenOptions::allow_off_loopback(),
+        )
         .await
         .map_err(|e| format!("listen: {e}"))?;
     let peer_id = transport.peer_id().to_string();

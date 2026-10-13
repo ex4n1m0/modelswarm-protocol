@@ -132,6 +132,44 @@ profile.
    evidence or a second consumer demands it; nothing in tier 1 (rules
    1–7) depends on it.
 
+## Revision note (2026-10-13, folded at protocol review of the v0.2.23 batch): stable label vocabularies
+
+The v0.2.23 shipped tier (commit 3a0bb60; protocol review
+`docs/reviews/review-v0223-batch-protocol-2026-10-13.md`, verdict
+approve-with-required-changes) extends rule 6's label set. The complete
+stable inventory, frozen as of the tester distribution (renaming any of
+these is a telemetry-compat break):
+
+- **Probe/pairing verdicts** (`family.probe.pairing`, counts only):
+  `pairing_confirmed | pin_mismatch | pin_unpinned | draft_unavailable |
+  local_selfcheck | selfcheck_unavailable`. `local_selfcheck` and
+  `selfcheck_unavailable` are the 2026-10-13 coordinator self-check gate
+  (every drafted window re-verified through a fresh cache-cold local
+  engine before it may hit the wire; fail-closed — a locally divergent
+  or uncheckable window is never sent).
+- **`pairing_detail` labels** (the Err-branch reasons, riding the same
+  event since the same batch): `rejected | cancelled | violation |
+  torn_down | dropped | timed_out | window_too_large |
+  session_torn_down | unparsable_result | io`.
+- **Chat engage ladder** (`family.engage`, labels + counts): 
+  `capability_unknown | capability_false | backend_mismatch |
+  gate_unmeasured | gate_no_win | blocked_content_contract |
+  gate_misconfigured` — pinned priority order: capability facts before
+  backend pairing before measurement presence before gate arithmetic
+  before the rule-5 content block, `gate_misconfigured` last.
+  `backend_mismatch` deliberately echoes the frozen `SessionReject`
+  reason (ADR-032 §3); the coordinator-side labels are their own
+  telemetry/UI namespace, never a wire frame. The margin actually used
+  is recorded in every `family.engage` event, rendered from the
+  scheduler's `DEFAULT_CONFIDENCE_MARGIN` (0.15; 0.05 is the reject
+  floor).
+
+All three vocabularies are bound by the counts-only rule: no token ids,
+prompts, or completions in any field. The capability source for the
+ladder is the family `SessionAccept` engine disclosure learned by the
+probe (no roster/wire field carries capability; a roster pre-filter
+column, if ever warranted, rides its own ADR).
+
 ## Resource note (recorded consequence)
 
 Removing the manual file removes the de-facto opt-in the light-up record

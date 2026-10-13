@@ -434,11 +434,10 @@ fn log_event(telemetry: &Telemetry, level: &str, event: &str, fields: &[(&str, &
 
 /// The serving-listener gate decision, pure and env-independent (owner
 /// directive 2026-10-13): the persisted "allow swarm pairing" toggle is
-/// the product gate — `MSP_LISTENER` is no longer READ here. The transport
-/// crate's own ADR-018 non-loopback guard still consults its env contract
-/// internally, so the bind path SETS it (never the reverse) when pairing
-/// is allowed; that hand-off is recorded in the handoff as the Network
-/// Engineer's seam.
+/// the product gate. Since the Network Engineer's `ListenOptions` landing
+/// (8d2284c) the transport's ADR-018 non-loopback guard takes an explicit
+/// typed opt-in (`listen_with(.., allow_off_loopback())`) — `MSP_LISTENER`
+/// is retired; nothing sets or reads it anymore.
 #[derive(Debug, PartialEq)]
 enum ListenerGate {
     /// The toggle allows pairing — proceed to bind.
@@ -483,12 +482,10 @@ async fn bind_serving_listener(
     if listener_gate(allow_swarm_pairing) == ListenerGate::Disabled {
         return ListenerBind::Disabled;
     }
-    // The transport's ADR-018 guard refuses non-loopback binds without its
-    // env contract; the toggle is the USER-facing decision, so satisfy the
-    // guard on the user's behalf (this process binds exactly what the
-    // toggle allowed). Cross-crate seam: the guard should take an explicit
-    // opt-in parameter — recorded for the Network Engineer.
-    std::env::set_var("MSP_LISTENER", "1");
+    // The ADR-018 guard is satisfied EXPLICITLY now (the Network
+    // Engineer's ListenOptions landing, 8d2284c): the toggle-allowed bind
+    // passes the typed opt-in — no process-global env detour. MSP_LISTENER
+    // is retired; nothing reads it anymore.
     let identity = match load_or_create_identity(data_dir, telemetry) {
         Ok(identity) => identity,
         Err(e) => {
@@ -515,7 +512,13 @@ async fn bind_serving_listener(
             return ListenerBind::Failed(detail);
         }
     };
-    let listener = match backend.listen("0.0.0.0:0").await {
+    let listener = match backend
+        .listen_with(
+            "0.0.0.0:0",
+            modelswarm_transport::libp2p_backend::ListenOptions::allow_off_loopback(),
+        )
+        .await
+    {
         Ok(l) => l,
         Err(e) => {
             let detail = format!("bind 0.0.0.0:0: {e}");
@@ -3504,8 +3507,9 @@ fn record_shadow_failure(
 // fills (the family `SessionAccept` disclosure is the only existing
 // capability surface — the roster carries NO batch-verify field, and
 // inventing one is a wire change needing an ADR). The gate itself is the
-// scheduler's frozen public rule (`should_engage_cooperative`, margin ≥
-// 0.05, fastest-single comparator).
+// scheduler's frozen public rule (`should_engage_cooperative`,
+// DEFAULT_CONFIDENCE_MARGIN 0.15 — 0.05 is only the reject floor —
+// fastest-single comparator).
 //
 // What is BLOCKED at the protocol boundary (recorded, not improvised):
 // routing a CHAT completion through a verifydrafts cooperative session
@@ -3599,6 +3603,13 @@ async fn family_engage_checkpoint(
         ("peer", peer_id.to_string()),
         ("engaged", "false".to_string()),
         ("reason", reason.to_string()),
+        // R2 (protocol review 2026-10-13): the scheduler's frozen rule
+        // requires the margin actually used in every run record — rendered
+        // from the constant so it can never drift from the gate arithmetic.
+        (
+            "margin",
+            format!("{}", modelswarm_scheduler::DEFAULT_CONFIDENCE_MARGIN),
+        ),
     ];
     if let Some(cap) = &cap {
         // The learned disclosure rides along (counts/labels only) so the

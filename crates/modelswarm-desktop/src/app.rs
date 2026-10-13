@@ -854,77 +854,42 @@ async fn ensure_family_pin(
 /// bridge (honest degradation, never a silent family-off). Every `None`
 /// path telemeters its stable reason and mirrors it in the returned
 /// [`FamilyStatus`].
-/// The resource ceiling the family tier respects while the M2 governor is
-/// not yet the enforcement authority: gate D11's 70% number (the ADR-034
-/// resource note records the RAM/VRAM-doubling posture against exactly
-/// this ceiling). This is a DESKTOP-SIDE honest degrade, advisory-grade
-/// until the Resource Engineer's governor owns enforcement — see the
-/// handoff for the coordination seam.
-#[cfg(feature = "verifydrafts")]
-const FAMILY_RESOURCE_CEILING_PERCENT: u64 = 70;
-
 /// The family-tier resource verdict (owner-flagged binding constraint):
 /// starting the in-process verify engine alongside the serving sidecar
-/// roughly doubles the model's resident footprint. As currently
-/// observable (one platform resource sample + the once-per-process
-/// hardware detection), project the doubling against the ceiling and
-/// degrade with the exact numbers when it would breach. Unobservable
-/// inputs (null sample fields, no GPU detection) are NOT guessed: the
-/// check passes and the gap is logged — honesty, not a fabricated block.
+/// roughly doubles the model's resident footprint. Since the M2 governor
+/// landing (ADR-035, cb57b87) this delegates to the ENFORCEMENT-authority
+/// governor — the D11 70% ceiling projection plus the winjob commit-cap
+/// backstop armed on Admit. Two intentional upgrades over the retired
+/// advisory check (pinned by the governor's tests): unobservable inputs
+/// fail CLOSED (degrade with the exact reason — never a guessed number,
+/// never a silent pass), and KV overhead is not yet modelable
+/// pre-construction, so the verdict carries the explicit
+/// `KnowledgeGap::KvUnmodeled` (ADR-035 §3).
 #[cfg(feature = "verifydrafts")]
 async fn family_resource_verdict(
     weights_bytes: u64,
     hardware: &HardwareInfo,
     serving_backend: Option<&str>,
-) -> Result<(), String> {
-    let mb = |b: u64| b / 1_000_000;
-    let sample = tokio::task::spawn_blocking(|| {
-        let mut sampler = modelswarm_resource::ResourceSampler::platform(
+) -> Result<modelswarm_resource::GovernorVerdict, String> {
+    let vram_total_bytes = hardware.gpu.as_ref().map(|g| g.vram_mb * 1_000_000);
+    let lands_in_vram = serving_backend == Some("vulkan");
+    tokio::task::spawn_blocking(move || {
+        let mut governor = modelswarm_resource::ResourceGovernor::platform(
             modelswarm_resource::ProcessScope::Roots(vec![std::process::id()]),
         );
-        sampler.sample()
+        governor.evaluate(&modelswarm_resource::AdmissionRequest {
+            added_weights_bytes: weights_bytes,
+            // HONEST MAPPING TODAY (ADR-035 §3): no public runtime API
+            // sizes the not-yet-constructed verify engine's KV — None
+            // carries KnowledgeGap::KvUnmodeled explicitly.
+            added_kv_bytes: None,
+            added_copy_lands_in_vram: lands_in_vram,
+            vram_total_bytes,
+            arm_tree_commit_cap: true,
+        })
     })
     .await
-    .map_err(|e| format!("resource sample task failed: {e}"))?;
-    if let (Some(used), Some(total)) = (sample.system_ram_used_bytes, sample.system_ram_total_bytes)
-    {
-        let projected = used.saturating_add(weights_bytes);
-        let ceiling = total.saturating_mul(FAMILY_RESOURCE_CEILING_PERCENT) / 100;
-        if projected > ceiling {
-            return Err(format!(
-                "system RAM: projected {}/{} MB would pass the {}% ceiling ({} MB in use + the verify engine's {} MB copy)",
-                mb(projected),
-                mb(total),
-                FAMILY_RESOURCE_CEILING_PERCENT,
-                mb(used),
-                mb(weights_bytes)
-            ));
-        }
-    }
-    // VRAM doubling applies when the family bundle will be the Vulkan
-    // class (it follows the serving variant); the sidecar already holds
-    // the weights in VRAM then, and the C-API copy would hold them again.
-    if serving_backend == Some("vulkan") {
-        if let (Some(used), Some(total_mb)) = (
-            sample.gpu_vram_used_bytes,
-            hardware.gpu.as_ref().map(|g| g.vram_mb),
-        ) {
-            let total = total_mb.saturating_mul(1_000_000);
-            let projected = used.saturating_add(weights_bytes);
-            let ceiling = total.saturating_mul(FAMILY_RESOURCE_CEILING_PERCENT) / 100;
-            if projected > ceiling {
-                return Err(format!(
-                    "VRAM: projected {}/{} MB would pass the {}% ceiling ({} MB in use + the verify engine's {} MB copy)",
-                    mb(projected),
-                    mb(total),
-                    FAMILY_RESOURCE_CEILING_PERCENT,
-                    mb(used),
-                    mb(weights_bytes)
-                ));
-            }
-        }
-    }
-    Ok(())
+    .map_err(|e| format!("resource governor task failed: {e}"))
 }
 
 #[cfg(feature = "verifydrafts")]
@@ -965,33 +930,61 @@ async fn compose_family_serving(
     // the engine's REAL geometry; the status below reports the same
     // real geometry, never this field.)
 
-    // The owner-flagged binding constraint, made honest: family-by-default
-    // means the verify engine's memory coexists with the sidecar. As
-    // currently observable, a projected breach of the D11 ceiling degrades
-    // the family tier with the exact numbers (the governor — the real
-    // enforcement authority — is the Resource Engineer's crate and is NOT
-    // touched here; see the handoff for the coordination seam).
-    if let Err(detail) =
-        family_resource_verdict(weights_bytes, hardware, handle.engine_backend.as_deref()).await
-    {
-        log_event(
-            telemetry,
-            "warn",
-            "family.fallback",
-            &[
-                ("reason", "resource_ceiling"),
-                (
-                    "ceiling_percent",
-                    &FAMILY_RESOURCE_CEILING_PERCENT.to_string(),
-                ),
-                ("detail", &detail),
-            ],
-        );
-        return (
-            None,
-            FamilyStatus::off_detail("resource_ceiling", detail),
-            None,
-        );
+    // The owner-flagged binding constraint, now under the M2 governor's
+    // enforcement authority (ADR-035): family-by-default means the verify
+    // engine's memory coexists with the sidecar; the governor projects the
+    // doubling against the D11 70% ceiling AND arms the winjob commit-cap
+    // backstop on Admit. Unobservables degrade fail-closed with the exact
+    // reason; the verdict's reason/gaps/enforcement ride the telemetry.
+    match family_resource_verdict(weights_bytes, hardware, handle.engine_backend.as_deref()).await {
+        Ok(verdict) if verdict.decision == modelswarm_resource::Decision::Admit => {}
+        Ok(verdict) => {
+            let detail = verdict.detail_line();
+            let governor_reason = verdict
+                .reason
+                .as_ref()
+                .map(|r| r.label())
+                .unwrap_or("unknown");
+            let gaps = verdict
+                .gaps
+                .iter()
+                .map(|g| g.label())
+                .collect::<Vec<_>>()
+                .join(",");
+            let enforcement = verdict.enforcement.label();
+            log_event(
+                telemetry,
+                "warn",
+                "family.fallback",
+                &[
+                    ("reason", "resource_ceiling"),
+                    ("governor_reason", governor_reason),
+                    ("gaps", &gaps),
+                    ("enforcement", enforcement),
+                    ("detail", &detail),
+                ],
+            );
+            return (
+                None,
+                FamilyStatus::off_detail("resource_ceiling", detail),
+                None,
+            );
+        }
+        Err(detail) => {
+            // The governor itself could not run (spawn failure) — the
+            // honest degrade carries that exact transport-level fact.
+            log_event(
+                telemetry,
+                "warn",
+                "family.fallback",
+                &[("reason", "governor_unavailable"), ("detail", &detail)],
+            );
+            return (
+                None,
+                FamilyStatus::off_detail("governor_unavailable", detail),
+                None,
+            );
+        }
     }
 
     // The engine source for THIS build.

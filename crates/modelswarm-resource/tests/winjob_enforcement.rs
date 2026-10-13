@@ -107,7 +107,8 @@ fn governor_admit_arms_the_real_winjob_seam() {
     assert_eq!(modelswarm_winjob::tree_memory_cap_bytes(), 4_100 * MB);
     let caps = modelswarm_winjob::retained_job_commit_caps();
     assert!(
-        caps.iter().all(|&c| (4_100 * MB - 4096..=4_100 * MB).contains(&c)),
+        caps.iter()
+            .all(|&c| (4_100 * MB - 4096..=4_100 * MB).contains(&c)),
         "every retained job capped (kernel may round down one page): {caps:?}"
     );
 

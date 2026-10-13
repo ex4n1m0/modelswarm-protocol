@@ -1,0 +1,8 @@
+# Tracker-local attributes (Tracker Engineer owned path).
+# The checksum manifest is consumed verbatim by POSIX `sha256sum -c` /
+# macOS `shasum -a 256 -c` via /downloads/SHA256SUMS.txt: a CRLF smudge
+# from core.autocrlf on the staging machine appends \r to every filename
+# and breaks verification for Linux/macOS users. Pin to LF in the
+# repository AND on checkout (mirrors the root rules for *.sh/*.yml,
+# kept local to apps/tracker/ to avoid a cross-path edit).
+public/downloads/SHA256SUMS.txt text eol=lf

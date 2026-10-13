@@ -32,12 +32,30 @@ technically read any prompt it serves. This is stated plainly at onboarding.
 Mitigation posture: invite-only swarm in v0.1, encrypted transport, no
 confidential-computing claims.
 
-**Planned change (follow-up track, gated):** the experimental cooperative
-modes in `docs/cooperative-plan.md` would deliver the prompt to a micro-swarm
-of 2–8 peers instead of one, multiplying exposure. If and when that track
-passes its prerequisite gate, this document must be updated with the exact
-recipient set per mode and the onboarding disclosure reworded before any
-cooperative request is served.
+**Family-verified chat (ADR-036, live):** an explicitly ELECTED mode (the
+chat-surface toggle, default OFF) opens a carrier session: the conversation —
+rendered through the pinned chat template and tokenizer, as token ids — goes
+to every verification peer of the turn (the actual cohort count N is shown in
+the always-visible disclosure; N is bounded by the preset cohort cap and the
+session budget's `max_endpoints` — 1 in the shipped configuration — plus the
+requester's own machine). Token ids are not encryption: a peer hosting the
+same exact profile holds the tokenizer and reads them trivially, and the
+disclosures say so. This mode is SLOWER than single-peer chat by design, not
+faster. The hub stays content-blind unconditionally. On the serving side,
+carrying other users' conversations through family verification is ON by
+default (owner directive 2026-10-13); the opt-out refuses carrier sessions
+with the honest `content_carriage_refused` reject, and the always-visible
+family-status disclosure states the posture. Telemetry stays counts-only for
+this mode: token counts yes; token ids, arrays, and content-derived hashes
+(including the pin commitment) never.
+
+**Planned change (follow-up track, gated):** the remaining experimental
+cooperative modes in `docs/cooperative-plan.md` (approximate tiers,
+multi-proposer trees, cross-machine speculative decode) would deliver the
+prompt to a micro-swarm of peers under research protocols. Until that track
+passes its prerequisite gate, this paragraph's obligation stands for those
+modes: the exact recipient set per mode must be recorded here and the
+onboarding disclosure reworded before any such cooperative request is served.
 
 ## 3. Secrets handling
 

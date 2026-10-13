@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MSP ADR-036 UI harness — carriage + family-verified chat</title>
+  <style>
+    body { font: 13px/1.5 system-ui, sans-serif; color: #e8edf7; background: #10141c; margin: 1.5rem; }
+    h1 { font-size: 16px; } h2 { font-size: 13px; color: #9aa7bf; text-transform: uppercase; }
+    .pass { color: #43c78f; } .fail { color: #e06565; }
+    td, th { text-align: left; padding: 3px 10px 3px 0; border-bottom: 1px solid #2c3850; }
+    code { color: #a855f7; }
+  </style>
+</head>
+<body>
+  <h1>ADR-036 harness — the carriage disclosure + the family-verified-chat election</h1>
+  <p>Loads the REAL <code>../ui/index.html</code> into a same-origin 1152×648 iframe with a stubbed
+  <code>window.__TAURI__</code> bridge, then asserts (ADR-036 §3.1, normative UI contract): the
+  serving-side carriage disclosure is ALWAYS VISIBLE while family serving is enabled and renders the
+  daemon's text VERBATIM (hidden while off / opted-out states honest); the Setup carriage toggle is
+  default ON and writes through <code>set_content_carriage</code>; the chat-surface election toggle
+  is default OFF (the user's choice — only the serving side is default-on), and while ELECTED the
+  §3.1 requester disclosure is always visible with the ACTUAL cohort count N and the honest cost;
+  an engaged reply names its cohort. Rendered geometry is measured at the app's default window
+  size (the owner's standing rule).</p>
+  <p><strong>Run:</strong> serve the crate root over http — e.g.
+  <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> — then open
+  <code>http://127.0.0.1:4817/ui-harness/adr036-carriage.html</code>.</p>
+  <h2>Results</h2>
+  <div id="results">running…</div>
+  <script>
+    // The §3.1 texts, verbatim (the daemon owns them; the harness pins them
+    // against drift in EITHER layer).
+    const SERVING_TEXT = "This computer carries other users’ conversations (as token ids it can read) through family verification. On by default — you can turn it off, and requesting peers are refused honestly when you do.";
+    const OFF_TEXT = /content_carriage_refused/;
+    const REQUESTER_TEXT = (n) => "Family verification ON: your conversation — in a form the receiving computers can read — goes to every verification peer this turn (" + n + "). It is slower than single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees any of it. Turn it off any time.";
+
+    const calls = { set_content_carriage: null, set_family_verified_chat: null };
+    const BASE = {
+      version: "0.0.0-harness", tracker: "https://stub.local", data_dir: "C:/stub",
+      engine_available: true, engine_path: "C:/stub/engine/llama-server.exe",
+      gpu_engine_available: false, license_accepted: true, profile_id: null, artifact: null,
+      pairing_allowed: true, content_carriage_allowed: true,
+      family_verified_chat: { elected: false, cohort: 1, disclosure: null },
+      node: { running: false, hosting: false, gateway_addr: null, installation_id: null,
+              engine_port: null, engine_backend: null, listener_addr: null, enrollment: null },
+      family: null, chat_turns: 0,
+    };
+    const hostingFamilyOn = {
+      ...BASE,
+      node: { ...BASE.node, running: true, hosting: true,
+              gateway_addr: "127.0.0.1:11435", installation_id: "stub-install",
+              listener_addr: "/ip4/192.168.1.9/udp/42420/quic-v1" },
+      family: { state: "on", reason: null, detail: null,
+                disclosure: { backend: "cpu", batch_verify: true, batch_window_max: 32 },
+                lease_roster_peers: 0, pin: null,
+                carriage: { enabled: true, disclosure: SERVING_TEXT } },
+    };
+    const hostingCarriageOff = {
+      ...hostingFamilyOn,
+      content_carriage_allowed: false,
+      family: { ...hostingFamilyOn.family,
+                carriage: { enabled: false,
+                            disclosure: "This computer is set NOT to carry other users’ conversations through family verification — requesting peers are refused honestly (content_carriage_refused)." } },
+    };
+    const hostingElected = {
+      ...hostingFamilyOn,
+      family_verified_chat: { elected: true, cohort: 1, disclosure: REQUESTER_TEXT(1) },
+    };
+    const hostingElectedCohort3 = {
+      ...hostingFamilyOn,
+      family_verified_chat: { elected: true, cohort: 3, disclosure: REQUESTER_TEXT(3) },
+    };
+
+    let mode = "idle";
+    window.__stubInvoke = async (cmd, args) => {
+      switch (cmd) {
+        case "get_status":
+          if (mode === "family-on") return hostingFamilyOn;
+          if (mode === "carriage-off") return hostingCarriageOff;
+          if (mode === "elected") return hostingElected;
+          if (mode === "elected-3") return hostingElectedCohort3;
+          return BASE;
+        case "analyze_hardware": return { ram_mb: 32000, cpu_cores: 12, gpu: null };
+        case "list_models": return [];
+        case "census": return { peers_online: 0, counts: {} };
+        case "resource_sample": return {};
+        case "lookup_peers": return [];
+        case "send_chat": return {
+          content: "stub verified reply", completion_tokens: 3, elapsed_ms: 40,
+          tokens_per_second: 75.0, mode: "family-verified — peer 12D3Koo (slower by design)",
+          served_by: "swarm", family_verified: true,
+          family_engage: { engaged: true, reason: "elected", cohort: 1 } };
+        case "set_content_carriage": calls.set_content_carriage = args; return {};
+        case "set_family_verified_chat": calls.set_family_verified_chat = args; return {};
+        default: return {};
+      }
+    };
+    const STUB = '<scr' + 'ipt>window.__TAURI__ = { core: { invoke: (cmd, args) => parent.__stubInvoke(cmd, args) }, event: { listen: async () => {} } };</scr' + 'ipt>';
+
+    async function runScenario(ui) {
+      const frame = document.createElement("iframe");
+      frame.setAttribute("aria-hidden", "true");
+      frame.style.cssText = "width:1152px;height:648px;border:0;position:absolute;left:-12000px;top:0;";
+      document.body.appendChild(frame);
+      frame.srcdoc = ui.replace("<head>", "<head>" + STUB);
+      let doc = null;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        await new Promise((r) => setTimeout(r, 100));
+        doc = frame.contentDocument;
+        if (doc && doc.getElementById("carriage-switch")) break;
+      }
+      return { doc, frame };
+    }
+
+    function render(rows) {
+      const table = document.createElement("table");
+      for (const { label, pass, detail } of rows) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td class="${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</td><td>${label}</td><td><code>${detail ?? ""}</code></td>`;
+        table.appendChild(tr);
+      }
+      const all = rows.every((r) => r.pass);
+      const summary = document.createElement("p");
+      summary.innerHTML = `<strong class="${all ? "pass" : "fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
+      document.getElementById("results").replaceChildren(summary, table);
+      document.title = all ? "ALL PASS" : "FAILURES";
+    }
+
+    (async () => {
+      const ui = await (await fetch("../ui/index.html")).text();
+      const rows = [];
+
+      // ---- Scenario A: hosting, family on, carriage on (the default) ----
+      mode = "family-on";
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        const line = doc.getElementById("carriage-line");
+        rows.push({ label: "serving: the §3.1 disclosure is ALWAYS VISIBLE while family serving is on",
+          pass: !!line && !line.hidden, detail: line ? (line.hidden ? "hidden" : "visible") : "missing" });
+        rows.push({ label: "serving: the disclosure text is the daemon’s, VERBATIM (§3.1)",
+          pass: !!line && line.textContent === SERVING_TEXT, detail: line ? line.textContent.slice(0, 60) + "…" : "missing" });
+        const sw = doc.getElementById("carriage-switch");
+        rows.push({ label: "setup: the carriage toggle is present, default ON",
+          pass: !!sw && sw.dataset.on === "true" && sw.getAttribute("aria-checked") === "true",
+          detail: sw ? sw.dataset.on : "missing" });
+        // The IPC round-trip writes the daemon key.
+        sw.click();
+        await new Promise((r) => setTimeout(r, 250));
+        rows.push({ label: "setup: the toggle writes set_content_carriage(false)",
+          pass: !!calls.set_content_carriage && calls.set_content_carriage.allowed === false,
+          detail: JSON.stringify(calls.set_content_carriage) });
+        // The election: default OFF, disclosure hidden.
+        const elect = doc.getElementById("verified-chat-switch");
+        rows.push({ label: "chat: the election toggle is present, default OFF (the user’s choice)",
+          pass: !!elect && elect.dataset.on === "false", detail: elect ? elect.dataset.on : "missing" });
+        rows.push({ label: "chat: the requester disclosure is HIDDEN while not elected",
+          pass: doc.getElementById("verified-chat-line").hidden, detail: "hidden" });
+        // Geometry: the disclosure line occupies real rendered space (not
+        // display:none’d by a rogue style).
+        const box = line.getBoundingClientRect();
+        rows.push({ label: "geometry: the disclosure line renders with real height at 1152×648",
+          pass: box.height > 8, detail: box.height.toFixed(1) + "px" });
+        frame.remove();
+      }
+
+      // ---- Scenario B: hosting, carriage opted out ---------------------
+      mode = "carriage-off";
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        const line = doc.getElementById("carriage-line");
+        rows.push({ label: "opt-out: the disclosure stays visible with the HONEST off statement",
+          pass: !!line && !line.hidden && OFF_TEXT.test(line.textContent), detail: line ? line.textContent.slice(0, 60) + "…" : "missing" });
+        const sw = doc.getElementById("carriage-switch");
+        rows.push({ label: "opt-out: the toggle renders OFF",
+          pass: sw.dataset.on === "false", detail: sw.dataset.on });
+        frame.remove();
+      }
+
+      // ---- Scenario C: hosting off — no disclosure ---------------------
+      mode = "idle";
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        rows.push({ label: "hosting off: no carriage disclosure is shown (nothing is carried)",
+          pass: doc.getElementById("carriage-line").hidden, detail: "hidden" });
+        frame.remove();
+      }
+
+      // ---- Scenario D: elected, cohort 1 -------------------------------
+      mode = "elected";
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        const line = doc.getElementById("verified-chat-line");
+        rows.push({ label: "elected: the §3.1 requester disclosure is ALWAYS VISIBLE",
+          pass: !!line && !line.hidden, detail: line ? (line.hidden ? "hidden" : "visible") : "missing" });
+        rows.push({ label: "elected: the disclosure renders the daemon’s text VERBATIM with N=1",
+          pass: !!line && line.textContent === REQUESTER_TEXT(1), detail: line ? line.textContent.slice(0, 70) + "…" : "missing" });
+        rows.push({ label: "elected: the honest cost is stated (slower, not faster)",
+          pass: !!line && line.textContent.includes("slower than single-peer chat, not faster"), detail: "" });
+        rows.push({ label: "elected: the hub-blind fact is stated",
+          pass: !!line && line.textContent.includes("never sees any of it"), detail: "" });
+        const elect = doc.getElementById("verified-chat-switch");
+        rows.push({ label: "elected: the toggle renders ON",
+          pass: elect.dataset.on === "true", detail: elect.dataset.on });
+        elect.click();
+        await new Promise((r) => setTimeout(r, 250));
+        rows.push({ label: "elected: the toggle writes set_family_verified_chat(false)",
+          pass: !!calls.set_family_verified_chat && calls.set_family_verified_chat.elected === false,
+          detail: JSON.stringify(calls.set_family_verified_chat) });
+        frame.remove();
+      }
+
+      // ---- Scenario E: elected, the ACTUAL cohort count (N=3) ----------
+      mode = "elected-3";
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        const line = doc.getElementById("verified-chat-line");
+        rows.push({ label: "cohort: the disclosure carries the ACTUAL cohort count (N=3)",
+          pass: !!line && line.textContent === REQUESTER_TEXT(3) && line.textContent.includes("(3)."),
+          detail: line ? line.textContent.slice(70, 110) : "missing" });
+        frame.remove();
+      }
+
+      render(rows);
+    })().catch((e) => render([{ label: "harness error", pass: false, detail: String(e) }]));
+  </script>
+</body>
+</html>

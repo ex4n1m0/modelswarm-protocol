@@ -163,6 +163,17 @@ must answer 302 with the `/downloads/` location.
 4. Re-run this rehearsal (the tool is committed at
    `tests/updater-manifest-verify`) at every release staging before
    the manifest goes public.
+5. The version-bump push MUST auto-trigger desktop-installer — its
+   `paths` filter includes `Cargo.toml`/`Cargo.lock` since 2026-10-13
+   (before that, bump-only commits matched no path and the correct
+   artifacts existed only via manual dispatch — the v0.2.23 near-miss).
+   On every train, the Integrator verifies that a desktop-installer run
+   appeared on the bump commit WITHOUT manual dispatch and that its
+   artifacts carry the NEW version in their filenames before staging
+   anything. If the bump push did not auto-trigger, STOP the train: the
+   filter has regressed — never paper over it with a dispatch. Manual
+   `workflow_dispatch` on the bump head remains the documented fallback
+   only for a cancelled or failed auto run.
 
 ## v0.2.23 staging rehearsal (same day, evening train)
 

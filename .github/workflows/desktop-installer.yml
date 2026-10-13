@@ -10,7 +10,21 @@ on:
   workflow_dispatch: {}
   push:
     branches: [main]
-    paths: ["crates/modelswarm-desktop/**", "crates/modelswarm-node/**", "runtime-pins.json", ".github/workflows/desktop-installer.yml"]
+    # Cargo.toml MUST be in this filter: the product version is
+    # single-sourced in the workspace Cargo.toml (rust.yml guards enforce
+    # that tauri.conf.json carries no version), so EVERY release-train bump
+    # commit edits it. Until v0.2.23 (2026-10-13) a bump-only commit matched
+    # no path here, so the installer never auto-built on the bump commit —
+    # the auto run on the preceding feature commit was building
+    # OLD-version-named artifacts (near-miss caught at staging; correct
+    # artifacts existed only via manual workflow_dispatch, run 38363557211).
+    # Cargo.lock rides along for the same reason: dependency edges are
+    # compiled into the shipped binary, so a lock change is an installer
+    # input. rust.yml and windows-package-dry-run.yml already filter on the
+    # same roots. Accepted cost, measured over main history (2026-07-01 to
+    # 2026-10-13 in docs/reviews/handoff-test-release-citrigger-2026-10-13.md):
+    # ~1-2 extra 4-OS runs per active development day.
+    paths: ["crates/modelswarm-desktop/**", "crates/modelswarm-node/**", "runtime-pins.json", ".github/workflows/desktop-installer.yml", "Cargo.toml", "Cargo.lock"]
 
 jobs:
   build:

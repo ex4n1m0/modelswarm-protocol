@@ -91,10 +91,19 @@ pub use engine_source::FamilyEngineSource;
 pub use modelswarm_runtime::{RuntimeError, SamplingParams};
 pub use modelswarm_session::negotiation::Backend;
 pub use modelswarm_session::negotiation::EngineDisclosure;
+// ADR-036 (2026-10-13): the session-open pin-carrier surface — the strict
+// reader, the first-failure admission table, the per-session carrier the
+// serve loop seeds its gate from, and the default-on carriage posture the
+// desktop's persisted setting flows into.
+pub use modelswarm_session::negotiation::pin_commitment_of;
+pub use modelswarm_session::negotiation::WirePinCarrier;
+pub use modelswarm_session::verifydrafts::sign_pin_carrier;
 pub use modelswarm_session::verifydrafts::BatchVerifyEngine;
 pub use serve::{
-    read_session_open, serve_verifydrafts_quic, serve_verifydrafts_session, ServeEndReason,
-    SessionOpenError, VerifyDraftsServeConfig, VerifyDraftsServeReport,
+    admit_pin_carrier, read_session_open, serve_verifydrafts_quic, serve_verifydrafts_session,
+    serve_verifydrafts_session_with_pin, AdmittedPinCarrier, ContentCarriage, PinAdmission,
+    ServeEndReason, SessionOpen, SessionOpenError, VerifyDraftsServeConfig,
+    VerifyDraftsServeReport,
 };
 pub use wire::{
     accept_quic, accept_staged, dial_quic, dial_staged, PrefacedWire, QuicVerifyWire,

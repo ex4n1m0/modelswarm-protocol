@@ -67,9 +67,29 @@ use crate::serving::{rfc3339_now, send_error, serve_one_seeded, Admission, Lease
 
 use super::engine_source::FamilyEngineSource;
 use super::serve::{
-    read_session_open, serve_verifydrafts_session, SessionOpenError, VerifyDraftsServeConfig,
+    admit_pin_carrier, read_session_open, serve_verifydrafts_session_with_pin, PinAdmission,
+    SessionOpen, SessionOpenError, VerifyDraftsServeConfig,
 };
 use super::wire::{PrefacedWire, QuicVerifyWire};
+use super::{unix_ms_now, verifying_key_from_peer_id};
+
+/// Sends the honest `SessionReject` for a refused pin carrier (the last
+/// frame on the session; codes only — the carrier's session id and
+/// protocol version are echoed, never its content).
+async fn send_pin_reject<W: super::wire::VerifyDraftsWire>(
+    wire: &mut W,
+    carrier: &modelswarm_session::negotiation::WirePinCarrier,
+    reason: modelswarm_session::negotiation::SessionRejectReason,
+    io_deadline: std::time::Duration,
+) {
+    let reject = modelswarm_session::negotiation::SessionReject {
+        session_id: carrier.session_id.clone(),
+        protocol_version: carrier.protocol_version.clone(),
+        reason,
+    };
+    let value = serde_json::to_value(&reject).expect("session reject serializes");
+    let _ = wire.send_json(&value, io_deadline).await;
+}
 
 /// How long a composed session may wait for its FIRST frame (mirrors the
 /// msp-v1 loop's between-requests wait — both vocabularies get the same
@@ -511,13 +531,18 @@ pub async fn serve_sessions_composed(
                 }
                 FirstFrame::Family(first) => {
                     // The session-open exchange (ADR-032 §2 admission
-                    // order): the coordinator's FIRST frame is its lease
-                    // carrier when it presents one, immediately followed
-                    // by the `SessionOffer`. Reading both here (before any
-                    // engine work) keeps the lease gate AT SESSION OPEN
-                    // and the engine untouched on refusal.
+                    // order, extended by ADR-036 §3.2 to the fixed
+                    // three-part order): the coordinator's FIRST frame is
+                    // its lease carrier when it presents one, then — for
+                    // an ELECTED family-verified chat — the ADR-036 pin
+                    // carrier (the user's conversation as token ids),
+                    // immediately followed by the `SessionOffer`. Reading
+                    // all of it here (before any engine work) keeps the
+                    // lease gate AT SESSION OPEN, the carrier admission
+                    // BEFORE the serve loop, and the engine untouched on
+                    // refusal.
                     let mut wire = QuicVerifyWire::over_session(session);
-                    let (presented, offer) = match read_session_open(
+                    let open: SessionOpen = match read_session_open(
                         &mut wire,
                         first,
                         family_config.io_deadline,
@@ -532,6 +557,30 @@ pub async fn serve_sessions_composed(
                             session_telemetry.warn(
                                 "verifydrafts.family_refused",
                                 &[("peer", &peer_id), ("reason", "invalid_lease")],
+                            );
+                            return;
+                        }
+                        Err(SessionOpenError::BadPinCarrier(_)) => {
+                            // ADR-036 §3.2 bad_frame class: strict
+                            // schema is closed (content-bearing frames
+                            // admit no unknown fields); labels only.
+                            session_telemetry.warn(
+                                "verifydrafts.pin_carrier_refused",
+                                &[("peer", &peer_id), ("reason", "bad_frame")],
+                            );
+                            return;
+                        }
+                        Err(SessionOpenError::PayloadTooLarge) => {
+                            session_telemetry.warn(
+                                "verifydrafts.pin_carrier_refused",
+                                &[("peer", &peer_id), ("reason", "payload_too_large")],
+                            );
+                            return;
+                        }
+                        Err(SessionOpenError::OutOfOrder(_)) => {
+                            session_telemetry.warn(
+                                "verifydrafts.pin_carrier_refused",
+                                &[("peer", &peer_id), ("reason", "bad_frame")],
                             );
                             return;
                         }
@@ -553,9 +602,13 @@ pub async fn serve_sessions_composed(
                     // per-request gate enforces, fail-closed; no frozen
                     // family reject code exists for a refused lease, so
                     // the honest answer is the session end (the client's
-                    // fallback-to-single signal).
+                    // fallback-to-single signal). The lease stays FIRST
+                    // in the processing order exactly as it is first on
+                    // the wire (the disclosure-minimizing rationale:
+                    // lease refusal happens before the conversation is
+                    // processed).
                     let lease_expires_at_ms =
-                        match family_lease.lease_for(&peer_id, presented.as_deref(), &profile) {
+                        match family_lease.lease_for(&peer_id, open.lease.as_deref(), &profile) {
                             Ok(expires_at_ms) => expires_at_ms,
                             Err(refusal) => {
                                 session_telemetry.warn(
@@ -565,7 +618,122 @@ pub async fn serve_sessions_composed(
                                 return;
                             }
                         };
-                    let engine = match family_engine.engine_for().await {
+                    // ADR-036 §3.2: the pin-carrier admission table —
+                    // BEFORE any engine work (a refused or malformed
+                    // carrier never constructs a prefilled engine), with
+                    // the coordinator key pinned from the
+                    // transport-authenticated PeerId exactly as the
+                    // serve loop pins it for round frames.
+                    let (pin, engine_root) = match open.pin {
+                        None => (None, None),
+                        Some(carrier) => {
+                            let coordinator_key = match family_config.pinned_coordinator_key {
+                                Some(pinned) => pinned,
+                                None => match verifying_key_from_peer_id(&peer_id) {
+                                    Ok(key) => key,
+                                    Err(_) => {
+                                        session_telemetry.warn(
+                                            "verifydrafts.pin_carrier_refused",
+                                            &[("peer", &peer_id), ("reason", "bad_frame")],
+                                        );
+                                        return;
+                                    }
+                                },
+                            };
+                            let params_hash =
+                                match modelswarm_session::verifydrafts::batch_generation_params_hash(
+                                    &family_config.sampling_params,
+                                ) {
+                                    Ok(hash) => hash,
+                                    Err(_) => {
+                                        session_telemetry.warn(
+                                            "verifydrafts.pin_carrier_refused",
+                                            &[("peer", &peer_id), ("reason", "misconfigured")],
+                                        );
+                                        return;
+                                    }
+                                };
+                            let arrival = unix_ms_now();
+                            match admit_pin_carrier(
+                                &carrier,
+                                &peer_id,
+                                &coordinator_key,
+                                &profile,
+                                &params_hash,
+                                family_config.content_carriage,
+                                family_config.prefill_context_tokens,
+                                arrival,
+                                arrival,
+                            ) {
+                                PinAdmission::Admitted(admitted) => {
+                                    // COUNTS ONLY (ADR-036 §3.2 hygiene:
+                                    // the token COUNT is permitted; ids,
+                                    // arrays, and content-derived hashes
+                                    // — including the pin commitment —
+                                    // never reach telemetry).
+                                    session_telemetry.info(
+                                        "verifydrafts.pin_carrier_admitted",
+                                        &[
+                                            ("peer", peer_id.as_str()),
+                                            ("tokens", &admitted.prompt_tokens.len().to_string()),
+                                            ("seq", &admitted.seq.to_string()),
+                                        ],
+                                    );
+                                    let root = admitted.prompt_tokens.clone();
+                                    (Some(admitted), Some(root))
+                                }
+                                PinAdmission::Rejected(reason) => {
+                                    send_pin_reject(
+                                        &mut wire,
+                                        &carrier,
+                                        reason,
+                                        family_config.io_deadline,
+                                    )
+                                    .await;
+                                    session_telemetry.warn(
+                                        "verifydrafts.pin_carrier_refused",
+                                        &[("peer", peer_id.as_str()), ("reason", reason.as_str())],
+                                    );
+                                    return;
+                                }
+                                PinAdmission::BadFrame(_) => {
+                                    session_telemetry.warn(
+                                        "verifydrafts.pin_carrier_refused",
+                                        &[("peer", peer_id.as_str()), ("reason", "bad_frame")],
+                                    );
+                                    return;
+                                }
+                                PinAdmission::DeadlineExceeded => {
+                                    session_telemetry.warn(
+                                        "verifydrafts.pin_carrier_refused",
+                                        &[
+                                            ("peer", peer_id.as_str()),
+                                            ("reason", "deadline_exceeded"),
+                                        ],
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    };
+                    // The ADR-036 deadline RE-CHECK immediately before
+                    // prefill dispatch (engine construction IS the
+                    // prefill under the Capi seam).
+                    if let Some(pin) = &pin {
+                        if unix_ms_now() >= pin.deadline_expires_at_ms {
+                            session_telemetry.warn(
+                                "verifydrafts.pin_carrier_refused",
+                                &[("peer", peer_id.as_str()), ("reason", "deadline_exceeded")],
+                            );
+                            return;
+                        }
+                    }
+                    // The engine: per-session prefilled — the CARRIER's
+                    // conversation root for a carrier session (ADR-036),
+                    // the daemon-pinned neutral prompt otherwise
+                    // (ADR-034). The per-session handle's drop at session
+                    // end bounds KV residency.
+                    let engine = match family_engine.engine_for_root(engine_root.as_deref()).await {
                         Ok(engine) => engine,
                         Err(_) => {
                             // Local engine-load failure: stable label, no
@@ -582,11 +750,17 @@ pub async fn serve_sessions_composed(
                     // The honest disclosure from the engine's REAL
                     // geometry (RC-8) — never the hand-set field.
                     config.engine = engine.capabilities();
-                    let wire = PrefacedWire::new(wire, Some(offer));
+                    let wire = PrefacedWire::new(wire, Some(open.offer));
                     // The report's end reason is telemetered inside the
                     // serve loop (`verifydrafts.session_ended`).
-                    let _report =
-                        serve_verifydrafts_session(wire, config, engine, &session_telemetry).await;
+                    let _report = serve_verifydrafts_session_with_pin(
+                        wire,
+                        config,
+                        engine,
+                        pin,
+                        &session_telemetry,
+                    )
+                    .await;
                 }
                 FirstFrame::Gone => {
                     // Idle/vanished before any frame: nothing honest to

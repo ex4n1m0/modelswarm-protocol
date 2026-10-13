@@ -31,17 +31,20 @@ use serde_json::Value;
 use modelswarm_identity::InstallationIdentity;
 use modelswarm_runtime::{RuntimeError, SamplingParams};
 use modelswarm_session::negotiation::{
-    Backend, EngineDisclosure, FrameRejectReason, Preset, SessionAccept, SessionBudget,
-    SessionOffer, SessionReject, SessionRejectReason, COOPERATIVE_PROTOCOL_VERSION,
+    Backend, EngineDisclosure, FrameRejectReason, PinCarrierError, Preset, SessionAccept,
+    SessionBudget, SessionOffer, SessionReject, SessionRejectReason, WirePinCarrier,
+    COOPERATIVE_PROTOCOL_VERSION,
 };
 use modelswarm_session::verifydrafts::{
-    batch_generation_params_hash, sign_verify_drafts_result, AdmissionDecision, BatchVerifyEngine,
-    CommitApplyOutcome, DispatchOutcome, GateState, RejectionFrame, VerifyDraftsGate,
-    VerifyDraftsGateConfig, WAIT_COMMIT_GRACE_MS,
+    batch_generation_params_hash, sign_verify_drafts_result, verify_pin_carrier_signature,
+    AdmissionDecision, BatchVerifyEngine, CommitApplyOutcome, DispatchOutcome, GatePreStateSeed,
+    GateState, RejectionFrame, VerifyDraftsGate, VerifyDraftsGateConfig, DEADLINE_CLAMP_MAX_MS,
+    DEADLINE_CLAMP_MIN_MS, WAIT_COMMIT_GRACE_MS,
 };
 use modelswarm_session::{CommitPrefix, GENESIS_PREFIX_HASH};
 use modelswarm_telemetry::Telemetry;
 use modelswarm_transport::ed25519_dalek::VerifyingKey;
+use modelswarm_transport::frame::MAX_FRAME_BYTES;
 use modelswarm_transport::libp2p_backend::Libp2pListener;
 
 use super::wire::{VerifyDraftsWire, WireError};
@@ -115,6 +118,36 @@ impl std::fmt::Display for ServeEndReason {
     }
 }
 
+/// The ADR-036 §3.1/§3.2 serving-side user-content carriage setting.
+/// DEFAULT ON per the owner directive 2026-10-13 ("the idea of a swarm is
+/// that all agents work together, privacy is not a concern at this
+/// moment"): a stock install carries elected carrier sessions with no
+/// additional configuration. The opt-OUT refuses a pin carrier with the
+/// honest labeled reject `content_carriage_refused` — never a silent
+/// drop, never a misleading label. Honest boundary of the opt-out
+/// (ADR-036 §3.1): it prevents this peer from PROCESSING the content (no
+/// prefill, no engine work); it cannot prevent RECEIVING the bytes of a
+/// session that was already dialed, because no roster or wire field
+/// carries the carriage posture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentCarriage {
+    /// Carry and process other users' conversations (token-id form)
+    /// through family verification — the default-on posture.
+    On,
+    /// Refuse carrier sessions honestly (`content_carriage_refused`).
+    Off,
+}
+
+impl ContentCarriage {
+    /// Stable label for status surfaces ("on" | "off").
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentCarriage::On => "on",
+            ContentCarriage::Off => "off",
+        }
+    }
+}
+
 /// Node-side configuration for one served VerifyDrafts session. The engine
 /// disclosure is wired through here — the honest default is
 /// [`http_adapter_disclosure`] (`batch_verify: false`: the pinned llama.cpp
@@ -149,6 +182,20 @@ pub struct VerifyDraftsServeConfig {
     /// transport-authenticated remote PeerId (roster policy / test pinning).
     /// `None` (production default): derive from the authenticated peer.
     pub pinned_coordinator_key: Option<VerifyingKey>,
+    /// ADR-036 §3.2: this peer's user-content carriage posture for
+    /// session-open pin carriers — DEFAULT [`ContentCarriage::On`] (the
+    /// owner's default-on directive). `Off` refuses a carrier with the
+    /// honest `content_carriage_refused` reject; the neutral family
+    /// (carrier-less sessions) is NOT affected by this field.
+    pub content_carriage: ContentCarriage,
+    /// ADR-036 §3.2: this peer's session-level prefill bound — a carrier
+    /// whose `prompt_tokens` length exceeds it is refused
+    /// `budget_infeasible` ("conversation does not fit this peer"),
+    /// honestly, never silently degraded. `None` = no session-level bound
+    /// is known locally; the ADR-035 governor's machine-level verdict (the
+    /// D11 70% ceiling, evaluated at hosting start and owning admission)
+    /// remains the enforcement authority either way.
+    pub prefill_context_tokens: Option<u64>,
     /// Idle timeout before a silent session ends.
     pub session_idle: Duration,
     /// Per-frame I/O deadline.
@@ -179,6 +226,11 @@ impl VerifyDraftsServeConfig {
             },
             lease_expires_at_ms: u64::MAX,
             pinned_coordinator_key: None,
+            // ADR-036 §3.1: carriage of other users' conversations through
+            // family verification is ON by default (the owner directive
+            // 2026-10-13); the desktop's persisted setting flows in here.
+            content_carriage: ContentCarriage::On,
+            prefill_context_tokens: None,
             session_idle: FAMILY_SESSION_IDLE,
             io_deadline: FAMILY_IO_DEADLINE,
         }
@@ -251,17 +303,29 @@ async fn send_reject<W: VerifyDraftsWire>(
 }
 
 /// Why [`read_session_open`] could not read the session-open exchange
-/// (labels only — never lease contents).
+/// (labels only — never lease or conversation contents).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionOpenError {
     /// The lease carrier arrived but failed its STRICT schema
     /// (`deny_unknown_fields`/type) — a malformed presented lease, mapped
     /// by the caller to the `invalid_lease` refusal classification.
     BadCarrier,
-    /// The carrier arrived but no `SessionOffer` followed within the
+    /// The pin carrier arrived but failed its STRICT schema
+    /// (`deny_unknown_fields`/types — ADR-036 §3.2's bad_frame class). The
+    /// label names the structural fault family, never any content.
+    BadPinCarrier(&'static str),
+    /// A pin-carrier frame exceeded the msp-v1 §6.4 256 KiB frame limit —
+    /// detected BEFORE parse (the transport class; ADR-036 §3.2 row 1).
+    PayloadTooLarge,
+    /// The fixed open order was violated (a lease carrier after the first
+    /// frame, a pin carrier repeated, a lease behind a pin carrier —
+    /// ADR-036 §3.2: "any other order is a `bad_frame`-class session
+    /// end").
+    OutOfOrder(&'static str),
+    /// The carriers arrived but no `SessionOffer` followed within the
     /// open deadline.
     OfferTimeout,
-    /// Transport failure reading the offer behind the carrier (label
+    /// Transport failure reading the offer behind the carriers (label
     /// only).
     Wire(&'static str),
 }
@@ -271,6 +335,9 @@ impl SessionOpenError {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::BadCarrier => "bad_lease_carrier",
+            Self::BadPinCarrier(_) => "bad_pin_carrier",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::OutOfOrder(_) => "open_order_violation",
             Self::OfferTimeout => "offer_timeout",
             Self::Wire(_) => "wire_failure",
         }
@@ -281,54 +348,308 @@ impl std::fmt::Display for SessionOpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadCarrier => write!(f, "lease carrier failed its strict schema"),
-            Self::OfferTimeout => write!(f, "no session offer behind the lease carrier"),
+            Self::BadPinCarrier(why) => {
+                write!(f, "pin carrier failed its strict schema: {why}")
+            }
+            Self::PayloadTooLarge => {
+                write!(
+                    f,
+                    "pin carrier exceeded the 256 KiB frame limit before parse"
+                )
+            }
+            Self::OutOfOrder(why) => write!(f, "session-open order violation: {why}"),
+            Self::OfferTimeout => write!(f, "no session offer behind the carriers"),
             Self::Wire(what) => write!(f, "transport failure: {what}"),
         }
     }
 }
 
+/// The read session-open exchange (ADR-036 §3.2, the fixed order):
+/// `[lease carrier]? → [pin carrier]? → SessionOffer`. Both carriers are
+/// STRICT-parsed here (the reader only routes, never decides admission —
+/// that is [`admit_pin_carrier`]'s table); the offer stays UNPARSED for
+/// the serve loop, handed pre-read through [`super::wire::PrefacedWire`].
+#[derive(Debug, Clone)]
+pub struct SessionOpen {
+    /// The PRESENTED lease token (the `WireSessionLease` carrier's
+    /// unchanged string); `None` when the coordinator opened offer-first
+    /// or pin-first (a pin carrier without a lease is valid — roster-fed
+    /// coordinators).
+    pub lease: Option<String>,
+    /// The STRICT-parsed ADR-036 pin carrier, when one was presented;
+    /// `None` = a NEUTRAL session (the existing path, byte-unchanged).
+    pub pin: Option<WirePinCarrier>,
+    /// The raw, unparsed `SessionOffer` frame.
+    pub offer: Value,
+}
+
+/// The pin carrier's discriminant keys (ADR-036 §4 disjointness: both are
+/// disjoint from every frozen §6 tag and every existing family
+/// discriminant key, pinned by the session crate's collision test).
+fn is_pin_carrier_frame(value: &Value) -> bool {
+    value.get("pin_commitment").is_some() && value.get("prompt_tokens").is_some()
+}
+
+/// Serialized frame length (the gate's stage-1 measure), saturating on a
+/// serialization failure.
+fn frame_len(value: &Value) -> usize {
+    serde_json::to_string(value).map_or(usize::MAX, |s| s.len())
+}
+
 /// Reads the family SESSION-OPEN exchange from an already-read FIRST
-/// frame (ADR-032 §2 admission order, wired 2026-10-12): the coordinator
-/// PRESENTS its consume lease in the minimal [`WireSessionLease`] carrier
-/// immediately BEFORE its `SessionOffer` — the family-side equivalent of
-/// msp-v1's per-request `capability_token`, at session open per §2. The
-/// returned offer value is UNPARSED (raw JSON, handed to the serve loop
-/// pre-read through [`super::wire::PrefacedWire`] — never decoded twice);
-/// the caller feeds the presented token into the SAME validation the
-/// roster path runs (`FamilyLeaseSource::lease_for`).
+/// frame (ADR-032 §2 admission order, wired 2026-10-12; EXTENDED by
+/// ADR-036 §3.2 to the fixed three-part order): the coordinator PRESENTS
+/// its consume lease in the minimal [`WireSessionLease`] carrier FIRST,
+/// then — when the session is an ELECTED family-verified chat — the
+/// ADR-036 [`WirePinCarrier`] (the user's conversation as token ids plus
+/// the rule-3 commitment), then the `SessionOffer`:
 ///
-/// An offer WITHOUT a preceding carrier is equally valid (presented =
-/// `None`): the roster-fed path and offer-only clients keep working —
-/// this reader only routes, never decides.
+/// ```text
+/// [lease carrier]?  →  [pin carrier]?  →  SessionOffer
+/// ```
+///
+/// Valid shapes: lease→pin→offer, pin→offer (a pin carrier without a
+/// lease is valid — roster-fed coordinators), lease→offer, offer (a
+/// NEUTRAL session — the pre-ADR-036 path, byte-unchanged). Any other
+/// order (a lease after the first frame, a repeated pin carrier, a lease
+/// behind a pin carrier) is [`SessionOpenError::OutOfOrder`] — a
+/// bad_frame-class session end. A pin-carrier frame over the 256 KiB
+/// limit is [`SessionOpenError::PayloadTooLarge`] BEFORE parse (the
+/// transport class; nothing content-sized is decoded).
+///
+/// This reader only routes, never decides: carrier admission (signature,
+/// carriage posture, pairing, commitment binding) is
+/// [`admit_pin_carrier`]'s first-failure table, run by the caller after
+/// the lease gate.
 pub async fn read_session_open<W: VerifyDraftsWire>(
     wire: &mut W,
     first: Value,
     offer_deadline: Duration,
-) -> Result<(Option<String>, Value), SessionOpenError> {
-    if first.get("lease").is_none() {
-        // Offer-first (roster/classic path): nothing presented.
-        return Ok((None, first));
-    }
-    let carrier: super::WireSessionLease =
-        serde_json::from_value(first).map_err(|_| SessionOpenError::BadCarrier)?;
-    let offer = match wire.recv_json(offer_deadline).await {
-        Ok(value) => value,
-        Err(WireError::Timeout) => return Err(SessionOpenError::OfferTimeout),
-        Err(_) => return Err(SessionOpenError::Wire("recv offer behind carrier")),
+) -> Result<SessionOpen, SessionOpenError> {
+    // Position 1: the lease carrier, when presented; position 2 (the pin
+    // carrier) is read from the pre-read first frame when the lease is
+    // absent, else from the frame behind the lease.
+    let (lease, pin_frame_or_offer) = if first.get("lease").is_some() {
+        let carrier: super::WireSessionLease =
+            serde_json::from_value(first).map_err(|_| SessionOpenError::BadCarrier)?;
+        match wire.recv_json(offer_deadline).await {
+            Ok(next) => {
+                if next.get("lease").is_some() {
+                    // A SECOND lease carrier: the lease is the FIRST
+                    // frame of the open sequence or not at this position
+                    // at all (ADR-036 §3.2: any other order is
+                    // bad_frame-class).
+                    return Err(SessionOpenError::OutOfOrder("lease carrier repeated"));
+                }
+                (Some(carrier.lease), next)
+            }
+            Err(WireError::Timeout) => return Err(SessionOpenError::OfferTimeout),
+            Err(_) => return Err(SessionOpenError::Wire("recv frame behind lease carrier")),
+        }
+    } else {
+        (None, first)
     };
-    Ok((Some(carrier.lease), offer))
+    if is_pin_carrier_frame(&pin_frame_or_offer) {
+        // Transport-class size gate BEFORE any parse of content-sized
+        // frames (ADR-036 §3.2 row 1).
+        if frame_len(&pin_frame_or_offer) > MAX_FRAME_BYTES {
+            return Err(SessionOpenError::PayloadTooLarge);
+        }
+        let pin: WirePinCarrier = serde_json::from_value(pin_frame_or_offer)
+            .map_err(|_| SessionOpenError::BadPinCarrier("schema"))?;
+        let offer = match wire.recv_json(offer_deadline).await {
+            Ok(value) => value,
+            Err(WireError::Timeout) => return Err(SessionOpenError::OfferTimeout),
+            Err(_) => return Err(SessionOpenError::Wire("recv offer behind pin carrier")),
+        };
+        if is_pin_carrier_frame(&offer) || offer.get("lease").is_some() {
+            return Err(SessionOpenError::OutOfOrder(
+                "carrier after the pin carrier (the offer must follow)",
+            ));
+        }
+        return Ok(SessionOpen {
+            lease,
+            pin: Some(pin),
+            offer,
+        });
+    }
+    Ok(SessionOpen {
+        lease,
+        pin: None,
+        offer: pin_frame_or_offer,
+    })
+}
+
+/// The admitted ADR-036 pin carrier — the conversation root plus the
+/// facts the serve loop seeds its gate with. `prompt_tokens` are CONTENT
+/// (ADR-036 §3.2 hygiene): never logged, never telemetered, never echoed
+/// in rejections or receipts; only their COUNT may appear in telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedPinCarrier {
+    /// The carrier's session id (MUST equal the subsequent offer's; the
+    /// serve loop enforces the binding — mismatch `bad_frame`).
+    pub session_id: String,
+    /// The conversation as token ids — the per-session PREFILLED root for
+    /// the family engine (the F2 seam; torn down at session end, which
+    /// bounds KV residency).
+    pub prompt_tokens: Vec<u32>,
+    /// The coordinator's seq baseline (RC-7): every later coordinator
+    /// `VerifyDrafts` carries `seq` strictly greater — enforced by seeding
+    /// the gate's `last_seq` with this value.
+    pub seq: u64,
+    /// The carrier's single-use nonce (I6): enters the session nonce
+    /// ledger — any later frame reusing it is `replayed_request`.
+    pub nonce: String,
+    /// The coordinator's installation id (the `last_seq` key).
+    pub sender: String,
+    /// The CLAMPED open-phase deadline expiry (`arrival +
+    /// clamp(deadline_ms, [1000, 120000])`); re-checked immediately
+    /// before prefill dispatch (engine construction).
+    pub deadline_expires_at_ms: u64,
+}
+
+/// [`admit_pin_carrier`]'s outcome (labels only — no content rides any
+/// variant, per the ADR-036 hygiene rules).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinAdmission {
+    /// Admitted: the carrier binds, the posture allows, the conversation
+    /// fits — the caller constructs the per-session prefilled engine and
+    /// seeds the serve loop's gate from the carried facts.
+    Admitted(AdmittedPinCarrier),
+    /// An honest `SessionReject` with the frozen reason (the caller sends
+    /// it as the session's last frame): `content_carriage_refused` |
+    /// `profile_mismatch` | `params_mismatch` | `pin_mismatch` |
+    /// `budget_infeasible`.
+    Rejected(SessionRejectReason),
+    /// A bad_frame-class session end (schema/signature/sender faults) —
+    /// no reject vocabulary exists; the label is local telemetry only.
+    BadFrame(&'static str),
+    /// The clamped open-phase deadline had already passed at admission.
+    DeadlineExceeded,
+}
+
+/// The ADR-036 §3.2 admission table for the session-open pin carrier —
+/// FIRST-FAILURE-WINS, in the ADR's row order:
+///
+/// 1. (frame size — `payload_too_large` — is enforced by
+///    [`read_session_open`] BEFORE parse, the transport class);
+/// 2. schema faults (strict parse already done by the reader; the pure
+///    [`WirePinCarrier::validate`] core's labels) → [`PinAdmission::BadFrame`],
+///    EXCEPT the commitment BIND, which is the `pin_mismatch` reject;
+/// 3. signature invalid / `sender` not the authenticated key /
+///    remote PeerId not derived from the pinned key → [`PinAdmission::BadFrame`];
+/// 4. carriage setting OFF → reject `content_carriage_refused`;
+/// 5. `profile_id` ≠ the pinned profile → reject `profile_mismatch`
+///    (the G3 early close, now triggerable at the carrier);
+/// 6. `generation_params_hash` ≠ the pinned params → reject
+///    `params_mismatch`;
+/// 7. `pin_commitment` ≠ `pin_commitment_of(prompt_tokens)` → reject
+///    `pin_mismatch`;
+/// 8. prefill infeasible (the session-level context bound; the ADR-035
+///    governor owns the machine-level ceiling) → reject `budget_infeasible`;
+/// 9. deadline past at admission (clamped `[1000, 120000]`) →
+///    [`PinAdmission::DeadlineExceeded`].
+///
+/// Pure (injected clocks, no engine work) so the golden vectors and the
+/// first-failure property pins replay it directly.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_pin_carrier(
+    carrier: &WirePinCarrier,
+    remote_peer_id: &str,
+    coordinator_key: &VerifyingKey,
+    pinned_profile: &str,
+    pinned_params_hash: &str,
+    carriage: ContentCarriage,
+    prefill_context_tokens: Option<u64>,
+    arrival_ms: u64,
+    now_ms: u64,
+) -> PinAdmission {
+    // Row 2 — schema: every pure-validate fault except the commitment
+    // BIND is bad_frame class (the bind is row 7's honest reject).
+    if let Err(fault) = carrier.validate() {
+        if fault != PinCarrierError::CommitmentMismatch {
+            return PinAdmission::BadFrame(fault.as_str());
+        }
+    }
+    // Row 3 — authentication family: the coordinator key is pinned from
+    // the transport-authenticated remote PeerId (or roster-pinned), and
+    // the stream's peer MUST derive from that same key; the signature
+    // verifies sender-binding-FIRST (§1 rule 5).
+    if modelswarm_identity::peer_id_for(&coordinator_key.to_bytes()) != remote_peer_id {
+        return PinAdmission::BadFrame("sender_not_authenticated_peer");
+    }
+    if verify_pin_carrier_signature(carrier, coordinator_key).is_err() {
+        return PinAdmission::BadFrame("bad_signature");
+    }
+    // Row 4 — the carriage posture (before pairing checks: a refused peer
+    // states its posture regardless of who asks).
+    if carriage == ContentCarriage::Off {
+        return PinAdmission::Rejected(SessionRejectReason::ContentCarriageRefused);
+    }
+    // Rows 5-6 — the G3 early close at the carrier.
+    if carrier.profile_id != pinned_profile {
+        return PinAdmission::Rejected(SessionRejectReason::ProfileMismatch);
+    }
+    if carrier.generation_params_hash != pinned_params_hash {
+        return PinAdmission::Rejected(SessionRejectReason::ParamsMismatch);
+    }
+    // Row 7 — the commitment binds the payload.
+    if !carrier.commitment_matches() {
+        return PinAdmission::Rejected(SessionRejectReason::PinMismatch);
+    }
+    // Row 8 — prefill feasibility: the session-level context bound (the
+    // machine-level ADR-035 governor verdict stays the authority at
+    // hosting start).
+    if let Some(cap) = prefill_context_tokens {
+        if carrier.prompt_tokens.len() as u64 > cap {
+            return PinAdmission::Rejected(SessionRejectReason::BudgetInfeasible);
+        }
+    }
+    // Row 9 — the clamped open-phase deadline at admission.
+    let clamped = carrier
+        .deadline_ms
+        .clamp(DEADLINE_CLAMP_MIN_MS, DEADLINE_CLAMP_MAX_MS);
+    let deadline_expires_at_ms = arrival_ms.saturating_add(u64::from(clamped));
+    if deadline_expires_at_ms <= now_ms {
+        return PinAdmission::DeadlineExceeded;
+    }
+    PinAdmission::Admitted(AdmittedPinCarrier {
+        session_id: carrier.session_id.clone(),
+        prompt_tokens: carrier.prompt_tokens.clone(),
+        seq: carrier.seq,
+        nonce: carrier.nonce.clone(),
+        sender: carrier.sender.clone(),
+        deadline_expires_at_ms,
+    })
+}
+
+/// Serves one NEUTRAL VerifyDrafts session (no ADR-036 carrier): the
+/// pre-ADR-036 path, byte-unchanged — see [`serve_verifydrafts_session_with_pin`].
+pub async fn serve_verifydrafts_session<W: VerifyDraftsWire>(
+    wire: W,
+    config: VerifyDraftsServeConfig,
+    engine: Arc<dyn BatchVerifyEngine>,
+    telemetry: &Telemetry,
+) -> VerifyDraftsServeReport {
+    serve_verifydrafts_session_with_pin(wire, config, engine, None, telemetry).await
 }
 
 /// Serves one VerifyDrafts session to its end and returns the report.
+/// `pin` carries the ADMITTED ADR-036 pin carrier for a carrier session
+/// (the conversation root + the gate-seeding facts — seq baseline, nonce
+/// ledger); `None` serves a NEUTRAL session, byte-identically to the
+/// pre-ADR-036 path.
 ///
 /// Never panics on peer input: every malformed frame becomes a serialized
 /// `RejectionFrame`/`CancelRoundFrame` or ends the session with a stable
-/// code; peer-supplied payloads never reach telemetry (privacy rule 5).
+/// code; peer-supplied payloads never reach telemetry (privacy rule 5;
+/// ADR-036 §3.2 extends it to `prompt_tokens` — counts only, ever).
 #[allow(clippy::too_many_lines)]
-pub async fn serve_verifydrafts_session<W: VerifyDraftsWire>(
+pub async fn serve_verifydrafts_session_with_pin<W: VerifyDraftsWire>(
     mut wire: W,
     config: VerifyDraftsServeConfig,
     engine: Arc<dyn BatchVerifyEngine>,
+    pin: Option<AdmittedPinCarrier>,
     telemetry: &Telemetry,
 ) -> VerifyDraftsServeReport {
     let remote_peer_id = wire.remote_peer_id().to_string();
@@ -379,6 +700,15 @@ pub async fn serve_verifydrafts_session<W: VerifyDraftsWire>(
     if offer.protocol_version != COOPERATIVE_PROTOCOL_VERSION {
         report.ended_by = ServeEndReason::BadOffer("protocol version");
         return report;
+    }
+    // ADR-036 §3.2: the carrier's `session_id` MUST equal the offer's —
+    // mismatch is `bad_frame` (the session-open binding, enforced before
+    // any accept).
+    if let Some(pin) = &pin {
+        if offer.session_id != pin.session_id {
+            report.ended_by = ServeEndReason::BadOffer("carrier session id mismatch");
+            return report;
+        }
     }
     report.session_id = offer.session_id.clone();
     if !config.supported_presets.contains(&offer.preset) {
@@ -555,6 +885,19 @@ pub async fn serve_verifydrafts_session<W: VerifyDraftsWire>(
             return report;
         }
     };
+    // ADR-036 §3.2 carrier seeding: the coordinator's seq baseline (every
+    // later `VerifyDrafts` strictly greater — RC-7) and the carrier's
+    // single-use nonce in the session ledger (reuse → `replayed_request`
+    // — I6). Rounds were already ≥ 1-only by construction (round 0 is
+    // `round_mismatch` at stage 8); the carrier's own `round: 0` is the
+    // session-open marker that monotonicity includes.
+    if let Some(pin) = &pin {
+        gate.seed_pre_state(GatePreStateSeed {
+            last_seq: vec![(pin.sender.clone(), pin.seq)],
+            consumed_nonces: vec![pin.nonce.clone()],
+            ..GatePreStateSeed::default()
+        });
+    }
 
     // RC-2: measure the exact engine-pass wall time around the engine call
     // (the gate trait is clock-free and takes caller-supplied clocks, so

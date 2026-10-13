@@ -63,7 +63,7 @@ pub mod verifydrafts;
 #[cfg(any(test, feature = "node-selftest"))]
 pub mod selftest;
 
-pub use executor::SingleLocalExecutor;
+pub use executor::{render_chatml, SingleLocalExecutor};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -564,6 +564,20 @@ pub async fn runtime_propose_window(
         .propose(&handle, prefix, window)
         .await
         .map_err(|e| format!("engine propose: {e}"))
+}
+
+/// The detokenization seam for ADR-036's elected family-verified chat
+/// path: decodes the session's committed token stream (the coordinator's
+/// OWN committed data — the ids this machine drafted and the peers
+/// verified) back to text under the pinned engine's tokenizer. Public
+/// free-function so the desktop composes it over a cloned runtime handle
+/// without a live node (the same pattern as [`runtime_tokenize`]).
+pub async fn runtime_detokenize(
+    runtime: Option<&Arc<dyn InferenceRuntime>>,
+    ids: &[u32],
+) -> Result<String, String> {
+    let runtime = runtime.ok_or("no supervised engine")?;
+    runtime.detokenize(ids).await.map_err(|e| e.to_string())
 }
 
 /// Picks the runtime per ADR-019:

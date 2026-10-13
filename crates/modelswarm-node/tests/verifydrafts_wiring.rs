@@ -824,10 +824,13 @@ mod presented_lease {
                 .expect("authenticated accept");
             // The composed daemon's family branch, verbatim in shape.
             let first = wire.recv_json(ACCEPT_DEADLINE).await.expect("first frame");
-            let (presented, offer) =
+            let open =
                 modelswarm_node::verifydrafts::read_session_open(&mut wire, first, ACCEPT_DEADLINE)
                     .await
                     .expect("session-open exchange");
+            let presented = open.lease;
+            let offer = open.offer;
+            assert!(open.pin.is_none(), "no pin carrier was sent");
             assert_eq!(
                 presented.as_deref(),
                 Some(expected_token.as_str()),
@@ -910,14 +913,14 @@ mod presented_lease {
                 .await
                 .expect("authenticated accept");
             let first = wire.recv_json(ACCEPT_DEADLINE).await.expect("first frame");
-            let (presented, _offer) =
+            let open =
                 modelswarm_node::verifydrafts::read_session_open(&mut wire, first, ACCEPT_DEADLINE)
                     .await
                     .expect("session-open exchange");
             // The gate refuses: NO serve loop, NO engine — drop the wire
             // (the composed loop's honest session end).
             let refusal = gate_roster
-                .lease_for(wire.remote_peer_id(), presented.as_deref(), TEST_PROFILE)
+                .lease_for(wire.remote_peer_id(), open.lease.as_deref(), TEST_PROFILE)
                 .expect_err("a wrong-profile presented lease must refuse");
             drop(wire);
             refusal

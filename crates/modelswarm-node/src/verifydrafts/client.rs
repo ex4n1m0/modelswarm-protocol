@@ -3,11 +3,15 @@
 //! `family_probe` pairing diagnostic since the 2026-10-12 presented-lease
 //! activation).
 //!
-//! The client opens a session (optional lease carrier → offer →
-//! accept/reject — the ADR-032 §2 admission order: when
+//! The client opens a session (optional lease carrier → optional ADR-036
+//! pin carrier → offer → accept/reject — the fixed open order: when
 //! [`VerifyDraftsClientConfig::lease`] is set the coordinator PRESENTS its
 //! hub-signed consume lease as the FIRST frame, the family-side equivalent
-//! of msp-v1's per-request `capability_token`), then drives rounds
+//! of msp-v1's per-request `capability_token`; when
+//! [`VerifyDraftsClientConfig::carrier_prompt_tokens`] is set — an
+//! ELECTED family-verified chat (ADR-036 §3.2) — the SIGNED pin carrier
+//! (the user's conversation as token ids plus the auto-computed rule-3
+//! commitment) rides between the lease and the offer), then drives rounds
 //! against [`modelswarm_session::verifydrafts::VerifyDraftsCoordinator`]:
 //! builds and signs `VerifyDrafts` (the coordinator's own RC-7 `seq`
 //! counter, fresh single-use nonce, chained parent hash), tracks the
@@ -27,11 +31,11 @@ use std::time::{Duration, Instant};
 use modelswarm_identity::{new_nonce, InstallationIdentity};
 use modelswarm_runtime::SamplingParams;
 use modelswarm_session::negotiation::{
-    Backend, FrameRejectReason, Preset, SessionAccept, SessionBudget, SessionOffer, SessionReject,
-    COOPERATIVE_PROTOCOL_VERSION,
+    pin_commitment_of, Backend, FrameRejectReason, Preset, SessionAccept, SessionBudget,
+    SessionOffer, SessionReject, WirePinCarrier, COOPERATIVE_PROTOCOL_VERSION,
 };
 use modelswarm_session::verifydrafts::{
-    batch_generation_params_hash, eligible_batch_verifier, sign_verify_drafts,
+    batch_generation_params_hash, eligible_batch_verifier, sign_pin_carrier, sign_verify_drafts,
     validate_session_accept, CancelRoundFrame, CrossCheckOutcome, RejectionFrame, ResultAdmission,
     ResultDrop, ResultViolation, SessionAcceptError, VerifierTimings, VerifyDrafts,
     VerifyDraftsCoordinator, VerifyDraftsCoordinatorConfig, VerifyDraftsResult, VerifyTelemetry,
@@ -40,6 +44,7 @@ use modelswarm_session::verifydrafts::{
 use modelswarm_session::CommitPrefix;
 use modelswarm_telemetry::Telemetry;
 use modelswarm_transport::ed25519_dalek::VerifyingKey;
+use modelswarm_transport::frame::MAX_FRAME_BYTES;
 
 use super::wire::{VerifyDraftsWire, WireError};
 use super::{NodeVerifyTelemetry, FAMILY_IO_DEADLINE};
@@ -194,6 +199,19 @@ pub struct VerifyDraftsClientConfig {
     /// fallback-to-single signal). `None` = open without presenting
     /// (roster-fed / stub venues).
     pub lease: Option<String>,
+    /// ADR-036: the ELECTED family-verified chat's conversation as token
+    /// ids (rendered through the profile's pinned chat template and
+    /// tokenizer by the CALLER — the desktop's elected path). When set,
+    /// `negotiate` sends the signed session-open PIN CARRIER (lease → pin
+    /// carrier → offer, the §3.2 fixed order; the commitment is
+    /// auto-computed via [`pin_commitment_of`], the signature via
+    /// [`sign_pin_carrier`], `sender` = this identity's installation id).
+    /// CONTENT (ADR-036 §3.2 hygiene): never logged, never telemetered,
+    /// never in errors; a carrier form over the 256 KiB frame limit
+    /// fails honestly at negotiate (truncating is FORBIDDEN — the caller
+    /// surfaces its `blocked_content_contract` label and falls back to
+    /// the plain single-serving path).
+    pub carrier_prompt_tokens: Option<Vec<u32>>,
     /// Per-round `deadline_ms` (clamped to `[1000, 120000]` by the gate).
     pub round_deadline_ms: u32,
     /// How long to wait for a result after sending a request.
@@ -219,6 +237,7 @@ impl VerifyDraftsClientConfig {
             verifier_key,
             sampling_params: SamplingParams::default(),
             lease: None,
+            carrier_prompt_tokens: None,
             round_deadline_ms: 2_500,
             result_wait: Duration::from_secs(10),
             io_deadline: FAMILY_IO_DEADLINE,
@@ -253,6 +272,15 @@ impl<W: VerifyDraftsWire> VerifyDraftsClient<W> {
     /// happens before any accept: the serving daemon ends the session and
     /// this client surfaces `ClientOpenError::Io` — the same honest
     /// fallback-to-single signal as every other refused open.
+    ///
+    /// When [`VerifyDraftsClientConfig::carrier_prompt_tokens`] is set
+    /// (ADR-036), the SIGNED pin carrier follows the lease carrier and
+    /// precedes the offer — an ELECTED family-verified chat session. The
+    /// serving side's carrier admission (`content_carriage_refused`,
+    /// `profile_mismatch`, `params_mismatch`, `pin_mismatch`,
+    /// `budget_infeasible`) arrives as a normal `SessionReject`, surfaced
+    /// honestly as [`ClientOpenError::Rejected`] with the frozen reason
+    /// string — the same fallback-to-single contract.
     pub async fn negotiate(
         mut wire: W,
         identity: InstallationIdentity,
@@ -273,6 +301,53 @@ impl<W: VerifyDraftsWire> VerifyDraftsClient<W> {
             wire.send_json(&carrier, config.io_deadline)
                 .await
                 .map_err(|_| ClientOpenError::Io("send lease carrier"))?;
+        }
+        // ADR-036 §3.2: the signed session-open PIN CARRIER — AFTER the
+        // lease carrier, immediately BEFORE the offer (the fixed
+        // three-part order). The coordinator's `seq` baseline is 1 (the
+        // carrier ESTABLISHES it; every later `VerifyDrafts` carries a
+        // strictly greater seq — the `next_seq` starting point below),
+        // `round` is the reserved session-open marker 0, and the
+        // commitment is auto-computed over the payload. The carrier form
+        // is bounded by the 256 KiB frame limit: a conversation that does
+        // not fit fails HERE, honestly — truncating to fit is FORBIDDEN
+        // (it would change the root and silently break verification).
+        let mut next_seq = 1u64;
+        if let Some(tokens) = &config.carrier_prompt_tokens {
+            if tokens.is_empty() {
+                return Err(ClientOpenError::Misconfigured(
+                    "carrier prompt_tokens must be non-empty".into(),
+                ));
+            }
+            let carrier = WirePinCarrier {
+                session_id: session_id.clone(),
+                protocol_version: COOPERATIVE_PROTOCOL_VERSION.to_string(),
+                seq: 1,
+                round: 0,
+                profile_id: config.profile_id.clone(),
+                generation_params_hash: params_hash.clone(),
+                prompt_tokens: tokens.clone(),
+                pin_commitment: pin_commitment_of(tokens),
+                nonce: new_nonce(),
+                deadline_ms: config.round_deadline_ms,
+                sender: identity.installation_id(),
+                signature: String::new(),
+            };
+            if serde_json::to_string(&carrier).map_or(usize::MAX, |s| s.len()) > MAX_FRAME_BYTES {
+                return Err(ClientOpenError::Misconfigured(
+                    "the rendered conversation exceeds the 256 KiB carrier frame limit \
+                     (truncating to fit is forbidden)"
+                        .into(),
+                ));
+            }
+            let mut signed = carrier;
+            signed.signature = sign_pin_carrier(&signed, &identity)
+                .map_err(|_| ClientOpenError::Misconfigured("pin carrier signing failed".into()))?;
+            let value = serde_json::to_value(&signed).expect("pin carrier serializes");
+            wire.send_json(&value, config.io_deadline)
+                .await
+                .map_err(|_| ClientOpenError::Io("send pin carrier"))?;
+            next_seq = 2;
         }
         // ADR-032 revision 4 §3/G3: the offer binds the coordinator's
         // pinned profile and sampling parameters (offer form v3) so the
@@ -344,7 +419,10 @@ impl<W: VerifyDraftsWire> VerifyDraftsClient<W> {
             accept,
             session_id,
             params_hash,
-            next_seq: 1,
+            // ADR-036: a carrier session's first `VerifyDrafts` seq is
+            // strictly greater than the carrier's baseline (1) — `next_seq`
+            // opened at 2 above; a neutral session keeps the original 1.
+            next_seq,
             next_round: 1,
             committed_stream: Vec::new(),
         })

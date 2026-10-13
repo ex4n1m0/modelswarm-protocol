@@ -100,8 +100,28 @@ impl FamilyEngineSource {
     /// failures (the composed loop refuses the session honestly — the
     /// coordinator falls back to single, never silently).
     pub async fn engine_for(&self) -> Result<Arc<dyn BatchVerifyEngine>, RuntimeError> {
+        self.engine_for_root(None).await
+    }
+
+    /// The ADR-036 form of the same seam: `root` overrides the
+    /// daemon-pinned neutral prompt with the session's OWN prefilled root
+    /// — for a carrier session, the user's conversation as token ids
+    /// (`Some(prompt_tokens)`); `None` keeps the ADR-034 neutral pin.
+    /// Under `verifydrafts-capi` this constructs a FRESH per-session
+    /// engine (KV residency is bounded by the session: the returned
+    /// handle's drop tears the engine down); the `Shared` variant yields
+    /// the injected engine unchanged (the scripted/test venue — no KV).
+    pub async fn engine_for_root(
+        &self,
+        root: Option<&[u32]>,
+    ) -> Result<Arc<dyn BatchVerifyEngine>, RuntimeError> {
         match self {
-            Self::Shared(engine) => Ok(Arc::clone(engine)),
+            Self::Shared(engine) => {
+                // The scripted/test venue ignores the root (no KV); the
+                // binding keeps the signature honest for both variants.
+                let _ = root;
+                Ok(Arc::clone(engine))
+            }
             #[cfg(feature = "verifydrafts-capi")]
             Self::Capi {
                 adapter,
@@ -109,7 +129,8 @@ impl FamilyEngineSource {
                 profile_id,
                 prompt_tokens,
             } => {
-                if prompt_tokens.is_empty() {
+                let tokens = root.unwrap_or(prompt_tokens);
+                if tokens.is_empty() {
                     return Err(RuntimeError::MalformedResponse(
                         "family engine source configured with an empty pinned prompt".to_string(),
                     ));
@@ -118,7 +139,7 @@ impl FamilyEngineSource {
                     Arc::clone(adapter),
                     *backend,
                     profile_id.clone(),
-                    prompt_tokens.clone(),
+                    tokens.to_vec(),
                 )
                 .await?;
                 Ok(Arc::new(engine))

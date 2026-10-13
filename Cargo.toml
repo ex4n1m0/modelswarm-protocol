@@ -31,7 +31,7 @@ exclude = ["tests/updater-manifest-verify"]
 # `version` (Tauri falls back to this package version), so desktop,
 # node --version, and the UI all report the same number. Bump HERE only.
 [workspace.package]
-version = "0.2.22"
+version = "0.2.23"
 edition = "2021"
 license = "Proprietary"
 repository = "modelswarm"

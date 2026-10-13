@@ -9,6 +9,8 @@
 //! | `get_status` | tracker, engine, artifact, node, roster, license state |
 //! | `set_tracker` | saves the tracker base URL |
 //! | `set_pairing_allowed` | the "allow swarm pairing" toggle (persisted, default on; gates the listener + family tier at hosting start) |
+//! | `set_content_carriage` | the ADR-036 serving-side carriage toggle (persisted, DEFAULT ON; opt-out refuses carrier sessions with the honest `content_carriage_refused` reject) |
+//! | `set_family_verified_chat` | the ADR-036 requester-side election (persisted, DEFAULT OFF; while elected, chat turns open carrier sessions with the always-visible §3.1 disclosure) |
 //! | `accept_privacy` | records the first-run license acceptance |
 //! | `list_models` | verified-catalog active profiles |
 //! | `census` | live per-profile peer counts (public `/api/v1/stats`) for the picker chips |
@@ -111,6 +113,24 @@ struct Inner {
     /// and the family tier at hosting start — never read from the
     /// environment.
     allow_swarm_pairing: bool,
+    /// ADR-036 §3.1: the SERVING-side user-content carriage posture
+    /// (persisted key, DEFAULT ON — the owner's swarm-together
+    /// directive). Flows into the family serve config at hosting start;
+    /// an opted-out peer refuses pin carriers with the honest
+    /// `content_carriage_refused` reject.
+    allow_content_carriage: bool,
+    /// ADR-036 §3.3: the REQUESTER-side family-verified-chat election
+    /// (persisted key, DEFAULT OFF — election is the user's choice; only
+    /// the serving side is default-on). While elected, swarm chat turns
+    /// open carrier sessions; the chat surface carries the always-visible
+    /// §3.1 disclosure with the actual cohort count.
+    family_verified_chat: bool,
+    /// The cohort size of the most recent ELECTED family-verified turn
+    /// (the §3.1 disclosure's N — the ACTUAL count for that turn, bounded
+    /// by the preset cohort cap and the budget's `max_endpoints`; 1 in
+    /// the shipped configuration). `None` before the first elected turn.
+    #[cfg(feature = "verifydrafts")]
+    last_family_cohort: Option<u32>,
     /// The coordinator-side family capability cache (ADR-032 §3
     /// disclosure learned through the existing family negotiation — the
     /// probe fills it; the chat auto-engage checkpoint reads it). No wire
@@ -175,6 +195,60 @@ struct FamilyStatus {
     /// pin hash. `None` while off/unpinned or not hosting (the off reason
     /// carries why).
     pin: Option<FamilyPinStatus>,
+    /// ADR-036 §3.1 (normative UI contract): the SERVING-side
+    /// user-content carriage posture, present whenever the family is on.
+    /// `enabled` mirrors the persisted setting in force for this hosting
+    /// session; `disclosure` is the always-visible §3.1 text VERBATIM
+    /// when enabled, or the honest opt-out statement when not.
+    carriage: Option<FamilyCarriageStatus>,
+}
+
+/// The ADR-036 §3.1 serving-side carriage posture as reported to the UI.
+#[derive(Debug, Clone, Serialize)]
+struct FamilyCarriageStatus {
+    /// Whether other users' conversations are carried through family
+    /// verification for this hosting session (the persisted setting at
+    /// hosting start).
+    enabled: bool,
+    /// The always-visible disclosure: the §3.1 text VERBATIM while
+    /// enabled, or the honest opt-out line when disabled.
+    disclosure: String,
+}
+
+/// ADR-036 §3.1 (NORMATIVE UI CONTRACT — verbatim, both ends, always
+/// visible while active, plain language, no modal, no one-time
+/// click-through, no security-through-tokenization implication, the
+/// honest cost stated, the hub-blind fact stated): the SERVING-side
+/// disclosure, shown on the family status line while family serving is
+/// enabled and carriage is on.
+#[cfg(feature = "verifydrafts")]
+const CARRIAGE_DISCLOSURE_SERVING: &str = "This computer carries other users' conversations \
+     (as token ids it can read) through family verification. On by default — you can turn it off, \
+     and requesting peers are refused honestly when you do.";
+
+/// ADR-036 §3.1: the serving-side opt-out line (the honest statement when
+/// the user has turned carriage off — the disclosure text would otherwise
+/// claim carrying is happening).
+#[cfg(feature = "verifydrafts")]
+const CARRIAGE_DISCLOSURE_OFF: &str = "This computer is set NOT to carry other users' \
+     conversations through family verification — requesting peers are refused honestly \
+     (content_carriage_refused).";
+
+/// ADR-036 §3.1 (NORMATIVE UI CONTRACT — verbatim): the REQUESTER-side
+/// disclosure, shown on the chat surface while family-verified chat is
+/// ELECTED. `{N}` is the ACTUAL cohort size for the turn (bounded by the
+/// preset cohort cap and the session budget's `max_endpoints`; 1 in the
+/// shipped configuration).
+#[cfg(feature = "verifydrafts")]
+const CARRIAGE_DISCLOSURE_REQUESTER: &str = "Family verification ON: your conversation — in a \
+     form the receiving computers can read — goes to every verification peer this turn ({N}). It \
+     is slower than single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees \
+     any of it. Turn it off any time.";
+
+/// Renders the §3.1 requester disclosure with the ACTUAL cohort count.
+#[cfg(feature = "verifydrafts")]
+fn requester_disclosure(cohort: u32) -> String {
+    CARRIAGE_DISCLOSURE_REQUESTER.replace("{N}", &cohort.to_string())
 }
 
 /// The ADR-034 rule-6a status fields: provenance, token count, pin hash —
@@ -200,6 +274,7 @@ impl FamilyStatus {
             disclosure: None,
             lease_roster_peers: 0,
             pin: None,
+            carriage: None,
         }
     }
 
@@ -279,6 +354,10 @@ impl DesktopState {
                 node: None,
                 chat_log: Vec::new(),
                 allow_swarm_pairing: config.allow_swarm_pairing,
+                allow_content_carriage: config.allow_content_carriage,
+                family_verified_chat: config.family_verified_chat,
+                #[cfg(feature = "verifydrafts")]
+                last_family_cohort: None,
                 #[cfg(feature = "verifydrafts")]
                 family_peer_caps: Default::default(),
                 #[cfg(feature = "verifydrafts")]
@@ -340,6 +419,24 @@ struct PersistedConfig {
     /// never the reverse).
     #[serde(default = "default_allow_swarm_pairing")]
     allow_swarm_pairing: bool,
+    /// ADR-036 §3.1 (the owner's swarm-together directive): the SERVING
+    /// posture for other users' conversations through family verification
+    /// — DEFAULT ON. Opting out refuses pin carriers with the honest
+    /// labeled reject `content_carriage_refused` (never a silent drop);
+    /// the neutral family is unaffected. Applies at the NEXT hosting start
+    /// (changing while hosting is refused — the live listener must never
+    /// contradict the setting).
+    #[serde(default = "default_allow_content_carriage")]
+    allow_content_carriage: bool,
+    /// ADR-036 §3.1/§3.3: the REQUESTER-side election for
+    /// family-verified chat — DEFAULT OFF. Election is the USER's choice
+    /// (only the serving side is default-on): while elected, chat turns
+    /// open carrier sessions (the conversation, as token ids, goes to
+    /// every verification peer) with the always-visible §3.1 disclosure
+    /// and its honest cost. Flippable at any time — it routes the NEXT
+    /// turn, contradicting no live session.
+    #[serde(default)]
+    family_verified_chat: bool,
 }
 
 fn default_tracker() -> String {
@@ -350,15 +447,22 @@ fn default_allow_swarm_pairing() -> bool {
     true
 }
 
+fn default_allow_content_carriage() -> bool {
+    true
+}
+
 impl Default for PersistedConfig {
     fn default() -> Self {
         // Mirrors the serde field defaults exactly: a missing file/keys
         // must read as the fresh-install posture (default tracker,
-        // pairing ALLOWED) — `derive(Default)` would zero the toggle.
+        // pairing ALLOWED, carriage ALLOWED, verified chat NOT elected) —
+        // `derive(Default)` would zero the on-defaults.
         Self {
             tracker: default_tracker(),
             profile_id: None,
             allow_swarm_pairing: default_allow_swarm_pairing(),
+            allow_content_carriage: default_allow_content_carriage(),
+            family_verified_chat: false,
         }
     }
 }
@@ -902,6 +1006,7 @@ async fn compose_family_serving(
     weights_bytes: u64,
     hardware: &HardwareInfo,
     handle: &NodeHandle,
+    allow_content_carriage: bool,
     telemetry: &std::sync::Arc<Telemetry>,
 ) -> (
     Option<FamilyServing>,
@@ -925,6 +1030,17 @@ async fn compose_family_serving(
         );
     };
     let config = VerifyDraftsServeConfig::honest(profile.to_string(), verifier_identity);
+    // ADR-036 §3.1: the carriage posture for this hosting session — the
+    // persisted setting at hosting start (DEFAULT ON; refused-while-
+    // hosting keeps the live listener honest). An opted-out peer refuses
+    // pin carriers with the honest `content_carriage_refused` reject; the
+    // neutral family (carrier-less sessions) is unaffected.
+    let mut config = config;
+    config.content_carriage = if allow_content_carriage {
+        modelswarm_node::verifydrafts::ContentCarriage::On
+    } else {
+        modelswarm_node::verifydrafts::ContentCarriage::Off
+    };
     // (The config's hand-set disclosure stays the honest `batch_verify:
     // false` default — the composed loop overrides it per session with
     // the engine's REAL geometry; the status below reports the same
@@ -1131,6 +1247,17 @@ async fn compose_family_serving(
         disclosure: Some(disclosure),
         lease_roster_peers,
         pin: Some(pin_status),
+        // ADR-036 §3.1: the always-visible serving-side disclosure — the
+        // normative text VERBATIM while carriage is on; the honest
+        // opt-out statement when off (the UI renders this verbatim).
+        carriage: Some(FamilyCarriageStatus {
+            enabled: allow_content_carriage,
+            disclosure: if allow_content_carriage {
+                CARRIAGE_DISCLOSURE_SERVING.to_string()
+            } else {
+                CARRIAGE_DISCLOSURE_OFF.to_string()
+            },
+        }),
     };
     (
         Some(FamilyServing {
@@ -1186,11 +1313,12 @@ async fn resolve_profile(
 
 fn persist_config(inner: &Inner) -> Result<(), String> {
     // TR-RC-8 (ADR-033 §9.2 review): READ-MODIFY-WRITE the FULL JSON
-    // object. The daemon owns exactly three keys (`tracker`,
-    // `profile_id`, `allow_swarm_pairing`); every other key in config.json
-    // — another subsystem's config surface that later moves in here — is
-    // preserved verbatim. (The previous struct-rewrite serialized only the
-    // known fields and SILENTLY DELETED everything else on every rewrite.)
+    // object. The daemon owns exactly five keys (`tracker`, `profile_id`,
+    // `allow_swarm_pairing`, `allow_content_carriage`,
+    // `family_verified_chat`); every other key in config.json — another
+    // subsystem's config surface that later moves in here — is preserved
+    // verbatim. (The previous struct-rewrite serialized only the known
+    // fields and SILENTLY DELETED everything else on every rewrite.)
     let path = inner.data_dir.join("config.json");
     let mut root: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
         .ok()
@@ -1201,6 +1329,14 @@ fn persist_config(inner: &Inner) -> Result<(), String> {
     root.insert(
         "allow_swarm_pairing".into(),
         serde_json::json!(inner.allow_swarm_pairing),
+    );
+    root.insert(
+        "allow_content_carriage".into(),
+        serde_json::json!(inner.allow_content_carriage),
+    );
+    root.insert(
+        "family_verified_chat".into(),
+        serde_json::json!(inner.family_verified_chat),
     );
     std::fs::write(
         &path,
@@ -1425,6 +1561,29 @@ async fn get_status(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<serde_json::Value, String> {
     let inner = state.inner.lock().await;
+    // ADR-036 §3.1: the requester-side election block — computed before
+    // the status macro (the `disclosure` is the always-visible §3.1 text
+    // with the ACTUAL cohort count, present only while elected).
+    let family_verified_chat_status = {
+        let elected = inner.family_verified_chat;
+        #[cfg(feature = "verifydrafts")]
+        {
+            let cohort = inner.last_family_cohort.unwrap_or(1);
+            serde_json::json!({
+                "elected": elected,
+                "cohort": cohort,
+                "disclosure": if elected {
+                    serde_json::json!(requester_disclosure(cohort))
+                } else {
+                    serde_json::Value::Null
+                },
+            })
+        }
+        #[cfg(not(feature = "verifydrafts"))]
+        {
+            serde_json::json!({ "elected": elected, "cohort": 1, "disclosure": null })
+        }
+    };
     let engine = engine_binary_path(&app);
     let node_running = inner.node.is_some();
     let enrollment = match &inner.node {
@@ -1453,6 +1612,11 @@ async fn get_status(
         // 2026-10-13): the UI renders the posture from THIS field, never
         // a guessed default.
         "pairing_allowed": inner.allow_swarm_pairing,
+        // ADR-036 §3.1: the serving-side carriage posture (default on)
+        // and the requester-side election (default off) — the UI's honest
+        // posture sources for both disclosures.
+        "content_carriage_allowed": inner.allow_content_carriage,
+        "family_verified_chat": family_verified_chat_status,
         "artifact": inner.artifact.as_ref().map(|a| serde_json::json!({
             "path": a.path.display().to_string(),
             "bytes": a.bytes,
@@ -1516,6 +1680,58 @@ async fn set_pairing_allowed(
         "info",
         "settings.pairing",
         &[("allowed", &allowed.to_string())],
+    );
+    persist_config(&inner)
+}
+
+/// ADR-036 §3.1: the SERVING-side user-content carriage toggle
+/// ("carry other users' conversations through family verification",
+/// persisted key `allow_content_carriage`, DEFAULT ON per the owner's
+/// swarm-together directive). Opting out refuses pin carriers with the
+/// honest `content_carriage_refused` reject. Applies at the NEXT hosting
+/// start — refusing while hosting keeps the live listener from
+/// contradicting the setting (the same discipline as the pairing toggle).
+#[tauri::command]
+async fn set_content_carriage(
+    state: tauri::State<'_, DesktopState>,
+    allowed: bool,
+) -> Result<(), String> {
+    let mut inner = state.inner.lock().await;
+    if inner.node.is_some() {
+        return Err(
+            "stop hosting before changing conversation carriage (applies at the next hosting start)"
+                .into(),
+        );
+    }
+    inner.allow_content_carriage = allowed;
+    log_event(
+        &state.telemetry,
+        "info",
+        "settings.content_carriage",
+        &[("allowed", &allowed.to_string())],
+    );
+    persist_config(&inner)
+}
+
+/// ADR-036 §3.1/§3.3: the REQUESTER-side family-verified-chat election
+/// (persisted key `family_verified_chat`, DEFAULT OFF — election is the
+/// user's explicit choice; only the SERVING side is default-on). While
+/// elected, swarm chat turns open carrier sessions and the chat surface
+/// carries the always-visible §3.1 disclosure with the actual cohort
+/// count and the honest cost. Flippable at any time (it routes the next
+/// turn; no live session is contradicted).
+#[tauri::command]
+async fn set_family_verified_chat(
+    state: tauri::State<'_, DesktopState>,
+    elected: bool,
+) -> Result<(), String> {
+    let mut inner = state.inner.lock().await;
+    inner.family_verified_chat = elected;
+    log_event(
+        &state.telemetry,
+        "info",
+        "settings.family_verified_chat",
+        &[("elected", &elected.to_string())],
     );
     persist_config(&inner)
 }
@@ -2172,6 +2388,7 @@ async fn set_hosting_inner(
                 ensured.bytes,
                 &hardware,
                 &handle,
+                inner.allow_content_carriage,
                 &state.telemetry,
             )
             .await;
@@ -3504,20 +3721,27 @@ fn record_shadow_failure(
 // DEFAULT_CONFIDENCE_MARGIN 0.15 — 0.05 is only the reject floor —
 // fastest-single comparator).
 //
-// What is BLOCKED at the protocol boundary (recorded, not improvised):
-// routing a CHAT completion through a verifydrafts cooperative session
-// requires the session prompt in the VERIFIER's engine KV, and the family
-// wire is content-blind BY DESIGN (ADR-032 §2/G6: the prompt is pinned
-// out-of-band; ADR-034 rule 5: "it does not smuggle user prompts onto the
-// family wire — arbitrary-user-prompt family sessions require the rule-8
-// commitment path or expert-pinned identical files on both ends", and
-// rule 8 is owner-gated). So engagement never fires for chat content
-// today; the plain swarm path serves (BEFORE the first output token, per
-// the v0.1 retry rule) with the exact reason surfaced — never a silent
-// non-engagement. The reason ladder below is the pinned vocabulary.
+// What the AUTOMATIC path may do (ADR-036 §3.3 — the narrowed
+// `blocked_content_contract`): the engage gate and the fastest-single
+// comparator stay OUTERMOST and byte-stable, and user content rides a
+// family session ONLY under the user's explicit election (the
+// family-verified-chat toggle — the ELECTED path in try_swarm_chat, the
+// probe's sibling: user-triggered, honest cost displayed, never an
+// automatic speed-up). The frozen label `blocked_content_contract` fires
+// when the gate would otherwise engage but the user-content carrier path
+// is NOT elected or not locally available (the carrier form exceeds the
+// §6.4 256 KiB frame limit, or the conversation is not renderable under
+// the pinned template/tokenizer) — never as a blanket content block, and
+// TRUNCATING a conversation to fit is FORBIDDEN (truncation changes the
+// root, breaks the commitment, and would fail verification silently).
+// The plain swarm path serves every turn before the first output token
+// regardless. The reason ladder below is the pinned vocabulary.
 
-/// Why the chat path is NOT routing this completion through a family
-/// session (stable labels; the ladder's order is the pinned priority).
+/// Why the AUTOMATIC chat path is not routing this completion through a
+/// family session (stable labels; the ladder's order is the pinned
+/// priority). With the election OFF (the default) the terminal label is
+/// the narrowed `blocked_content_contract` even when the gate would
+/// engage — the election, not the gate, is what carries content.
 #[cfg(feature = "verifydrafts")]
 fn family_engage_reason(
     cap: Option<&FamilyPeerCap>,
@@ -3548,9 +3772,13 @@ fn family_engage_reason(
         modelswarm_scheduler::DEFAULT_CONFIDENCE_MARGIN,
     ) {
         Ok(false) => "gate_no_win",
-        // The gate would engage, but ADR-034 rule 5 blocks user-content
-        // family sessions (the owner-gated rule-8 commitment path is the
-        // recorded route to lifting this).
+        // The gate WOULD engage — the automatic path still does not carry
+        // user content: ADR-036 §3.3's narrowed label fires because the
+        // user-content carrier path is not elected (the election, never
+        // the gate, carries content). With the election ON, the elected
+        // path runs INSTEAD of this ladder (user-triggered, like the
+        // probe) and this label then means "not locally available"
+        // (carrier form over the 256 KiB frame limit / unrenderable).
         Ok(true) => "blocked_content_contract",
         Err(_) => "gate_misconfigured",
     }
@@ -3621,6 +3849,360 @@ async fn family_engage_checkpoint(
     let fields: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
     telemetry.info("family.engage", &fields);
     reason
+}
+
+/// ADR-036 §3.3 — the ELECTED family-verified chat turn (the probe's
+/// sibling: user-triggered via the family-verified-chat toggle, honest
+/// cost displayed; it does NOT ride the engage gate because the user has
+/// explicitly accepted the measured cost the gate exists to protect them
+/// from). Renders the conversation under the profile's pinned chat
+/// template + tokenizer (the ADR-025 application point — the same
+/// `render_chatml` the serving executor applies, so the carrier root is
+/// the same tokenization the single-serving path would send), opens ONE
+/// carrier session to the verifying peer (lease → signed pin carrier →
+/// offer), then drives the lossless `speculative_exact` loop: THIS
+/// machine's own engine drafts every window (greedy, pinned params), the
+/// local self-check gates each drafted window (cache-cold — the standing
+/// 2026-10-13 rule), the peer verifies, and the committed stream (the
+/// verifying peer's engine's own continuation) IS the reply.
+///
+/// HONEST COST (ADR-036 §3.4, never softened): this is SLOWER than
+/// single-peer chat, not faster — the requester's own engine drafts every
+/// committed word and the peers check, they do not relieve it. The mode
+/// label says so. On ANY honest failure (no local engine, unrenderable or
+/// oversized carrier form, refused open, engine gap) this returns `None`
+/// and the caller falls back to the plain swarm path — the mandatory
+/// fallback-to-single contract, never silent.
+#[cfg(feature = "verifydrafts")]
+#[allow(clippy::too_many_arguments)]
+async fn try_family_verified_chat(
+    inner: &tokio::sync::Mutex<Inner>,
+    telemetry: &std::sync::Arc<Telemetry>,
+    profile: &str,
+    log: &[ChatTurn],
+    max_tokens: Option<u32>,
+    addr: &str,
+    remote_peer_id: &str,
+    identity: &modelswarm_identity::InstallationIdentity,
+    lease: Option<&str>,
+    on_delta: &(dyn Fn(&str) + Send + Sync),
+) -> Option<serde_json::Value> {
+    let engage_label = |reason: &str, detail: Option<&str>| {
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("phase", "chat"),
+            ("peer", remote_peer_id),
+            ("engaged", "false"),
+            ("reason", reason),
+        ];
+        if let Some(detail) = detail {
+            fields.push(("detail", detail));
+        }
+        telemetry.info("family.engage", &fields);
+    };
+    // The local drafting + self-check surfaces: this machine's own
+    // hosting runtime (drafts) and the family engine source (cache-cold
+    // local verification). Without either, the elected path is not
+    // locally available — the honest label, then the plain path.
+    let (runtime, family_engine, engine_backend) = {
+        let guard = inner.lock().await;
+        let node = guard.node.as_ref();
+        (
+            node.and_then(|r| r.handle.runtime.clone()),
+            guard.family_engine.clone(),
+            node.and_then(|r| r.handle.engine_backend.clone()),
+        )
+    };
+    let (Some(runtime), Some(family_engine)) = (runtime, family_engine) else {
+        engage_label("elected_no_local_engine", None);
+        return None;
+    };
+    // The conversation root: the SAME ChatML rendering + pinned
+    // tokenizer the serving path applies (ADR-025 application point;
+    // ADR-036 §3.2 "the ids ARE the contract" — the serving side does
+    // NOT re-derive).
+    let turns: Vec<modelswarm_gateway::NormalizedMessage> = log
+        .iter()
+        .map(|t| modelswarm_gateway::NormalizedMessage {
+            role: t.role.clone(),
+            content: t.content.clone(),
+        })
+        .collect();
+    let rendered = modelswarm_node::render_chatml(&turns);
+    let root = match modelswarm_node::runtime_tokenize(Some(&runtime), &rendered).await {
+        Ok(ids) if !ids.is_empty() => ids,
+        Ok(_) => {
+            engage_label(
+                "blocked_content_contract",
+                Some("unrenderable_conversation"),
+            );
+            return None;
+        }
+        Err(e) => {
+            engage_label("blocked_content_contract", Some(&format!("tokenize: {e}")));
+            return None;
+        }
+    };
+    // §3.3's residual meaning, for real: a carrier form over the 256 KiB
+    // frame limit fires `blocked_content_contract` — TRUNCATING the
+    // conversation to fit is FORBIDDEN (it would change the root, break
+    // the commitment, and fail verification silently). Fall back to the
+    // plain path. The probe carries every field at its real worst-case
+    // wire length (nonce/commitment/signature/base64 sizes), so the
+    // bound is exact, not fudged.
+    let frame_bound = modelswarm_transport::frame::MAX_FRAME_BYTES;
+    let probe = modelswarm_node::verifydrafts::WirePinCarrier {
+        session_id: "vd-0000000000000000".to_string(),
+        protocol_version: "msp-cooperative-v1".to_string(),
+        seq: 1,
+        round: 0,
+        profile_id: profile.to_string(),
+        generation_params_hash: "0".repeat(64),
+        prompt_tokens: root.clone(),
+        pin_commitment: "0".repeat(64),
+        nonce: "0".repeat(16),
+        deadline_ms: 120_000,
+        sender: identity.installation_id(),
+        signature: "0".repeat(88),
+    };
+    let carrier_fits = serde_json::to_string(&probe).is_ok_and(|s| s.len() <= frame_bound);
+    drop(probe);
+    if !carrier_fits {
+        engage_label(
+            "blocked_content_contract",
+            Some("carrier_exceeds_frame_limit"),
+        );
+        return None;
+    }
+    // The verifier key is PINNED from the roster peer id (the probe's
+    // discipline — never a payload claim).
+    let Ok(verifier_key) =
+        modelswarm_node::verifydrafts::verifying_key_from_peer_id(remote_peer_id)
+    else {
+        engage_label("peer_id_not_ed25519", None);
+        return None;
+    };
+    let mut config = modelswarm_node::verifydrafts::VerifyDraftsClientConfig::new(
+        profile.to_string(),
+        verifier_key,
+    );
+    // E0 pairing: the offer carries THIS machine's real engine backend.
+    config.verifier_backend = match engine_backend.as_deref() {
+        Some("vulkan") => modelswarm_node::verifydrafts::Backend::Vulkan,
+        _ => modelswarm_node::verifydrafts::Backend::Cpu,
+    };
+    config.lease = lease.map(str::to_string);
+    config.carrier_prompt_tokens = Some(root.clone());
+    // The open-phase deadline: the serving side prefills the WHOLE
+    // conversation at engine construction before the accept (the Capi
+    // seam), so the carrier's deadline must bound that work honestly —
+    // the 2.5 s round default would refuse real conversations as
+    // `deadline_exceeded`. 20 s sits inside the 30 s per-frame I/O
+    // deadline with margin; the serving side clamps [1000, 120000].
+    config.round_deadline_ms = 20_000;
+    let wire = match modelswarm_node::verifydrafts::dial_quic(
+        addr,
+        identity,
+        &verifier_key,
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(wire) => wire,
+        Err(e) => {
+            engage_label("dial_failed", Some(&e.to_string()));
+            return None;
+        }
+    };
+    let tel = Telemetry::memory().0;
+    let mut client = match modelswarm_node::verifydrafts::VerifyDraftsClient::negotiate(
+        wire,
+        identity.clone(),
+        config,
+        &tel,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(error) => {
+            // The honest refusal classification: the peer's reject reason
+            // (pin_mismatch / content_carriage_refused / profile_mismatch
+            // / params_mismatch / budget_infeasible — "conversation does
+            // not fit this peer") rides the label; the caller falls back
+            // to the plain path, never silently.
+            let label = match &error {
+                modelswarm_node::verifydrafts::ClientOpenError::Rejected(reason) => *reason,
+                other => family_open_error_reason(other),
+            };
+            engage_label(label, Some(&error.to_string()));
+            return None;
+        }
+    };
+    // The self-check engine for THIS conversation (prefilled with the
+    // carrier root; KV advances round by round exactly as the serving
+    // engine's does — cache-cold by construction at open).
+    let selfcheck = match family_engine.engine_for_root(Some(&root)).await {
+        Ok(engine) => engine,
+        Err(e) => {
+            engage_label("selfcheck_unavailable", Some(&format!("engine load: {e}")));
+            return None;
+        }
+    };
+    // The lossless verified loop: draft (this machine's engine, greedy
+    // under the pinned params) → local self-check → wire → commit. The
+    // COMMITTED stream is the verifying peer's engine's own continuation
+    // (ADR-036 §3.2 — lossless-verification sessions only).
+    let started = Instant::now();
+    let mut committed: Vec<u32> = Vec::new();
+    let max_out = max_tokens.unwrap_or(256) as usize;
+    let w_cap = 8u32.min(client.engine_disclosure().batch_window_max).max(1);
+    let mut rounds = 0u32;
+    let mut divergence_label: Option<&'static str> = None;
+    while committed.len() < max_out {
+        let remaining = max_out - committed.len();
+        let want = w_cap.min(remaining as u32) as usize;
+        let mut prefix = root.clone();
+        prefix.extend_from_slice(&committed);
+        let window = match modelswarm_node::runtime_propose_window(
+            Some(&runtime),
+            profile,
+            &prefix,
+            want as u32,
+        )
+        .await
+        {
+            Ok(window) => window,
+            Err(e) => {
+                divergence_label = Some("draft_unavailable");
+                telemetry.warn(
+                    "chat.family_verified.draft_failed",
+                    &[("phase", "draft"), ("error", &e)],
+                );
+                break;
+            }
+        };
+        let window: Vec<u32> = window.into_iter().take(remaining).collect();
+        if window.is_empty() {
+            break; // the engine ended its turn (EOS): an honest short reply
+        }
+        // The pre-wire gate (the standing 2026-10-13 rule): a locally
+        // divergent window NEVER hits the wire.
+        let params = modelswarm_node::verifydrafts::SamplingParams::default();
+        match selfcheck.verify_window(&window, &params).await {
+            Ok((accepted, _)) if accepted as usize == window.len() => {}
+            Ok((accepted, _)) => {
+                divergence_label = Some("local_selfcheck");
+                telemetry.info(
+                    "family.engage",
+                    &[
+                        ("phase", "chat"),
+                        ("peer", remote_peer_id),
+                        ("engaged", "false"),
+                        ("reason", "local_selfcheck"),
+                        ("window", &window.len().to_string()),
+                        ("accepted", &accepted.to_string()),
+                    ],
+                );
+                break;
+            }
+            Err(e) => {
+                divergence_label = Some("selfcheck_unavailable");
+                telemetry.warn(
+                    "chat.family_verified.selfcheck_failed",
+                    &[("phase", "verify"), ("error", &e.to_string())],
+                );
+                break;
+            }
+        }
+        match client.round(&window, &tel).await {
+            Ok(outcome) => {
+                let eos_now =
+                    outcome.divergence_point.is_none() && (window.len() as u32) < want as u32;
+                for token in &outcome.committed {
+                    committed.push(*token);
+                }
+                rounds += 1;
+                if eos_now {
+                    break;
+                }
+            }
+            Err(failure) => {
+                divergence_label = Some(pairing_round_failure_label(&failure));
+                break;
+            }
+        }
+    }
+    drop(selfcheck); // teardown-bounded: the conversation-rooted engine dies here
+    if committed.is_empty() {
+        // Nothing verified: the honest empty outcome falls back to the
+        // plain path (labeled, never silent).
+        engage_label(divergence_label.unwrap_or("no_committed_tokens"), None);
+        return None;
+    }
+    // The committed stream is THIS machine's own committed data (its
+    // drafts + the peers' corrections) — decode it under the pinned
+    // tokenizer; deltas stream as the final text renders.
+    let content = match modelswarm_node::runtime_detokenize(Some(&runtime), &committed).await {
+        Ok(text) => text,
+        Err(e) => {
+            engage_label("detokenize_failed", Some(&e));
+            return None;
+        }
+    };
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        engage_label("empty_reply", None);
+        return None;
+    }
+    on_delta(&content);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let completion_tokens = committed.len() as u64;
+    let tok_s = if elapsed_ms > 0 {
+        (completion_tokens as f64) * 1000.0 / elapsed_ms as f64
+    } else {
+        0.0
+    };
+    // The cohort: ONE verifying peer in the shipped configuration
+    // (bounded by the preset cohort cap and the budget's max_endpoints).
+    let cohort: u32 = 1;
+    {
+        let mut guard = inner.lock().await;
+        guard.last_family_cohort = Some(cohort);
+    }
+    telemetry.info(
+        "family.engage",
+        &[
+            ("phase", "chat"),
+            ("peer", remote_peer_id),
+            ("engaged", "true"),
+            ("reason", "elected"),
+            ("cohort", &cohort.to_string()),
+            ("rounds", &rounds.to_string()),
+            ("tokens", &completion_tokens.to_string()),
+            ("elapsed_ms", &elapsed_ms.to_string()),
+        ],
+    );
+    telemetry.info(
+        "chat.family_verified.completed",
+        &[
+            ("peer", remote_peer_id),
+            ("rounds", &rounds.to_string()),
+            ("completion_tokens", &completion_tokens.to_string()),
+            ("elapsed_ms", &elapsed_ms.to_string()),
+        ],
+    );
+    Some(serde_json::json!({
+        "content": content,
+        "completion_tokens": completion_tokens,
+        "elapsed_ms": elapsed_ms,
+        "tokens_per_second": tok_s,
+        // The honest mode label: verified AND slower by design (§3.4 —
+        // presenting this mode as a speed feature is a defect).
+        "mode": format!(
+            "family-verified — peer {}… (slower by design)",
+            remote_peer_id.chars().take(12).collect::<String>()
+        ),
+        "family_engage": { "engaged": true, "reason": "elected", "cohort": cohort },
+    }))
 }
 
 /// F1(3): swarm-first chat. Finds a peer verifiably hosting this exact
@@ -3736,6 +4318,10 @@ async fn try_swarm_chat(
     // F15: the roster's advertised queueMs rides along (untrusted input,
     // recorded next to the measured admission-to-first-token).
     let advertised_queue_ms = candidate.queue_ms;
+    // The elected ADR-036 path (below) dials its own carrier session to
+    // the same candidate before the pooled executor takes the addr.
+    #[cfg(feature = "verifydrafts")]
+    let elected_addr = addr.clone();
     let peer = modelswarm_node::remote::RemotePeer {
         addr,
         peer_id: candidate.peer_id,
@@ -3755,12 +4341,55 @@ async fn try_swarm_chat(
 
     // FAMILY AUTO-ENGAGE CHECKPOINT (owner directive 2026-10-13, zero
     // buttons): evaluated on every swarm chat turn, behind the engage
-    // gate. Engagement is protocol-blocked for chat content today
-    // (ADR-034 rule 5 — the reason label says so); the plain swarm path
-    // below serves this turn either way, BEFORE the first output token.
+    // gate. For the AUTOMATIC path (no election) engagement never carries
+    // chat content (ADR-036 §3.3 — the reason label says so); the plain
+    // swarm path below serves this turn either way, BEFORE the first
+    // output token. The ELECTED path (ADR-036 §3.3 — the user's explicit
+    // family-verified-chat toggle) runs INSTEAD of the ladder, like the
+    // probe: user-triggered, honest cost displayed, with its own honest
+    // fallback to the plain path below on any failure.
     #[cfg(feature = "verifydrafts")]
-    let family_engage =
-        family_engage_checkpoint(inner, profile, &remote_peer_id, &shadow_plan, telemetry).await;
+    let elected = {
+        let guard = inner.lock().await;
+        guard.family_verified_chat
+    };
+    #[cfg(feature = "verifydrafts")]
+    let elected_reply = if elected {
+        try_family_verified_chat(
+            inner,
+            telemetry,
+            profile,
+            log,
+            max_tokens,
+            &elected_addr,
+            &remote_peer_id,
+            &identity,
+            lease.as_deref(),
+            on_delta,
+        )
+        .await
+    } else {
+        None
+    };
+    #[cfg(feature = "verifydrafts")]
+    if let Some(reply) = elected_reply {
+        // The elected turn SERVED through a carrier session — cohort N
+        // verified, slower by design, never hidden (the reply carries
+        // family_engage { engaged: true, cohort }).
+        let mut reply = reply;
+        reply["served_by"] = serde_json::json!("swarm");
+        reply["family_verified"] = serde_json::json!(true);
+        return Some(reply);
+    }
+    #[cfg(feature = "verifydrafts")]
+    let family_engage = if elected {
+        // The elected path already telemetered its own honest outcome
+        // (engaged:false + reason); the automatic ladder has nothing to
+        // add for this turn.
+        "elected_fell_back"
+    } else {
+        family_engage_checkpoint(inner, profile, &remote_peer_id, &shadow_plan, telemetry).await
+    };
 
     let make_request = || modelswarm_gateway::NormalizedRequest {
         request_id: format!("chat-{}", modelswarm_identity::new_nonce()),
@@ -4698,6 +5327,8 @@ pub fn run() {
             get_status,
             set_tracker,
             set_pairing_allowed,
+            set_content_carriage,
+            set_family_verified_chat,
             accept_privacy,
             list_models,
             census,
@@ -5177,6 +5808,7 @@ mod tests {
             })),
             lease_roster_peers: 0,
             pin: None,
+            carriage: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["state"], "on");
@@ -5493,6 +6125,7 @@ mod tests {
                     token_count: ids.len() as u64,
                     pin_hash: family_pin_hash(&ids),
                 }),
+                carriage: None,
             };
             let json = serde_json::to_value(&status).unwrap();
             assert_eq!(json["pin"]["provenance"], provenance);
@@ -5610,6 +6243,10 @@ mod tests {
             node: None,
             chat_log: Vec::new(),
             allow_swarm_pairing: true,
+            allow_content_carriage: true,
+            family_verified_chat: false,
+            #[cfg(feature = "verifydrafts")]
+            last_family_cohort: None,
             #[cfg(feature = "verifydrafts")]
             family_peer_caps: Default::default(),
             #[cfg(feature = "verifydrafts")]
@@ -5664,8 +6301,8 @@ mod tests {
         assert_eq!(saved["window_state"]["maximized"], false);
     }
 
-    /// Fresh-install shapes: a missing file starts from `{}` (the two
-    /// daemon keys land, nothing else), and a `null` profile round-trips
+    /// Fresh-install shapes: a missing file starts from `{}` (the
+    /// daemon's keys land, nothing else), and a `null` profile round-trips
     /// as `null` exactly as the previous writer emitted it.
     #[test]
     fn config_write_fresh_file_and_null_profile() {
@@ -5678,14 +6315,273 @@ mod tests {
         assert_eq!(saved["profile_id"], serde_json::Value::Null);
         assert_eq!(
             saved.as_object().unwrap().len(),
-            3,
+            5,
             "a fresh file carries exactly the daemon's keys"
         );
         assert_eq!(saved["allow_swarm_pairing"], true, "default-on posture");
-        // Round-trips: read_config still reads the tolerant two fields.
+        // Round-trips: read_config still reads the tolerant field set.
         let config = read_config(dir.path());
         assert_eq!(config.tracker, "https://t.example");
         assert_eq!(config.profile_id, None);
+    }
+
+    // ---- ADR-036 (2026-10-13): the carriage posture, both disclosures,
+    // the election, and the narrowed content contract -------------------
+
+    /// The ADR-036 fresh-install postures (§3.1): SERVING carriage
+    /// DEFAULT ON (the owner's swarm-together directive), REQUESTER
+    /// election DEFAULT OFF (the user's choice). Both round-trip through
+    /// the persisted config, and a config that predates ADR-036 (no
+    /// keys) reads as the same postures via the serde defaults.
+    #[test]
+    fn adr036_postures_default_on_serving_off_requester() {
+        // Fresh install.
+        let dir = tempfile::tempdir().unwrap();
+        let config = read_config(dir.path());
+        assert!(config.allow_content_carriage, "carriage default ON");
+        assert!(!config.family_verified_chat, "election default OFF");
+        // A pre-ADR-036 config (the three old keys, none of ours).
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"tracker":"https://t.example","profile_id":null,"allow_swarm_pairing":true}"#,
+        )
+        .unwrap();
+        let config = read_config(dir.path());
+        assert!(config.allow_content_carriage, "missing key = default ON");
+        assert!(!config.family_verified_chat, "missing key = default OFF");
+        // Round-trip: flipping both persists and re-reads.
+        let mut inner = test_inner(dir.path(), "https://t.example", None);
+        inner.allow_content_carriage = false;
+        inner.family_verified_chat = true;
+        persist_config(&inner).unwrap();
+        let config = read_config(dir.path());
+        assert!(!config.allow_content_carriage);
+        assert!(config.family_verified_chat);
+        // And the daemon's five keys are exactly what the writer owns.
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["allow_content_carriage"], false);
+        assert_eq!(saved["family_verified_chat"], true);
+    }
+
+    /// The §3.1 disclosures are VERBATIM (normative UI contract — the
+    /// exact texts ship in the binary, N rendered from the actual
+    /// cohort), and the honest cost + hub-blind facts are stated.
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn adr036_disclosure_texts_are_verbatim() {
+        assert_eq!(
+            CARRIAGE_DISCLOSURE_SERVING,
+            "This computer carries other users' conversations (as token ids it can read) \
+             through family verification. On by default — you can turn it off, and requesting \
+             peers are refused honestly when you do."
+        );
+        assert!(CARRIAGE_DISCLOSURE_OFF.contains("content_carriage_refused"));
+        // The requester text with the ACTUAL cohort count.
+        assert_eq!(
+            requester_disclosure(1),
+            "Family verification ON: your conversation — in a form the receiving computers \
+             can read — goes to every verification peer this turn (1). It is slower than \
+             single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees \
+             any of it. Turn it off any time."
+        );
+        assert!(requester_disclosure(3).contains("this turn (3)."));
+        // The honesty discipline: never implies unreadability, encrypted
+        // beyond transport, or faster.
+        let text = requester_disclosure(1);
+        assert!(text.contains("can read"));
+        assert!(text.contains("slower than single-peer chat, not faster"));
+        assert!(text.contains("never sees any of it"));
+    }
+
+    /// The family status carries the carriage disclosure whenever the
+    /// family is ON (§3.1: always visible while active) — the exact text
+    /// while enabled, the honest opt-out statement when not.
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn family_status_carries_the_carriage_disclosure_when_on() {
+        let mut status = FamilyStatus {
+            state: "on".into(),
+            reason: None,
+            detail: None,
+            disclosure: None,
+            lease_roster_peers: 0,
+            pin: None,
+            carriage: Some(FamilyCarriageStatus {
+                enabled: true,
+                disclosure: CARRIAGE_DISCLOSURE_SERVING.to_string(),
+            }),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["carriage"]["enabled"], true);
+        assert_eq!(
+            json["carriage"]["disclosure"], CARRIAGE_DISCLOSURE_SERVING,
+            "the UI renders the daemon's text verbatim"
+        );
+        // Opted out: enabled false + the honest off statement.
+        status.carriage = Some(FamilyCarriageStatus {
+            enabled: false,
+            disclosure: CARRIAGE_DISCLOSURE_OFF.to_string(),
+        });
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["carriage"]["enabled"], false);
+        assert_eq!(json["carriage"]["disclosure"], CARRIAGE_DISCLOSURE_OFF);
+        // Every off family carries NO disclosure (nothing is carried
+        // while the family is down).
+        assert!(
+            serde_json::to_value(FamilyStatus::off("pairing_disabled")).unwrap()["carriage"]
+                .is_null()
+        );
+    }
+
+    /// ADR-036 §3.2 hygiene, pinned at the status surface: the webview
+    /// NEVER receives carrier content — no `prompt_tokens`, no
+    /// `pin_commitment` (the content-derived commitment stays OUT of
+    /// status AND telemetry; the neutral `pin.pin_hash` remains allowed
+    /// per ADR-034 rule 7's public-constant analysis, which ADR-036 §4.4
+    /// explicitly does NOT transfer to user-content commitments).
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn adr036_carrier_fields_never_reach_the_status_surface() {
+        let mut status = FamilyStatus {
+            state: "on".into(),
+            reason: None,
+            detail: None,
+            disclosure: None,
+            lease_roster_peers: 0,
+            pin: Some(FamilyPinStatus {
+                provenance: "file".into(),
+                version: FAMILY_PROMPT_VERSION.to_string(),
+                token_count: 12,
+                pin_hash: family_pin_hash(&[1, 2, 3]),
+            }),
+            carriage: Some(FamilyCarriageStatus {
+                enabled: true,
+                disclosure: CARRIAGE_DISCLOSURE_SERVING.to_string(),
+            }),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        let text = json.to_string();
+        assert!(
+            !text.contains("prompt_tokens"),
+            "no carrier payload key in the status surface: {text}"
+        );
+        assert!(
+            !text.contains("pin_commitment"),
+            "the content-derived commitment stays OUT of status: {text}"
+        );
+        assert!(!text.contains('['), "no arrays ride the status: {text}");
+        // The carriage object itself is exactly {enabled, disclosure}.
+        let mut keys: Vec<&str> = json["carriage"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["disclosure", "enabled"]);
+        // Off families serialize without any carriage content either.
+        status.carriage = None;
+        assert!(!serde_json::to_value(&status)
+            .unwrap()
+            .to_string()
+            .contains("pin_commitment"));
+    }
+
+    /// The opt-out refusal path is honest END TO END at the unit level:
+    /// the OFF posture flows into the serve config, and the node's
+    /// admission table refuses a well-formed carrier with the frozen
+    /// `content_carriage_refused` reject (never a silent drop, never a
+    /// misleading pin_mismatch).
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn adr036_opt_out_refusal_is_honest() {
+        use modelswarm_identity::InstallationIdentity;
+        use modelswarm_node::verifydrafts::{
+            admit_pin_carrier, ContentCarriage, PinAdmission, WirePinCarrier,
+        };
+        // The posture flows: inner.allow_content_carriage=false → the
+        // serve config the compose call builds.
+        let mut config = modelswarm_node::verifydrafts::VerifyDraftsServeConfig::honest(
+            "msp1:x".to_string(),
+            InstallationIdentity::from_bytes(&[0x99; 32]),
+        );
+        assert_eq!(
+            config.content_carriage,
+            ContentCarriage::On,
+            "honest() defaults to the owner's default-on posture"
+        );
+        config.content_carriage = ContentCarriage::Off;
+        assert_eq!(config.content_carriage.as_str(), "off");
+
+        // A well-formed, correctly SIGNED carrier under the OFF posture.
+        let identity = InstallationIdentity::from_bytes(&[0x98; 32]);
+        let tokens = vec![151644u32, 7, 151645];
+        let params = "3d".repeat(32);
+        let mut carrier = WirePinCarrier {
+            session_id: "vd-refuse".into(),
+            protocol_version: "msp-cooperative-v1".into(),
+            seq: 1,
+            round: 0,
+            profile_id: "msp1:x".into(),
+            generation_params_hash: params.clone(),
+            prompt_tokens: tokens.clone(),
+            pin_commitment: modelswarm_node::verifydrafts::pin_commitment_of(&tokens),
+            nonce: "n".repeat(16),
+            deadline_ms: 60_000,
+            sender: identity.installation_id(),
+            signature: String::new(),
+        };
+        carrier.signature =
+            modelswarm_node::verifydrafts::sign_pin_carrier(&carrier, &identity).unwrap();
+        match admit_pin_carrier(
+            &carrier,
+            &identity.peer_id(),
+            &identity.verifying_key(),
+            "msp1:x",
+            &params,
+            config.content_carriage,
+            None,
+            1,
+            1,
+        ) {
+            PinAdmission::Rejected(reason) => assert_eq!(
+                reason.as_str(),
+                "content_carriage_refused",
+                "the refusal is labeled honestly, never a mismatch"
+            ),
+            other => panic!("the opt-out must refuse, got {other:?}"),
+        }
+    }
+
+    /// The narrowed `blocked_content_contract` (ADR-036 §3.3/§4.4): the
+    /// ladder's terminal label still fires for the AUTOMATIC path when
+    /// the gate would engage (the election, not the gate, carries
+    /// content) — the vocabulary is frozen, the meaning narrowed.
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn adr036_blocked_content_contract_stays_frozen_but_narrowed() {
+        let cap = FamilyPeerCap {
+            batch_verify: true,
+            batch_window_max: 8,
+            backend: "cpu".to_string(),
+            learned_unix_ms: 0,
+        };
+        assert_eq!(
+            family_engage_reason(Some(&cap), Some("cpu"), Some(1.0), Some(2.0)),
+            "blocked_content_contract",
+            "the gate WOULD engage — the automatic path still does not carry content"
+        );
+        // The ladder below the terminal label is unchanged.
+        assert_eq!(
+            family_engage_reason(Some(&cap), Some("cpu"), Some(1.9), Some(2.0)),
+            "gate_no_win"
+        );
+        assert_eq!(
+            family_engage_reason(None, Some("cpu"), Some(1.0), Some(2.0)),
+            "capability_unknown"
+        );
     }
 
     // ---- v0.2.23 batch: the pairing toggle, the self-check gate, the
@@ -5721,7 +6617,11 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["allow_swarm_pairing"], true);
         assert_eq!(saved["advisory"]["caps"], 3, "unknown keys survive");
-        assert_eq!(saved.as_object().unwrap().len(), 4);
+        assert_eq!(
+            saved.as_object().unwrap().len(),
+            6,
+            "five daemon keys + the one unknown key"
+        );
     }
 
     /// The honest-degrade shape: an off family carries the reason AND the

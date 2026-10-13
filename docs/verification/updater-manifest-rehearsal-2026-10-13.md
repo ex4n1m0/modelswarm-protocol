@@ -163,3 +163,52 @@ must answer 302 with the `/downloads/` location.
 4. Re-run this rehearsal (the tool is committed at
    `tests/updater-manifest-verify`) at every release staging before
    the manifest goes public.
+
+## v0.2.23 staging rehearsal (same day, evening train)
+
+Staged set (canonical dashed names, from desktop-installer run
+38363557211 — workflow_dispatch on the bump commit 8a6f772; the
+workflow's path filter means bump-only commits do not auto-trigger it,
+so the run was dispatched explicitly after cancelling the wrong-version
+auto run on 3a0bb60):
+
+- ModelSwarm-Setup-0.2.23-windows-x64.exe
+  sha256 cccbd8afd492c9a59684b7eea95b58baef68ff2651b226d45e04a1760e608ba0
+- ModelSwarm-0.2.23-linux-amd64.deb
+  sha256 adb263876c9c02a6861c80e687db3d8d83f19f812d6da746391e9a6227c9ba88
+- ModelSwarm-0.2.23-linux-amd64.AppImage
+  sha256 ce3da1134234b1473ac38d856528f8dfaedff45df4280217c2ee75d9ced1aedc
+- ModelSwarm-0.2.23-macos-arm64.dmg
+  sha256 f00ee120672e45e9e0dc6c0c9c838d6fb7475c7ac05df87117ac8f233dea85e4
+
+Hash chain: per-job CI artifact SHA256SUMS.txt verified with
+`sha256sum -c` (all OK) over the downloaded files; the staged copies are
+byte-identical copies. 0.2.22 binaries removed (all-OS-together rule).
+
+Signing: `npx -y @tauri-apps/cli@2 signer sign -f <key path>
+--app-version 0.2.23` per installer (owner-local key file, passwordless,
+non-interactive; key path only, never contents). Every .sig trusted
+comment carries `file:<canonical name>` and `version:0.2.23` (decoded
+and checked for all four).
+
+**TRAIN FINDING (fixed before deploy — the rehearsal did its job):** the
+first manifest build base64-encoded the .sig file CONTENT into
+`platforms[...].signature`, and the rehearsal failed all three platforms
+with `InvalidEncoding`: the v2 CLI's .sig files ALREADY contain the
+base64 the plugin expects, so the manifest signature must be the .sig
+content VERBATIM (exactly the 0.2.22 manifest's shape — the plugin's
+`base64_to_string` + `Signature::decode` chain then yields the minisign
+text). Regenerated verbatim; the standing rule for future trains: the
+manifest signature == the .sig file's own text, never re-encoded.
+
+Rehearsal verdict after the fix — `cargo run --manifest-path
+tests/updater-manifest-verify/Cargo.toml`: ALL PLATFORM SIGNATURES
+VERIFY against the embedded public key (key id 38FC98CB4B064F37) over
+the staged artifact bytes, signed version == 0.2.23 on all three
+platforms, sha256 values match the staged files; /api/download URL
+shape validated against the counting route's NAME_PATTERN.
+
+Tracker landing retarget: apps/tracker/app/page.tsx 0.2.22 → 0.2.23
+(version label + 4 download links; copy rules kept — honest tense, no
+engine names, no status pills); typecheck clean; `next build` green.
+Tracker-Engineer-owned path — flagged for review with this commit.

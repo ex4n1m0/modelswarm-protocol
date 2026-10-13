@@ -2259,7 +2259,7 @@ async fn lookup_peers(
 async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Value, String> {
     let fail =
         |reason: &str| serde_json::json!({ "probed": false, "opened": false, "reason": reason });
-    let (profile, gateway, tracker_url, data_dir, engine) = {
+    let (profile, gateway, tracker_url, data_dir, engine, engine_backend) = {
         let inner = state.inner.lock().await;
         let running = inner.node.as_ref();
         let Some(running) = running else {
@@ -2274,6 +2274,7 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
             inner.tracker_url.clone(),
             inner.data_dir.clone(),
             running.handle.runtime.clone(),
+            running.handle.engine_backend.clone(),
         )
     };
 
@@ -2384,6 +2385,14 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
 
     let mut config =
         modelswarm_node::verifydrafts::VerifyDraftsClientConfig::new(profile.clone(), verifier_key);
+    // E0 pairing: the offer must carry the REQUESTER's real engine backend
+    // (the config defaults to cpu; a GPU machine offering cpu gets an
+    // honest-but-wrong backend_mismatch reject from a GPU verifier — the
+    // 2026-10-13 live-pairing finding).
+    config.verifier_backend = match engine_backend.as_deref() {
+        Some("vulkan") => modelswarm_node::verifydrafts::Backend::Vulkan,
+        _ => modelswarm_node::verifydrafts::Backend::Cpu,
+    };
     config.lease = Some(lease);
     let wire = match modelswarm_node::verifydrafts::dial_quic(
         &addr,

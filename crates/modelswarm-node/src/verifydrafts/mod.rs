@@ -84,6 +84,7 @@ pub use composed::{
 #[cfg(feature = "verifydrafts-capi")]
 pub use engine_bridge::{capi_disclosure, CapiBatchVerifyEngine};
 pub use engine_source::FamilyEngineSource;
+pub use modelswarm_session::negotiation::Backend;
 pub use serve::{
     read_session_open, serve_verifydrafts_quic, serve_verifydrafts_session, ServeEndReason,
     SessionOpenError, VerifyDraftsServeConfig, VerifyDraftsServeReport,
@@ -93,7 +94,7 @@ pub use wire::{
     StagedVerifyWire, VerifyDraftsWire, WireError,
 };
 
-use modelswarm_session::negotiation::{Backend, EngineDisclosure, Preset, SessionBudget};
+use modelswarm_session::negotiation::{EngineDisclosure, Preset, SessionBudget};
 use modelswarm_session::verifydrafts::VerifyTelemetry;
 use modelswarm_telemetry::Telemetry;
 use modelswarm_transport::ed25519_dalek::VerifyingKey;

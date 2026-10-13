@@ -19,6 +19,17 @@
 //! - Post-handshake messages travel inside the established session; per the
 //!   §6.1 flow staging they are not individually signed.
 //!
+//! Non-loopback listen policy (2026-10-13): the staged TCP backend never
+//! binds beyond loopback. The `libp2p-backend` feature's
+//! [`libp2p_backend::Libp2pTransport::listen_with`] is the ONLY surface that
+//! can, and only via the explicit
+//! [`libp2p_backend::ListenOptions::allow_off_loopback`] argument — a typed
+//! operator decision made at the call site (the desktop's settings toggle;
+//! the owner-gated cross-machine harness). The historical `MSP_LISTENER=1`
+//! environment escape hatch is retired: this crate never reads it, so a
+//! stale machine-scope setting neither opens a bind without the opt-in nor
+//! blocks one with it (test-pinned in `libp2p_backend`).
+//!
 //! Wire encoding: this crate renders the frozen `protocol/messages.proto`
 //! schema as snake_case JSON inside u32-BE length-prefixed frames (max
 //! 256 KiB, msp-v1 §6.4). The Phase 3 framing ADR may change the encoding;

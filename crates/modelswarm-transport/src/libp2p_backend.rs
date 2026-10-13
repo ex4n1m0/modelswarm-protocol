@@ -7,9 +7,15 @@
 //! cooperative extension families (bare JSON frames, e.g. ADR-032
 //! VerifyDrafts) ride QUIC without joining the frozen §6 typed surface.
 //!
-//! Loopback-only listeners are STILL enforced (the ADR-018 honesty guard
-//! applies to every backend until the full Phase F ops set — public relay,
-//! AutoNAT — is reviewed). Keys derive from the [`InstallationIdentity`]
+//! Non-loopback listeners are refused by default (the ADR-018 honesty
+//! guard applies to every backend until the full Phase F ops set — public
+//! relay, AutoNAT — is reviewed). Since 2026-10-13 the ONLY lift is the
+//! explicit [`ListenOptions::allow_off_loopback`] argument at the call
+//! site: the historical `MSP_LISTENER=1` environment escape hatch is
+//! RETIRED and never read, so a stale machine-scope variable cannot open
+//! an off-loopback bind, and product policy (the desktop's settings
+//! toggle) reaches this guard as a typed parameter instead of
+//! process-global state. Keys derive from the [`InstallationIdentity`]
 //! seed, so a node's libp2p `PeerId` equals its ADR-020 `peer_id()`
 //! derivation byte for byte, and `dial` verifies the connected peer's
 //! QUIC-authenticated PeerId against the expected derivation.
@@ -461,6 +467,50 @@ impl std::fmt::Debug for Libp2pTransport {
     }
 }
 
+/// Explicit options for [`Libp2pTransport::listen_with`] — the sole way to
+/// lift the ADR-018 non-loopback bind guard on this backend (2026-10-13:
+/// replaces the retired `MSP_LISTENER=1` environment read, which this crate
+/// never consults anymore).
+///
+/// The staged TCP backend ([`crate::SignedFrameTransport`]) has NO
+/// off-loopback mode at all — it lacks confidentiality (ADR-018); only this
+/// QUIC backend, whose TLS handshake authenticates and encrypts the channel,
+/// may listen beyond loopback, and only via the typed opt-in below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenOptions {
+    allow_off_loopback: bool,
+}
+
+impl ListenOptions {
+    /// Loopback-only — the default posture everywhere and the exact behavior
+    /// of [`Libp2pTransport::listen`]. Non-loopback bind addresses are
+    /// refused with [`TransportError::NonLoopbackDenied`].
+    #[must_use]
+    pub fn loopback_only() -> Self {
+        Self {
+            allow_off_loopback: false,
+        }
+    }
+
+    /// The explicit operator opt-in: non-loopback (LAN / all-interface) bind
+    /// addresses are allowed. Pass this ONLY as a deliberate, user-visible
+    /// decision (the desktop's "allow swarm pairing" settings toggle; the
+    /// owner-gated cross-machine harness) — never inferred from the
+    /// environment or defaults, and never as a crate-internal default.
+    #[must_use]
+    pub fn allow_off_loopback() -> Self {
+        Self {
+            allow_off_loopback: true,
+        }
+    }
+}
+
+impl Default for ListenOptions {
+    fn default() -> Self {
+        Self::loopback_only()
+    }
+}
+
 impl Libp2pTransport {
     /// Builds the backend whose PeerId equals `identity.peer_id()`.
     pub fn new(identity: &InstallationIdentity) -> Result<Self, TransportError> {
@@ -474,22 +524,45 @@ impl Libp2pTransport {
         libp2p::PeerId::from_public_key(&self.keypair.public())
     }
 
-    /// Binds `bind` (e.g. `"127.0.0.1:0"`). Refuses any address whose IP is
-    /// not loopback with [`TransportError::NonLoopbackDenied`] — the ADR-018
-    /// honesty guard applies to this backend too.
+    /// Binds `bind` (e.g. `"127.0.0.1:0"`), loopback-only: any address whose
+    /// IP is not loopback is refused with [`TransportError::NonLoopbackDenied`]
+    /// — the ADR-018 honesty guard applies to this backend too, and no
+    /// environment variable is ever consulted. Equivalent to
+    /// [`Libp2pTransport::listen_with`] with [`ListenOptions::loopback_only`].
     ///
     /// Spawns the transport's driver task (see the module docs for why
     /// continuous polling is required).
     pub async fn listen(&self, bind: &str) -> Result<Libp2pListener, TransportError> {
+        self.listen_with(bind, ListenOptions::loopback_only()).await
+    }
+
+    /// Binds `bind` under explicit [`ListenOptions`] — the ONLY path that can
+    /// lift the ADR-018 non-loopback guard: `options` must be
+    /// [`ListenOptions::allow_off_loopback`] (an explicit, typed operator
+    /// decision made at the call site) for any non-loopback IP to bind.
+    /// Everything else about the bind matches [`Libp2pTransport::listen`],
+    /// and it spawns the transport's driver task the same way.
+    ///
+    /// Contract history: until 2026-10-13 the guard also accepted
+    /// `MSP_LISTENER=1` from the process environment. That escape hatch is
+    /// RETIRED — the variable is never read, so a stale machine-scope setting
+    /// cannot open an off-loopback bind, and the desktop's settings toggle
+    /// reaches this guard as an argument (test-pinned by
+    /// `libp2p_listen_explicit_opt_in_is_the_sole_authority`). The opt-in
+    /// never changes what addresses are ADVERTISED — that stays the
+    /// heartbeat's honest multiaddr, updated separately by the caller.
+    pub async fn listen_with(
+        &self,
+        bind: &str,
+        options: ListenOptions,
+    ) -> Result<Libp2pListener, TransportError> {
         let addr: std::net::SocketAddr = bind
             .parse()
             .map_err(|e| TransportError::Io(invalid_data("invalid bind address", e)))?;
         // ADR-018 honesty guard: the listener stays loopback-only unless the
-        // operator explicitly opts in for Phase F0 friendly-network testing.
-        // `MSP_LISTENER=1` is a per-machine decision, logged by the caller;
-        // the flag never changes what addresses are ADVERTISED (that is the
-        // heartbeat's honest multiaddr, updated separately).
-        if !addr.ip().is_loopback() && std::env::var("MSP_LISTENER").as_deref() != Ok("1") {
+        // caller passes the explicit typed opt-in — an operator decision,
+        // made at the call site and reviewable there (never the environment).
+        if !addr.ip().is_loopback() && !options.allow_off_loopback {
             return Err(TransportError::NonLoopbackDenied);
         }
         let ip = addr.ip();
@@ -599,8 +672,9 @@ impl Libp2pTransport {
     }
 }
 
-/// Loopback-only libp2p listener yielding framed sessions. Dropping it
-/// stops the driver task.
+/// Libp2p listener yielding framed sessions (loopback by default;
+/// off-loopback only via the explicit [`ListenOptions`] opt-in at
+/// [`Libp2pTransport::listen_with`]). Dropping it stops the driver task.
 pub struct Libp2pListener {
     _driver: tokio::task::JoinHandle<()>,
     events: tokio::sync::mpsc::Receiver<DriverEvent>,
@@ -657,7 +731,9 @@ mod tests {
     }
 
     /// ADR-018 honesty guard: the libp2p backend refuses non-loopback binds
-    /// before any socket exists, exactly like the staged backend.
+    /// before any socket exists, exactly like the staged backend — and since
+    /// the 2026-10-13 contract this refusal is environment-INDEPENDENT (no
+    /// variable is read on this path at all).
     #[tokio::test]
     async fn libp2p_listen_refuses_non_loopback() {
         let identity = InstallationIdentity::from_bytes(&[4u8; 32]);
@@ -670,6 +746,62 @@ mod tests {
             transport.listen("192.168.1.10:9000").await.unwrap_err(),
             TransportError::NonLoopbackDenied
         ));
+    }
+
+    /// The 2026-10-13 explicit-parameter contract (opt-in wins; the env is
+    /// dead): a non-loopback bind is refused WITHOUT the opt-in EVEN WHEN
+    /// `MSP_LISTENER=1` is set — the retired escape hatch is never read —
+    /// and allowed WITH the opt-in regardless of the environment.
+    #[tokio::test]
+    async fn libp2p_listen_explicit_opt_in_is_the_sole_authority() {
+        let identity = InstallationIdentity::from_bytes(&[47u8; 32]);
+        let transport = Libp2pTransport::new(&identity).unwrap();
+
+        // The legacy variable set to exactly the value both live test
+        // machines still carry at machine scope: it must NOT open a bind.
+        std::env::set_var("MSP_LISTENER", "1");
+        assert!(matches!(
+            transport.listen("0.0.0.0:0").await.unwrap_err(),
+            TransportError::NonLoopbackDenied
+        ));
+        assert!(matches!(
+            transport
+                .listen_with("0.0.0.0:0", ListenOptions::default())
+                .await
+                .unwrap_err(),
+            TransportError::NonLoopbackDenied
+        ));
+        assert!(matches!(
+            transport
+                .listen_with("192.168.1.10:9000", ListenOptions::loopback_only())
+                .await
+                .unwrap_err(),
+            TransportError::NonLoopbackDenied
+        ));
+
+        // The explicit opt-in binds off-loopback WITH the variable still set…
+        let listener = transport
+            .listen_with("0.0.0.0:0", ListenOptions::allow_off_loopback())
+            .await
+            .expect("explicit opt-in binds the all-interfaces address");
+        drop(listener);
+
+        // …and with it removed: the parameter, not the environment, decides.
+        std::env::remove_var("MSP_LISTENER");
+        let listener = transport
+            .listen_with("0.0.0.0:0", ListenOptions::allow_off_loopback())
+            .await
+            .expect("opt-in binds regardless of environment");
+        drop(listener);
+
+        // Loopback needs no opt-in on either entry point.
+        let plain = transport.listen("127.0.0.1:0").await.unwrap();
+        drop(plain);
+        let explicit = transport
+            .listen_with("127.0.0.1:0", ListenOptions::loopback_only())
+            .await
+            .unwrap();
+        drop(explicit);
     }
 
     /// One loopback QUIC round trip: listener + dial + framed typed exchange,

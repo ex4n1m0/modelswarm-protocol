@@ -2,7 +2,7 @@
 name = "modelswarm-resource"
 version = "0.1.0"
 edition = "2021"
-description = "M1 hardware profiling + M2 resource governance: live ResourceSampler first (owner request 2026-10-12); the governor lands later behind its own ADR"
+description = "M1 hardware profiling + M2 resource governance: live ResourceSampler (2026-10-12) + the 70%-ceiling resource governor (ADR-035, gate D11) with the winjob enforcement seam"
 
 # Like modelswarm-winjob, this crate exists BECAUSE the workspace forbids
 # unsafe: live sampling needs raw Win32 calls (Toolhelp, psapi, PDH), so the

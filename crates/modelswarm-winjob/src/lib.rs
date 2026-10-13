@@ -16,13 +16,14 @@
 #[cfg(windows)]
 mod imp {
     use std::mem::size_of;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList,
         JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
         JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
     };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
@@ -70,6 +71,41 @@ mod imp {
         JOBS.get_or_init(|| Mutex::new(Vec::new()))
     }
 
+    /// The resource-governor's remembered tree commit cap (M2, ADR-035 /
+    /// gate D11): 0 = none armed. Kept OUTSIDE the retained-jobs mutex so
+    /// job creation never nests locks; read once per assign, written only
+    /// by [`apply_tree_memory_cap`].
+    static TREE_COMMIT_CAP: AtomicU64 = AtomicU64::new(0);
+
+    /// Sets a job's extended limits: ALWAYS kill-on-close (the crate's
+    /// founding contract), plus the remembered commit cap when one is
+    /// armed. Single `SetInformationJobObject` call, so the flags can
+    /// never be observed half-applied.
+    fn set_job_limits(job: *mut core::ffi::c_void, cap_bytes: u64) -> Result<(), String> {
+        unsafe {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if cap_bytes > 0 {
+                flags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                info.ProcessMemoryLimit = cap_bytes as usize;
+            }
+            info.BasicLimitInformation.LimitFlags = flags;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as *mut core::ffi::c_void,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                return Err(format!(
+                    "SetInformationJobObject: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+    }
+
     /// Safe entry point: assigns `pid` (the engine child) to a
     /// kill-on-close job. Opens the process handle internally so no raw
     /// pointer crosses the crate boundary.
@@ -93,7 +129,10 @@ mod imp {
     }
 
     /// Creates a kill-on-close job, assigns `process_handle`, and retains
-    /// the job handle until process death.
+    /// the job handle until process death. When a tree commit cap is
+    /// armed ([`apply_tree_memory_cap`]), the new job is born with it —
+    /// the cap must cover children assigned AFTER arming, not just the
+    /// jobs that existed when it was set.
     pub fn assign_kill_on_close_job(process_handle: *mut core::ffi::c_void) -> Result<(), String> {
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -103,19 +142,7 @@ mod imp {
                     std::io::Error::last_os_error()
                 ));
             }
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &mut info as *mut _ as *mut core::ffi::c_void,
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) == 0
-            {
-                let e = format!(
-                    "SetInformationJobObject: {}",
-                    std::io::Error::last_os_error()
-                );
+            if let Err(e) = set_job_limits(job, TREE_COMMIT_CAP.load(Ordering::SeqCst)) {
                 CloseHandle(job);
                 return Err(e);
             }
@@ -133,6 +160,89 @@ mod imp {
                 .push(JobHandle(job));
             Ok(())
         }
+    }
+
+    /// Resource-governor seam (M2, ADR-035 / gate D19): arms a
+    /// committed-memory cap (`JOB_OBJECT_LIMIT_PROCESSMEMORY`) over EVERY
+    /// retained kill-on-close job — the supervised engine tree — and
+    /// remembers it so children assigned later inherit the same limit at
+    /// assignment time. The kill-on-close contract is always preserved
+    /// (both flags ride one `SetInformationJobObject` call). Returns the
+    /// number of EXISTING jobs the cap was applied to (0 = nothing
+    /// supervised right now; the remembered cap still covers future
+    /// assigns). A job whose update fails is skipped and counted out —
+    /// an honest undercount, never a failure of the whole call.
+    ///
+    /// Semantics note for the governor: the OS enforces this on COMMIT,
+    /// while the admission projection is working-set arithmetic; mapped
+    /// weights are largely section-backed and do not count against
+    /// commit, so the cap bites at or before the point the projection
+    /// would reach the enforced system ceiling — never later.
+    pub fn apply_tree_memory_cap(bytes: u64) -> Result<usize, String> {
+        if bytes == 0 {
+            return Err(
+                "apply_tree_memory_cap: 0 is not a cap (0 would fail every allocation)".to_string(),
+            );
+        }
+        TREE_COMMIT_CAP.store(bytes, Ordering::SeqCst);
+        let jobs = match retained_jobs().lock() {
+            Ok(jobs) => jobs,
+            Err(e) => return Err(e.to_string()),
+        };
+        let mut armed = 0;
+        for &JobHandle(job) in jobs.iter() {
+            // The handle came from CreateJobObjectW and is owned by the
+            // retained list.
+            if set_job_limits(job, bytes).is_ok() {
+                armed += 1;
+            }
+        }
+        Ok(armed)
+    }
+
+    /// The remembered tree commit cap (0 = none armed) — the governor's
+    /// readback that arming landed and stuck.
+    pub fn tree_memory_cap_bytes() -> u64 {
+        TREE_COMMIT_CAP.load(Ordering::SeqCst)
+    }
+
+    /// Test hook: forgets the remembered cap (existing jobs keep whatever
+    /// limits they already have; only future assigns are affected).
+    pub fn reset_tree_memory_cap_for_test() {
+        TREE_COMMIT_CAP.store(0, Ordering::SeqCst);
+    }
+
+    /// Per-retained-job commit caps via `QueryInformationJobObject` —
+    /// diagnostic readback proving the cap reached the kernel objects
+    /// (0 entries = nothing supervised; a 0 element = that job has no
+    /// memory limit armed).
+    pub fn retained_job_commit_caps() -> Vec<u64> {
+        let jobs = match retained_jobs().lock() {
+            Ok(jobs) => jobs,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for &JobHandle(job) in jobs.iter() {
+            unsafe {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                let ok = QueryInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &mut info as *mut _ as *mut core::ffi::c_void,
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    std::ptr::null_mut(),
+                );
+                if ok != 0
+                    && (info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_PROCESS_MEMORY)
+                        != 0
+                {
+                    out.push(info.ProcessMemoryLimit as u64);
+                } else {
+                    out.push(0);
+                }
+            }
+        }
+        out
     }
 
     /// Test hook: closes one retained job handle (KILL_ON_JOB_CLOSE then
@@ -242,8 +352,9 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{
-    assign_child, close_all_retained_jobs, close_one_retained_job_for_test, supervised_process_ids,
-    total_ram_bytes,
+    apply_tree_memory_cap, assign_child, close_all_retained_jobs, close_one_retained_job_for_test,
+    reset_tree_memory_cap_for_test, retained_job_commit_caps, supervised_process_ids,
+    total_ram_bytes, tree_memory_cap_bytes,
 };
 
 #[cfg(test)]
@@ -373,5 +484,73 @@ mod tests {
         // Reap both so the test leaves no zombies behind.
         let _ = a.wait();
         let _ = b.wait();
+    }
+
+    /// The resource-governor commit-cap seam (M2, ADR-035): arming the
+    /// tree cap (a) lands `JOB_OBJECT_LIMIT_PROCESSMEMORY` on every
+    /// retained job as the KERNEL sees it (readback via
+    /// `QueryInformationJobObject`, not the remembered value), (b) is
+    /// remembered so a child assigned AFTER arming is born capped, and
+    /// (c) never strips kill-on-close (both flags ride one call — the
+    /// readback asserts the memory flag, and the child staying alive
+    /// until we kill it shows the job still works). Cleanup: direct kill
+    /// + reap + reset the remembered cap so later assigns are unaffected.
+    #[test]
+    #[cfg(windows)]
+    fn tree_memory_cap_lands_and_sticks_for_children_assigned_later() {
+        use std::process::Stdio;
+        let _guard = job_test_lock();
+        super::reset_tree_memory_cap_for_test();
+        assert_eq!(super::tree_memory_cap_bytes(), 0);
+
+        let mut first = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        super::assign_child(first.id()).expect("assign first");
+        // Sibling tests may leave drained/dead retained jobs behind, so
+        // assert on VALUES not counts: nothing carries a cap yet.
+        let before = super::retained_job_commit_caps();
+        assert!(!before.is_empty(), "our job must be retained");
+        assert!(before.iter().all(|&c| c == 0), "no cap yet: {before:?}");
+
+        const CAP: u64 = 512 * 1024 * 1024;
+        assert!(
+            super::apply_tree_memory_cap(CAP).expect("arm cap") >= 1,
+            "at least our job must have been capped"
+        );
+        assert_eq!(super::tree_memory_cap_bytes(), CAP);
+        let capped = super::retained_job_commit_caps();
+        assert!(
+            capped.iter().all(|&c| c == CAP),
+            "all jobs capped: {capped:?}"
+        );
+        assert_eq!(capped.len(), before.len(), "arming adds no jobs");
+
+        // The sticky cap covers children assigned AFTER arming.
+        let mut second = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ping 2");
+        super::assign_child(second.id()).expect("assign second");
+        let after = super::retained_job_commit_caps();
+        assert_eq!(after.len(), capped.len() + 1, "exactly one new job");
+        assert!(
+            after.iter().all(|&c| c == CAP),
+            "new job born capped: {after:?}"
+        );
+
+        // Zero is refused (it would fail every allocation in the job).
+        assert!(super::apply_tree_memory_cap(0).is_err());
+
+        let _ = first.kill();
+        let _ = second.kill();
+        let _ = first.wait();
+        let _ = second.wait();
+        super::reset_tree_memory_cap_for_test();
     }
 }

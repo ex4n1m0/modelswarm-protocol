@@ -1,9 +1,13 @@
 //! Live resource sampling for the desktop monitor panel (owner request
-//! 2026-10-12: a simple task-manager-style CPU/GPU/RAM display) — the first
-//! module of the M1/M2 resource crate. The M2 governor (the 70%-ceiling
-//! enforcement point, gate D11) lands later behind its own ADR; this
-//! sampler is advisory/read-only and must NEVER be used as an enforcement
-//! mechanism.
+//! 2026-10-12) plus the M2 resource governor (ADR-035, 2026-10-13): the
+//! runtime 70%-ceiling ENFORCEMENT authority of gate D11. The sampler is
+//! the read-only observability layer; the governor
+//! ([`crate::governor::ResourceGovernor`]) is the decision layer that
+//! consumes it — verdicts are binding for the optional tiers they govern
+//! (family enablement today), fail closed when a required input is
+//! unobservable, and arm OS-level caps through the [`crate::enforce`]
+//! seam (winjob job objects on Windows; honest
+//! `not_enforced_unsupported_platform` labels elsewhere).
 //!
 //! # What the desktop should do with it
 //!
@@ -38,6 +42,8 @@
 //! mainstream distro; documented rather than queried to keep the path
 //! trivial, per the owner's cross-platform-honesty instruction).
 
+pub mod enforce;
+pub mod governor;
 pub mod parsers;
 pub mod profile;
 pub mod source;
@@ -54,6 +60,13 @@ pub mod fallback;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+pub use enforce::WinJobEnforcer;
+pub use enforce::{CeilingEnforcer, EnforcementRecord, MockEnforcer, UnsupportedEnforcer};
+pub use governor::{
+    AdmissionRequest, Decision, DegradeReason, DomainNumbers, GovernorVerdict, KnowledgeGap,
+    ResourceGovernor, VerdictNumbers, ENFORCED_CEILING_PERCENT, RECOMMENDATION_BAR_CEILING_PERCENT,
+};
 pub use profile::{GpuGeometry, HardwareProfile};
 pub use source::{
     descendant_pids, GpuLive, MockSource, ProcSample, ProcessScope, SampleSource, SystemMemory,

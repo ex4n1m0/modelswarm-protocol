@@ -30,6 +30,9 @@ exclude = ["tests/updater-manifest-verify"]
 # Single source of the product version: tauri.conf.json omits its
 # `version` (Tauri falls back to this package version), so desktop,
 # node --version, and the UI all report the same number. Bump HERE only.
+# Since 2026-10-13 editing this version auto-triggers the 4-OS
+# desktop-installer build (its push.paths includes Cargo.toml): the
+# bump commit is exactly where shippable artifacts must come from.
 [workspace.package]
 version = "0.2.23"
 edition = "2021"

@@ -8,6 +8,7 @@
 //! |---|---|
 //! | `get_status` | tracker, engine, artifact, node, roster, license state |
 //! | `set_tracker` | saves the tracker base URL |
+//! | `set_pairing_allowed` | the "allow swarm pairing" toggle (persisted, default on; gates the listener + family tier at hosting start) |
 //! | `accept_privacy` | records the first-run license acceptance |
 //! | `list_models` | verified-catalog active profiles |
 //! | `census` | live per-profile peer counts (public `/api/v1/stats`) for the picker chips |
@@ -15,7 +16,8 @@
 //! | `download_model` | streams `download` events, returns artifact state |
 //! | `set_hosting` | starts/stops the in-process node (+ roster heartbeat) |
 //! | `family_probe` | opens one real family session on an eligible peer, PRESENTING this installation's earned lease (ADR-032 §2), then runs the ONE-round ADR-034 pairing confirmation (counts only); returns the honest outcome, never the lease or token ids |
-//! | `send_chat` | one function: chat through the node's loopback gateway |
+//! | `send_chat` | one function: chat through the node's loopback gateway (user temperature optional; greedy default) |
+//! | `clear_chat` | resets the persisted conversation (the language-drift escape hatch) |
 //! | `hf_search_models` | public HF Hub repo search (ADR-023 picker) |
 //! | `hf_list_ggufs` | pinned revision + artifact rows for one repo |
 //! | `request_model` | files a community model request with the tracker |
@@ -104,10 +106,28 @@ struct Inner {
     artifact: Option<EnsuredArtifact>,
     node: Option<RunningNode>,
     chat_log: Vec<ChatTurn>,
+    /// The "allow swarm pairing" settings toggle (owner directive
+    /// 2026-10-13; persisted key, DEFAULT ON). Gates the serving listener
+    /// and the family tier at hosting start — never read from the
+    /// environment.
+    allow_swarm_pairing: bool,
+    /// The coordinator-side family capability cache (ADR-032 §3
+    /// disclosure learned through the existing family negotiation — the
+    /// probe fills it; the chat auto-engage checkpoint reads it). No wire
+    /// field exists for roster-level capability, so this is the honest
+    /// seam: capability is KNOWN only after a real session accept.
+    #[cfg(feature = "verifydrafts")]
+    family_peer_caps: std::collections::HashMap<String, FamilyPeerCap>,
+    /// The local family engine source while hosting with the family on —
+    /// the coordinator's SELF-VERIFY path (tonight's warm-cache root
+    /// cause: every drafted window is re-verified locally, cache-cold,
+    /// before it may hit the wire). Same `Arc` the serving half holds.
+    #[cfg(feature = "verifydrafts")]
+    family_engine: Option<Arc<modelswarm_node::verifydrafts::FamilyEngineSource>>,
     /// The advertised QUIC serving address while the listener is bound
-    /// (MSP_LISTENER=1 + hosting on); None = no listener. get_status
-    /// reports it so the UI's "remote serve" chip is truth, not a
-    /// static label.
+    /// (the "allow swarm pairing" toggle + hosting on); None = no
+    /// listener. get_status reports it so the UI's "remote serve" chip is
+    /// truth, not a static label.
     listener_addr: Option<String>,
     /// The composed daemon's family half (ADR-032 light-up): what the UI
     /// must show honestly — on (both vocabularies, behind the RC-L1
@@ -132,8 +152,14 @@ struct FamilyStatus {
     state: String,
     /// Stable off reason (telemetry label): "family_prompt_unpinned" |
     /// "engine_bridge_failed" | "engine_bridge_not_compiled" |
-    /// "verifier_identity_unavailable".
+    /// "verifier_identity_unavailable" | "pairing_disabled" (the settings
+    /// toggle) | "listener_bind_failed" | "resource_ceiling".
     reason: Option<String>,
+    /// The exact degrade detail behind `reason` (bind error text, the
+    /// projected-vs-ceiling numbers, …) — labels and counts only, never
+    /// secrets or content. Honest degrade rule: a family that cannot
+    /// start says WHY here, never a silent off.
+    detail: Option<String>,
     /// The engine's real disclosed geometry (backend / batch_verify /
     /// batch_window_max) when the bridge inited — from the engine, never
     /// hand-set.
@@ -170,11 +196,39 @@ impl FamilyStatus {
         Self {
             state: "off".into(),
             reason: Some(reason.into()),
+            detail: None,
             disclosure: None,
             lease_roster_peers: 0,
             pin: None,
         }
     }
+
+    /// The honest-degrade shape: the stable reason PLUS the exact detail
+    /// (bind error, resource projection) so the family line never reads
+    /// as a silent off.
+    fn off_detail(reason: &str, detail: impl Into<String>) -> Self {
+        Self {
+            detail: Some(detail.into()),
+            ..Self::off(reason)
+        }
+    }
+}
+
+/// What the coordinator learned about one peer's family engine through the
+/// EXISTING negotiation surface (the `SessionAccept` disclosure — no wire
+/// or roster field carries capability, so this cache is filled by
+/// `family_probe` and read by the chat auto-engage checkpoint). Counts and
+/// labels only.
+#[cfg(feature = "verifydrafts")]
+#[derive(Clone)]
+struct FamilyPeerCap {
+    batch_verify: bool,
+    batch_window_max: u32,
+    /// The peer's disclosed backend ("cpu" | "vulkan").
+    backend: String,
+    /// When the disclosure was learned (unix ms) — stale caps re-learn
+    /// through the next probe.
+    learned_unix_ms: u64,
 }
 
 struct RunningNode {
@@ -224,6 +278,11 @@ impl DesktopState {
                 artifact: None,
                 node: None,
                 chat_log: Vec::new(),
+                allow_swarm_pairing: config.allow_swarm_pairing,
+                #[cfg(feature = "verifydrafts")]
+                family_peer_caps: Default::default(),
+                #[cfg(feature = "verifydrafts")]
+                family_engine: None,
                 swarm_lease: None,
                 swarm_executor: None,
                 peer_metrics: None,
@@ -266,16 +325,42 @@ async fn license_accepted(tracker_url: &str, data_dir: &std::path::Path) -> bool
         .unwrap_or(false)
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct PersistedConfig {
     #[serde(default = "default_tracker")]
     tracker: String,
     #[serde(default)]
     profile_id: Option<String>,
+    /// Owner directive (2026-10-13): the settings toggle "allow swarm
+    /// pairing" replaces the `MSP_LISTENER` env var as the product gate for
+    /// the serving listener + family tier. DEFAULT ON for testers; the
+    /// daemon never reads `MSP_LISTENER` for this decision anymore (the
+    /// transport crate's internal ADR-018 non-loopback guard still reads
+    /// its own env contract — the desktop SETS it when the toggle allows,
+    /// never the reverse).
+    #[serde(default = "default_allow_swarm_pairing")]
+    allow_swarm_pairing: bool,
 }
 
 fn default_tracker() -> String {
     "https://modelswarm.deepflux.space".to_string()
+}
+
+fn default_allow_swarm_pairing() -> bool {
+    true
+}
+
+impl Default for PersistedConfig {
+    fn default() -> Self {
+        // Mirrors the serde field defaults exactly: a missing file/keys
+        // must read as the fresh-install posture (default tracker,
+        // pairing ALLOWED) — `derive(Default)` would zero the toggle.
+        Self {
+            tracker: default_tracker(),
+            profile_id: None,
+            allow_swarm_pairing: default_allow_swarm_pairing(),
+        }
+    }
 }
 
 fn read_config(data_dir: &std::path::Path) -> PersistedConfig {
@@ -347,42 +432,100 @@ fn log_event(telemetry: &Telemetry, level: &str, event: &str, fields: &[(&str, &
     };
 }
 
-/// F0(2): when the operator opted in (MSP_LISTENER=1), bind the libp2p
+/// The serving-listener gate decision, pure and env-independent (owner
+/// directive 2026-10-13): the persisted "allow swarm pairing" toggle is
+/// the product gate — `MSP_LISTENER` is no longer READ here. The transport
+/// crate's own ADR-018 non-loopback guard still consults its env contract
+/// internally, so the bind path SETS it (never the reverse) when pairing
+/// is allowed; that hand-off is recorded in the handoff as the Network
+/// Engineer's seam.
+#[derive(Debug, PartialEq)]
+enum ListenerGate {
+    /// The toggle allows pairing — proceed to bind.
+    Allowed,
+    /// The toggle is off: no listener, and the family line says so with
+    /// the exact reason (never a silent off).
+    Disabled,
+}
+
+fn listener_gate(allow_swarm_pairing: bool) -> ListenerGate {
+    if allow_swarm_pairing {
+        ListenerGate::Allowed
+    } else {
+        ListenerGate::Disabled
+    }
+}
+
+/// The bind outcome for the family/hosting status surface.
+enum ListenerBind {
+    /// The bound listener plus its honestly-advertised LAN multiaddr.
+    Bound(modelswarm_transport::libp2p_backend::Libp2pListener, String),
+    /// Pairing disabled by the settings toggle.
+    Disabled,
+    /// The toggle allowed pairing but the bind failed — carries the exact
+    /// phase + error for the family line (honest degrade, never silent).
+    Failed(String),
+}
+
+/// F0(2): when the settings toggle allows pairing (default on since
+/// 2026-10-13; replaces the MSP_LISTENER=1 opt-in), bind the libp2p
 /// serving listener on 0.0.0.0 and return the honestly-advertised LAN
 /// multiaddr. The listener is parked in a holding task — dropping it stops
 /// the driver, so it lives until process end (or hosting stop kills the
 /// node; the listener itself is connectionless until the serving bridge
-/// lands in F0(3)). None = not opted in or bind failed (log both).
+/// lands in F0(3)). `Disabled`/`Failed` carry the exact reason upward so
+/// the family line can state it.
 async fn bind_serving_listener(
     data_dir: &std::path::Path,
     telemetry: &Telemetry,
-) -> Option<(modelswarm_transport::libp2p_backend::Libp2pListener, String)> {
-    if std::env::var("MSP_LISTENER").as_deref() != Ok("1") {
-        return None;
+    allow_swarm_pairing: bool,
+) -> ListenerBind {
+    if listener_gate(allow_swarm_pairing) == ListenerGate::Disabled {
+        return ListenerBind::Disabled;
     }
-    let identity = load_or_create_identity(data_dir, telemetry).ok()?;
-    let backend = match modelswarm_transport::libp2p_backend::Libp2pTransport::new(&identity) {
-        Ok(b) => b,
+    // The transport's ADR-018 guard refuses non-loopback binds without its
+    // env contract; the toggle is the USER-facing decision, so satisfy the
+    // guard on the user's behalf (this process binds exactly what the
+    // toggle allowed). Cross-crate seam: the guard should take an explicit
+    // opt-in parameter — recorded for the Network Engineer.
+    std::env::set_var("MSP_LISTENER", "1");
+    let identity = match load_or_create_identity(data_dir, telemetry) {
+        Ok(identity) => identity,
         Err(e) => {
+            let detail = format!("identity: {e}");
             log_event(
                 telemetry,
                 "warn",
                 "listener.error",
-                &[("phase", "backend"), ("error", &e.to_string())],
+                &[("phase", "identity"), ("error", &detail)],
             );
-            return None;
+            return ListenerBind::Failed(detail);
+        }
+    };
+    let backend = match modelswarm_transport::libp2p_backend::Libp2pTransport::new(&identity) {
+        Ok(b) => b,
+        Err(e) => {
+            let detail = format!("transport backend: {e}");
+            log_event(
+                telemetry,
+                "warn",
+                "listener.error",
+                &[("phase", "backend"), ("error", &detail)],
+            );
+            return ListenerBind::Failed(detail);
         }
     };
     let listener = match backend.listen("0.0.0.0:0").await {
         Ok(l) => l,
         Err(e) => {
+            let detail = format!("bind 0.0.0.0:0: {e}");
             log_event(
                 telemetry,
                 "warn",
                 "listener.error",
-                &[("phase", "bind"), ("error", &e.to_string())],
+                &[("phase", "bind"), ("error", &detail)],
             );
-            return None;
+            return ListenerBind::Failed(detail);
         }
     };
     // Bind says 0.0.0.0; advertise the real LAN IP (UDP-connect trick —
@@ -398,7 +541,7 @@ async fn bind_serving_listener(
         .to_string()
         .replace("/0.0.0.0/", &format!("/{lan_ip}/"));
     log_event(telemetry, "info", "listener.bound", &[("addr", &addr)]);
-    Some((listener, addr))
+    ListenerBind::Bound(listener, addr)
 }
 
 // ---- The composed daemon's family half (ADR-032 light-up; cfg
@@ -708,15 +851,95 @@ async fn ensure_family_pin(
 /// bridge (honest degradation, never a silent family-off). Every `None`
 /// path telemeters its stable reason and mirrors it in the returned
 /// [`FamilyStatus`].
+/// The resource ceiling the family tier respects while the M2 governor is
+/// not yet the enforcement authority: gate D11's 70% number (the ADR-034
+/// resource note records the RAM/VRAM-doubling posture against exactly
+/// this ceiling). This is a DESKTOP-SIDE honest degrade, advisory-grade
+/// until the Resource Engineer's governor owns enforcement — see the
+/// handoff for the coordination seam.
 #[cfg(feature = "verifydrafts")]
+const FAMILY_RESOURCE_CEILING_PERCENT: u64 = 70;
+
+/// The family-tier resource verdict (owner-flagged binding constraint):
+/// starting the in-process verify engine alongside the serving sidecar
+/// roughly doubles the model's resident footprint. As currently
+/// observable (one platform resource sample + the once-per-process
+/// hardware detection), project the doubling against the ceiling and
+/// degrade with the exact numbers when it would breach. Unobservable
+/// inputs (null sample fields, no GPU detection) are NOT guessed: the
+/// check passes and the gap is logged — honesty, not a fabricated block.
+#[cfg(feature = "verifydrafts")]
+async fn family_resource_verdict(
+    weights_bytes: u64,
+    hardware: &HardwareInfo,
+    serving_backend: Option<&str>,
+) -> Result<(), String> {
+    let mb = |b: u64| b / 1_000_000;
+    let sample = tokio::task::spawn_blocking(|| {
+        let mut sampler = modelswarm_resource::ResourceSampler::platform(
+            modelswarm_resource::ProcessScope::Roots(vec![std::process::id()]),
+        );
+        sampler.sample()
+    })
+    .await
+    .map_err(|e| format!("resource sample task failed: {e}"))?;
+    if let (Some(used), Some(total)) = (sample.system_ram_used_bytes, sample.system_ram_total_bytes)
+    {
+        let projected = used.saturating_add(weights_bytes);
+        let ceiling = total.saturating_mul(FAMILY_RESOURCE_CEILING_PERCENT) / 100;
+        if projected > ceiling {
+            return Err(format!(
+                "system RAM: projected {}/{} MB would pass the {}% ceiling ({} MB in use + the verify engine's {} MB copy)",
+                mb(projected),
+                mb(total),
+                FAMILY_RESOURCE_CEILING_PERCENT,
+                mb(used),
+                mb(weights_bytes)
+            ));
+        }
+    }
+    // VRAM doubling applies when the family bundle will be the Vulkan
+    // class (it follows the serving variant); the sidecar already holds
+    // the weights in VRAM then, and the C-API copy would hold them again.
+    if serving_backend == Some("vulkan") {
+        if let (Some(used), Some(total_mb)) = (
+            sample.gpu_vram_used_bytes,
+            hardware.gpu.as_ref().map(|g| g.vram_mb),
+        ) {
+            let total = total_mb.saturating_mul(1_000_000);
+            let projected = used.saturating_add(weights_bytes);
+            let ceiling = total.saturating_mul(FAMILY_RESOURCE_CEILING_PERCENT) / 100;
+            if projected > ceiling {
+                return Err(format!(
+                    "VRAM: projected {}/{} MB would pass the {}% ceiling ({} MB in use + the verify engine's {} MB copy)",
+                    mb(projected),
+                    mb(total),
+                    FAMILY_RESOURCE_CEILING_PERCENT,
+                    mb(used),
+                    mb(weights_bytes)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "verifydrafts")]
+#[allow(clippy::too_many_arguments)]
 async fn compose_family_serving(
     app: &tauri::AppHandle,
     data_dir: &Path,
     profile: &str,
     model_path: &Path,
+    weights_bytes: u64,
+    hardware: &HardwareInfo,
     handle: &NodeHandle,
     telemetry: &std::sync::Arc<Telemetry>,
-) -> (Option<FamilyServing>, FamilyStatus) {
+) -> (
+    Option<FamilyServing>,
+    FamilyStatus,
+    Option<Arc<modelswarm_node::verifydrafts::FamilyEngineSource>>,
+) {
     // The verifier identity: the SAME per-installation identity the
     // serving listener authenticated with — it signs every
     // VerifyDraftsResult (RC-2).
@@ -727,13 +950,46 @@ async fn compose_family_serving(
             "family.fallback",
             &[("reason", "verifier_identity_unavailable")],
         );
-        return (None, FamilyStatus::off("verifier_identity_unavailable"));
+        return (
+            None,
+            FamilyStatus::off("verifier_identity_unavailable"),
+            None,
+        );
     };
     let config = VerifyDraftsServeConfig::honest(profile.to_string(), verifier_identity);
     // (The config's hand-set disclosure stays the honest `batch_verify:
     // false` default — the composed loop overrides it per session with
     // the engine's REAL geometry; the status below reports the same
     // real geometry, never this field.)
+
+    // The owner-flagged binding constraint, made honest: family-by-default
+    // means the verify engine's memory coexists with the sidecar. As
+    // currently observable, a projected breach of the D11 ceiling degrades
+    // the family tier with the exact numbers (the governor — the real
+    // enforcement authority — is the Resource Engineer's crate and is NOT
+    // touched here; see the handoff for the coordination seam).
+    if let Err(detail) =
+        family_resource_verdict(weights_bytes, hardware, handle.engine_backend.as_deref()).await
+    {
+        log_event(
+            telemetry,
+            "warn",
+            "family.fallback",
+            &[
+                ("reason", "resource_ceiling"),
+                (
+                    "ceiling_percent",
+                    &FAMILY_RESOURCE_CEILING_PERCENT.to_string(),
+                ),
+                ("detail", &detail),
+            ],
+        );
+        return (
+            None,
+            FamilyStatus::off_detail("resource_ceiling", detail),
+            None,
+        );
+    }
 
     // The engine source for THIS build.
     #[cfg(feature = "verifydrafts-capi")]
@@ -761,7 +1017,7 @@ async fn compose_family_serving(
                         ("detail", &detail),
                     ],
                 );
-                return (None, FamilyStatus::off("family_prompt_unpinned"));
+                return (None, FamilyStatus::off("family_prompt_unpinned"), None);
             }
         };
         let pin_status = FamilyPinStatus {
@@ -805,7 +1061,7 @@ async fn compose_family_serving(
             Err(error) => {
                 // The bridge could not init (missing C-API bundle, model
                 // load failure, ABI canary): honest degradation with the
-                // local error detail in the log only.
+                // local error detail in the log AND the status line.
                 log_event(
                     telemetry,
                     "warn",
@@ -815,7 +1071,11 @@ async fn compose_family_serving(
                         ("error", &error.to_string()),
                     ],
                 );
-                return (None, FamilyStatus::off("engine_bridge_failed"));
+                return (
+                    None,
+                    FamilyStatus::off_detail("engine_bridge_failed", error.to_string()),
+                    None,
+                );
             }
         }
     };
@@ -823,6 +1083,7 @@ async fn compose_family_serving(
     let engine: Option<(
         std::sync::Arc<modelswarm_node::verifydrafts::FamilyEngineSource>,
         serde_json::Value,
+        FamilyPinStatus,
     )> = {
         // A dev build without the C-API bridge: the honest engine answer
         // is the http-adapter disclosure (`batch_verify: false` — a
@@ -837,14 +1098,14 @@ async fn compose_family_serving(
                 ("disclosure", "batch_verify:false (http adapter)"),
             ],
         );
-        return (None, FamilyStatus::off("engine_bridge_not_compiled"));
+        return (None, FamilyStatus::off("engine_bridge_not_compiled"), None);
     };
 
     let Some((engine, disclosure, pin_status)) = engine else {
         // Every None path returned above; this is unreachable by
         // construction, kept as a fail-closed guard rather than an
         // `expect`.
-        return (None, FamilyStatus::off("engine_bridge_failed"));
+        return (None, FamilyStatus::off("engine_bridge_failed"), None);
     };
 
     // RC-L1 + the §2 admission order: the production lease source under
@@ -870,6 +1131,7 @@ async fn compose_family_serving(
     let status = FamilyStatus {
         state: "on".into(),
         reason: None,
+        detail: None,
         disclosure: Some(disclosure),
         lease_roster_peers,
         pin: Some(pin_status),
@@ -877,10 +1139,11 @@ async fn compose_family_serving(
     (
         Some(FamilyServing {
             config,
-            engine,
+            engine: Arc::clone(&engine),
             lease,
         }),
         status,
+        Some(engine),
     )
 }
 
@@ -927,11 +1190,11 @@ async fn resolve_profile(
 
 fn persist_config(inner: &Inner) -> Result<(), String> {
     // TR-RC-8 (ADR-033 §9.2 review): READ-MODIFY-WRITE the FULL JSON
-    // object. The daemon owns exactly two keys (`tracker`, `profile_id`);
-    // every other key in config.json — another subsystem's config surface
-    // that later moves in here — is preserved verbatim. (The previous
-    // struct-rewrite serialized only the two known fields and SILENTLY
-    // DELETED everything else on every tracker/profile change.)
+    // object. The daemon owns exactly three keys (`tracker`,
+    // `profile_id`, `allow_swarm_pairing`); every other key in config.json
+    // — another subsystem's config surface that later moves in here — is
+    // preserved verbatim. (The previous struct-rewrite serialized only the
+    // known fields and SILENTLY DELETED everything else on every rewrite.)
     let path = inner.data_dir.join("config.json");
     let mut root: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
         .ok()
@@ -939,6 +1202,10 @@ fn persist_config(inner: &Inner) -> Result<(), String> {
         .unwrap_or_default();
     root.insert("tracker".into(), serde_json::json!(inner.tracker_url));
     root.insert("profile_id".into(), serde_json::json!(inner.profile_id));
+    root.insert(
+        "allow_swarm_pairing".into(),
+        serde_json::json!(inner.allow_swarm_pairing),
+    );
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?,
@@ -1186,6 +1453,10 @@ async fn get_status(
         "gpu_engine_available": engine_gpu_binary_path(&app).is_some(),
         "license_accepted": inner.license_accepted,
         "profile_id": inner.profile_id,
+        // The settings toggle's honest current state (owner directive
+        // 2026-10-13): the UI renders the posture from THIS field, never
+        // a guessed default.
+        "pairing_allowed": inner.allow_swarm_pairing,
         "artifact": inner.artifact.as_ref().map(|a| serde_json::json!({
             "path": a.path.display().to_string(),
             "bytes": a.bytes,
@@ -1226,6 +1497,48 @@ async fn set_tracker(state: tauri::State<'_, DesktopState>, url: String) -> Resu
     // The same round-trip-preserving writer as every other config change
     // (TR-RC-8): unknown keys in config.json survive a tracker change.
     persist_config(&inner)
+}
+
+/// The "allow swarm pairing" settings toggle (owner directive 2026-10-13):
+/// persisted key, default on. The toggle gates the serving listener + the
+/// family verify engine at HOSTING START — changing it while hosting would
+/// leave the live listener contradicting the setting, so it is refused
+/// until hosting stops (the same discipline as `set_tracker`). The honest
+/// current state always flows through `get_status.pairing_allowed`.
+#[tauri::command]
+async fn set_pairing_allowed(
+    state: tauri::State<'_, DesktopState>,
+    allowed: bool,
+) -> Result<(), String> {
+    let mut inner = state.inner.lock().await;
+    if inner.node.is_some() {
+        return Err("stop hosting before changing swarm pairing".into());
+    }
+    inner.allow_swarm_pairing = allowed;
+    log_event(
+        &state.telemetry,
+        "info",
+        "settings.pairing",
+        &[("allowed", &allowed.to_string())],
+    );
+    persist_config(&inner)
+}
+
+/// Clears the persisted conversation (owner directive 2026-10-13 — the
+/// greedy language-drift escape hatch; tonight's live confirmation: a
+/// restart cleared the drift, so the SAME reset must be reachable without
+/// one). Resets the daemon-side rendered history AND tells the UI to drop
+/// the transcript.
+#[tauri::command]
+async fn clear_chat(
+    state: tauri::State<'_, DesktopState>,
+    window: tauri::Window,
+) -> Result<serde_json::Value, String> {
+    let mut inner = state.inner.lock().await;
+    inner.chat_log.clear();
+    let _ = window.emit("chat-cleared", ());
+    log_event(&state.telemetry, "info", "chat.cleared", &[]);
+    Ok(serde_json::json!({ "cleared": true, "chat_turns": 0 }))
 }
 
 #[tauri::command]
@@ -1759,6 +2072,10 @@ async fn set_hosting_inner(
         }
         inner.listener_addr = None;
         inner.family = None;
+        #[cfg(feature = "verifydrafts")]
+        {
+            inner.family_engine = None;
+        }
         return Ok(serde_json::json!({ "hosting": false }));
     }
 
@@ -1825,9 +2142,23 @@ async fn set_hosting_inner(
     // msp-v1 unchanged, family sessions behind the RC-L1 profile-bound
     // lease gate; when the family half cannot init the daemon degrades
     // HONESTLY to the plain msp-v1 bridge (a logged reason + the status
-    // field, never a silent family-off).
+    // field, never a silent family-off). The family tier is ON BY DEFAULT
+    // since 2026-10-13: the "allow swarm pairing" settings toggle (default
+    // on) gates the listener; a bind failure surfaces its exact reason in
+    // the family line.
+    let hardware = hardware_of(app, state).await;
     let mut advertised_addr: Option<String> = None;
-    if let Some((listener, addr)) = bind_serving_listener(&inner.data_dir, &state.telemetry).await {
+    let listener_bind =
+        bind_serving_listener(&inner.data_dir, &state.telemetry, inner.allow_swarm_pairing).await;
+    let listener_bind_reason: Option<(&'static str, String)> = match &listener_bind {
+        ListenerBind::Bound(_, _) => None,
+        ListenerBind::Disabled => Some((
+            "pairing_disabled",
+            "the allow-swarm-pairing setting is off".into(),
+        )),
+        ListenerBind::Failed(detail) => Some(("listener_bind_failed", detail.clone())),
+    };
+    if let ListenerBind::Bound(listener, addr) = listener_bind {
         if let (Some(executor), Some(profile)) =
             (handle.executor.clone(), handle.profile_id.clone())
         {
@@ -1837,11 +2168,13 @@ async fn set_hosting_inner(
             let serving_telemetry = std::sync::Arc::clone(&state.telemetry);
 
             #[cfg(feature = "verifydrafts")]
-            let (family_serving, family_status) = compose_family_serving(
+            let (family_serving, family_status, family_engine) = compose_family_serving(
                 app,
                 &inner.data_dir,
                 &profile,
                 &ensured.path,
+                ensured.bytes,
+                &hardware,
                 &handle,
                 &state.telemetry,
             )
@@ -1849,6 +2182,12 @@ async fn set_hosting_inner(
             #[cfg(feature = "verifydrafts")]
             {
                 inner.family = Some(family_status);
+                // The coordinator's self-verify engine: the SAME source the
+                // serving half holds (Arc clone). None whenever the family
+                // tier is degraded — the probe then fails closed with the
+                // honest `selfcheck_unavailable` label instead of sending
+                // an unverified draft (tonight's warm-cache lesson).
+                inner.family_engine = family_engine;
                 match family_serving {
                     Some(family) => {
                         tokio::spawn(modelswarm_node::verifydrafts::serve_sessions_composed(
@@ -1888,16 +2227,25 @@ async fn set_hosting_inner(
     }
 
     // The family status must be the truth in EVERY configuration: when the
-    // serving listener never bound (MSP_LISTENER off) there is no family
-    // serving regardless of features; when the family tier is not compiled
-    // in, this build is a dev shell — both carry their exact reason
-    // instead of a null field the UI would have to guess about.
+    // serving listener never bound (the toggle off, or the bind failed)
+    // there is no family serving regardless of features; when the family
+    // tier is not compiled in, this build is a dev shell — every case
+    // carries its exact reason (and detail) instead of a null field the UI
+    // would have to guess about.
     if inner.family.is_none() {
         #[cfg(feature = "verifydrafts")]
-        let reason = "listener_off";
+        let fallback = match listener_bind_reason {
+            Some((reason, detail)) => FamilyStatus::off_detail(reason, detail),
+            // Bound but no executor/profile (a runtime-less node): the
+            // composed bridge was never attached.
+            None => FamilyStatus::off_detail(
+                "serving_bridge_unavailable",
+                "the node has no serving executor",
+            ),
+        };
         #[cfg(not(feature = "verifydrafts"))]
-        let reason = "family_not_compiled";
-        inner.family = Some(FamilyStatus::off(reason));
+        let fallback = FamilyStatus::off("family_not_compiled");
+        inner.family = Some(fallback);
     }
 
     // Roster heartbeat: device-enroll (approval gated) → session →
@@ -2255,11 +2603,27 @@ async fn lookup_peers(
 /// this machine's own hosting engine — reporting `pairing_confirmed` /
 /// `pin_mismatch` (counts only; no prompt content and no token ids ever
 /// cross the wire or reach a result field).
+/// A build without the family tier can honestly say so before earning
+/// anything (the dev-shell answer; the shipped tauri-shell build always
+/// chains `verifydrafts-capi`).
+#[cfg(not(feature = "verifydrafts"))]
+#[tauri::command]
+async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Value, String> {
+    log_event(
+        &state.telemetry,
+        "warn",
+        "family.probe",
+        &[("reason", "family_not_compiled")],
+    );
+    Ok(serde_json::json!({ "probed": false, "opened": false, "reason": "family_not_compiled" }))
+}
+
+#[cfg(feature = "verifydrafts")]
 #[tauri::command]
 async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Value, String> {
     let fail =
         |reason: &str| serde_json::json!({ "probed": false, "opened": false, "reason": reason });
-    let (profile, gateway, tracker_url, data_dir, engine, engine_backend) = {
+    let (profile, gateway, tracker_url, data_dir, engine, engine_backend, family_engine) = {
         let inner = state.inner.lock().await;
         let running = inner.node.as_ref();
         let Some(running) = running else {
@@ -2275,22 +2639,9 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
             inner.data_dir.clone(),
             running.handle.runtime.clone(),
             running.handle.engine_backend.clone(),
+            inner.family_engine.clone(),
         )
     };
-
-    // A build without the family tier can honestly say so before earning
-    // anything.
-    #[cfg(not(feature = "verifydrafts"))]
-    {
-        let _ = (&profile, &gateway, &tracker_url, &data_dir, &engine);
-        log_event(
-            &state.telemetry,
-            "warn",
-            "family.probe",
-            &[("reason", "family_not_compiled")],
-        );
-        return Ok(fail("family_not_compiled"));
-    }
 
     // The lease to present: earned through the hosting challenge and
     // cached per profile (F3(2)) — exactly what the msp-v1 swarm path
@@ -2453,10 +2804,19 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
             // drafted by this machine's OWN hosting engine (its sidecar —
             // no second engine on the coordinator), greedy under the
             // session's pinned sampling params (both ends pin the same
-            // defaults through generation_params_hash).
+            // defaults through generation_params_hash). The window passes
+            // the LOCAL self-check before `family_probe_round` may send it.
             let pairing = match pin_ids {
                 Err(_) => {
-                    family_probe_round(&mut client, &session_id, true, None, &state.telemetry).await
+                    family_probe_round(
+                        &mut client,
+                        &session_id,
+                        true,
+                        None,
+                        family_engine.as_ref(),
+                        &state.telemetry,
+                    )
+                    .await
                 }
                 Ok(ids) => {
                     let w = 8u32.min(client.engine_disclosure().batch_window_max);
@@ -2469,11 +2829,32 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
                         &session_id,
                         false,
                         window.as_deref(),
+                        family_engine.as_ref(),
                         &state.telemetry,
                     )
                     .await
                 }
             };
+            // The coordinator-side capability cache (the auto-engage
+            // checkpoint's honest seam): the accept's engine disclosure is
+            // the ONLY existing capability surface — no roster field
+            // carries it. Learned here, counts and labels only.
+            {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let mut inner = state.inner.lock().await;
+                inner.family_peer_caps.insert(
+                    candidate.peer_id.clone(),
+                    FamilyPeerCap {
+                        batch_verify: disclosure.batch_verify,
+                        batch_window_max: disclosure.batch_window_max,
+                        backend: disclosure.backend.to_string(),
+                        learned_unix_ms: now_ms,
+                    },
+                );
+            }
             log_event(
                 &state.telemetry,
                 "info",
@@ -2584,13 +2965,118 @@ fn pairing_result_fields(
     out
 }
 
+/// The one telemetry call every pairing outcome flows through (the
+/// 2026-10-13 gap fix: the DETAIL label — the Err-branch reasons like
+/// `rejected`/`io`/`local_selfcheck` — now reaches the
+/// `family.probe.pairing` event; counts and labels only, never token
+/// ids).
+#[cfg(feature = "verifydrafts")]
+#[allow(clippy::too_many_arguments)]
+fn log_family_pairing(
+    telemetry: &Telemetry,
+    session_id: &str,
+    pairing: &str,
+    window: Option<u32>,
+    accepted: Option<u32>,
+    divergence: Option<u32>,
+    detail: Option<&str>,
+) {
+    telemetry.info(
+        "family.probe.pairing",
+        &[
+            ("session", session_id),
+            ("pairing", pairing),
+            ("window", &window.map(|w| w.to_string()).unwrap_or_default()),
+            (
+                "accepted",
+                &accepted.map(|a| a.to_string()).unwrap_or_default(),
+            ),
+            (
+                "divergence",
+                &divergence.map(|d| d.to_string()).unwrap_or_default(),
+            ),
+            ("detail", detail.unwrap_or("")),
+        ],
+    );
+}
+
+// ---- Coordinator self-verify (tonight's 2026-10-13 live root cause) ----
+//
+// The probe's DRAFT is produced by the shared llama sidecar — the same
+// engine serving chat — and a WARM prompt cache flips the draft's first
+// greedy token (a warm-drafted round was rejected 0/8 divergence-at-0 by
+// the peer's verifier while both cold-drafted rounds confirmed 8/8). The
+// owner-approved fix: before ANY drafted window is sent to a verifier
+// (probe today, the auto-engage path when it exists), re-run the window
+// through the LOCAL batch-verify engine and only send windows that pass
+// LOCAL verification. A fresh engine per check (the family source's
+// `engine_for`) is cache-cold BY CONSTRUCTION — the ADR-032 §3 cache-cold
+// audit rule — so the check catches warm-cache flips and any other local
+// inconsistency. Counts only; a window that fails locally NEVER hits the
+// wire.
+
+/// The local self-check verdict for one drafted window.
+#[cfg(feature = "verifydrafts")]
+#[derive(Debug)]
+enum FamilySelfcheck {
+    /// The local engine reproduces the window — safe to send.
+    Send,
+    /// The local engine diverged at `accepted` (== the divergence point,
+    /// ADR-032 §1): the window is NOT sent; the honest label carries the
+    /// counts only.
+    LocalDivergence { accepted: u32 },
+    /// No usable local verify engine (family tier degraded / dev build):
+    /// fail closed — no unverified draft is ever sent.
+    Unavailable(String),
+}
+
+/// Runs one drafted window through the local batch-verify engine (a FRESH
+/// prefilled engine per call — cache-cold) and returns whether it may hit
+/// the wire. Shared by every coordinator path that drafts: the probe
+/// today, the chat auto-engage checkpoint when engagement unblocks.
+#[cfg(feature = "verifydrafts")]
+async fn family_selfcheck_window(
+    source: Option<&Arc<modelswarm_node::verifydrafts::FamilyEngineSource>>,
+    window: &[u32],
+) -> FamilySelfcheck {
+    let Some(source) = source else {
+        return FamilySelfcheck::Unavailable(
+            "no local family engine (family tier off or degraded)".into(),
+        );
+    };
+    let engine = match source.engine_for().await {
+        Ok(engine) => engine,
+        Err(e) => return FamilySelfcheck::Unavailable(format!("engine load: {e}")),
+    };
+    // The session's pinned sampling parameters — the same defaults both
+    // ends pin through `generation_params_hash`; deliberately NOT the
+    // chat temperature (the draft path stays greedy-pinned).
+    let params = modelswarm_node::verifydrafts::SamplingParams::default();
+    match engine.verify_window(window, &params).await {
+        Ok((accepted, _correction)) => {
+            if accepted == window.len() as u32 {
+                FamilySelfcheck::Send
+            } else {
+                FamilySelfcheck::LocalDivergence {
+                    accepted: accepted.min(window.len() as u32),
+                }
+            }
+        }
+        Err(e) => FamilySelfcheck::Unavailable(format!("engine verify: {e}")),
+    }
+}
+
 /// Runs the probe's ONE deterministic pairing round (ADR-034 rule 6b)
 /// over the coordinator-drafted `window` and returns the counts-only
 /// result fields. `pin_unpinned`/`window` carry the honest pre-round
 /// states: no usable local pin ⇒ `pin_unpinned`; a pin the local engine
 /// could not draft (or an all-EOS zero-token draft) ⇒
 /// `draft_unavailable` — never a fabricated confirmation, never token
-/// ids in any field.
+/// ids in any field. Since 2026-10-13 every drafted window first passes
+/// the LOCAL self-check (`family_selfcheck_window`): a locally divergent
+/// window (`local_selfcheck`, counts only) or a missing local engine
+/// (`selfcheck_unavailable`) NEVER reaches `client.round` — the wire
+/// only ever carries locally-verified drafts.
 #[cfg(feature = "verifydrafts")]
 async fn family_probe_round(
     client: &mut modelswarm_node::verifydrafts::VerifyDraftsClient<
@@ -2599,6 +3085,7 @@ async fn family_probe_round(
     session_id: &str,
     pin_unpinned: bool,
     window: Option<&[u32]>,
+    selfcheck_source: Option<&Arc<modelswarm_node::verifydrafts::FamilyEngineSource>>,
     telemetry: &Telemetry,
 ) -> Vec<(String, serde_json::Value)> {
     let fields = |pairing: &str,
@@ -2607,21 +3094,8 @@ async fn family_probe_round(
                   divergence: Option<u32>,
                   detail: Option<&str>|
      -> Vec<(String, serde_json::Value)> {
-        telemetry.info(
-            "family.probe.pairing",
-            &[
-                ("session", session_id),
-                ("pairing", pairing),
-                ("window", &window.map(|w| w.to_string()).unwrap_or_default()),
-                (
-                    "accepted",
-                    &accepted.map(|a| a.to_string()).unwrap_or_default(),
-                ),
-                (
-                    "divergence",
-                    &divergence.map(|d| d.to_string()).unwrap_or_default(),
-                ),
-            ],
+        log_family_pairing(
+            telemetry, session_id, pairing, window, accepted, divergence, detail,
         );
         pairing_result_fields(pairing, window, accepted, divergence, detail)
     };
@@ -2631,6 +3105,29 @@ async fn family_probe_round(
     let Some(window) = window.filter(|w| !w.is_empty()) else {
         return fields("draft_unavailable", None, None, None, None);
     };
+    // The pre-wire gate (owner-approved 2026-10-13): local verification
+    // FIRST, cache-cold; only a passing window may hit the wire.
+    match family_selfcheck_window(selfcheck_source, window).await {
+        FamilySelfcheck::Send => {}
+        FamilySelfcheck::LocalDivergence { accepted } => {
+            return fields(
+                "local_selfcheck",
+                Some(window.len() as u32),
+                Some(accepted),
+                Some(accepted),
+                None,
+            );
+        }
+        FamilySelfcheck::Unavailable(why) => {
+            return fields(
+                "selfcheck_unavailable",
+                Some(window.len() as u32),
+                None,
+                None,
+                Some(&why),
+            );
+        }
+    }
     match client.round(window, telemetry).await {
         Ok(outcome) => {
             let verdict = pairing_verdict(
@@ -2997,6 +3494,131 @@ fn record_shadow_failure(
     );
 }
 
+// ---- Chat auto-engage behind the engage gate (owner directive
+// 2026-10-13: "chat must auto-engage the family behind the engage gate,
+// zero buttons; the probe button remains diagnostic only") --------------
+//
+// What LANDED: the honest capability-check seam + the engage-gate
+// evaluation, wired into every swarm chat turn with telemetry and a UI
+// surface. Capability comes from the coordinator-side cache the PROBE
+// fills (the family `SessionAccept` disclosure is the only existing
+// capability surface — the roster carries NO batch-verify field, and
+// inventing one is a wire change needing an ADR). The gate itself is the
+// scheduler's frozen public rule (`should_engage_cooperative`, margin ≥
+// 0.05, fastest-single comparator).
+//
+// What is BLOCKED at the protocol boundary (recorded, not improvised):
+// routing a CHAT completion through a verifydrafts cooperative session
+// requires the session prompt in the VERIFIER's engine KV, and the family
+// wire is content-blind BY DESIGN (ADR-032 §2/G6: the prompt is pinned
+// out-of-band; ADR-034 rule 5: "it does not smuggle user prompts onto the
+// family wire — arbitrary-user-prompt family sessions require the rule-8
+// commitment path or expert-pinned identical files on both ends", and
+// rule 8 is owner-gated). So engagement never fires for chat content
+// today; the plain swarm path serves (BEFORE the first output token, per
+// the v0.1 retry rule) with the exact reason surfaced — never a silent
+// non-engagement. The reason ladder below is the pinned vocabulary.
+
+/// Why the chat path is NOT routing this completion through a family
+/// session (stable labels; the ladder's order is the pinned priority).
+#[cfg(feature = "verifydrafts")]
+fn family_engage_reason(
+    cap: Option<&FamilyPeerCap>,
+    own_backend: Option<&str>,
+    predicted_swarm_ms: Option<f64>,
+    predicted_fastest_single_ms: Option<f64>,
+) -> &'static str {
+    let Some(cap) = cap else {
+        return "capability_unknown";
+    };
+    if !cap.batch_verify {
+        return "capability_false";
+    }
+    // E0 pairing: a cross-backend family session rejects at open anyway.
+    let own = own_backend.unwrap_or("cpu");
+    if !cap.backend.eq_ignore_ascii_case(own) {
+        return "backend_mismatch";
+    }
+    let (Some(swarm), Some(single)) = (predicted_swarm_ms, predicted_fastest_single_ms) else {
+        // No measured family-round timings exist yet (the remaining seam —
+        // the F15 recorder tracks the plain path only). Never-worse: no
+        // prediction of a win means no engagement, honestly labeled.
+        return "gate_unmeasured";
+    };
+    match modelswarm_scheduler::should_engage_cooperative(
+        swarm,
+        single,
+        modelswarm_scheduler::DEFAULT_CONFIDENCE_MARGIN,
+    ) {
+        Ok(false) => "gate_no_win",
+        // The gate would engage, but ADR-034 rule 5 blocks user-content
+        // family sessions (the owner-gated rule-8 commitment path is the
+        // recorded route to lifting this).
+        Ok(true) => "blocked_content_contract",
+        Err(_) => "gate_misconfigured",
+    }
+}
+
+/// The per-turn checkpoint: reads the capability cache + the F15 measured
+/// single, evaluates the ladder, telemeters the outcome. NEVER dials,
+/// NEVER opens a session, NEVER delays the chat — the plain swarm path
+/// serves this turn regardless (the pre-first-token fallback the engage
+/// rule demands).
+#[cfg(feature = "verifydrafts")]
+async fn family_engage_checkpoint(
+    inner: &tokio::sync::Mutex<Inner>,
+    profile: &str,
+    peer_id: &str,
+    plan: &ShadowPlan,
+    telemetry: &std::sync::Arc<Telemetry>,
+) -> &'static str {
+    let (cap, own_backend) = {
+        let guard = inner.lock().await;
+        let cap = guard.family_peer_caps.get(peer_id).cloned();
+        let backend = guard
+            .node
+            .as_ref()
+            .and_then(|r| r.handle.engine_backend.clone());
+        (cap, backend)
+    };
+    let predicted_single = plan
+        .metrics
+        .observe(peer_id)
+        .profile(profile)
+        .and_then(|p| p.total_ewma_ms);
+    let reason = family_engage_reason(
+        cap.as_ref(),
+        own_backend.as_deref(),
+        // No family-round timing EWMA exists yet (recorded seam); None
+        // keeps the ladder honest instead of inventing a prediction.
+        None,
+        predicted_single,
+    );
+    let mut fields: Vec<(&str, String)> = vec![
+        ("phase", "chat".to_string()),
+        ("peer", peer_id.to_string()),
+        ("engaged", "false".to_string()),
+        ("reason", reason.to_string()),
+    ];
+    if let Some(cap) = &cap {
+        // The learned disclosure rides along (counts/labels only) so the
+        // engage telemetry shows WHAT was known, not just the verdict.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        fields.push(("cap_backend", cap.backend.clone()));
+        fields.push(("cap_window", cap.batch_window_max.to_string()));
+        fields.push((
+            "cap_age_ms",
+            now_ms.saturating_sub(cap.learned_unix_ms).to_string(),
+        ));
+    }
+    let fields: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    telemetry.info("family.engage", &fields);
+    reason
+}
+
 /// F1(3): swarm-first chat. Finds a peer verifiably hosting this exact
 /// profile with a REAL advertised address (not the no-listener
 /// placeholder, not ourselves), and asks it first. The REMOTE executor is
@@ -3014,6 +3636,11 @@ async fn try_swarm_chat(
     local_executor: std::sync::Arc<dyn modelswarm_gateway::InferenceExecutor>,
     log: &[ChatTurn],
     max_tokens: Option<u32>,
+    // The user-set chat temperature (owner directive 2026-10-13; greedy
+    // 0.0 is the default AND the determinism contract for pairing — this
+    // affects CHAT completions only; the pairing draft path stays
+    // greedy-pinned and the family session pins its own defaults).
+    temperature: f32,
     lease: Option<String>,
     on_delta: &(dyn Fn(&str) + Send + Sync),
 ) -> Option<serde_json::Value> {
@@ -3122,6 +3749,15 @@ async fn try_swarm_chat(
     // production pick — the 9.6 pass-1 divergence seed.
     let shadow_pick = log_shadow_decision(telemetry, &shadow_plan, profile, &remote_peer_id);
 
+    // FAMILY AUTO-ENGAGE CHECKPOINT (owner directive 2026-10-13, zero
+    // buttons): evaluated on every swarm chat turn, behind the engage
+    // gate. Engagement is protocol-blocked for chat content today
+    // (ADR-034 rule 5 — the reason label says so); the plain swarm path
+    // below serves this turn either way, BEFORE the first output token.
+    #[cfg(feature = "verifydrafts")]
+    let family_engage =
+        family_engage_checkpoint(inner, profile, &remote_peer_id, &shadow_plan, telemetry).await;
+
     let make_request = || modelswarm_gateway::NormalizedRequest {
         request_id: format!("chat-{}", modelswarm_identity::new_nonce()),
         profile_id: profile.to_string(),
@@ -3134,7 +3770,10 @@ async fn try_swarm_chat(
             })
             .collect(),
         sampling: modelswarm_gateway::Sampling {
-            temperature: 0.0,
+            // The user-set chat temperature rides the EXISTING wire
+            // sampling fields (msp-v1 §6 carries them; the serving side
+            // maps them back through the executor) — no protocol change.
+            temperature,
             top_p: 1.0,
             top_k: 40,
             seed: None,
@@ -3400,13 +4039,22 @@ async fn try_swarm_chat(
             ],
         );
     }
-    Some(serde_json::json!({
+    // Execution-mode honesty: whether THIS reply used the family
+    // cooperative tier, and if not, the exact reason (labels only).
+    // The desktop never hides single-vs-cooperative execution.
+    let mut reply = serde_json::json!({
         "content": content,
         "completion_tokens": completion_tokens,
         "elapsed_ms": elapsed_ms,
         "tokens_per_second": tok_s,
         "mode": mode,
-    }))
+        "family_engage": { "engaged": false },
+    });
+    #[cfg(feature = "verifydrafts")]
+    {
+        reply["family_engage"]["reason"] = serde_json::json!(family_engage);
+    }
+    Some(reply)
 }
 
 #[tauri::command]
@@ -3415,7 +4063,15 @@ async fn send_chat(
     window: tauri::Window,
     message: String,
     max_tokens: Option<u32>,
+    // The user-set chat temperature (owner directive 2026-10-13 — the
+    // greedy language-drift escape hatch). None/0 = greedy, the default
+    // and the determinism contract for pairing. Clamped to the msp-v1
+    // 6.4 range [0, 2]. Affects CHAT completions only: the pairing draft
+    // path (runtime_propose_window) and the family session's pinned
+    // params stay greedy regardless.
+    temperature: Option<f64>,
 ) -> Result<serde_json::Value, String> {
+    let temperature = temperature.unwrap_or(0.0).clamp(0.0, 2.0) as f32;
     // Per-delta surface (P1): every path that produces tokens (remote swarm
     // peer, local fallback, local gateway SSE) calls this so the UI renders
     // text as it arrives. Content only — the final turn (mode label, error
@@ -3486,6 +4142,7 @@ async fn send_chat(
                 executor.clone(),
                 &log,
                 max_tokens,
+                temperature,
                 lease,
                 &on_delta,
             )
@@ -3533,7 +4190,9 @@ async fn send_chat(
             "model": profile,
             "messages": turns,
             "max_tokens": max_tokens.unwrap_or(256),
-            "temperature": 0.0,
+            // The user-set chat temperature through the gateway's public
+            // OpenAI-compatible surface (clamped [0, 2] there too).
+            "temperature": temperature,
             "stream": true,
         }))
         .send()
@@ -4034,6 +4693,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             set_tracker,
+            set_pairing_allowed,
             accept_privacy,
             list_models,
             census,
@@ -4044,6 +4704,7 @@ pub fn run() {
             lookup_peers,
             family_probe,
             send_chat,
+            clear_chat,
             open_approval_page,
             hf_search_models,
             hf_list_ggufs,
@@ -4506,6 +5167,7 @@ mod tests {
         let status = FamilyStatus {
             state: "on".into(),
             reason: None,
+            detail: None,
             disclosure: Some(serde_json::json!({
                 "backend": "cpu", "batch_verify": true, "batch_window_max": 32
             })),
@@ -4818,6 +5480,7 @@ mod tests {
             let status = FamilyStatus {
                 state: "on".into(),
                 reason: None,
+                detail: None,
                 disclosure: None,
                 lease_roster_peers: 0,
                 pin: Some(FamilyPinStatus {
@@ -4942,6 +5605,11 @@ mod tests {
             artifact: None,
             node: None,
             chat_log: Vec::new(),
+            allow_swarm_pairing: true,
+            #[cfg(feature = "verifydrafts")]
+            family_peer_caps: Default::default(),
+            #[cfg(feature = "verifydrafts")]
+            family_engine: None,
             listener_addr: None,
             family: None,
             updater: updater::UpdaterStatus::Idle,
@@ -5006,12 +5674,252 @@ mod tests {
         assert_eq!(saved["profile_id"], serde_json::Value::Null);
         assert_eq!(
             saved.as_object().unwrap().len(),
-            2,
+            3,
             "a fresh file carries exactly the daemon's keys"
         );
+        assert_eq!(saved["allow_swarm_pairing"], true, "default-on posture");
         // Round-trips: read_config still reads the tolerant two fields.
         let config = read_config(dir.path());
         assert_eq!(config.tracker, "https://t.example");
         assert_eq!(config.profile_id, None);
+    }
+
+    // ---- v0.2.23 batch: the pairing toggle, the self-check gate, the
+    // telemetry detail fix, the engage ladder ---------------------------
+
+    /// The settings toggle is CONFIG-DRIVEN and env-free (owner directive
+    /// 2026-10-13): the gate never consults MSP_LISTENER — the decision
+    /// is the persisted key alone, defaulting ON for a fresh install.
+    #[test]
+    fn listener_gate_is_config_driven_and_env_free() {
+        // Fresh-install default: pairing allowed.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_config(dir.path()).allow_swarm_pairing);
+        assert_eq!(listener_gate(true), ListenerGate::Allowed);
+        assert_eq!(listener_gate(false), ListenerGate::Disabled);
+        // A persisted OFF decision round-trips through the writer.
+        let mut inner = test_inner(dir.path(), "https://t.example", None);
+        inner.allow_swarm_pairing = false;
+        persist_config(&inner).unwrap();
+        assert!(!read_config(dir.path()).allow_swarm_pairing);
+        // The persisted key rides the same round-trip-preserving writer
+        // (TR-RC-8): unknown keys survive a toggle flip.
+        let path = dir.path().join("config.json");
+        let mut root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        root.as_object_mut()
+            .unwrap()
+            .insert("advisory".into(), serde_json::json!({ "caps": 3 }));
+        std::fs::write(&path, serde_json::to_string(&root).unwrap()).unwrap();
+        inner.allow_swarm_pairing = true;
+        persist_config(&inner).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["allow_swarm_pairing"], true);
+        assert_eq!(saved["advisory"]["caps"], 3, "unknown keys survive");
+        assert_eq!(saved.as_object().unwrap().len(), 4);
+    }
+
+    /// The honest-degrade shape: an off family carries the reason AND the
+    /// exact detail (bind error text, resource projection) — never a
+    /// silent off.
+    #[test]
+    fn family_status_off_detail_carries_the_exact_reason() {
+        let status = FamilyStatus::off_detail(
+            "listener_bind_failed",
+            "bind 0.0.0.0:0: quic listen refused",
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["state"], "off");
+        assert_eq!(json["reason"], "listener_bind_failed");
+        assert_eq!(json["detail"], "bind 0.0.0.0:0: quic listen refused");
+        assert!(json["pin"].is_null());
+        // The plain off shape keeps detail absent (not a garbage string).
+        assert!(
+            serde_json::to_value(FamilyStatus::off("pairing_disabled")).unwrap()["detail"]
+                .is_null()
+        );
+    }
+
+    /// The coordinator self-check gate (tonight's 2026-10-13 root cause):
+    /// a deliberately DIVERGENT window is caught LOCALLY and never sent —
+    /// the gate returns LocalDivergence (counts only), not Send; a passing
+    /// window returns Send; a missing local engine fails CLOSED
+    /// (Unavailable), so no unverified draft can reach the wire.
+    #[cfg(feature = "verifydrafts")]
+    #[tokio::test]
+    async fn selfcheck_gates_divergent_windows_before_the_wire() {
+        use modelswarm_node::verifydrafts::{
+            BatchVerifyEngine, EngineDisclosure, RuntimeError, SamplingParams,
+        };
+
+        /// A scripted local engine: full acceptance, divergence at a fixed
+        /// point, or an engine error — enough to pin every gate arm.
+        struct ScriptedEngine {
+            accepted_for_len_8: u32,
+            fail: bool,
+        }
+        #[async_trait::async_trait]
+        impl BatchVerifyEngine for ScriptedEngine {
+            async fn verify_window(
+                &self,
+                window: &[u32],
+                _params: &SamplingParams,
+            ) -> Result<(u32, Option<u32>), RuntimeError> {
+                if self.fail {
+                    return Err(RuntimeError::MalformedResponse(
+                        "scripted local engine failure".into(),
+                    ));
+                }
+                // Divergence at 0 is tonight's canonical warm-cache flip.
+                Ok((self.accepted_for_len_8.min(window.len() as u32), Some(7)))
+            }
+            fn capabilities(&self) -> EngineDisclosure {
+                EngineDisclosure {
+                    backend: modelswarm_node::verifydrafts::Backend::Cpu,
+                    batch_verify: true,
+                    batch_window_max: 8,
+                }
+            }
+        }
+        let source_of = |accepted: u32, fail: bool| {
+            Some(std::sync::Arc::new(
+                modelswarm_node::verifydrafts::FamilyEngineSource::Shared(std::sync::Arc::new(
+                    ScriptedEngine {
+                        accepted_for_len_8: accepted,
+                        fail,
+                    },
+                )),
+            ))
+        };
+        let window = [11u32, 22, 33, 44, 55, 66, 77, 88];
+
+        // The deliberately divergent window (0/8 — exactly tonight's
+        // warm-cache flip): caught locally, NEVER Send.
+        match family_selfcheck_window(source_of(0, false).as_ref(), &window).await {
+            FamilySelfcheck::LocalDivergence { accepted } => assert_eq!(accepted, 0),
+            other => panic!("divergent window must be caught locally, got {other:?}"),
+        }
+        // Mid-window divergence (3/8) carries the count.
+        match family_selfcheck_window(source_of(3, false).as_ref(), &window).await {
+            FamilySelfcheck::LocalDivergence { accepted } => assert_eq!(accepted, 3),
+            other => panic!("partial divergence must be caught, got {other:?}"),
+        }
+        // A locally-verified window may proceed to the wire.
+        assert!(matches!(
+            family_selfcheck_window(source_of(8, false).as_ref(), &window).await,
+            FamilySelfcheck::Send
+        ));
+        // A broken local engine fails CLOSED — no unverified draft sends.
+        assert!(matches!(
+            family_selfcheck_window(source_of(8, true).as_ref(), &window).await,
+            FamilySelfcheck::Unavailable(_)
+        ));
+        // No local family engine at all (dev build / degraded tier): the
+        // same fail-closed posture.
+        assert!(matches!(
+            family_selfcheck_window(None, &window).await,
+            FamilySelfcheck::Unavailable(_)
+        ));
+    }
+
+    /// The 2026-10-13 telemetry gap fix: the pairing DETAIL label (the
+    /// Err-branch reasons — `rejected`, `io`, `local_selfcheck`, …) now
+    /// reaches the `family.probe.pairing` event, counts and labels only.
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn pairing_telemetry_carries_the_detail_label() {
+        let (t, sink) = Telemetry::memory();
+        log_family_pairing(
+            &t,
+            "vd-fix",
+            "pin_mismatch",
+            Some(8),
+            None,
+            None,
+            Some("rejected"),
+        );
+        let rows = sink.snapshot();
+        assert_eq!(rows.len(), 1, "one event: {rows:?}");
+        assert!(rows[0].contains("\"event\":\"family.probe.pairing\""));
+        assert!(
+            rows[0].contains("\"detail\":\"rejected\""),
+            "row: {}",
+            rows[0]
+        );
+        assert!(rows[0].contains("\"pairing\":\"pin_mismatch\""));
+        // No token-id list can ride the event (counts/labels only).
+        assert!(!rows[0].contains('['), "no arrays: {}", rows[0]);
+        // The no-detail arm emits the empty label, not a stale one.
+        log_family_pairing(
+            &t,
+            "vd-fix2",
+            "local_selfcheck",
+            Some(8),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let rows = sink.snapshot();
+        assert!(rows[1].contains("\"pairing\":\"local_selfcheck\""));
+        assert!(rows[1].contains("\"detail\":\"\""));
+    }
+
+    /// The auto-engage reason ladder (owner directive 2026-10-13): stable
+    /// labels in the pinned priority order — capability unknown/false,
+    /// E0 backend mismatch, unmeasured gate (never-worse: no measurement
+    /// ⇒ no engagement), gate no-win, and the content-blindness block
+    /// (ADR-034 rule 5) even when the gate would engage.
+    #[cfg(feature = "verifydrafts")]
+    #[test]
+    fn family_engage_reason_ladder_is_stable() {
+        let cap = |batch_verify: bool, backend: &str| FamilyPeerCap {
+            batch_verify,
+            batch_window_max: 8,
+            backend: backend.to_string(),
+            learned_unix_ms: 0,
+        };
+        // No learned capability (roster carries none — the probe is the
+        // only source): the honest unknown.
+        assert_eq!(
+            family_engage_reason(None, Some("cpu"), Some(1.0), Some(2.0)),
+            "capability_unknown"
+        );
+        assert_eq!(
+            family_engage_reason(Some(&cap(false, "cpu")), Some("cpu"), None, None),
+            "capability_false"
+        );
+        assert_eq!(
+            family_engage_reason(Some(&cap(true, "vulkan")), Some("cpu"), None, None),
+            "backend_mismatch"
+        );
+        // Never-worse: without BOTH predictions the gate cannot claim a
+        // win, so no engagement — labeled, not silent.
+        assert_eq!(
+            family_engage_reason(Some(&cap(true, "cpu")), Some("cpu"), None, Some(2.0)),
+            "gate_unmeasured"
+        );
+        assert_eq!(
+            family_engage_reason(Some(&cap(true, "cpu")), Some("cpu"), Some(1.0), None),
+            "gate_unmeasured"
+        );
+        assert_eq!(
+            family_engage_reason(Some(&cap(true, "cpu")), Some("cpu"), Some(1.9), Some(2.0)),
+            "gate_no_win"
+        );
+        // The gate WOULD engage (1.0 × 1.15 < 2.0) — and the protocol
+        // boundary stops it: the family wire never carries the session
+        // prompt (ADR-034 rule 5; the rule-8 commitment path is
+        // owner-gated). Honest label, never a silent skip.
+        assert_eq!(
+            family_engage_reason(Some(&cap(true, "cpu")), Some("cpu"), Some(1.0), Some(2.0)),
+            "blocked_content_contract"
+        );
+        // Backend labels compare case-insensitively (roster vs disclosure
+        // vocabularies).
+        assert_eq!(
+            family_engage_reason(Some(&cap(true, "CPU")), Some("cpu"), None, None),
+            "gate_unmeasured"
+        );
     }
 }

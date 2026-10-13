@@ -151,10 +151,16 @@
         <h2 id="chat-h">Test box — chat with the hosted model</h2>
         <div id="chat">
           <div id="transcript" aria-live="polite"></div>
+          <div class="row" style="justify-content:space-between;align-items:center;gap:8px">
+            <label class="note" for="chat-temp" style="margin:0;white-space:nowrap">temp <span id="chat-temp-val" style="font-family:var(--mono)">0 (greedy)</span></label>
+            <input type="range" id="chat-temp" min="0" max="1" step="0.05" value="0" style="flex:1;min-width:80px" aria-label="Chat temperature">
+            <button type="button" class="ghost" id="clear-chat" title="Clear the conversation (resets the model's rendered history)">clear chat</button>
+          </div>
           <form id="chat-form">
             <input type="text" id="chat-input" placeholder="Ask the hosted model…" aria-label="Message" autocomplete="off" maxlength="4000">
             <button type="submit" id="send-btn">send</button>
           </form>
+          <p class="note" style="margin:0">temperature applies to chat replies only — pairing/verification stays greedy (its determinism contract).</p>
         </div>
       </section>
     </div>
@@ -166,6 +172,10 @@
           <dt>Tracker</dt><dd><input type="text" id="tracker-url" aria-label="Tracker base URL"></dd>
           <dt>Engine</dt><dd id="engine-line">—</dd>
           <dt>Device approval</dt><dd><span id="enroll-line">—</span> <button class="ghost" id="enroll-open" hidden>approve this device…</button></dd>
+          <dt>Swarm pairing</dt><dd class="row" style="flex-wrap:nowrap;gap:8px;align-items:center">
+            <button type="button" class="switch" id="pairing-switch" data-on="true" role="switch" aria-checked="true" aria-label="Allow swarm pairing toggle"><span class="knob"></span></button>
+            <span class="note" id="pairing-note" style="margin:0">allow — the serving listener + family verify engine start with hosting</span>
+          </dd>
         </dl>
         <div class="row" style="margin-top:8px">
           <button class="ghost" id="save-tracker">save tracker</button>
@@ -272,10 +282,17 @@
         $("hw-line").textContent = "recommendations unavailable — showing all models";
       }
       const anyRecommended = models.some(m => m.recommended);
-      // Shortlist by default (owner directive: 6 picks per machine);
-      // downloaded/selected models always stay visible; "show all" restores.
-      // Card order is the daemon's canonical census order — kept verbatim.
-      const visible = showAll || !anyRecommended ? models
+      // PEERS-FIRST by default (owner directive 2026-10-13): when any
+      // model has a live peer (census >= 1), show ONLY those —
+      // downloaded/selected models always stay visible; everything else
+      // hides behind the existing "show all N (x more)" button. No live
+      // peers anywhere: the v0.2.19 hardware shortlist rule (6 picks per
+      // machine) applies as before. Card order is the daemon's canonical
+      // census order — kept verbatim within each tier.
+      const anyLivePeers = models.some(m => (m.peers ?? 0) >= 1);
+      const visible = showAll ? models
+        : anyLivePeers ? models.filter(m => (m.peers ?? 0) >= 1 || m.downloaded || m.selected)
+        : !anyRecommended ? models
         : models.filter(m => m.recommended || m.downloaded || m.selected);
       const hidden = models.length - visible.length;
       $("more-models").hidden = !(hidden > 0);
@@ -447,6 +464,16 @@
         $("enroll-line").textContent = "starts with hosting (automatic)";
       }
       $("privacy-gate").hidden = s.license_accepted;
+      // The "allow swarm pairing" toggle (owner directive 2026-10-13):
+      // get_status carries the daemon's honest current posture; the note
+      // states what the toggle governs and that it applies at the NEXT
+      // hosting start.
+      const pairingAllowed = s.pairing_allowed !== false;
+      $("pairing-switch").dataset.on = pairingAllowed;
+      $("pairing-switch").setAttribute("aria-checked", pairingAllowed);
+      $("pairing-note").textContent = pairingAllowed
+        ? "allow — the serving listener + family verify engine start with hosting"
+        : "off — this machine only serves locally until re-enabled (applies at next hosting start)";
       hostingOn = s.node.hosting;
       $("hosting-switch").dataset.on = hostingOn;
       $("hosting-switch").setAttribute("aria-checked", hostingOn);
@@ -462,11 +489,15 @@
       $("chip-hosting").textContent = hostingOn ? "hosting on" : "hosting off";
       $("chip-direct").dataset.state = "inactive";
       // Truth, not a static label: the listener state from get_status
-      // (bound under MSP_LISTENER=1 while hosting) decides the text.
+      // (bound while the "allow swarm pairing" toggle allows it) decides
+      // the text; a failed bind or a disabled toggle names the exact
+      // cause here AND in the family line below.
       const listener = s.node.listener_addr;
       $("chip-direct").textContent = listener
         ? "remote serve: on (" + listener + ")"
-        : "remote serve: off (dev listener flag not set)";
+        : pairingAllowed
+          ? "remote serve: off (bind failed — see family line)"
+          : "remote serve: off (swarm pairing off in Setup)";
       // ADR-032 family: the daemon's own verdict with its real engine
       // geometry — on (cpu|vulkan, batch window) / off (exact reason) /
       // null while not hosting. Never a static label. Since the
@@ -488,7 +519,10 @@
           (d.batch_window_max || "?") + ", coordinator leases: presented at session open (roster " +
           (fam.lease_roster_peers ?? 0) + ")" + pin;
       } else {
-        $("family-line").textContent = "batch-verify family: off — " + (fam.reason || "unknown");
+        // Honest degrade: the exact reason AND its detail (bind error,
+        // resource projection) — never a silent off.
+        $("family-line").textContent = "batch-verify family: off — " + (fam.reason || "unknown") +
+          (fam.detail ? " (" + fam.detail + ")" : "");
       }
       $("chat-input").disabled = !hostingOn;
       $("send-btn").disabled = !hostingOn;
@@ -522,6 +556,32 @@
 
     $("save-tracker").onclick = async () => { try { await invoke("set_tracker", { url: $("tracker-url").value }); error(""); } catch (e) { error(String(e)); } };
     $("accept-btn").onclick = async () => { try { await invoke("accept_privacy"); } catch (e) { error(String(e)); } refresh(); };
+    // The pairing toggle writes the persisted key through the daemon; the
+    // daemon refuses while hosting (the live listener must not contradict
+    // the setting), which surfaces as the error banner here.
+    $("pairing-switch").onclick = async () => {
+      const next = $("pairing-switch").dataset.on !== "true";
+      try { await invoke("set_pairing_allowed", { allowed: next }); error(""); }
+      catch (e) { error(String(e)); }
+      refresh();
+    };
+    // Clear conversation (owner directive 2026-10-13): resets the daemon's
+    // rendered history AND the transcript — the language-drift escape
+    // hatch without an app restart.
+    $("clear-chat").onclick = async () => {
+      if (busy) return;
+      try { await invoke("clear_chat"); } catch (e) { error(String(e)); return; }
+      $("transcript").replaceChildren();
+      clearLiveBubble();
+    };
+    listen("chat-cleared", () => { $("transcript").replaceChildren(); clearLiveBubble(); });
+    // Temperature control: greedy 0 is the default; the value label is
+    // live and the choice rides send_chat (chat replies only — never the
+    // pairing draft path).
+    $("chat-temp").oninput = () => {
+      const t = parseFloat($("chat-temp").value);
+      $("chat-temp-val").textContent = t === 0 ? "0 (greedy)" : t.toFixed(2);
+    };
     // The two-desktop pairing diagnostic (ADR-032 §2): opens one real
     // family session presenting this machine's earned lease. The outcome
     // is the daemon's own truth — opened (peer, real disclosure) or the
@@ -650,9 +710,17 @@
       startChatTurn();
       addMsg("user", text);
       try {
-        const r = await invoke("send_chat", { message: text });
+        const temperature = parseFloat($("chat-temp").value) || 0;
+        const r = await invoke("send_chat", { message: text, temperature });
         clearLiveBubble();
-        const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms`;
+        // Execution-mode honesty: the family tier's engage outcome rides
+        // every swarm reply — never hidden whether the reply used the
+        // cooperative tier, and if not, why (labels only).
+        const famNote = r.family_engage
+          ? ` · family: ${r.family_engage.engaged ? "engaged" : "not engaged (" + (r.family_engage.reason || "?") + ")"}`
+          : "";
+        const tempNote = temperature > 0 ? ` · temp ${temperature.toFixed(2)}` : "";
+        const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms${tempNote}${famNote}`;
         if (r.error) addMsg("assistant", `⚠ local engine failed (${r.error.code}) — ${r.error.message || "see Diagnostics/logs/node.jsonl"}. Restart hosting or try another model.`, meta);
         else if (r.content) addMsg("assistant", r.content, meta);
         else addMsg("assistant", "(no reply — the model ended its turn before the first token; rephrase the message and send again)", meta);

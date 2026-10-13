@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MSP v0.2.23 UI harness — pairing toggle + chat controls</title>
+  <style>
+    body { font: 13px/1.5 system-ui, sans-serif; color: #e8edf7; background: #10141c; margin: 1.5rem; }
+    h1 { font-size: 16px; } h2 { font-size: 13px; color: #9aa7bf; text-transform: uppercase; }
+    .pass { color: #43c78f; } .fail { color: #e06565; }
+    td, th { text-align: left; padding: 3px 10px 3px 0; border-bottom: 1px solid #2c3850; }
+    code { color: #a855f7; }
+  </style>
+</head>
+<body>
+  <h1>Pairing toggle + chat controls stub harness (v0.2.23 batch)</h1>
+  <p>Loads the REAL <code>../ui/index.html</code> into a same-origin 1152×648 iframe with a stubbed
+  <code>window.__TAURI__</code> bridge, then asserts: the Setup "allow swarm pairing" toggle renders
+  the daemon's honest posture (on/off + the off note), the remote-serve chip and the family line
+  carry the exact degrade reason/detail, the chat box gains the clear button + temperature control,
+  <code>send_chat</code> receives the temperature, and <code>clear_chat</code> empties the transcript.
+  Rendered geometry is MEASURED at the app's default window size (the owner's standing rule).</p>
+  <p><strong>Run:</strong> serve the crate root over http — e.g.
+  <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> — then open
+  <code>http://127.0.0.1:4817/ui-harness/pairing-chat.html</code>.</p>
+  <h2>Results</h2>
+  <div id="results">running…</div>
+  <script>
+    // Captured IPC calls, per scenario.
+    const calls = { send_chat: null, clear_chat: 0, set_pairing_allowed: null };
+    const STATUS_ON = {
+      version: "0.0.0-harness", tracker: "https://stub.local", data_dir: "C:/stub",
+      engine_available: true, engine_path: "C:/stub/engine/llama-server.exe",
+      gpu_engine_available: false, license_accepted: true, profile_id: null, artifact: null,
+      pairing_allowed: true,
+      node: { running: false, hosting: false, gateway_addr: null, installation_id: null,
+              engine_port: null, engine_backend: null, listener_addr: null, enrollment: null },
+      family: null, chat_turns: 0,
+    };
+    const STATUS_OFF_DEGRADED = {
+      ...STATUS_ON,
+      pairing_allowed: false,
+      // Hosting ON with the family degraded: the branch that must carry
+      // the exact reason + detail (a hosting-off fixture would hit the
+      // "off (hosting off)" arm instead).
+      node: { ...STATUS_ON.node, running: true, hosting: true,
+              gateway_addr: "127.0.0.1:11435", installation_id: "stub-install" },
+      family: { state: "off", reason: "pairing_disabled",
+                detail: "the allow-swarm-pairing setting is off", disclosure: null,
+                lease_roster_peers: 0, pin: null },
+    };
+    window.__mode = "on";
+    window.__stubInvoke = async (cmd, args) => {
+      switch (cmd) {
+        case "get_status": return window.__mode === "on" ? STATUS_ON : STATUS_OFF_DEGRADED;
+        case "analyze_hardware": return { ram_mb: 32000, cpu_cores: 12, gpu: null };
+        case "list_models": return [];
+        case "census": return { peers_online: 0, counts: {} };
+        case "resource_sample": return {};
+        case "send_chat": calls.send_chat = args; return {
+          content: "stub reply", completion_tokens: 2, elapsed_ms: 12,
+          tokens_per_second: 166.6, mode: "swarm — remote peer 12D3Koo",
+          served_by: "swarm", family_engage: { engaged: false, reason: "capability_unknown" } };
+        case "clear_chat": calls.clear_chat += 1; return { cleared: true, chat_turns: 0 };
+        case "set_pairing_allowed": calls.set_pairing_allowed = args; return {};
+        default: return {};
+      }
+    };
+    const STUB = '<scr' + 'ipt>window.__TAURI__ = { core: { invoke: (cmd, args) => parent.__stubInvoke(cmd, args) }, event: { listen: async () => {} } };</scr' + 'ipt>';
+
+    async function runScenario(ui) {
+      const frame = document.createElement("iframe");
+      frame.setAttribute("aria-hidden", "true");
+      frame.style.cssText = "width:1152px;height:648px;border:0;position:absolute;left:-12000px;top:0;";
+      document.body.appendChild(frame);
+      frame.srcdoc = ui.replace("<head>", "<head>" + STUB);
+      let doc = null;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        await new Promise((r) => setTimeout(r, 100));
+        doc = frame.contentDocument;
+        if (doc && doc.getElementById("pairing-switch")) break;
+      }
+      const out = { doc, frame };
+      return out;
+    }
+
+    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    function render(rows) {
+      const table = document.createElement("table");
+      for (const { label, pass, detail } of rows) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td class="${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</td><td>${label}</td><td><code>${detail ?? ""}</code></td>`;
+        table.appendChild(tr);
+      }
+      const all = rows.every((r) => r.pass);
+      const summary = document.createElement("p");
+      summary.innerHTML = `<strong class="${all ? "pass" : "fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
+      document.getElementById("results").replaceChildren(summary, table);
+      document.title = all ? "ALL PASS" : "FAILURES";
+    }
+
+    (async () => {
+      const ui = await (await fetch("../ui/index.html")).text();
+      const rows = [];
+      // ---- Scenario A: default posture (toggle on) ---------------------
+      window.__mode = "on";
+      let { doc, frame } = await runScenario(ui);
+      const sw = doc.getElementById("pairing-switch");
+      rows.push({ label: "setup: pairing toggle present, ON by default (role=switch, aria-checked)",
+        pass: !!sw && sw.dataset.on === "true" && sw.getAttribute("aria-checked") === "true",
+        detail: sw ? sw.dataset.on + "/" + sw.getAttribute("aria-checked") : "missing" });
+      rows.push({ label: "setup: the ON note states what the toggle governs",
+        pass: (doc.getElementById("pairing-note").textContent || "").includes("listener + family verify engine"),
+        detail: doc.getElementById("pairing-note").textContent });
+      rows.push({ label: "chat: temperature control present, default 0 (greedy), range note visible",
+        pass: doc.getElementById("chat-temp").value === "0"
+          && doc.getElementById("chat-temp-val").textContent.includes("greedy")
+          && (doc.querySelector("#chat + p.note, section p.note") || doc.body).textContent.length > 0
+          && [...doc.querySelectorAll("p.note")].some((p) => p.textContent.includes("pairing/verification stays greedy")),
+        detail: doc.getElementById("chat-temp").value + " / " + doc.getElementById("chat-temp-val").textContent });
+      rows.push({ label: "chat: clear button present",
+        pass: !!doc.getElementById("clear-chat"), detail: String(!!doc.getElementById("clear-chat")) });
+      // Send a chat turn: temperature 0.55 must ride send_chat; the meta
+      // line renders the family engage reason + temp.
+      doc.getElementById("chat-temp").value = "0.55";
+      doc.getElementById("chat-temp").oninput();
+      doc.getElementById("chat-input").value = "hello";
+      const form = doc.getElementById("chat-form");
+      form.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+      await new Promise((r) => setTimeout(r, 300));
+      rows.push({ label: "chat: send_chat receives the slider temperature (0.55)",
+        pass: !!calls.send_chat && calls.send_chat.temperature === 0.55,
+        detail: JSON.stringify(calls.send_chat) });
+      const lastMeta = [...doc.querySelectorAll(".msg .meta")].pop();
+      rows.push({ label: "chat: meta carries the family engage reason + temp (execution mode never hidden)",
+        pass: !!lastMeta && lastMeta.textContent.includes("family: not engaged (capability_unknown)")
+          && lastMeta.textContent.includes("temp 0.55"),
+        detail: lastMeta ? lastMeta.textContent : "(none)" });
+      // Clear: transcript empties + the daemon command fired.
+      doc.getElementById("clear-chat").onclick();
+      await new Promise((r) => setTimeout(r, 200));
+      rows.push({ label: "chat: clear empties the transcript and calls clear_chat",
+        pass: calls.clear_chat === 1 && doc.getElementById("transcript").children.length === 0,
+        detail: "calls=" + calls.clear_chat + " left=" + doc.getElementById("transcript").children.length });
+      // GEOMETRY at 1152x648: the chat controls row must not blow the
+      // layout (chat section stays within the column; transcript keeps a
+      // sane minimum) and the Setup section height grows only by the
+      // toggle row.
+      const chatSection = doc.querySelector("section[aria-labelledby='chat-h']");
+      const setupSection = doc.querySelector("section[aria-labelledby='setup-h']");
+      const rightCol = doc.querySelector("main > .col:last-child");
+      rows.push({ label: "geometry: chat section fits the column (clientHeight <= column, no forced overflow)",
+        pass: chatSection.clientHeight <= rightCol.clientHeight + 1,
+        detail: `chat ${chatSection.clientHeight}px vs col ${rightCol.clientHeight}px` });
+      rows.push({ label: "geometry: transcript keeps >= 80px minimum",
+        pass: doc.getElementById("transcript").clientHeight >= 80,
+        detail: doc.getElementById("transcript").clientHeight + "px" });
+      rows.push({ label: "geometry: setup section measured (toggle row cost) — recorded for the handoff",
+        pass: setupSection.offsetHeight > 0 && setupSection.offsetHeight < 260,
+        detail: setupSection.offsetHeight + "px" });
+      frame.remove();
+
+      // ---- Scenario B: toggle off + degraded family -------------------
+      window.__mode = "off";
+      ({ doc, frame } = await runScenario(ui));
+      const sw2 = doc.getElementById("pairing-switch");
+      rows.push({ label: "setup: toggle renders OFF from get_status (posture from the daemon, never a guess)",
+        pass: sw2.dataset.on === "false" && sw2.getAttribute("aria-checked") === "false",
+        detail: sw2.dataset.on });
+      rows.push({ label: "setup: the OFF note names locally-only serving",
+        pass: doc.getElementById("pairing-note").textContent.includes("only serves locally"),
+        detail: doc.getElementById("pairing-note").textContent });
+      rows.push({ label: "chip: remote serve off cites the Setup toggle",
+        pass: doc.getElementById("chip-direct").textContent.includes("swarm pairing off in Setup"),
+        detail: doc.getElementById("chip-direct").textContent });
+      const famLine = doc.getElementById("family-line").textContent;
+      rows.push({ label: "family line: exact reason AND detail (never a silent off)",
+        pass: famLine.includes("pairing_disabled") && famLine.includes("the allow-swarm-pairing setting is off"),
+        detail: famLine });
+      frame.remove();
+      render(rows);
+    })().catch((e) => {
+      document.getElementById("results").innerHTML =
+        `<span class="fail">harness error: ${e}<br>(did you open this over http? file:// cannot fetch the UI)</span>`;
+      document.title = "FAILURES";
+    });
+  </script>
+</body>
+</html>

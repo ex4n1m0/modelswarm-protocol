@@ -76,6 +76,10 @@ pub mod wire;
 pub use client::{
     ClientOpenError, RoundFailure, RoundOutcome, VerifyDraftsClient, VerifyDraftsClientConfig,
 };
+// Desktop-facing re-exports (the coordinator self-verify helper lives in the
+// desktop and needs the trait + the pinned sampling type; without these the
+// desktop would need direct deps on the session/runtime crates just to name
+// them). No new semantics — the same public types this module already uses.
 #[cfg(all(feature = "verifydrafts", feature = "libp2p-backend"))]
 pub use composed::{
     serve_sessions_composed, FamilyLeaseRefusal, FamilyLeaseSource, FamilyServing,
@@ -84,7 +88,10 @@ pub use composed::{
 #[cfg(feature = "verifydrafts-capi")]
 pub use engine_bridge::{capi_disclosure, CapiBatchVerifyEngine};
 pub use engine_source::FamilyEngineSource;
+pub use modelswarm_runtime::{RuntimeError, SamplingParams};
 pub use modelswarm_session::negotiation::Backend;
+pub use modelswarm_session::negotiation::EngineDisclosure;
+pub use modelswarm_session::verifydrafts::BatchVerifyEngine;
 pub use serve::{
     read_session_open, serve_verifydrafts_quic, serve_verifydrafts_session, ServeEndReason,
     SessionOpenError, VerifyDraftsServeConfig, VerifyDraftsServeReport,
@@ -94,7 +101,7 @@ pub use wire::{
     StagedVerifyWire, VerifyDraftsWire, WireError,
 };
 
-use modelswarm_session::negotiation::{EngineDisclosure, Preset, SessionBudget};
+use modelswarm_session::negotiation::{Preset, SessionBudget};
 use modelswarm_session::verifydrafts::VerifyTelemetry;
 use modelswarm_telemetry::Telemetry;
 use modelswarm_transport::ed25519_dalek::VerifyingKey;

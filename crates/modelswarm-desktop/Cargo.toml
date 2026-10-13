@@ -45,8 +45,14 @@ tauri-shell = [
 # (serve_sessions_composed — ONE listener, BOTH vocabularies, the RC-L1
 # production FamilyLeaseSource). Without tauri-shell this only turns the
 # node crate's family tier on for library consumers; the desktop's swap
-# itself lives in app.rs (compiled only under tauri-shell).
-verifydrafts = ["dep:modelswarm-node", "modelswarm-node/verifydrafts"]
+# itself lives in app.rs (compiled only under tauri-shell). `async-trait`
+# implements the scripted BatchVerifyEngine of the self-check unit test
+# (the node crate re-exports the trait itself).
+verifydrafts = [
+  "dep:modelswarm-node",
+  "modelswarm-node/verifydrafts",
+  "dep:async-trait",
+]
 # The G4 engine bridge (implies `verifydrafts` and Runtime's
 # `capi-adapter`): the family's real C-API batch-verify engine. The
 # desktop degrades HONESTLY when the bridge cannot init (plain msp-v1
@@ -93,6 +99,9 @@ futures-util = { version = "0.3", optional = true, default-features = false, fea
 # ADR-034 family pin identity: bare sha256 over LE-u32 token ids.
 sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
+# The coordinator self-check unit test's scripted engine impl (the trait's
+# own attribute macro; the trait comes re-exported from the node crate).
+async-trait = { version = "0.1", optional = true }
 
 [build-dependencies]
 tauri-build = { version = "2", optional = true, default-features = false , features = [] }

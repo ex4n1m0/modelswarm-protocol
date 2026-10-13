@@ -141,22 +141,26 @@
       const ui = await (await fetch("../ui/index.html")).text();
       const rows = [];
       // ---- Scenario 1: census reachable (bb: 3 peers, dd: 1) ----------
+      // Owner directive 2026-10-13 (peers-first picker): with ANY live
+      // peers, ONLY live-peer models show (downloaded/selected always
+      // stay visible); the rest hide behind "show all N (x more)". The
+      // canonical census order is kept verbatim WITHIN what is visible.
       window.__censusMode = "ok";
       const ok = await runScenario(ui);
-      rows.push({ label: "reachable: order kept verbatim = shortlist → tier → peers (bb 3p before aa 0p), downloaded dd visible, ee hidden",
-        pass: eq(ok.ids, ["msp1:bb", "msp1:aa", "msp1:cc", "msp1:dd"]), detail: JSON.stringify(ok.ids) });
-      rows.push({ label: "reachable: chips — bb 3 peers, dd 1 peer (singular), aa/cc first peer",
-        pass: eq(ok.chip, { "msp1:bb": "3 peers", "msp1:aa": "first peer", "msp1:cc": "first peer", "msp1:dd": "1 peer" }),
+      rows.push({ label: "reachable: peers-first — only bb (3 peers) + downloaded dd visible; aa/cc/ee behind the button",
+        pass: eq(ok.ids, ["msp1:bb", "msp1:dd"]), detail: JSON.stringify(ok.ids) });
+      rows.push({ label: "reachable: chips — bb 3 peers, dd 1 peer (singular)",
+        pass: eq(ok.chip, { "msp1:bb": "3 peers", "msp1:dd": "1 peer" }),
         detail: JSON.stringify(ok.chip) });
-      rows.push({ label: "reachable: shortlist filter untouched (1 more model behind the button)",
-        pass: !ok.moreHidden && ok.more.includes("5 models") && ok.more.includes("1 more"), detail: ok.more });
+      rows.push({ label: "reachable: 3 more models behind the show-all button",
+        pass: !ok.moreHidden && ok.more.includes("5 models") && ok.more.includes("3 more"), detail: ok.more });
       // ---- Scenario 2: census unreachable ------------------------------
       window.__censusMode = "na";
       const na = await runScenario(ui);
       rows.push({ label: "unreachable: every chip degrades to census n/a (never 'first peer')",
         pass: eq(na.chip, { "msp1:aa": "census n/a", "msp1:bb": "census n/a", "msp1:cc": "census n/a", "msp1:dd": "census n/a" }),
         detail: JSON.stringify(na.chip) });
-      rows.push({ label: "unreachable: order falls back to shortlist → tier → name (no invented counts)",
+      rows.push({ label: "unreachable: NO live peers — the hardware shortlist rule applies (order shortlist → tier → name)",
         pass: eq(na.ids, ["msp1:aa", "msp1:bb", "msp1:cc", "msp1:dd"]), detail: JSON.stringify(na.ids) });
       rows.push({ label: "unreachable: downloaded dd still visible",
         pass: na.ids.includes("msp1:dd") && !na.ids.includes("msp1:ee"), detail: JSON.stringify(na.ids) });

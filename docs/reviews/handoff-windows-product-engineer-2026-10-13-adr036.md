@@ -322,3 +322,32 @@ are in ADR-036 §6), and run the one-pass rendered-UI check
 traffic is unblocked; the v0.2.24 train (when opened) carries the
 disclosures into release notes verbatim — §3.4's performance-honesty
 discipline applies to any copy that mentions the mode.
+
+## Integrator audit addendum (2026-10-13 late night)
+
+Both review-seat dispatches died on the 5h usage limit before starting
+(reset 00:29). The Integrator ran an independent line-by-line audit of
+the three commits (NOT a substitute for the seat sign-offs — carrier
+traffic stays blocked until both seats review):
+
+- Gates independently re-run: fmt clean; clippy workspace + desktop
+  tauri-shell + the reported feature combos clean; workspace 526/0/6
+  (baseline exact); desktop tauri-shell 56/0/0; the rendered harness
+  adr036-carriage.html 17/17 ALL PASS in-browser at 1152×648 (the agent
+  could only run it headless).
+- admit_pin_carrier: row-for-row faithful to ADR-036 §3.2's
+  first-failure table (schema → sender-binding-first auth → carriage →
+  profile → params → commitment bind → prefill → clamped deadline);
+  PinMismatch is honestly separated from ContentCarriageRefused.
+- Coordinator send: seq-1 baseline / round-0, auto-computed rule-3
+  commitment, non-empty check, the 256 KiB frame-limit refusal BEFORE
+  sending (truncation forbidden), signed between lease and offer,
+  next_seq opens at 2 (strictly greater first round).
+- Gate seeding via the public seed_pre_state (seq baseline + nonce
+  ledger); the neutral path is byte-unchanged.
+- Redaction discipline verified by inspection: every desktop
+  prompt_tokens/pin_commitment reference is the carrier construction
+  itself or a NEGATIVE test assertion; no content-derived field reaches
+  telemetry or the disclosure texts.
+
+Verdict: no findings. The seats' reviews remain the gate.

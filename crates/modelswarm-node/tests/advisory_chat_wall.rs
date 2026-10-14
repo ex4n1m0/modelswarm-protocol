@@ -45,29 +45,402 @@ fn read_file(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// Production-source view of one file: the TRAILING `#[cfg(test)] mod
-/// …` block (the inline unit-test surface, on the ADR's layer-2
-/// allowlist as `*/tests/`) is stripped when it is the file's last
-/// item. A mid-file cfg(test) module is NOT stripped — the scanner then
-/// flags it, which errs on the safe side (test-only advisory references
-/// belong in the trailing module or a `tests/` tree).
+/// Production-source view of one file: trailing `#[cfg(test)] mod …`
+/// blocks (the inline unit-test surface, on the ADR's layer-2 allowlist
+/// as `*/tests/`) are stripped — each one only when its module is the
+/// file's LAST item (brace-matched; only whitespace/comments may follow
+/// the close). A NON-TRAILING `#[cfg(test)]` marker is a hard error:
+/// production code after a test module must never silently leave the
+/// layer-2 scan (protocol review 2026-10-14, Finding R-2 — the
+/// under-inclusive direction is the UNSAFE one). Panics here fail every
+/// layer-2 test loudly.
 fn production_source(path: &Path) -> String {
     let text = read_file(path);
-    if let Some(pos) = text.find(
-        "#[cfg(test)]
-mod ",
-    ) {
-        let tail = &text[pos..];
-        // Keep only if the remainder contains no production items after
-        // the test module's closing brace would be non-trivial to compute
-        // with format-string braces around; the tree's test modules are
-        // trailing, so assert that: after the marker, the rest of the
-        // file must be the module itself (we simply strip to EOF and let
-        // the workspace's fmt/clippy/tests keep the shape pinned).
-        let _ = tail;
-        return text[..pos].to_string();
+    strip_trailing_test_modules(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// Pure core of [`production_source`] (unit-fixture-tested below).
+/// Repeatedly removes the file's last `#[cfg(test)] mod` while it runs to
+/// EOF; errors on any marker whose module has production items after it.
+/// The marker match is CRLF-tolerant (`\r?\n`) so a CRLF checkout cannot
+/// silently disable the strip (that failure direction is over-inclusive,
+/// i.e. safe — but pinning it is free).
+fn strip_trailing_test_modules(text: &str) -> Result<String, String> {
+    let mut text = text.to_string();
+    loop {
+        let Some(marker_pos) = rfind_cfg_test_mod_marker(&text) else {
+            return Ok(text);
+        };
+        let open = match find_module_open_brace(&text, marker_pos) {
+            Some(open) => open,
+            None => {
+                return Err(format!(
+                    "at byte {marker_pos}: #[cfg(test)] marker is not followed by a `mod … {{` item"
+                ))
+            }
+        };
+        let close = brace_match(&text, open).map_err(|e| {
+            format!("at byte {marker_pos}: test module braces do not balance ({e})")
+        })?;
+        let after = &text[close..];
+        if !is_only_trivia(after) {
+            return Err(format!(
+                "at byte {marker_pos}: NON-TRAILING #[cfg(test)] module — production items follow its close (byte {close}); move the test module to the end of the file (or a tests/ tree) so the layer-2 scan cannot skip production code"
+            ));
+        }
+        text.truncate(marker_pos);
     }
-    text
+}
+
+/// The byte position of the LAST `#[cfg(test)]` in `text` that is
+/// immediately followed by a newline (`\n` or `\r\n`), further
+/// attributes, and a `mod` item.
+fn rfind_cfg_test_mod_marker(text: &str) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find("#[cfg(test)]") {
+        let pos = from + rel;
+        from = pos + 1;
+        if is_cfg_test_mod_at(text, pos) {
+            best = Some(pos);
+        }
+    }
+    best
+}
+
+/// Whether the exact-token `#[cfg(test)]` at `pos` introduces a `mod`
+/// item (newline, then any further `#[…]` attributes/whitespace, then
+/// `mod` + non-identifier continuation).
+fn is_cfg_test_mod_at(text: &str, pos: usize) -> bool {
+    let mut i = pos + "#[cfg(test)]".len();
+    let bytes = text.as_bytes();
+    if bytes.get(i) == Some(&b'\r') && bytes.get(i + 1) == Some(&b'\n') {
+        i += 2;
+    } else if bytes.get(i) == Some(&b'\n') {
+        i += 1;
+    } else {
+        return false;
+    }
+    let mod_at = skip_attributes_and_trivia(text, i);
+    text[mod_at..].starts_with("mod") && !rest_is_ident_char(&text[mod_at + 3..])
+}
+
+fn rest_is_ident_char(rest: &str) -> bool {
+    rest.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Advances past whitespace, comments, and stacked `#[…]` attributes.
+fn skip_attributes_and_trivia(text: &str, mut i: usize) -> usize {
+    loop {
+        i = skip_trivia(text, i);
+        if text[i..].starts_with("#[") {
+            // Skip one balanced-bracket attribute group.
+            let mut depth = 0usize;
+            let mut j = i;
+            let bytes = text.as_bytes();
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i = j + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                return i; // malformed tail — caller reports
+            }
+        } else {
+            return i;
+        }
+    }
+}
+
+/// The byte index of the module's opening `{` (after `mod NAME` and any
+/// trivia/comments), or None if the item shape is not a braced module.
+fn find_module_open_brace(text: &str, marker_pos: usize) -> Option<usize> {
+    let after_marker = marker_pos + "#[cfg(test)]".len();
+    // Newline first (\r\n or \n) — the marker check guaranteed one.
+    let start = skip_attributes_and_trivia(text, after_marker);
+    let rest = &text[start..];
+    if !rest.starts_with("mod") || rest_is_ident_char(&rest[3..]) {
+        return None;
+    }
+    let mut i = start + 3;
+    // Identifier, then trivia, then `{`.
+    i = skip_trivia(text, i);
+    let bytes = text.as_bytes();
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    i = skip_trivia(text, i);
+    (bytes.get(i) == Some(&b'{')).then_some(i)
+}
+
+/// Index just past the `}` matching the `{` at `open`, Rust-lexically
+/// (string literals, raw strings, char literals, and nested comments
+/// cannot open or close the module).
+fn brace_match(text: &str, open: usize) -> Result<usize, String> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = skip_line_comment(text, i);
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = skip_block_comment(text, i)
+                    .ok_or_else(|| "unterminated block comment".to_string())?;
+            }
+            b'"' => {
+                i = skip_string(text, i)
+                    .ok_or_else(|| "unterminated string literal".to_string())?;
+            }
+            b'r' if is_raw_string_start(text, i) => {
+                i = skip_raw_string(text, i)
+                    .ok_or_else(|| "unterminated raw string".to_string())?;
+            }
+            b'\'' => {
+                i = skip_char_or_lifetime(text, i);
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Ok(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Err("module braces do not balance before EOF".to_string())
+}
+
+/// Whitespace and comments only (line comments; nested block comments).
+fn is_only_trivia(mut text: &str) -> bool {
+    loop {
+        text = text.trim_start();
+        if text.is_empty() {
+            return true;
+        }
+        if let Some(rest) = text.strip_prefix("//") {
+            text = match rest.find('\n') {
+                Some(nl) => &rest[nl..],
+                None => "",
+            };
+            continue;
+        }
+        if text.starts_with("/*") {
+            match skip_block_comment(text, 0) {
+                Some(next) => text = &text[next..],
+                None => return true, // unterminated trailing comment
+            }
+            continue;
+        }
+        return false;
+    }
+}
+
+fn skip_trivia(text: &str, mut i: usize) -> usize {
+    loop {
+        let bytes = text.as_bytes();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'/') {
+            i = skip_line_comment(text, i);
+            continue;
+        }
+        if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+            match skip_block_comment(text, i) {
+                Some(next) => i = next,
+                None => return text.len(),
+            }
+            continue;
+        }
+        return i;
+    }
+}
+
+/// Index just past the line comment starting at `i` (`// …` to EOL).
+fn skip_line_comment(text: &str, i: usize) -> usize {
+    match text[i..].find('\n') {
+        Some(nl) => i + nl + 1,
+        None => text.len(),
+    }
+}
+
+/// Index just past a (nested) block comment starting at `i`; None if
+/// unterminated.
+fn skip_block_comment(text: &str, i: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut j = i;
+    while j < bytes.len() {
+        if bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
+            depth += 1;
+            j += 2;
+        } else if bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/') {
+            depth -= 1;
+            j += 2;
+            if depth == 0 {
+                return Some(j);
+            }
+        } else {
+            j += 1;
+        }
+    }
+    None
+}
+
+/// Index just past a `"…"` string literal (backslash escapes honored).
+fn skip_string(text: &str, i: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Whether `r` at `i` begins a raw string (`r"…"`, `r#"…"#`, …).
+fn is_raw_string_start(text: &str, i: usize) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.get(i) != Some(&b'r') {
+        return false;
+    }
+    match bytes.get(i + 1) {
+        Some(b'"') => true,
+        Some(b'#') => {
+            let mut j = i + 1;
+            while bytes.get(j) == Some(&b'#') {
+                j += 1;
+            }
+            bytes.get(j) == Some(&b'"')
+        }
+        _ => false,
+    }
+}
+
+/// Index just past a raw string starting at `i`.
+fn skip_raw_string(text: &str, i: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut j = i + 1;
+    while bytes.get(j) == Some(&b'#') {
+        j += 1;
+    }
+    let hashes = j - i - 1;
+    if bytes.get(j) != Some(&b'"') {
+        return None;
+    }
+    j += 1;
+    while j < bytes.len() {
+        if bytes[j] == b'"' {
+            let mut k = j + 1;
+            let mut seen = 0usize;
+            while seen < hashes && bytes.get(k) == Some(&b'#') {
+                k += 1;
+                seen += 1;
+            }
+            if seen == hashes {
+                return Some(k);
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Index just past a char literal (`'a'`, `'\n'`, `'\u{1F600}'`) or a
+/// lifetime tick (`'a`, `'_` — identifiers cannot carry braces, so
+/// skipping the tick alone is sound).
+fn skip_char_or_lifetime(text: &str, i: usize) -> usize {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    // `'\u{…}'`: consume the unicode escape's braces, then the quote.
+    if bytes.get(i + 1) == Some(&b'\\')
+        && bytes.get(i + 2) == Some(&b'u')
+        && bytes.get(i + 3) == Some(&b'{')
+    {
+        if let Some(close) = text[i + 4..].find('}') {
+            let after = i + 4 + close + 1;
+            return (bytes.get(after) == Some(&b'\''))
+                .then_some(after + 1)
+                .unwrap_or(after);
+        }
+        return i + 1;
+    }
+    // `'\''` / `'\n'`: escaped single char, then the quote.
+    if bytes.get(i + 1) == Some(&b'\\') {
+        return if bytes.get(i + 3) == Some(&b'\'') {
+            i + 4
+        } else if i + 2 < n {
+            i + 2 // lone escape inside a lifetime-ish token — skip conservatively
+        } else {
+            n
+        };
+    }
+    // `'x'`: one non-quote char then the quote; anything else is a
+    // lifetime (`'a`) — skip the tick only.
+    match bytes.get(i + 1) {
+        Some(c) if *c != b'\'' && bytes.get(i + 2) == Some(&b'\'') => i + 3,
+        _ => i + 1,
+    }
+}
+
+#[test]
+fn layer2_strip_fails_loudly_on_midfile_test_modules() {
+    // R-2's unit fixture: the helper must ERROR on a synthetic mid-file
+    // marker (production after a test module can never silently leave
+    // the layer-2 scan) and strip only trailing modules.
+    let trailing =
+        "fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn f() { let s = format!(\"{}\"); }\n}\n";
+    assert_eq!(
+        strip_trailing_test_modules(trailing).unwrap(),
+        "fn prod() {}\n"
+    );
+    let midfile = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn b() {}\n";
+    assert!(strip_trailing_test_modules(midfile).is_err());
+    // Two stacked trailing modules both strip (egress.rs's shape).
+    let stacked = "fn a() {}\n#[cfg(test)]\nmod one {}\n#[cfg(test)]\nmod two {}\n";
+    assert_eq!(strip_trailing_test_modules(stacked).unwrap(), "fn a() {}\n");
+    // CRLF checkouts strip too (the marker match is `\\r?\\n`-tolerant).
+    let crlf = "fn a() {}\r\n#[cfg(test)]\r\nmod tests {}\r\n";
+    assert_eq!(strip_trailing_test_modules(crlf).unwrap(), "fn a() {}\r\n");
+    // Only whitespace and comments may follow the close.
+    let commented = "fn a() {}\n#[cfg(test)]\nmod t {}\n// trailing comment\n/* block */\n";
+    assert_eq!(
+        strip_trailing_test_modules(commented).unwrap(),
+        "fn a() {}\n"
+    );
+    // Raw strings, nested block comments, char/lifetime ticks, and
+    // format-string braces inside the module body must not break the
+    // brace match (the tree's real test modules contain all of these).
+    let gnarly = "fn a() {}\n#[cfg(test)]\nmod tests {\n    let j = r#\"{ \\\"raw\\\": 1 }\"#;\n    /* { nested } */ let c = '}';\n    let l: &'static str = \"}\";\n    let f = format!(\"{}{}\", '{', '}');\n}\n";
+    assert_eq!(strip_trailing_test_modules(gnarly).unwrap(), "fn a() {}\n");
+    // A cfg(test) FUNCTION (not a module) is not a strip marker — it
+    // stays in the production view like today.
+    let cfg_fn = "#[cfg(test)]\nfn helper() {}\nfn prod() {}\n";
+    assert_eq!(strip_trailing_test_modules(cfg_fn).unwrap(), cfg_fn);
+    // An unterminated module brace is a loud error, never a silent skip.
+    let unbalanced = "fn a() {}\n#[cfg(test)]\nmod tests {\n";
+    assert!(strip_trailing_test_modules(unbalanced).is_err());
 }
 
 fn rust_sources_under(dir: &Path, skip: Option<&Path>) -> BTreeMap<PathBuf, String> {

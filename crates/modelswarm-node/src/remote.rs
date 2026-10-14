@@ -461,111 +461,6 @@ impl InferenceExecutor for RemoteExecutor {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::serving::serve_sessions;
-    use futures_util::StreamExt;
-    use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedRequest};
-    use modelswarm_identity::InstallationIdentity;
-    use modelswarm_transport::libp2p_backend::Libp2pTransport;
-    use std::sync::Arc;
-
-    /// F1 same-host proof: RemoteExecutor dials a serving peer over real
-    /// QUIC and re-emits its frames as gateway executor events — the
-    /// exact path a requesting gateway will drive.
-    #[tokio::test]
-    async fn remote_executor_streams_from_serving_peer() {
-        struct FixedExecutor;
-        #[async_trait::async_trait]
-        impl modelswarm_gateway::InferenceExecutor for FixedExecutor {
-            async fn execute(
-                &self,
-                _request: NormalizedRequest,
-            ) -> Result<ExecutorStream, ExecutorError> {
-                Ok(Box::pin(futures_util::stream::iter(vec![
-                    modelswarm_gateway::ExecutorEvent::TokenDelta {
-                        delta: "remote ".into(),
-                        index: 0,
-                    },
-                    modelswarm_gateway::ExecutorEvent::TokenDelta {
-                        delta: "answer".into(),
-                        index: 1,
-                    },
-                    modelswarm_gateway::ExecutorEvent::Completed {
-                        finish_reason: modelswarm_gateway::FinishReason::Stop,
-                    },
-                ])))
-            }
-        }
-
-        let server_identity = InstallationIdentity::from_bytes(&[27u8; 32]);
-        let client_identity = InstallationIdentity::from_bytes(&[28u8; 32]);
-        let server = Libp2pTransport::new(&server_identity).unwrap();
-        let listener = server.listen("127.0.0.1:0").await.unwrap();
-
-        let peer = RemotePeer {
-            addr: listener.bound_addr().to_string(),
-            peer_id: server.peer_id().to_string(),
-        };
-        let client_peer_id = Libp2pTransport::new(&client_identity)
-            .unwrap()
-            .peer_id()
-            .to_string();
-        let (policy, token) = crate::serving::lease_helpers::policy_and_lease(
-            crate::serving::lease_helpers::TEST_PROFILE,
-            &client_peer_id,
-        );
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(serve_sessions(
-            listener,
-            Arc::new(FixedExecutor),
-            crate::serving::lease_helpers::TEST_PROFILE.into(),
-            policy,
-            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
-            shutdown_rx,
-        ));
-
-        let executor = RemoteExecutor::new(peer, client_identity);
-        let stream = executor
-            .execute(NormalizedRequest {
-                request_id: "req-f1".into(),
-                profile_id: crate::serving::lease_helpers::TEST_PROFILE.into(),
-                capability_token: Some(token),
-                messages: vec![modelswarm_gateway::NormalizedMessage {
-                    role: "user".into(),
-                    content: "hi".into(),
-                }],
-                sampling: modelswarm_gateway::Sampling {
-                    temperature: 0.0,
-                    top_p: 1.0,
-                    top_k: 40,
-                    seed: None,
-                },
-                max_tokens: 8,
-                deadline_ms: 10_000,
-                stream: true,
-            })
-            .await
-            .expect("remote execute starts");
-
-        let mut text = String::new();
-        let mut finish = String::new();
-        futures_util::pin_mut!(stream);
-        while let Some(event) = stream.next().await {
-            match event {
-                ExecutorEvent::TokenDelta { delta, .. } => text.push_str(&delta),
-                ExecutorEvent::Completed { finish_reason } => {
-                    finish = format!("{finish_reason:?}");
-                }
-                other => panic!("unexpected event: {other:?}"),
-            }
-        }
-        assert_eq!(text, "remote answer");
-        assert_eq!(finish, "Stop");
-    }
-}
-
 /// F1.5 chooser: remote-first with honest local fallback. If a serving
 /// peer is known for the profile, requests go there; ANY pre-first-token
 /// failure (dial, send, retryable error) falls back to the LOCAL
@@ -1559,5 +1454,110 @@ mod shadow_tests {
         let json = serde_json::to_string(&decision).expect("serializes");
         assert!(json.contains("\"predicted_ms\":null"));
         assert!(!json.contains("infinity") && !json.contains("NaN"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serving::serve_sessions;
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedRequest};
+    use modelswarm_identity::InstallationIdentity;
+    use modelswarm_transport::libp2p_backend::Libp2pTransport;
+    use std::sync::Arc;
+
+    /// F1 same-host proof: RemoteExecutor dials a serving peer over real
+    /// QUIC and re-emits its frames as gateway executor events — the
+    /// exact path a requesting gateway will drive.
+    #[tokio::test]
+    async fn remote_executor_streams_from_serving_peer() {
+        struct FixedExecutor;
+        #[async_trait::async_trait]
+        impl modelswarm_gateway::InferenceExecutor for FixedExecutor {
+            async fn execute(
+                &self,
+                _request: NormalizedRequest,
+            ) -> Result<ExecutorStream, ExecutorError> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    modelswarm_gateway::ExecutorEvent::TokenDelta {
+                        delta: "remote ".into(),
+                        index: 0,
+                    },
+                    modelswarm_gateway::ExecutorEvent::TokenDelta {
+                        delta: "answer".into(),
+                        index: 1,
+                    },
+                    modelswarm_gateway::ExecutorEvent::Completed {
+                        finish_reason: modelswarm_gateway::FinishReason::Stop,
+                    },
+                ])))
+            }
+        }
+
+        let server_identity = InstallationIdentity::from_bytes(&[27u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[28u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let listener = server.listen("127.0.0.1:0").await.unwrap();
+
+        let peer = RemotePeer {
+            addr: listener.bound_addr().to_string(),
+            peer_id: server.peer_id().to_string(),
+        };
+        let client_peer_id = Libp2pTransport::new(&client_identity)
+            .unwrap()
+            .peer_id()
+            .to_string();
+        let (policy, token) = crate::serving::lease_helpers::policy_and_lease(
+            crate::serving::lease_helpers::TEST_PROFILE,
+            &client_peer_id,
+        );
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_sessions(
+            listener,
+            Arc::new(FixedExecutor),
+            crate::serving::lease_helpers::TEST_PROFILE.into(),
+            policy,
+            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
+            shutdown_rx,
+        ));
+
+        let executor = RemoteExecutor::new(peer, client_identity);
+        let stream = executor
+            .execute(NormalizedRequest {
+                request_id: "req-f1".into(),
+                profile_id: crate::serving::lease_helpers::TEST_PROFILE.into(),
+                capability_token: Some(token),
+                messages: vec![modelswarm_gateway::NormalizedMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                sampling: modelswarm_gateway::Sampling {
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: 40,
+                    seed: None,
+                },
+                max_tokens: 8,
+                deadline_ms: 10_000,
+                stream: true,
+            })
+            .await
+            .expect("remote execute starts");
+
+        let mut text = String::new();
+        let mut finish = String::new();
+        futures_util::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            match event {
+                ExecutorEvent::TokenDelta { delta, .. } => text.push_str(&delta),
+                ExecutorEvent::Completed { finish_reason } => {
+                    finish = format!("{finish_reason:?}");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(text, "remote answer");
+        assert_eq!(finish, "Stop");
     }
 }

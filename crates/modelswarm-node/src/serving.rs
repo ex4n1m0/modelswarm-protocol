@@ -488,6 +488,89 @@ pub(crate) async fn send_error(session: &mut Libp2pSession, code: &str, detail: 
         .await;
 }
 
+// ---- F3: lease verification at session open (ADR-026) ----------------------
+//
+// A serving peer admits a session only when the request carries a
+// hub-signed EligibilityLease in `capability_token` that (1) verifies
+// against the pinned hub key, (2) names THIS node's profile, (3) grants
+// can_consume with slots, and (4) is bound to the remote's
+// QUIC-authenticated PeerId — a lease stolen from another peer is
+// worthless. This closes the F0 TODO: serving is no longer
+// protocol-speaking-anyone.
+
+/// RFC 3339 "now" (shared by the gate and external verifiers).
+pub fn rfc3339_now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("rfc3339 formats")
+}
+
+/// The pinned hub signing key (protocol/keys/hub-public.hex) — the same
+/// key the tracker's catalog envelopes are verified against.
+const HUB_PUBLIC_KEY_HEX: &str = include_str!("../../../protocol/keys/hub-public.hex");
+
+#[derive(Clone)]
+pub struct LeasePolicy {
+    hub_pubkey: ed25519_dalek::VerifyingKey,
+}
+
+impl LeasePolicy {
+    /// Production policy: the pinned hub key.
+    pub fn production() -> Self {
+        Self::from_hex(HUB_PUBLIC_KEY_HEX.trim()).expect("pinned hub key parses")
+    }
+
+    /// Test policy over an arbitrary key (hex of 32 bytes).
+    pub fn from_hex(hex_str: &str) -> Result<Self, String> {
+        let bytes = hex::decode(hex_str).map_err(|e| format!("hub key hex: {e}"))?;
+        let key = ed25519_dalek::VerifyingKey::from_bytes(
+            &bytes[..32]
+                .try_into()
+                .map_err(|_| "hub key must be 32 bytes".to_string())?,
+        )
+        .map_err(|e| format!("hub key: {e}"))?;
+        Ok(Self { hub_pubkey: key })
+    }
+
+    /// The pinned hub verifying key (for verification by other layers).
+    pub fn hub_key(&self) -> &ed25519_dalek::VerifyingKey {
+        &self.hub_pubkey
+    }
+
+    /// Full admission check for one inbound request.
+    pub fn check(
+        &self,
+        capability_token: &str,
+        served_profile: &str,
+        remote_peer_id: &str,
+    ) -> Result<(), String> {
+        if capability_token.is_empty() || capability_token.starts_with("f0-unverified") {
+            return Err("no lease presented".into());
+        }
+        let lease = modelswarm_eligibility::EligibilityLease::from_wire(capability_token)
+            .map_err(|e| format!("bad lease: {e}"))?;
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| format!("clock: {e}"))?;
+        lease
+            .verify(&self.hub_pubkey, &now)
+            .map_err(|e| format!("lease invalid: {e}"))?;
+        if lease.model_profile_id != served_profile {
+            return Err(format!(
+                "lease is for another profile: {}",
+                lease.model_profile_id
+            ));
+        }
+        if !lease.can_consume || lease.slots == 0 {
+            return Err("lease grants no consume right".into());
+        }
+        if lease.peer_id != remote_peer_id {
+            return Err("lease is not bound to this peer".into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod lease_helpers {
     use super::LeasePolicy;
@@ -1020,88 +1103,5 @@ mod tests {
         assert!(adm.check_request_fresh("peer-a", "req-1"));
         assert!(!adm.check_request_fresh("peer-a", "req-1"));
         assert!(adm.check_request_fresh("peer-b", "req-1"));
-    }
-}
-
-// ---- F3: lease verification at session open (ADR-026) ----------------------
-//
-// A serving peer admits a session only when the request carries a
-// hub-signed EligibilityLease in `capability_token` that (1) verifies
-// against the pinned hub key, (2) names THIS node's profile, (3) grants
-// can_consume with slots, and (4) is bound to the remote's
-// QUIC-authenticated PeerId — a lease stolen from another peer is
-// worthless. This closes the F0 TODO: serving is no longer
-// protocol-speaking-anyone.
-
-/// RFC 3339 "now" (shared by the gate and external verifiers).
-pub fn rfc3339_now() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .expect("rfc3339 formats")
-}
-
-/// The pinned hub signing key (protocol/keys/hub-public.hex) — the same
-/// key the tracker's catalog envelopes are verified against.
-const HUB_PUBLIC_KEY_HEX: &str = include_str!("../../../protocol/keys/hub-public.hex");
-
-#[derive(Clone)]
-pub struct LeasePolicy {
-    hub_pubkey: ed25519_dalek::VerifyingKey,
-}
-
-impl LeasePolicy {
-    /// Production policy: the pinned hub key.
-    pub fn production() -> Self {
-        Self::from_hex(HUB_PUBLIC_KEY_HEX.trim()).expect("pinned hub key parses")
-    }
-
-    /// Test policy over an arbitrary key (hex of 32 bytes).
-    pub fn from_hex(hex_str: &str) -> Result<Self, String> {
-        let bytes = hex::decode(hex_str).map_err(|e| format!("hub key hex: {e}"))?;
-        let key = ed25519_dalek::VerifyingKey::from_bytes(
-            &bytes[..32]
-                .try_into()
-                .map_err(|_| "hub key must be 32 bytes".to_string())?,
-        )
-        .map_err(|e| format!("hub key: {e}"))?;
-        Ok(Self { hub_pubkey: key })
-    }
-
-    /// The pinned hub verifying key (for verification by other layers).
-    pub fn hub_key(&self) -> &ed25519_dalek::VerifyingKey {
-        &self.hub_pubkey
-    }
-
-    /// Full admission check for one inbound request.
-    pub fn check(
-        &self,
-        capability_token: &str,
-        served_profile: &str,
-        remote_peer_id: &str,
-    ) -> Result<(), String> {
-        if capability_token.is_empty() || capability_token.starts_with("f0-unverified") {
-            return Err("no lease presented".into());
-        }
-        let lease = modelswarm_eligibility::EligibilityLease::from_wire(capability_token)
-            .map_err(|e| format!("bad lease: {e}"))?;
-        let now = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .map_err(|e| format!("clock: {e}"))?;
-        lease
-            .verify(&self.hub_pubkey, &now)
-            .map_err(|e| format!("lease invalid: {e}"))?;
-        if lease.model_profile_id != served_profile {
-            return Err(format!(
-                "lease is for another profile: {}",
-                lease.model_profile_id
-            ));
-        }
-        if !lease.can_consume || lease.slots == 0 {
-            return Err("lease grants no consume right".into());
-        }
-        if lease.peer_id != remote_peer_id {
-            return Err("lease is not bound to this peer".into());
-        }
-        Ok(())
     }
 }

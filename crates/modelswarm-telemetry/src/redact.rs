@@ -33,7 +33,33 @@ pub const FORBIDDEN_FIELDS: &[&str] = &[
     "password",
     "private_key",
     "signature_seed",
+    // ADR-036 (T/R review R1, 2026-10-14): the pin carrier's
+    // content-bearing fields are forbidden BY NAME as well — the
+    // conversation's token ids and the content-derived commitment can
+    // never reach a log sink even if a caller forgets the counts-only
+    // rule. (Legitimate count fields like `tokens: 8` stay allowed —
+    // see the shape scrub below.)
+    "prompt_tokens",
+    "pin_commitment",
 ];
+
+/// A bare u32-array value: `[digits, digits, …]` (arbitrary whitespace),
+/// at least one element — token-id shaped (ADR-036's carrier payload
+/// form; the T/R review R1 shape scrub).
+fn is_bare_u32_array(value: &str) -> bool {
+    let v = value.trim();
+    if !(v.starts_with('[') && v.ends_with(']')) {
+        return false;
+    }
+    let inner = v[1..v.len() - 1].trim();
+    if inner.is_empty() {
+        return false;
+    }
+    inner.split(',').all(|part| {
+        let p = part.trim();
+        !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct Redactor {
@@ -61,6 +87,13 @@ impl Redactor {
         let lower = name.to_ascii_lowercase();
         if self.forbidden.contains(&lower) {
             return format!("[REDACTED:{} len={}]", lower, value.chars().count());
+        }
+        // ADR-036 (T/R review R1, 2026-10-14): a bare u32-array VALUE is
+        // token-id-shaped content under ANY field name — redacted by
+        // shape. Count fields stay legible (a scalar like "8" is not an
+        // array); only whole-value `[1, 2, …]` integer arrays match.
+        if is_bare_u32_array(value) {
+            return "[REDACTED:TOKEN_ARRAY]".to_string();
         }
         let mut v = self.scrub_content(value);
         if v.chars().count() > self.max_value_chars {
@@ -193,5 +226,39 @@ mod tests {
         // privacy contract is enforced at the call sites via forbidden
         // names + this module's audit tests; document the boundary.
         assert!(out.contains("user said"));
+    }
+
+    /// A bare u32-array value: `[digits, digits, …]` (arbitrary
+    /// whitespace), at least one element — token-id shaped.
+    #[test]
+    fn adr036_carrier_fields_are_forbidden_by_name() {
+        let r = Redactor::default();
+        let out = r.redact_field("prompt_tokens", "[151644, 11, 22]");
+        // len is the VALUE's char count (the drop-with-count contract).
+        assert_eq!(out, "[REDACTED:prompt_tokens len=16]");
+        let out = r.redact_field("pin_commitment", "1bf75c5b110835d7");
+        assert_eq!(out, "[REDACTED:pin_commitment len=16]");
+    }
+
+    #[test]
+    fn bare_u32_array_values_are_redacted_by_shape_under_any_name() {
+        let r = Redactor::default();
+        // Under an innocent name — the shape is the leak.
+        assert_eq!(
+            r.redact_field("window", "[151644, 11, 22, 33]"),
+            "[REDACTED:TOKEN_ARRAY]"
+        );
+        assert_eq!(
+            r.redact_field("weird_field", " [ 1 , 2 ] "),
+            "[REDACTED:TOKEN_ARRAY]"
+        );
+        assert_eq!(r.redact_field("single", "[7]"), "[REDACTED:TOKEN_ARRAY]");
+        // NOT arrays: scalar counts stay legible (the counts-only permit).
+        assert_eq!(r.redact_field("tokens", "8"), "8");
+        assert_eq!(r.redact_field("accepted", "0"), "0");
+        // Not integer arrays: text and mixed content pass through the
+        // normal scrub path.
+        assert!(r.redact_field("mode", "remote").contains("remote"));
+        assert!(r.redact_field("ids", "[abc, def]").contains("abc"));
     }
 }

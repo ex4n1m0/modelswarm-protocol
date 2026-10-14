@@ -223,3 +223,25 @@ Tracker landing retarget: apps/tracker/app/page.tsx 0.2.22 → 0.2.23
 (version label + 4 download links; copy rules kept — honest tense, no
 engine names, no status pills); typecheck clean; `next build` green.
 Tracker-Engineer-owned path — flagged for review with this commit.
+
+## v0.2.24 staging rehearsal (2026-10-14, the true-swarm release)
+
+Artifacts from desktop-installer run 38571419953 — AUTO-TRIGGERED on the
+bump commit fe50f01 (the ba0ed1a path-filter fix's first real train;
+zero production-code delta to the current head 549dd18, whose only
+change is the cfg(test)-only env-lock race fix — the b1c2234 precedent).
+Hash chain: CI per-job SHA256SUMS verified (4/4 OK) over the downloaded
+files; staged copies byte-identical. 0.2.23 binaries removed
+(all-OS-together rule). Signed at owner-local staging (v2 CLI,
+--app-version 0.2.24, key file path only; trusted comments carry
+file:<canonical name> version:0.2.24 — decoded+checked, 4/4). Manifest:
+signature = the .sig file text VERBATIM (the 0.2.23 standing rule —
+first-try verify this train). SHA256SUMS retargeted. Rehearsal verdict —
+tests/updater-manifest-verify: ALL THREE PLATFORM SIGNATURES VERIFY
+against the embedded key (38FC98CB4B064F37) over the staged bytes,
+signed version == 0.2.24, sha256 match, URL shape OK. Staged hashes:
+win exe 2e7669fd…f857e2; deb 5011daf5…1e622c; AppImage 737bc146…
+bc2a8e5; dmg ea7eec77…c2b4690. CROSS-PATH: page.tsx 0.2.23→0.2.24
+retarget (5 replacements) — Tracker-Engineer-owned, flagged for review;
+typecheck clean, build green. Owner rulings in force: unsigned by
+decision; key rotation deferred until he says so.

@@ -50,6 +50,40 @@ pub struct EgressVocabulary {
     /// against this map (and the fixture manifest) in both directions.
     #[serde(default, rename = "emit_site_events")]
     pub emit_site_events: EmitSiteEventsSection,
+    /// ADR-037 §4.2: the assistant-plane typed context block (the frozen
+    /// field set + typed shapes + bounds). `admit_context` and
+    /// `choke_point_rescan_assistant` below are driven by this section.
+    #[serde(default, rename = "assistant_context_block")]
+    pub assistant_context_block: AssistantContextSection,
+    /// ADR-037 §4.2: the plane enum (`digest | assistant`) for the plane's
+    /// own telemetry rows.
+    #[serde(default, rename = "plane_enum")]
+    pub plane_enum: PlaneEnumSection,
+}
+
+/// The ADR-037 §3.5 assistant context-block contract: the frozen field
+/// set, the typed shapes, and the picker-row sub-schema.
+#[derive(Debug, Default, Deserialize)]
+pub struct AssistantContextSection {
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
+    #[serde(default, rename = "value_types")]
+    pub value_types: BTreeMap<String, String>,
+    #[serde(default, rename = "picker_row_fields")]
+    pub picker_row_fields: BTreeMap<String, String>,
+    #[serde(default, rename = "max_picker_rows")]
+    pub max_picker_rows: usize,
+}
+
+/// The `plane_enum` section.
+#[derive(Debug, Default, Deserialize)]
+pub struct PlaneEnumSection {
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub values: Vec<String>,
 }
 
 /// The R-1 exhaustive emit-site vocabulary section: the tie note plus the
@@ -400,6 +434,332 @@ pub fn choke_point_rescan(body: &str, max_request_bytes: usize) -> Result<(), Re
 }
 
 // ---------------------------------------------------------------------------
+// The assistant-plane context-block gate (ADR-037 §3.5, one edit with the
+// artifact's assistant_context_block section)
+// ---------------------------------------------------------------------------
+
+/// One picker row of the context block (§3.2a): `display_name` and
+/// `quant_method` are the RC-11 owner-controlled string class (signed
+/// catalog/candidate rows only); everything else is numeric or a frozen
+/// enum; `census_peers` is `None` when the census is unreachable (the
+/// field is omitted — never a guessed zero).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextPickerRow {
+    pub display_name: String,
+    pub quant_method: String,
+    pub quant_bits: i64,
+    pub download_mb: i64,
+    pub ram_mb_est: i64,
+    /// `gpu_full | gpu_partial | ram_only`; `None` = fit unknown (the
+    /// field is omitted from the row).
+    pub fit: Option<String>,
+    pub recommended: bool,
+    pub census_peers: Option<i64>,
+}
+
+/// A context-block field value. The typed shapes of the artifact's
+/// `assistant_context_block.value_types` — there is deliberately NO
+/// free-text variant: the user's assistant-channel text is the one
+/// disclosed exception and rides the request's turn/history members,
+/// never the context block (ADR-037 §3.5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContextValue {
+    Int(i64),
+    Bool(bool),
+    Enum {
+        vocabulary: &'static str,
+        value: String,
+    },
+    /// RC-11 class: bounded 128 chars, no control chars.
+    DisplayName(String),
+    /// Bounded 128 chars, no control chars (engine device-listing text).
+    GpuName(String),
+    /// Bounded 32 chars, charset `[A-Za-z0-9.+-]`.
+    Version(String),
+    /// Keys VALUE-matched against a frozen vocabulary, integer values.
+    VocabCountMap {
+        vocabulary: &'static str,
+        counts: BTreeMap<String, i64>,
+    },
+    PickerRows(Vec<ContextPickerRow>),
+}
+
+/// A named context-block field entering the gate (the assistant-plane
+/// analogue of [`DigestField`]).
+#[derive(Debug, Clone)]
+pub struct ContextField {
+    pub name: String,
+    pub value: ContextValue,
+}
+
+fn is_bound_display_string(s: &str, max_chars: usize) -> bool {
+    !s.is_empty() && s.chars().count() <= max_chars && !s.chars().any(|c| c.is_control())
+}
+
+fn is_version_string(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().count() <= 32
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+}
+
+fn vocab_contains(vocab_name: &str, value: &str) -> bool {
+    vocabulary()
+        .vocabularies
+        .get(vocab_name)
+        .is_some_and(|set| set.values.iter().any(|v| v == value))
+}
+
+fn context_type_of(field: &str) -> Option<&str> {
+    vocabulary()
+        .assistant_context_block
+        .fields
+        .get(field)
+        .map(String::as_str)
+}
+
+impl ContextValue {
+    /// Validates this value against the field's declared artifact type
+    /// and renders the JSON value it may be sent as. `Err(())` = drop
+    /// and count.
+    fn admit(&self, declared: &str) -> Result<serde_json::Value, ()> {
+        match declared {
+            "integer" => match self {
+                ContextValue::Int(i) => Ok(serde_json::Value::from(*i)),
+                _ => Err(()),
+            },
+            "boolean" => match self {
+                ContextValue::Bool(b) => Ok(serde_json::Value::from(*b)),
+                _ => Err(()),
+            },
+            _ if declared.starts_with("enum:") => match self {
+                ContextValue::Enum { vocabulary, value } => {
+                    // The field's declared vocabulary IS the authority
+                    // (a builder cannot borrow another vocabulary's
+                    // shape to smuggle a value).
+                    if declared.strip_prefix("enum:") == Some(vocabulary)
+                        && vocab_contains(vocabulary, value)
+                    {
+                        Ok(serde_json::Value::String(value.clone()))
+                    } else {
+                        Err(())
+                    }
+                }
+                _ => Err(()),
+            },
+            "display_name_string" => match self {
+                ContextValue::DisplayName(s) if is_bound_display_string(s, 128) => {
+                    Ok(serde_json::Value::String(s.clone()))
+                }
+                _ => Err(()),
+            },
+            "gpu_name_string" => match self {
+                ContextValue::GpuName(s) if is_bound_display_string(s, 128) => {
+                    Ok(serde_json::Value::String(s.clone()))
+                }
+                _ => Err(()),
+            },
+            "version_string" => match self {
+                ContextValue::Version(s) if is_version_string(s) => {
+                    Ok(serde_json::Value::String(s.clone()))
+                }
+                _ => Err(()),
+            },
+            _ if declared.starts_with("vocab_count_map:") => match self {
+                ContextValue::VocabCountMap { vocabulary, counts } => {
+                    if declared.strip_prefix("vocab_count_map:") != Some(vocabulary) {
+                        return Err(());
+                    }
+                    let mut map = serde_json::Map::new();
+                    for (value, count) in counts {
+                        if !vocab_contains(vocabulary, value) {
+                            return Err(());
+                        }
+                        map.insert(value.clone(), serde_json::Value::from(*count));
+                    }
+                    Ok(serde_json::Value::Object(map))
+                }
+                _ => Err(()),
+            },
+            "picker_row[]" => match self {
+                ContextValue::PickerRows(rows) => {
+                    let block = &vocabulary().assistant_context_block;
+                    if rows.len() > block.max_picker_rows.max(1) {
+                        return Err(());
+                    }
+                    let mut out = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        out.push(serde_json::json!({
+                            "display_name": admit_bound(&row.display_name)?,
+                            "quant_method": admit_bound(&row.quant_method)?,
+                            "quant_bits": row.quant_bits,
+                            "download_mb": row.download_mb,
+                            "ram_mb_est": row.ram_mb_est,
+                            "fit": match &row.fit {
+                                // The row's fit is the frozen picker_fit
+                                // vocabulary, or omitted when unknown.
+                                Some(fit) if vocab_contains("picker_fit", fit) => {
+                                    serde_json::Value::String(fit.clone())
+                                }
+                                Some(_) => return Err(()),
+                                None => serde_json::Value::Null,
+                            },
+                            "recommended": row.recommended,
+                            "census_peers": row
+                                .census_peers
+                                .map(serde_json::Value::from)
+                                .unwrap_or(serde_json::Value::Null),
+                        }));
+                    }
+                    Ok(serde_json::Value::Array(out))
+                }
+                _ => Err(()),
+            },
+            _ => Err(()),
+        }
+    }
+}
+
+fn admit_bound(s: &str) -> Result<serde_json::Value, ()> {
+    if is_bound_display_string(s, 128) {
+        Ok(serde_json::Value::String(s.to_string()))
+    } else {
+        Err(())
+    }
+}
+
+/// Re-validates one SERIALIZED context value against the field's
+/// declared type (the choke-point re-scan's context pass — RC-3/A-1
+/// defense-in-depth: name→type binding re-checked on the final bytes).
+fn context_value_rematches(declared: &str, value: &serde_json::Value) -> bool {
+    match declared {
+        "integer" => value.as_i64().is_some(),
+        "boolean" => value.as_bool().is_some(),
+        _ if declared.starts_with("enum:") => value
+            .as_str()
+            .is_some_and(|v| vocab_contains(declared.strip_prefix("enum:").unwrap_or(""), v)),
+        "display_name_string" | "gpu_name_string" => value
+            .as_str()
+            .is_some_and(|s| is_bound_display_string(s, 128)),
+        "version_string" => value.as_str().is_some_and(is_version_string),
+        _ if declared.starts_with("vocab_count_map:") => {
+            let vocab = declared.strip_prefix("vocab_count_map:").unwrap_or("");
+            value.as_object().is_some_and(|map| {
+                map.iter()
+                    .all(|(k, v)| vocab_contains(vocab, k) && v.as_i64().is_some())
+            })
+        }
+        "picker_row[]" => value.as_array().is_some_and(|rows| {
+            rows.len() <= vocabulary().assistant_context_block.max_picker_rows.max(1)
+                && rows.iter().all(|row| {
+                    row.as_object().is_some_and(|obj| {
+                        let fields = &vocabulary().assistant_context_block.picker_row_fields;
+                        obj.len() == fields.len()
+                            && obj.iter().all(|(k, v)| {
+                                fields
+                                    .get(k)
+                                    .is_some_and(|declared| context_value_rematches(declared, v))
+                            })
+                    })
+                })
+        }),
+        _ => false,
+    }
+}
+
+/// The assistant-plane context gate: every field name must be on the
+/// frozen artifact set and every value must match its declared type;
+/// forbidden names (the Redactor set) drop. Returns the admitted context
+/// object and the drop count (counted, never sent).
+pub fn admit_context(fields: Vec<ContextField>) -> Admitted {
+    let redactor = Redactor::default();
+    let mut body = serde_json::Map::new();
+    let mut dropped = 0u64;
+    for field in fields {
+        if redactor
+            .redact_field(&field.name, "x")
+            .starts_with("[REDACTED:")
+        {
+            dropped += 1;
+            continue;
+        }
+        let Some(declared) = context_type_of(&field.name) else {
+            dropped += 1; // not on the frozen field set
+            continue;
+        };
+        match field.value.admit(declared) {
+            Ok(v) => {
+                body.insert(field.name.clone(), v);
+            }
+            Err(()) => dropped += 1,
+        }
+    }
+    Admitted { body, dropped }
+}
+
+/// The assistant-plane choke-point re-scan (ADR-037 §3.5): on the FINAL
+/// serialized body, the `context` object must re-match the frozen field
+/// set (name→type binding included — advisory A-1), the history/turn
+/// strings must pass `scrub_content` unchanged, and the body must be
+/// within `max_request_bytes`. Any failure ⇒ nothing is sent.
+pub fn choke_point_rescan_assistant(
+    body: &str,
+    max_request_bytes: usize,
+) -> Result<(), RescanRejection> {
+    if body.len() > max_request_bytes {
+        return Err(RescanRejection::TooLarge);
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| RescanRejection::Unparseable)?;
+    let obj = parsed.as_object().ok_or(RescanRejection::Unparseable)?;
+    for (key, value) in obj {
+        match key.as_str() {
+            "context" => {
+                let ctx = value.as_object().ok_or(RescanRejection::ValueFailed)?;
+                for (name, v) in ctx {
+                    let declared = context_type_of(name).ok_or(RescanRejection::ValueFailed)?;
+                    if !context_value_rematches(declared, v) {
+                        return Err(RescanRejection::ValueFailed);
+                    }
+                }
+            }
+            "history" => {
+                let entries = value.as_array().ok_or(RescanRejection::ValueFailed)?;
+                if entries.len() > 64 {
+                    return Err(RescanRejection::ValueFailed);
+                }
+                for entry in entries {
+                    let entry = entry.as_object().ok_or(RescanRejection::ValueFailed)?;
+                    let role = entry.get("role").and_then(|r| r.as_str());
+                    let content = entry.get("content").and_then(|c| c.as_str());
+                    match (role, content) {
+                        (Some("user" | "assistant"), Some(_)) => {}
+                        _ => return Err(RescanRejection::ValueFailed),
+                    }
+                }
+            }
+            "turn" => {
+                let turn = value.as_object().ok_or(RescanRejection::ValueFailed)?;
+                let id = turn.get("conversation_id").and_then(|t| t.as_str());
+                let number = turn.get("turn").and_then(|t| t.as_u64());
+                if !id.is_some_and(is_16_lower_hex) || number.is_none() {
+                    return Err(RescanRejection::ValueFailed);
+                }
+                if turn.get("text").and_then(|t| t.as_str()).is_none() {
+                    return Err(RescanRejection::ValueFailed);
+                }
+            }
+            _ => return Err(RescanRejection::Unparseable),
+        }
+    }
+    let redactor = Redactor::default();
+    if redactor.scrub_content(body) != body {
+        return Err(RescanRejection::ScrubWouldAlter);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // The clamp table application (§4 malformed table, RC-7)
 // ---------------------------------------------------------------------------
 
@@ -449,9 +809,10 @@ mod tests {
         assert_eq!(registry.len(), 16);
         assert!(registry.contains(&"invalid_lease".to_string()));
         assert!(registry.contains(&"replayed_request".to_string()));
-        // Gap vocabulary: EXACTLY the 12 digest-plane values at this leg
-        // (ADR-037 §4.3's rate_limited/request_oversized land with the
-        // assistant leg — their presence now would be a red build).
+        // Gap vocabulary: the 12 digest-plane values PLUS the two
+        // ADR-037 §4.3 assistant-leg values (rate_limited,
+        // request_oversized) — 14 total, tied to the Gap enum's golden
+        // test in state.rs.
         let gaps = &vocab.vocabularies["advisory_gap"].values;
         assert_eq!(
             gaps,
@@ -467,14 +828,14 @@ mod tests {
                 "quota",
                 "response_oversized",
                 "schema",
-                "late"
+                "late",
+                "rate_limited",
+                "request_oversized"
             ]
             .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
         );
-        assert!(!gaps.contains(&"rate_limited".to_string()));
-        assert!(!gaps.contains(&"request_oversized".to_string()));
         // Suggestion types: the four digest-plane classes only.
         assert_eq!(
             vocab.vocabularies["suggestion_type"].values,
@@ -724,11 +1085,147 @@ mod emit_site_events_tie_tests {
             "advisory.cycle.sent",
             "advisory.cycle.gap",
             "advisory.suggestion.recorded",
+            "assistant.turn.sent",
+            "assistant.turn.gap",
         ] {
             assert!(
                 emit.contains_key(event),
                 "source event {event} missing a row"
             );
         }
+        // ADR-037 §4.2: the assistant turn events are plane_own rows and
+        // the plane enum is exactly digest | assistant.
+        assert_eq!(
+            emit.get("assistant.turn.sent").map(String::as_str),
+            Some("plane_own")
+        );
+        assert_eq!(
+            emit.get("assistant.turn.gap").map(String::as_str),
+            Some("plane_own")
+        );
+        assert_eq!(
+            vocab.plane_enum.values,
+            vec!["digest".to_string(), "assistant".to_string()]
+        );
+    }
+
+    /// ADR-037 §3.5: the context-block gate drops unknown names, wrong
+    /// types, out-of-vocabulary enums, over-bound strings, foreign
+    /// vocabulary borrows, and oversized picker arrays — and admits the
+    /// typed shapes. The post-serialization re-scan re-matches the SAME
+    /// bindings (advisory A-1's defense-in-depth).
+    #[test]
+    fn assistant_context_gate_admits_typed_and_drops_the_rest() {
+        use super::{admit_context, choke_point_rescan_assistant, ContextField, ContextValue};
+        let f = |name: &str, value: ContextValue| ContextField {
+            name: name.to_string(),
+            value,
+        };
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("timeout".to_string(), 3);
+        counts.insert("schema".to_string(), 1);
+        let admitted = admit_context(vec![
+            f("hw.logical_cpus", ContextValue::Int(16)),
+            f("hosting.on", ContextValue::Bool(true)),
+            f("app.version", ContextValue::Version("0.2.24+meta".into())),
+            f(
+                "hw.gpu.name",
+                ContextValue::GpuName("NVIDIA GeForce RTX 5080 Laptop GPU".into()),
+            ),
+            f(
+                "family.off_reason",
+                ContextValue::Enum {
+                    vocabulary: "family_off_reason",
+                    value: "resource_ceiling".into(),
+                },
+            ),
+            // A value from ANOTHER vocabulary under this field's name:
+            // dropped (the declared vocabulary is the authority).
+            f(
+                "family.state",
+                ContextValue::Enum {
+                    vocabulary: "family_state",
+                    value: "resource_ceiling".into(),
+                },
+            ),
+            f(
+                "status.advisory_gap_counts",
+                ContextValue::VocabCountMap {
+                    vocabulary: "advisory_gap",
+                    counts: counts.clone(),
+                },
+            ),
+            f(
+                "picker.rows",
+                ContextValue::PickerRows(vec![super::ContextPickerRow {
+                    display_name: "Qwen2.5 1.5B Instruct Q4_K_M".into(),
+                    quant_method: "q4_k_m".into(),
+                    quant_bits: 4,
+                    download_mb: 105,
+                    ram_mb_est: 512,
+                    fit: Some("gpu_full".into()),
+                    recommended: true,
+                    census_peers: Some(2),
+                }]),
+            ),
+            f("not.a.field", ContextValue::Int(1)),
+            f("prompt", ContextValue::Int(1)), // forbidden name
+            f(
+                "hw.gpu.name",
+                ContextValue::GpuName(format!("X{}", "x".repeat(200))),
+            ),
+            f("app.version", ContextValue::Version("bad version!".into())),
+        ]);
+        assert_eq!(
+            admitted.dropped, 5,
+            "unknown field, forbidden name, foreign enum, over-bound gpu name, bad version"
+        );
+        assert_eq!(admitted.body["hw.logical_cpus"], 16);
+        assert_eq!(admitted.body["hosting.on"], true);
+        assert_eq!(admitted.body["app.version"], "0.2.24+meta");
+        assert_eq!(admitted.body["family.off_reason"], "resource_ceiling");
+        assert!(admitted.body.get("family.state").is_none());
+        let gaps = admitted.body["status.advisory_gap_counts"]
+            .as_object()
+            .unwrap();
+        assert_eq!(gaps["timeout"], 3);
+        assert_eq!(gaps["schema"], 1);
+        assert_eq!(
+            admitted.body["picker.rows"][0]["display_name"],
+            "Qwen2.5 1.5B Instruct Q4_K_M"
+        );
+        // A poisoned count map (one key outside the frozen vocabulary)
+        // drops WHOLE — fail closed, never a partial count set.
+        let mut poisoned = std::collections::BTreeMap::new();
+        poisoned.insert("timeout".to_string(), 3);
+        poisoned.insert("not_a_gap".to_string(), 1);
+        let strict = admit_context(vec![f(
+            "status.advisory_gap_counts",
+            ContextValue::VocabCountMap {
+                vocabulary: "advisory_gap",
+                counts: poisoned,
+            },
+        )]);
+        assert_eq!(strict.dropped, 1);
+        assert!(strict.body.is_empty());
+        // The serialized context re-matches through the assistant
+        // choke-point re-scan (role: context only here).
+        let body = serde_json::json!({
+            "context": admitted.body,
+            "history": [{"role": "user", "content": "hello"}],
+            "turn": {"conversation_id": "0123456789abcdef", "turn": 1, "text": "hi"}
+        })
+        .to_string();
+        assert!(choke_point_rescan_assistant(&body, 65_536).is_ok());
+        // Post-gate corruption of one context field stops the request.
+        let mut parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        parsed["context"]["hw.logical_cpus"] = serde_json::json!("sixteen");
+        assert!(choke_point_rescan_assistant(&parsed.to_string(), 65_536).is_err());
+        // A smuggled field name in the context fails the re-scan.
+        let mut parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        parsed["context"]["smuggled"] = serde_json::json!(1);
+        assert!(choke_point_rescan_assistant(&parsed.to_string(), 65_536).is_err());
+        // Oversize fails.
+        assert!(choke_point_rescan_assistant(&body, 8).is_err());
     }
 }

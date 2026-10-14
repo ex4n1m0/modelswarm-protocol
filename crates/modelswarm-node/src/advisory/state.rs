@@ -22,9 +22,9 @@
 
 use super::egress::{self, DigestField, HintAdmission};
 
-/// The frozen 12-value gap vocabulary (ADR-033 §6 at this leg;
-/// ADR-037 §4.3's `rate_limited`/`request_oversized` land with the
-/// assistant leg). A further value needs an amendment.
+/// The frozen 14-value gap vocabulary (ADR-033 §6's twelve digest-plane
+/// values plus ADR-037 §4.3's `rate_limited` and `request_oversized`).
+/// A further value needs an ADR-037 amendment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gap {
     Disabled,
@@ -42,6 +42,11 @@ pub enum Gap {
     /// response arriving after its cycle closed — permitted ONLY
     /// following a `Timeout` gap for the same cycle.
     Late,
+    /// ADR-037 §4.3: the assistant hourly burst bound (60/hour default).
+    RateLimited,
+    /// ADR-037 §4.3: the assistant body over `max_request_bytes` even at
+    /// zero history — nothing is sent.
+    RequestOversized,
 }
 
 impl Gap {
@@ -60,12 +65,14 @@ impl Gap {
             Gap::ResponseOversized => "response_oversized",
             Gap::Schema => "schema",
             Gap::Late => "late",
+            Gap::RateLimited => "rate_limited",
+            Gap::RequestOversized => "request_oversized",
         }
     }
 
     /// All values, in the artifact's frozen order (the golden enum tie:
     /// this list, the artifact row, and the ADR §6 vocabulary are one).
-    pub const ALL: [Gap; 12] = [
+    pub const ALL: [Gap; 14] = [
         Gap::Disabled,
         Gap::NoKey,
         Gap::NoConfig,
@@ -78,6 +85,8 @@ impl Gap {
         Gap::ResponseOversized,
         Gap::Schema,
         Gap::Late,
+        Gap::RateLimited,
+        Gap::RequestOversized,
     ];
 }
 
@@ -240,6 +249,12 @@ pub struct ProviderRequest {
     /// Response body cap (the adapter refuses to buffer beyond it; the
     /// state machine re-checks on the returned bytes).
     pub max_response_bytes: usize,
+    /// The fixed system prompt for this call. `None` = the digest
+    /// plane's [`DIGEST_SYSTEM_PROMPT`]; the assistant plane pins
+    /// [`ASSISTANT_SYSTEM_PROMPT`
+    /// (crate::advisory::assistant::ASSISTANT_SYSTEM_PROMPT)]. Repo-
+    /// versioned constants only — never caller text.
+    pub system_prompt: Option<&'static str>,
 }
 
 /// Effects the runner must execute. Counts and labels only on the
@@ -529,6 +544,7 @@ fn step_timer(
         timeout_ms: state.caps.request_timeout_ms,
         max_completion_tokens: state.caps.max_completion_tokens,
         max_response_bytes: state.caps.max_response_bytes,
+        system_prompt: None,
     }));
 }
 
@@ -622,7 +638,11 @@ fn parse_response(bytes: &[u8], cycle_id: &str) -> Result<Vec<Result<RecordedSug
     Ok(out)
 }
 
-fn parse_one_suggestion(raw: &serde_json::Value) -> Result<RecordedSuggestion, ()> {
+/// Parses ONE suggestion (the ADR-033 §4 shape; shared by the digest
+/// cycle response and the assistant reply's `hints` array — the
+/// assistant plane additionally discards the `tuning_hint` class whole
+/// per ADR-037 §3.3/§3.7).
+pub(super) fn parse_one_suggestion(raw: &serde_json::Value) -> Result<RecordedSuggestion, ()> {
     let obj = raw.as_object().ok_or(())?;
     let kind =
         SuggestionType::parse(obj.get("type").and_then(|t| t.as_str()).ok_or(())?).ok_or(())?;
@@ -698,9 +718,10 @@ mod tests {
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
-    fn golden_gap_enum_is_the_twelve_frozen_values() {
+    fn golden_gap_enum_is_the_fourteen_frozen_values() {
         // TR-AD-3: a new gap value without an amendment note is a red
-        // build — here, in the artifact row, and in the ADR §6 text.
+        // build — here, in the artifact row, and in the ADR §6 text
+        // (as extended by ADR-037 §4.3: rate_limited, request_oversized).
         let labels: Vec<&str> = Gap::ALL.iter().map(|g| g.as_str()).collect();
         assert_eq!(
             labels,
@@ -716,7 +737,9 @@ mod tests {
                 "quota",
                 "response_oversized",
                 "schema",
-                "late"
+                "late",
+                "rate_limited",
+                "request_oversized"
             ]
         );
         // And the artifact row matches this enum exactly.

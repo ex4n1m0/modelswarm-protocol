@@ -52,6 +52,14 @@ use tokio::sync::Mutex;
 /// renders one status line from it and nothing else.
 mod updater;
 
+/// The assistant PANEL surface (ADR-037 §3.6/§4.5): the setup-helper
+/// panel's typed context builders, verbatim disclosure texts, static
+/// help corpus, reply renderer, and the `assistant_turn`/`
+/// `assistant_reset` cores. Its own section, its own input, its own
+/// `assistant-*` webview events — never the swarm chat transcript
+/// (the chat wall, W1/W4).
+mod assistant;
+
 /// The registered no-listener-yet multiaddr: present in the roster, fails
 /// direct-connect honestly for every remote peer (beta boundary).
 const ADDR_NO_LISTENER: &str = "/ip4/0.0.0.0/tcp/0";
@@ -158,6 +166,34 @@ struct Inner {
     /// `get_status`. A failure here is a status line, never a block on
     /// app usage.
     updater: updater::UpdaterStatus,
+    /// ADR-037 §3.6: the armed assistant plane. `None` = built-in help
+    /// mode, with the honest gap label in `assistant_degrade_gap` (never
+    /// a blank box, never a spinner that hides absence).
+    assistant_plane: Option<assistant::Plane>,
+    /// The honest degrade gap label while `assistant_plane` is None.
+    assistant_degrade_gap: String,
+    /// The §3.6 first-use disclosure acknowledgement (persisted; the
+    /// first cloud call is BLOCKED until true).
+    assistant_acknowledged: bool,
+    /// The Settings opt-out toggle (persisted; both this AND the owner's
+    /// `assistant.enabled` master switch must be on for cloud mode).
+    assistant_enabled: bool,
+    /// The last `list_models` cards — the assistant's picker rows come
+    /// from THIS cache (the signed catalog/candidate rows the picker
+    /// already computed; the assistant never fetches or recomputes
+    /// them).
+    last_cards: Vec<serde_json::Value>,
+    /// The engage ladder label of the last swarm turn (assistant context
+    /// + the static corpus's index into it).
+    last_engage_reason: Option<String>,
+    /// The governor verdict label of the last hosting-start resource
+    /// check, when one degraded.
+    last_governor_verdict: Option<String>,
+    /// The last family-probe pairing verdict.
+    last_probe_verdict: Option<String>,
+    /// The self-reported capacityClass of this installation's earned
+    /// lease, when one was earned (ADR-012).
+    capacity_class: Option<String>,
 }
 
 /// The composed daemon's family half, reported to the UI exactly as the
@@ -201,6 +237,11 @@ struct FamilyStatus {
     /// session; `disclosure` is the always-visible §3.1 text VERBATIM
     /// when enabled, or the honest opt-out statement when not.
     carriage: Option<FamilyCarriageStatus>,
+    /// ADR-037 §3.2b: the governor verdict LABEL behind a
+    /// `resource_ceiling` off-reason (frozen vocabulary — ram_ceiling |
+    /// vram_ceiling | ram_unobservable | vram_unobservable |
+    /// vram_total_unknown | weights_not_positive). Labels only.
+    governor_label: Option<String>,
 }
 
 /// The ADR-036 §3.1 serving-side carriage posture as reported to the UI.
@@ -275,6 +316,7 @@ impl FamilyStatus {
             lease_roster_peers: 0,
             pin: None,
             carriage: None,
+            governor_label: None,
         }
     }
 
@@ -285,6 +327,15 @@ impl FamilyStatus {
         Self {
             detail: Some(detail.into()),
             ..Self::off(reason)
+        }
+    }
+
+    /// The resource-ceiling degrade with the governor's frozen verdict
+    /// label attached (ADR-037 §3.2b context-block source).
+    fn off_governor(reason: &str, detail: impl Into<String>, label: &str) -> Self {
+        Self {
+            governor_label: Some(label.to_string()),
+            ..Self::off_detail(reason, detail)
         }
     }
 }
@@ -339,6 +390,7 @@ impl DesktopState {
         let config = read_config(&data_dir);
         let license_accepted = license_accepted(&config.tracker, &data_dir).await;
         let telemetry = std::sync::Arc::new(open_node_telemetry(&data_dir));
+        let (assistant_plane, assistant_degrade_gap) = assistant::Plane::spawn(&data_dir);
         Self {
             hardware: tokio::sync::OnceCell::new(),
             telemetry,
@@ -368,6 +420,15 @@ impl DesktopState {
                 listener_addr: None,
                 family: None,
                 updater: updater::UpdaterStatus::Idle,
+                assistant_plane,
+                assistant_degrade_gap,
+                assistant_acknowledged: config.assistant_acknowledged,
+                assistant_enabled: config.assistant_enabled,
+                last_cards: Vec::new(),
+                last_engage_reason: None,
+                last_governor_verdict: None,
+                last_probe_verdict: None,
+                capacity_class: None,
             }),
         }
     }
@@ -437,6 +498,24 @@ struct PersistedConfig {
     /// turn, contradicting no live session.
     #[serde(default)]
     family_verified_chat: bool,
+    /// ADR-037 §3.6 (disclosure and consent): the first-use disclosure
+    /// acknowledgement. DEFAULT FALSE — the first cloud call is BLOCKED
+    /// until the user acknowledges the verbatim disclosure in the
+    /// assistant panel.
+    #[serde(default)]
+    assistant_acknowledged: bool,
+    /// ADR-037 §3.6 (Settings opt-out): the user's cloud-assistant
+    /// toggle. DEFAULT TRUE — this is the "turn it off any time"
+    /// control; the §3.4 master switch (`assistant.enabled` in
+    /// advisory.json) is the OWNER's, and BOTH must be on for cloud
+    /// mode. Opting out is a config flip with zero functional loss
+    /// (built-in help + the deterministic recommendation stay).
+    #[serde(default = "default_assistant_enabled")]
+    assistant_enabled: bool,
+}
+
+fn default_assistant_enabled() -> bool {
+    true
 }
 
 fn default_tracker() -> String {
@@ -455,7 +534,8 @@ impl Default for PersistedConfig {
     fn default() -> Self {
         // Mirrors the serde field defaults exactly: a missing file/keys
         // must read as the fresh-install posture (default tracker,
-        // pairing ALLOWED, carriage ALLOWED, verified chat NOT elected) —
+        // pairing ALLOWED, carriage ALLOWED, verified chat NOT elected,
+        // assistant disclosure NOT acknowledged, assistant toggle ON) —
         // `derive(Default)` would zero the on-defaults.
         Self {
             tracker: default_tracker(),
@@ -463,6 +543,8 @@ impl Default for PersistedConfig {
             allow_swarm_pairing: default_allow_swarm_pairing(),
             allow_content_carriage: default_allow_content_carriage(),
             family_verified_chat: false,
+            assistant_acknowledged: false,
+            assistant_enabled: default_assistant_enabled(),
         }
     }
 }
@@ -1082,7 +1164,7 @@ async fn compose_family_serving(
             );
             return (
                 None,
-                FamilyStatus::off_detail("resource_ceiling", detail),
+                FamilyStatus::off_governor("resource_ceiling", detail, governor_reason),
                 None,
             );
         }
@@ -1258,6 +1340,7 @@ async fn compose_family_serving(
                 CARRIAGE_DISCLOSURE_OFF.to_string()
             },
         }),
+        governor_label: None,
     };
     (
         Some(FamilyServing {
@@ -1313,9 +1396,10 @@ async fn resolve_profile(
 
 fn persist_config(inner: &Inner) -> Result<(), String> {
     // TR-RC-8 (ADR-033 §9.2 review): READ-MODIFY-WRITE the FULL JSON
-    // object. The daemon owns exactly five keys (`tracker`, `profile_id`,
+    // object. The daemon owns exactly seven keys (`tracker`, `profile_id`,
     // `allow_swarm_pairing`, `allow_content_carriage`,
-    // `family_verified_chat`); every other key in config.json — another
+    // `family_verified_chat`, `assistant_acknowledged`,
+    // `assistant_enabled`); every other key in config.json — another
     // subsystem's config surface that later moves in here — is preserved
     // verbatim. (The previous struct-rewrite serialized only the known
     // fields and SILENTLY DELETED everything else on every rewrite.)
@@ -1337,6 +1421,14 @@ fn persist_config(inner: &Inner) -> Result<(), String> {
     root.insert(
         "family_verified_chat".into(),
         serde_json::json!(inner.family_verified_chat),
+    );
+    root.insert(
+        "assistant_acknowledged".into(),
+        serde_json::json!(inner.assistant_acknowledged),
+    );
+    root.insert(
+        "assistant_enabled".into(),
+        serde_json::json!(inner.assistant_enabled),
     );
     std::fs::write(
         &path,
@@ -1640,6 +1732,29 @@ async fn get_status(
         // request 2026-10-12). Never a block on app usage.
         "updater": inner.updater.view(),
         "chat_turns": inner.chat_log.len(),
+        // ADR-037 §3.6: the assistant panel's honest mode facts — which
+        // mode it is in and why (labels only; the disclosure text rides
+        // the panel, the reply rides assistant-turn events).
+        "assistant": {
+            "cloud": inner.assistant_plane.is_some() && inner.assistant_enabled,
+            "gap": if inner.assistant_plane.is_none() {
+                inner.assistant_degrade_gap.clone()
+            } else if !inner.assistant_enabled {
+                "disabled".to_string()
+            } else {
+                "none".to_string()
+            },
+            "acknowledged": inner.assistant_acknowledged,
+            "enabled": inner.assistant_enabled,
+            "disclosure": if inner.assistant_plane.is_some()
+                && inner.assistant_enabled
+                && !inner.assistant_acknowledged
+            {
+                Some(assistant::FIRST_USE_DISCLOSURE)
+            } else {
+                None
+            },
+        },
     }))
 }
 
@@ -1751,6 +1866,133 @@ async fn clear_chat(
     let _ = window.emit("chat-cleared", ());
     log_event(&state.telemetry, "info", "chat.cleared", &[]);
     Ok(serde_json::json!({ "cleared": true, "chat_turns": 0 }))
+}
+
+// ---- The assistant panel's IPC (ADR-037 §4.5): its own commands, its
+// own `assistant-*` event namespace — nothing here touches the swarm
+// chat transcript (W4), and the panel's turns are the ONLY user-trigger
+// of the plane (W2).
+
+/// One assistant panel turn: user-triggered UI only. Builds the typed
+/// context from the app's own facts (hardware, picker cache, family
+/// status labels), drives the plane, and renders the outcome — cloud
+/// reply (provenance chip always adjacent), honest gap, first-use
+/// disclosure gate, or built-in static help. Emits `assistant-turn`.
+#[tauri::command]
+async fn assistant_turn(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopState>,
+    window: tauri::Window,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    let inner = state.inner.lock().await;
+    let hardware = hardware_of(&app, &state).await;
+    let family = inner.family.clone();
+    let hosting_on = inner.node.is_some();
+    let listener_addr = inner.listener_addr.clone();
+    let engine_backend = inner
+        .node
+        .as_ref()
+        .and_then(|r| r.handle.engine_backend.clone());
+    let inputs = assistant::ContextInputs {
+        hardware: &hardware,
+        picker: &inner.last_cards,
+        family: family.as_ref(),
+        hosting_on,
+        listener_addr: listener_addr.as_deref(),
+        engine_backend: engine_backend.as_deref(),
+        engage_last: inner.last_engage_reason.as_deref(),
+        governor_verdict: inner.last_governor_verdict.as_deref(),
+        probe_verdict: inner.last_probe_verdict.as_deref(),
+        capacity_class: inner.capacity_class.as_deref(),
+        app_version: env!("CARGO_PKG_VERSION"),
+    };
+    let deps = assistant::TurnDeps {
+        plane: inner.assistant_plane.as_ref(),
+        degrade_gap: &inner.assistant_degrade_gap,
+        acknowledged: inner.assistant_acknowledged,
+        opt_out: !inner.assistant_enabled,
+        telemetry: state.telemetry.as_ref(),
+        inputs: &inputs,
+    };
+    let outcome = assistant::turn(deps, &message).await;
+    drop(inner);
+    let payload = assistant_outcome_json(&outcome);
+    let _ = window.emit("assistant-turn", &payload);
+    Ok(payload)
+}
+
+/// Resets the assistant conversation (`assistant_reset`): closes the
+/// conversation and clears the local history. Emits `assistant-reset`.
+#[tauri::command]
+async fn assistant_reset(
+    state: tauri::State<'_, DesktopState>,
+    window: tauri::Window,
+) -> Result<serde_json::Value, String> {
+    let inner = state.inner.lock().await;
+    if let Some(plane) = &inner.assistant_plane {
+        plane.reset();
+    }
+    drop(inner);
+    let _ = window.emit("assistant-reset", ());
+    Ok(serde_json::json!({ "reset": true }))
+}
+
+/// Records the §3.6 first-use disclosure acknowledgement (persisted).
+/// The first cloud call is blocked until this lands.
+#[tauri::command]
+async fn assistant_acknowledge(state: tauri::State<'_, DesktopState>) -> Result<(), String> {
+    let mut inner = state.inner.lock().await;
+    inner.assistant_acknowledged = true;
+    persist_config(&inner)
+}
+
+/// The Settings opt-out toggle (persisted; zero functional loss).
+#[tauri::command]
+async fn set_assistant_enabled(
+    state: tauri::State<'_, DesktopState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut inner = state.inner.lock().await;
+    inner.assistant_enabled = enabled;
+    persist_config(&inner)
+}
+
+/// Renders one [`assistant::PanelOutcome`] for the webview (labels and
+/// display text only — the provenance chip and AD-3 facts pairing are
+/// rendered by the panel around this).
+fn assistant_outcome_json(outcome: &assistant::PanelOutcome) -> serde_json::Value {
+    match outcome {
+        assistant::PanelOutcome::NeedsAcknowledgement => {
+            serde_json::json!({ "kind": "needs_ack", "disclosure": assistant::FIRST_USE_DISCLOSURE })
+        }
+        assistant::PanelOutcome::CloudReply {
+            reply,
+            conversation_id,
+            turn,
+            hints,
+            hints_discarded,
+        } => serde_json::json!({
+            "kind": "reply",
+            "reply": reply,
+            "conversation_id": conversation_id,
+            "turn": turn,
+            "hints": hints,
+            "hints_discarded": hints_discarded,
+            "chip": assistant::PROVENANCE_CHIP,
+        }),
+        assistant::PanelOutcome::CloudGap { gap } => {
+            serde_json::json!({ "kind": "gap", "gap": gap, "chip": assistant::PROVENANCE_CHIP })
+        }
+        assistant::PanelOutcome::StaticHelp { entries, line } => serde_json::json!({
+            "kind": "static",
+            "line": line,
+            "entries": entries
+                .iter()
+                .map(|e| serde_json::json!({ "label": e.label, "text": e.text }))
+                .collect::<Vec<_>>(),
+        }),
+    }
 }
 
 #[tauri::command]
@@ -1867,6 +2109,11 @@ async fn list_models(
             "profile_id": p.profile_id,
             "display_name": p.display_name,
             "quantization": format!("{} ({} bit)", p.manifest.quantization().method(), p.manifest.quantization().bits()),
+            // Structured twins of the rendered quantization line (the
+            // assistant panel's picker rows read these typed fields —
+            // the signed catalog's method/bits, never a re-parse).
+            "quant_method": p.manifest.quantization().method(),
+            "quant_bits": p.manifest.quantization().bits(),
             "runtime": p.manifest.runtime().version(),
             "downloaded": downloaded,
             "hw": hw_json,
@@ -1930,6 +2177,9 @@ async fn list_models(
         // exactly once, so the Nulls left behind are never read again.
         ordered.push(std::mem::take(&mut out[i]));
     }
+    // Cache the final cards for the assistant panel's picker rows (the
+    // typed catalog/candidate rows exactly as the picker computed them).
+    inner.last_cards = ordered.clone();
     Ok(ordered)
 }
 
@@ -2397,6 +2647,9 @@ async fn set_hosting_inner(
             .await;
             #[cfg(feature = "verifydrafts")]
             {
+                // ADR-037 §3.2b: the governor verdict label of THIS
+                // hosting-start resource check (assistant context).
+                inner.last_governor_verdict = family_status.governor_label.clone();
                 inner.family = Some(family_status);
                 // The coordinator's self-verify engine: the SAME source the
                 // serving half holds (Arc clone). None whenever the family
@@ -3092,6 +3345,12 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
             for (key, value) in pairing {
                 result[key] = value;
             }
+            // ADR-037 §3.2b: this probe's pairing VERDICT joins the
+            // assistant context (labels only — the verdict is
+            // count-based by construction).
+            if let Some(verdict) = result["pairing"].as_str() {
+                state.inner.lock().await.last_probe_verdict = Some(verdict.to_string());
+            }
             Ok(result)
         }
         Err(error) => {
@@ -3486,12 +3745,21 @@ async fn earn_lease(
         fail("challenge_refused", "no challengeId in response".into());
         return None;
     };
-    if let Err(e) = tracker
+    match tracker
         .challenge_complete(&lease_id, profile, &challenge_id, total_ms, total_ms)
         .await
     {
-        fail("challenge_refused", e.to_string());
-        return None;
+        Err(e) => {
+            fail("challenge_refused", e.to_string());
+            return None;
+        }
+        // ADR-012/ADR-037 §3.2b: the self-reported capacityClass label
+        // of THIS installation's challenge (the assistant context's
+        // capacity.class source; labels only, never timings).
+        Ok(completed) => {
+            let mut guard = inner.lock().await;
+            guard.capacity_class = completed["capacityClass"].as_str().map(str::to_string);
+        }
     }
     let issued = match tracker.request_lease(&lease_id, profile).await {
         Ok(i) => i,
@@ -3822,6 +4090,8 @@ async fn family_engage_checkpoint(
         None,
         predicted_single,
     );
+    // ADR-037 §3.2b: the ladder label of THIS turn (assistant context).
+    inner.lock().await.last_engage_reason = Some(reason.to_string());
     let mut fields: Vec<(&str, String)> = vec![
         ("phase", "chat".to_string()),
         ("peer", peer_id.to_string()),
@@ -4389,6 +4659,7 @@ async fn try_swarm_chat(
         // The elected path already telemetered its own honest outcome
         // (engaged:false + reason); the automatic ladder has nothing to
         // add for this turn.
+        inner.lock().await.last_engage_reason = Some("elected_fell_back".to_string());
         "elected_fell_back"
     } else {
         family_engage_checkpoint(inner, profile, &remote_peer_id, &shadow_plan, telemetry).await
@@ -5343,6 +5614,10 @@ pub fn run() {
             family_probe,
             send_chat,
             clear_chat,
+            assistant_turn,
+            assistant_reset,
+            assistant_acknowledge,
+            set_assistant_enabled,
             open_approval_page,
             hf_search_models,
             hf_list_ggufs,
@@ -5812,6 +6087,7 @@ mod tests {
             lease_roster_peers: 0,
             pin: None,
             carriage: None,
+            governor_label: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["state"], "on");
@@ -6129,6 +6405,7 @@ mod tests {
                     pin_hash: family_pin_hash(&ids),
                 }),
                 carriage: None,
+                governor_label: None,
             };
             let json = serde_json::to_value(&status).unwrap();
             assert_eq!(json["pin"]["provenance"], provenance);
@@ -6257,6 +6534,15 @@ mod tests {
             listener_addr: None,
             family: None,
             updater: updater::UpdaterStatus::Idle,
+            assistant_plane: None,
+            assistant_degrade_gap: "disabled".to_string(),
+            assistant_acknowledged: false,
+            assistant_enabled: true,
+            last_cards: Vec::new(),
+            last_engage_reason: None,
+            last_governor_verdict: None,
+            last_probe_verdict: None,
+            capacity_class: None,
         }
     }
 
@@ -6318,10 +6604,18 @@ mod tests {
         assert_eq!(saved["profile_id"], serde_json::Value::Null);
         assert_eq!(
             saved.as_object().unwrap().len(),
-            5,
+            7,
             "a fresh file carries exactly the daemon's keys"
         );
         assert_eq!(saved["allow_swarm_pairing"], true, "default-on posture");
+        assert_eq!(
+            saved["assistant_acknowledged"], false,
+            "the §3.6 disclosure is NOT acknowledged on a fresh install"
+        );
+        assert_eq!(
+            saved["assistant_enabled"], true,
+            "the Settings toggle defaults on"
+        );
         // Round-trips: read_config still reads the tolerant field set.
         let config = read_config(dir.path());
         assert_eq!(config.tracker, "https://t.example");
@@ -6415,6 +6709,7 @@ mod tests {
                 enabled: true,
                 disclosure: CARRIAGE_DISCLOSURE_SERVING.to_string(),
             }),
+            governor_label: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["carriage"]["enabled"], true);
@@ -6463,6 +6758,7 @@ mod tests {
                 enabled: true,
                 disclosure: CARRIAGE_DISCLOSURE_SERVING.to_string(),
             }),
+            governor_label: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         let text = json.to_string();
@@ -6622,8 +6918,8 @@ mod tests {
         assert_eq!(saved["advisory"]["caps"], 3, "unknown keys survive");
         assert_eq!(
             saved.as_object().unwrap().len(),
-            6,
-            "five daemon keys + the one unknown key"
+            8,
+            "seven daemon keys + the one unknown key"
         );
     }
 
@@ -6845,7 +7141,7 @@ mod tests {
     mod chat_wall {
         use super::*;
         use modelswarm_gateway::{
-            ExecutorError, ExecutorStream, InferenceExecutor, NormalizedRequest,
+            ExecutorError, ExecutorEvent, ExecutorStream, InferenceExecutor, NormalizedRequest,
         };
         use modelswarm_node::advisory::{self, AdvisoryTransport, CountingTransport};
         use std::sync::Arc;
@@ -6978,6 +7274,463 @@ mod tests {
             // presented to any provider transport.
             assert!(double.bodies().is_empty());
             assert!(double.presented_keys().is_empty());
+        }
+
+        /// The protocol review's recorded follow-up, closed with this
+        /// leg: a behavioral QUIC DIAL-FAILURE leg — the mock tracker
+        /// answers a roster whose candidate has a real (DEAD) QUIC
+        /// address, the remote dial fails pre-token, the honest local
+        /// fallback serves, and the plane records ZERO calls (item 10's
+        /// "every failure path" letter).
+        #[tokio::test]
+        async fn chat_wall_quic_dial_failure_records_zero_advisory_calls() {
+            let dir = tempfile::tempdir().unwrap();
+            let (telemetry, _sink) = Telemetry::memory();
+            let telemetry = Arc::new(telemetry);
+            let (_plane, double, _tx) = armed_plane(dir.path());
+
+            // The mock tracker: one FOREIGN peer with free slots and a
+            // real QUIC multiaddr pointing at a dead loopback port.
+            let app = axum::Router::new().route(
+                "/api/v1/peers",
+                axum::routing::get(|| async move {
+                    axum::Json(serde_json::json!({ "peers": [{
+                        "peerId": "12D3KooWDialFailPeer0000000000000000",
+                        "addresses": ["/ip4/127.0.0.1/udp/1/quic-v1"],
+                        "queueMs": 5, "freeSlots": 1,
+                        "capacityClass": "cpu", "leaseExpiresAt": "z", "lastSeenAt": "z",
+                    }]}))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            std::fs::write(dir.path().join("session.token"), "wall-test-session").unwrap();
+
+            // A LOCAL executor that serves (the honest fallback path —
+            // dial failure must end in a served reply, not a dead end).
+            struct LocalOk;
+            #[async_trait::async_trait]
+            impl InferenceExecutor for LocalOk {
+                async fn execute(
+                    &self,
+                    _request: NormalizedRequest,
+                ) -> Result<ExecutorStream, ExecutorError> {
+                    Ok(Box::pin(futures_util::stream::iter(vec![
+                        ExecutorEvent::TokenDelta {
+                            delta: "local ok".into(),
+                            index: 0,
+                        },
+                        ExecutorEvent::Usage {
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                            prefill_ms: 1.0,
+                            decode_ms: 1.0,
+                        },
+                        ExecutorEvent::Completed {
+                            finish_reason: modelswarm_gateway::FinishReason::Stop,
+                        },
+                    ])))
+                }
+            }
+
+            let inner = tokio::sync::Mutex::new(test_inner(
+                dir.path(),
+                &format!("http://{addr}"),
+                Some("msp1:wall"),
+            ));
+            let executor: Arc<dyn InferenceExecutor> = Arc::new(LocalOk);
+            let log = vec![ChatTurn {
+                role: "user".into(),
+                content: "dial fail canary".into(),
+            }];
+            let noop = |_: &str| {};
+            let reply = try_swarm_chat(
+                &inner,
+                &format!("http://{addr}"),
+                dir.path(),
+                &telemetry,
+                "msp1:wall",
+                executor,
+                &log,
+                Some(8),
+                0.0,
+                None,
+                &noop,
+            )
+            .await;
+            let reply = reply.expect("the honest local fallback serves after a dial failure");
+            assert!(
+                reply["mode"]
+                    .as_str()
+                    .unwrap()
+                    .contains("remote dial failed"),
+                "the mode label names the dial failure: {}",
+                reply["mode"]
+            );
+            // THE WALL: the dial-failure turn never reached the plane.
+            assert_eq!(double.count(), 0, "W1: zero advisory calls");
+            assert!(double.bodies().is_empty());
+            assert!(double.presented_keys().is_empty());
+        }
+    }
+
+    /// ADR-037 §4.4 items (11 desktop half), (13), (14): the assistant
+    /// panel's disclosure/consent, opt-out, degraded mode, renderer,
+    /// canary, and A3 discipline.
+    mod assistant_panel {
+        use super::super::*;
+        use std::sync::Arc;
+
+        use crate::app::assistant::{self, PanelOutcome, TurnDeps};
+        use modelswarm_node::advisory::{AdvisoryTransport, CountingTransport};
+
+        #[allow(unused_imports)]
+        use super::test_inner;
+
+        fn hw() -> HardwareInfo {
+            HardwareInfo {
+                ram_mb: 32_000,
+                cpu_cores: 12,
+                gpu: Some(GpuInfo {
+                    name: "RTX 5080".into(),
+                    vram_mb: 16_003,
+                }),
+            }
+        }
+
+        fn cards() -> Vec<serde_json::Value> {
+            vec![serde_json::json!({
+                "profile_id": "msp1:aa", "display_name": "Alpha 9B",
+                "quant_method": "q4_k_m", "quant_bits": 4,
+                "hw": {"download_mb": 5_680, "ram_mb_est": 6_144},
+                "fit": "gpu_full", "recommended": true, "peers": 2,
+            })]
+        }
+
+        fn inputs<'a>(
+            hw: &'a HardwareInfo,
+            cards: &'a [serde_json::Value],
+        ) -> assistant::ContextInputs<'a> {
+            assistant::ContextInputs {
+                hardware: hw,
+                picker: cards,
+                family: None,
+                hosting_on: true,
+                listener_addr: None,
+                engine_backend: Some("cpu"),
+                engage_last: None,
+                governor_verdict: None,
+                probe_verdict: None,
+                capacity_class: None,
+                app_version: "0.2.24",
+            }
+        }
+
+        fn boot_cloud(
+            dir: &std::path::Path,
+            double: Arc<CountingTransport>,
+        ) -> Option<assistant::Plane> {
+            std::fs::write(
+                dir.join("advisory.json"),
+                r#"{"assistant.enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"test-model"}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.join("advisory-key.txt"), "test-key-local-double\n").unwrap();
+            std::env::set_var("MSP_ADVISORY_KEY_FILE", dir.join("advisory-key.txt"));
+            let (plane, _) =
+                assistant::Plane::spawn_with_double(dir, double as Arc<dyn AdvisoryTransport>);
+            std::env::remove_var("MSP_ADVISORY_KEY_FILE");
+            plane
+        }
+
+        fn deps<'a>(
+            plane: Option<&'a assistant::Plane>,
+            degrade_gap: &'a str,
+            acknowledged: bool,
+            opt_out: bool,
+            telemetry: &'a Telemetry,
+            inputs: &'a assistant::ContextInputs<'a>,
+        ) -> TurnDeps<'a> {
+            TurnDeps {
+                plane,
+                degrade_gap,
+                acknowledged,
+                opt_out,
+                telemetry,
+                inputs,
+            }
+        }
+
+        /// §4.4 item (13): the first cloud call is BLOCKED until the
+        /// disclosure is acknowledged — then it runs, with the
+        /// provenance chip riding the outcome.
+        #[tokio::test]
+        async fn disclosure_blocks_the_first_cloud_call_until_acknowledged() {
+            let dir = tempfile::tempdir().unwrap();
+            let double = Arc::new(CountingTransport::assistant_echo("short advice".into()));
+            let plane = boot_cloud(dir.path(), double.clone());
+            let plane = plane.expect("the plane arms");
+            let (telemetry, _sink) = Telemetry::memory();
+            let hardware = hw();
+            let picker = cards();
+            let ctx = inputs(&hardware, &picker);
+
+            // NOT acknowledged: the turn is blocked, ZERO calls.
+            let outcome = assistant::turn(
+                deps(Some(&plane), "none", false, false, &telemetry, &ctx),
+                "which model?",
+            )
+            .await;
+            assert_eq!(outcome, PanelOutcome::NeedsAcknowledgement);
+            assert_eq!(double.count(), 0, "the call is BLOCKED until acknowledged");
+
+            // Acknowledged: the turn runs and the reply renders.
+            let outcome = assistant::turn(
+                deps(Some(&plane), "none", true, false, &telemetry, &ctx),
+                "which model?",
+            )
+            .await;
+            match outcome {
+                PanelOutcome::CloudReply { reply, .. } => assert_eq!(reply, "short advice"),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(double.count(), 1);
+        }
+
+        /// §4.4 item (13): opt-out yields ZERO calls (counting double)
+        /// and the built-in static help with the `disabled` label.
+        #[tokio::test]
+        async fn opt_out_yields_zero_calls_and_static_help() {
+            let dir = tempfile::tempdir().unwrap();
+            let double = Arc::new(CountingTransport::assistant_echo("never".into()));
+            let plane = boot_cloud(dir.path(), double.clone());
+            let plane = plane.expect("the plane arms");
+            let (telemetry, _sink) = Telemetry::memory();
+            let hardware = hw();
+            let picker = cards();
+            let ctx = inputs(&hardware, &picker);
+            let outcome = assistant::turn(
+                deps(Some(&plane), "none", true, true, &telemetry, &ctx),
+                "what does resource_ceiling mean?",
+            )
+            .await;
+            match outcome {
+                PanelOutcome::StaticHelp { entries, line } => {
+                    assert_eq!(
+                        line,
+                        "Built-in help — the cloud assistant is off/unreachable (disabled)."
+                    );
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].label, "resource_ceiling");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(double.count(), 0, "opt-out = zero calls");
+        }
+
+        /// §4.4 item (13): degraded mode renders static help with the
+        /// honest gap label — never a blank box, never a spinner.
+        #[tokio::test]
+        async fn degraded_mode_renders_static_help_with_the_gap_label() {
+            let _dir = tempfile::tempdir().unwrap();
+            let (telemetry, _sink) = Telemetry::memory();
+            let hardware = hw();
+            let picker = cards();
+            let ctx = inputs(&hardware, &picker);
+            let outcome = assistant::turn(
+                deps(None, "no_key", false, false, &telemetry, &ctx),
+                "why is family off (pairing_disabled)?",
+            )
+            .await;
+            match outcome {
+                PanelOutcome::StaticHelp { entries, line } => {
+                    assert_eq!(
+                        line,
+                        "Built-in help — the cloud assistant is off/unreachable (no_key)."
+                    );
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].label, "pairing_disabled");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// §3.7 rendering contract end-to-end: a >4000-char provider
+        /// reply renders TRUNCATED at the display cap.
+        #[tokio::test]
+        async fn reply_renders_capped_at_the_display_cap() {
+            let dir = tempfile::tempdir().unwrap();
+            let long: String = "x".repeat(5_000);
+            let double = Arc::new(CountingTransport::assistant_echo(long));
+            let plane = boot_cloud(dir.path(), double.clone());
+            let plane = plane.expect("the plane arms");
+            let (telemetry, _sink) = Telemetry::memory();
+            let hardware = hw();
+            let picker = cards();
+            let ctx = inputs(&hardware, &picker);
+            let outcome = assistant::turn(
+                deps(Some(&plane), "none", true, false, &telemetry, &ctx),
+                "q",
+            )
+            .await;
+            match outcome {
+                PanelOutcome::CloudReply { reply, .. } => {
+                    assert_eq!(
+                        reply.chars().count(),
+                        4_000 + "…[truncated]".chars().count()
+                    );
+                    assert!(reply.ends_with("…[truncated]"));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// §4.4 item (11), desktop half: the app's OWN conversation
+        /// transcript and an ADR-036-shaped carrier payload are seeded
+        /// into process state; assistant turns run; the canary bytes
+        /// appear NOWHERE in any serialized request. The builder is
+        /// structurally fed none of it (W3) — this proves the bytes
+        /// cannot leak through the typed context.
+        #[tokio::test]
+        async fn desktop_canary_suite_transcript_and_carrier_absent() {
+            let dir = tempfile::tempdir().unwrap();
+            let double = Arc::new(CountingTransport::assistant_echo("advice".into()));
+            let plane = boot_cloud(dir.path(), double.clone());
+            let plane = plane.expect("the plane arms");
+            let (telemetry, _sink) = Telemetry::memory();
+
+            const CANARY_TRANSCRIPT: &str = "DESKTOP-WALL-CANARY-transcript-0123456789abcdef";
+            const CANARY_CARRIER: &str = "DESKTOP-WALL-CANARY-carrier-fedcba9876543210";
+            // Seed the app state the way a real session would: a
+            // transcript full of canary bytes and a lease-shaped carrier
+            // payload string.
+            let mut inner = test_inner(dir.path(), "http://127.0.0.1:9", Some("msp1:canary"));
+            inner.chat_log = vec![
+                ChatTurn {
+                    role: "user".into(),
+                    content: format!("{CANARY_TRANSCRIPT} hello"),
+                },
+                ChatTurn {
+                    role: "assistant".into(),
+                    content: format!("reply {CANARY_TRANSCRIPT}"),
+                },
+            ];
+            inner.swarm_lease = Some((
+                "msp1:canary".into(),
+                format!("{{\"promptTokens\": [1, 2, 3], \"payload\": \"{CANARY_CARRIER}\"}}"),
+                u64::MAX,
+            ));
+            inner.last_engage_reason = Some("gate_no_win".into());
+
+            let hardware = hw();
+            let picker = cards();
+            let ctx = inputs(&hardware, &picker);
+            let outcome = assistant::turn(
+                deps(Some(&plane), "none", true, false, &telemetry, &ctx),
+                "which model fits my machine?",
+            )
+            .await;
+            assert!(matches!(outcome, PanelOutcome::CloudReply { .. }));
+            assert!(!double.bodies().is_empty());
+            for body in double.bodies() {
+                assert!(
+                    !body.contains(CANARY_TRANSCRIPT),
+                    "transcript canary reached the provider"
+                );
+                assert!(
+                    !body.contains(CANARY_CARRIER),
+                    "carrier canary reached the provider"
+                );
+                assert!(!body.contains("promptTokens"));
+                assert!(!body.contains("test-key-local-double"));
+            }
+        }
+
+        /// §4.4 item (14), the A3 extension: with the assistant plane
+        /// ABSENT vs ENABLED-WITH-ERRORING-TRANSPORT, the deterministic
+        /// surfaces are byte-identical (the picker pipeline's pure
+        /// functions; the engage ladder is pinned by its own golden
+        /// test), and the telemetry streams are byte-identical after
+        /// filtering `advisory.*`/`assistant.*`.
+        #[tokio::test]
+        async fn assistant_a3_extension_plane_absent_vs_erroring() {
+            let dir = tempfile::tempdir().unwrap();
+
+            // The deterministic picker pipeline, computed identically in
+            // both postures (fit_and_score + the census join order).
+            let hardware = hw();
+            let models: Vec<serde_json::Value> = vec![
+                serde_json::json!({
+                    "profile_id": "msp1:aa", "display_name": "Alpha 9B",
+                    "fit": "gpu_full", "recommended": true,
+                }),
+                serde_json::json!({
+                    "profile_id": "msp1:bb", "display_name": "Bravo 27B",
+                    "fit": "gpu_partial", "recommended": false,
+                }),
+            ];
+            let mut counts = std::collections::BTreeMap::new();
+            counts.insert("msp1:aa".to_string(), 2);
+            counts.insert("msp1:bb".to_string(), 9);
+            let view_a = census_view(&models, Some(&counts));
+            let view_b = census_view(&models, Some(&counts));
+            assert_eq!(
+                serde_json::to_string(&view_a).unwrap(),
+                serde_json::to_string(&view_b).unwrap(),
+                "the census join is a pure function — identical by construction"
+            );
+            // fit_and_score over the same inputs is byte-identical.
+            let score = |ram: u64, w: u64| {
+                let ranked = fit_and_score(&hardware, ram, w).map(|(fit, s)| (fit.label(), s));
+                serde_json::to_string(&ranked).unwrap()
+            };
+            assert_eq!(score(6_144, 5_680), score(6_144, 5_680));
+
+            // Plane ABSENT vs erroring: the telemetry streams, filtered
+            // of advisory.*/assistant.*, are byte-identical.
+            let (telemetry_absent, sink_absent) = Telemetry::memory();
+            let picker = cards();
+            let ctx = inputs(&hardware, &picker);
+            let absent = assistant::turn(
+                deps(None, "no_key", true, false, &telemetry_absent, &ctx),
+                "question",
+            )
+            .await;
+            let (telemetry_erroring, sink_erroring) = Telemetry::memory();
+            let double = Arc::new(CountingTransport::always_erroring());
+            let plane = boot_cloud(dir.path(), double.clone());
+            let erroring = assistant::turn(
+                deps(
+                    plane.as_ref(),
+                    "none",
+                    true,
+                    false,
+                    &telemetry_erroring,
+                    &ctx,
+                ),
+                "question",
+            )
+            .await;
+            assert!(matches!(absent, PanelOutcome::StaticHelp { .. }));
+            assert!(matches!(erroring, PanelOutcome::CloudGap { .. }));
+            let filter = |rows: Vec<String>| -> Vec<String> {
+                rows.into_iter()
+                    .filter(|l| {
+                        !l.contains("\"event\":\"advisory.")
+                            && !l.contains("\"event\":\"assistant.")
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                filter(sink_absent.snapshot()),
+                filter(sink_erroring.snapshot()),
+                "A3: byte-identical after filtering the planes' own rows"
+            );
+            // And the erroring plane emitted ONLY assistant.* rows.
+            for line in sink_erroring.snapshot() {
+                assert!(line.contains("\"event\":\"assistant."), "{line}");
+            }
         }
     }
 }

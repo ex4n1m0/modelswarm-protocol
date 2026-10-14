@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MSP ADR-037 UI harness — the assistant panel</title>
+  <style>
+    body { font: 13px/1.5 system-ui, sans-serif; color: #e8edf7; background: #10141c; margin: 1.5rem; }
+    h1 { font-size: 16px; } h2 { font-size: 13px; color: #9aa7bf; text-transform: uppercase; }
+    .pass { color: #43c78f; } .fail { color: #e06565; }
+    td, th { text-align: left; padding: 3px 10px 3px 0; border-bottom: 1px solid #2c3850; }
+    code { color: #a855f7; }
+  </style>
+</head>
+<body>
+  <h1>ADR-037 harness — the setup-assistant panel (chat wall W4 + §3.6 disclosure + §3.7 rendering)</h1>
+  <p>Loads the REAL <code>../ui/index.html</code> into a same-origin 1152×648 iframe with a stubbed
+  <code>window.__TAURI__</code> bridge, then asserts (ADR-037 §3.6/§3.7, §4.4 item 13): the first-use
+  disclosure renders VERBATIM and the first cloud call is blocked until acknowledged; every cloud reply
+  carries the always-adjacent provenance chip; replies render PLAIN TEXT ONLY (markup-looking text stays
+  literal, nothing is parsed) and clip at the 4000-char display cap; degraded mode renders built-in help
+  with the honest gap label; the Settings opt-out toggle writes through; the assistant lives on its OWN
+  <code>assistant-*</code> event namespace and its output NEVER reaches the swarm chat transcript; AD-3
+  local-facts pairing stays under the replies. Rendered geometry is measured at the app's default window
+  size (the owner's standing rule).</p>
+  <p><strong>Run:</strong> serve the crate root over http — e.g.
+  <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> — then open
+  <code>http://127.0.0.1:4817/ui-harness/assistant.html</code>.</p>
+  <h2>Results</h2>
+  <div id="results">running…</div>
+  <script>
+    // The §3.6/§3.7 texts, verbatim (the daemon owns them; the harness
+    // pins them against drift in EITHER layer).
+    const DISCLOSURE = "This assistant sends what you type here, plus facts about your machine and setup (hardware, model list, status labels — never your swarm chats), to a cloud service (DeepSeek) using a key configured on this machine. It is advice only — it cannot change any decision this app makes. You can turn it off any time in Settings.";
+    const CHIP = "Cloud assistant — advice only; this app's rules decide.";
+    const DEGRADED = (gap) => "Built-in help — the cloud assistant is off/unreachable (" + gap + ").";
+
+    const calls = { assistant_turn: [], assistant_acknowledge: 0, set_assistant_enabled: null, assistant_reset: 0 };
+    let mode = "cloud-unacked";
+    let turnPayload = null;
+
+    const BASE = {
+      version: "0.0.0-harness", tracker: "https://stub.local", data_dir: "C:/stub",
+      engine_available: true, engine_path: "C:/stub/engine/llama-server.exe",
+      gpu_engine_available: false, license_accepted: true, profile_id: null, artifact: null,
+      pairing_allowed: true, content_carriage_allowed: true,
+      family_verified_chat: { elected: false, cohort: 1, disclosure: null },
+      node: { running: true, hosting: true, gateway_addr: "127.0.0.1:11435", installation_id: "stub-install",
+              engine_port: 1, engine_backend: "cpu", listener_addr: null, enrollment: null },
+      family: { state: "off", reason: "pairing_disabled", detail: null, disclosure: null,
+                lease_roster_peers: 0, pin: null, carriage: null, governor_label: null },
+      chat_turns: 0,
+    };
+    const statusOf = () => {
+      if (mode === "cloud-unacked") return { ...BASE, assistant: { cloud: true, gap: "none", acknowledged: false, enabled: true, disclosure: DISCLOSURE } };
+      if (mode === "cloud-acked")   return { ...BASE, assistant: { cloud: true, gap: "none", acknowledged: true,  enabled: true, disclosure: null } };
+      if (mode === "opted-out")     return { ...BASE, assistant: { cloud: false, gap: "disabled", acknowledged: true, enabled: false, disclosure: null } };
+      return { ...BASE, assistant: { cloud: false, gap: "no_key", acknowledged: false, enabled: true, disclosure: null } };
+    };
+
+    window.__listens = {};
+    window.__stubInvoke = async (cmd, args) => {
+      switch (cmd) {
+        case "get_status": return statusOf();
+        case "analyze_hardware": return { ram_mb: 32000, cpu_cores: 12, gpu: null };
+        case "list_models": return [];
+        case "census": return { peers_online: 0, counts: {} };
+        case "resource_sample": return {};
+        case "lookup_peers": return [];
+        case "send_chat": return { content: "swarm reply", completion_tokens: 2, elapsed_ms: 10, tokens_per_second: 50, mode: "local" };
+        case "assistant_turn":
+          calls.assistant_turn.push(args);
+          if (turnPayload) return turnPayload;
+          if (mode === "cloud-unacked") return { kind: "needs_ack", disclosure: DISCLOSURE };
+          if (mode === "degraded" || mode === "opted-out")
+            return { kind: "static", line: DEGRADED(mode === "opted-out" ? "disabled" : "no_key"),
+                     entries: [{ label: "pairing_disabled", text: "The swarm-pairing toggle is off." }] };
+          return { kind: "reply", reply: "stub advice", conversation_id: "0123456789abcdef", turn: 1, hints: [], hints_discarded: 0, chip: CHIP };
+        case "assistant_acknowledge": calls.assistant_acknowledge += 1; return {};
+        case "set_assistant_enabled": calls.set_assistant_enabled = args; return {};
+        case "assistant_reset": calls.assistant_reset += 1; return { reset: true };
+        default: return {};
+      }
+    };
+    const STUB = '<scr' + 'ipt>window.__TAURI__ = { core: { invoke: (cmd, args) => parent.__stubInvoke(cmd, args) }, event: { listen: async (name, cb) => { parent.__listens[name] = cb } } };</scr' + 'ipt>';
+
+    async function runScenario(ui, waitFor = "assistant-section") {
+      const frame = document.createElement("iframe");
+      frame.setAttribute("aria-hidden", "true");
+      frame.style.cssText = "width:1152px;height:648px;border:0;position:absolute;left:-12000px;top:0;";
+      document.body.appendChild(frame);
+      frame.srcdoc = ui.replace("<head>", "<head>" + STUB);
+      let doc = null;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        await new Promise((r) => setTimeout(r, 100));
+        doc = frame.contentDocument;
+        if (doc && doc.getElementById(waitFor)) break;
+      }
+      return { doc, frame };
+    }
+
+    function render(rows) {
+      const table = document.createElement("table");
+      for (const { label, pass, detail } of rows) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td class="${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</td><td>${label}</td><td><code>${detail ?? ""}</code></td>`;
+        table.appendChild(tr);
+      }
+      const all = rows.every((r) => r.pass);
+      const summary = document.createElement("p");
+      summary.innerHTML = `<strong class="${all ? "pass" : "fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
+      document.getElementById("results").replaceChildren(summary, table);
+      document.title = all ? "ALL PASS" : "FAILURES";
+    }
+
+    async function submit(doc, text) {
+      doc.getElementById("assistant-input").value = text;
+      doc.getElementById("assistant-form").dispatchEvent(new doc.defaultView.Event("submit", { cancelable: true }));
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
+    (async () => {
+      const ui = await (await fetch("../ui/index.html")).text();
+      const rows = [];
+
+      // ---- Scenario A: cloud mode, disclosure NOT acknowledged ------
+      mode = "cloud-unacked"; turnPayload = null;
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        const box = doc.getElementById("assistant-disclosure");
+        rows.push({ label: "A: the §3.6 first-use disclosure is visible before the first call",
+          pass: !!box && !box.hidden, detail: box ? (box.hidden ? "hidden" : "visible") : "missing" });
+        rows.push({ label: "A: the disclosure text is VERBATIM (§3.6)",
+          pass: doc.getElementById("assistant-disclosure-text").textContent === DISCLOSURE,
+          detail: doc.getElementById("assistant-disclosure-text").textContent.slice(0, 50) + "…" });
+        // A turn before acknowledgement: blocked, zero-render of replies.
+        await submit(doc, "which model fits?");
+        const transcript = doc.getElementById("assistant-transcript").innerText;
+        rows.push({ label: "A: the first cloud call is BLOCKED until acknowledged (needs_ack renders)",
+          pass: transcript.includes("blocked until you acknowledge"), detail: transcript.slice(-60) });
+        rows.push({ label: "A: no cloud reply rendered while blocked",
+          pass: !transcript.includes("stub advice"), detail: "" });
+        // The acknowledge button writes through.
+        doc.getElementById("assistant-ack").click();
+        await new Promise((r) => setTimeout(r, 250));
+        rows.push({ label: "A: the acknowledge button invokes assistant_acknowledge",
+          pass: calls.assistant_acknowledge >= 1, detail: String(calls.assistant_acknowledge) });
+        // W4: the swarm chat transcript is untouched by assistant turns.
+        rows.push({ label: "A: the swarm chat transcript does NOT render assistant output (W4)",
+          pass: !doc.getElementById("transcript").textContent.includes("acknowledge")
+            && doc.getElementById("transcript").children.length === 0, detail: "empty" });
+        const section = doc.getElementById("assistant-section").getBoundingClientRect();
+        rows.push({ label: "A: geometry — the panel renders with real height at 1152×648",
+          pass: section.height > 60, detail: section.height.toFixed(1) + "px" });
+        frame.remove();
+      }
+
+      // ---- Scenario B: acknowledged; plain-text + chip + cap --------
+      mode = "cloud-acked";
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        rows.push({ label: "B: acknowledged — the disclosure is hidden",
+          pass: doc.getElementById("assistant-disclosure").hidden, detail: "hidden" });
+        // Markup-looking reply stays literal; nothing parses.
+        const hostile = "<img src=x onerror=alert(1)> <b>not bold</b> [link](https://evil.example)";
+        turnPayload = { kind: "reply", reply: hostile, conversation_id: "0123456789abcdef", turn: 1, hints: [], hints_discarded: 0, chip: CHIP };
+        await submit(doc, "show me something hostile");
+        const last = doc.getElementById("assistant-transcript").lastElementChild;
+        rows.push({ label: "B: markup-looking reply renders PLAIN TEXT ONLY (no elements parse)",
+          pass: !!last && last.querySelectorAll("img, b, a").length === 0
+            && last.textContent.startsWith(hostile), detail: last ? last.textContent.slice(0, 40) : "missing" });
+        const chip = doc.getElementById("assistant-chip");
+        rows.push({ label: "B: the provenance chip is visible and VERBATIM",
+          pass: !!chip && !chip.hidden && chip.textContent === CHIP, detail: chip ? chip.textContent : "missing" });
+        rows.push({ label: "B: AD-3 — the local-facts pairing line is present (non-empty, under the replies)",
+          pass: doc.getElementById("assistant-facts").textContent.includes("local facts")
+            && doc.getElementById("assistant-facts").textContent.includes("pairing_disabled"),
+          detail: doc.getElementById("assistant-facts").textContent });
+        // The 4000-char display cap.
+        turnPayload = { kind: "reply", reply: "y".repeat(5000), conversation_id: "0123456789abcdef", turn: 2, hints: [], hints_discarded: 0, chip: CHIP };
+        await submit(doc, "long reply please");
+        const capped = doc.getElementById("assistant-transcript").lastElementChild.textContent;
+        rows.push({ label: "B: a >4000-char reply clips at the display cap with the honest marker",
+          pass: capped.length === 4000 + "…[truncated]".length && capped.endsWith("…[truncated]"),
+          detail: capped.length + " chars" });
+        frame.remove();
+      }
+
+      // ---- Scenario C: degraded (no_key) — built-in help ------------
+      mode = "degraded"; turnPayload = null;
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        rows.push({ label: "C: the mode line states built-in help WITH the gap label",
+          pass: doc.getElementById("assistant-mode").textContent === DEGRADED("no_key"),
+          detail: doc.getElementById("assistant-mode").textContent });
+        await submit(doc, "what does pairing_disabled mean?");
+        const transcript = doc.getElementById("assistant-transcript").innerText;
+        rows.push({ label: "C: a label question renders the static entry (label-keyed)",
+          pass: transcript.includes("pairing_disabled") && transcript.includes("swarm-pairing toggle is off"),
+          detail: transcript.slice(-80) });
+        rows.push({ label: "C: no provenance chip in built-in mode (no cloud reply shown)",
+          pass: doc.getElementById("assistant-chip").hidden, detail: "hidden" });
+        frame.remove();
+      }
+
+      // ---- Scenario D: the Settings opt-out -------------------------
+      mode = "cloud-acked"; turnPayload = null;
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        const sw = doc.getElementById("assistant-switch");
+        rows.push({ label: "D: the Settings cloud-assistant toggle is present, default ON",
+          pass: !!sw && sw.dataset.on === "true" && sw.getAttribute("aria-checked") === "true",
+          detail: sw ? sw.dataset.on : "missing" });
+        sw.click();
+        await new Promise((r) => setTimeout(r, 250));
+        rows.push({ label: "D: the toggle writes set_assistant_enabled(false)",
+          pass: !!calls.set_assistant_enabled && calls.set_assistant_enabled.enabled === false,
+          detail: JSON.stringify(calls.set_assistant_enabled) });
+        frame.remove();
+      }
+
+      // ---- Scenario E: the assistant-* event namespace (W4) ---------
+      mode = "cloud-acked"; turnPayload = null;
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        rows.push({ label: "E: the page registered the assistant-turn listener",
+          pass: !!window.__listens["assistant-turn"], detail: Object.keys(window.__listens).join(",") });
+        rows.push({ label: "E: the page registered the assistant-reset listener",
+          pass: !!window.__listens["assistant-reset"], detail: "" });
+        if (window.__listens["assistant-turn"]) {
+          const before = doc.getElementById("transcript").children.length;
+          window.__listens["assistant-turn"]({ payload: { kind: "reply", reply: "event reply", conversation_id: "0123456789abcdef", turn: 9, hints: [], hints_discarded: 0, chip: CHIP } });
+          await new Promise((r) => setTimeout(r, 100));
+          const assistantText = doc.getElementById("assistant-transcript").innerText;
+          rows.push({ label: "E: an assistant-turn event renders in the ASSISTANT transcript",
+            pass: assistantText.includes("event reply"), detail: assistantText.slice(-40) });
+          rows.push({ label: "E: the event rendered NOTHING in the swarm chat transcript (W1/W4)",
+            pass: doc.getElementById("transcript").children.length === before
+              && !doc.getElementById("transcript").textContent.includes("event reply"), detail: "untouched" });
+        }
+        if (window.__listens["assistant-reset"]) {
+          window.__listens["assistant-reset"]();
+          await new Promise((r) => setTimeout(r, 100));
+          rows.push({ label: "E: an assistant-reset event clears the assistant transcript only",
+            pass: doc.getElementById("assistant-transcript").children.length === 0
+              && doc.getElementById("transcript").children.length === 0, detail: "cleared" });
+        }
+        frame.remove();
+      }
+
+      render(rows);
+    })().catch((e) => render([{ label: "harness error", pass: false, detail: String(e) }]));
+  </script>
+</body>
+</html>

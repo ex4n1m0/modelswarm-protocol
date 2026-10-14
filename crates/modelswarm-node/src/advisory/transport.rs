@@ -97,10 +97,14 @@ impl AdvisoryTransport for ReqwestTransport {
         request: &ProviderRequest,
         key: &str,
     ) -> Result<Vec<u8>, TransportFailure> {
+        // The system prompt is a repo-versioned constant pinned to the
+        // plane (`digest` default, the assistant plane's override) —
+        // never caller text.
+        let system = request.system_prompt.unwrap_or(DIGEST_SYSTEM_PROMPT);
         let body = serde_json::json!({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": DIGEST_SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user", "content": request.body},
             ],
             "max_tokens": request.max_completion_tokens,
@@ -162,6 +166,9 @@ pub struct CountingTransport {
     keys: std::sync::Mutex<Vec<String>>,
     /// Replayed per call in order; the last entry repeats.
     script: std::sync::Mutex<Vec<Result<Vec<u8>, TransportFailure>>>,
+    /// When set, every call is answered with a valid assistant reply
+    /// echoing the request's turn (overrides the script).
+    assistant_echo: Option<String>,
 }
 
 impl CountingTransport {
@@ -170,6 +177,7 @@ impl CountingTransport {
             calls: std::sync::Mutex::new(Vec::new()),
             keys: std::sync::Mutex::new(Vec::new()),
             script: std::sync::Mutex::new(script),
+            assistant_echo: None,
         }
     }
 
@@ -183,6 +191,23 @@ impl CountingTransport {
     /// A double that always fails at the network layer.
     pub fn always_erroring() -> Self {
         Self::new(vec![Err(TransportFailure::Network("double".into()))])
+    }
+
+    /// A double that answers every call with a VALID assistant reply
+    /// (schema `advisory-assistant/v1`) echoing the request's
+    /// conversation_id/turn — the assistant panel's success-path tests
+    /// ride it (the plane's conversation id is internally generated, so
+    /// a canned body could never echo it).
+    pub fn assistant_echo(reply_text: String) -> Self {
+        Self::new(vec![Err(TransportFailure::Network(
+            "placeholder, replaced in send".into(),
+        ))])
+        .with_assistant_echo(reply_text)
+    }
+
+    fn with_assistant_echo(mut self, reply_text: String) -> Self {
+        self.assistant_echo = Some(reply_text);
+        self
     }
 
     /// Number of calls INITIATED through this double.
@@ -216,6 +241,25 @@ impl AdvisoryTransport for CountingTransport {
     ) -> Result<Vec<u8>, TransportFailure> {
         self.calls.lock().unwrap().push(request.clone());
         self.keys.lock().unwrap().push(key.to_string());
+        if let Some(reply) = &self.assistant_echo {
+            // Echo the request's own turn (a canned body could not know
+            // the plane's internally-generated conversation id).
+            let body: serde_json::Value = serde_json::from_str(&request.body)
+                .map_err(|e| TransportFailure::Network(format!("echo double: {e}")))?;
+            let turn = body
+                .get("turn")
+                .cloned()
+                .ok_or_else(|| TransportFailure::Network("echo double: no turn".into()))?;
+            return Ok(serde_json::json!({
+                "schema": "advisory-assistant/v1",
+                "conversation_id": turn["conversation_id"],
+                "turn": turn["turn"],
+                "reply": reply,
+                "hints": [],
+            })
+            .to_string()
+            .into_bytes());
+        }
         let mut script = self.script.lock().unwrap();
         if script.is_empty() {
             return Err(TransportFailure::Network("script exhausted".into()));

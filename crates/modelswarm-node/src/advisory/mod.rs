@@ -34,6 +34,7 @@
 //! measured-before-trusted (nothing here applies anything).
 
 pub mod accum;
+pub mod assistant;
 pub mod config;
 pub mod egress;
 pub mod runner;
@@ -49,6 +50,16 @@ pub use config::AdvisoryConfig;
 pub use runner::AdvisoryHandle;
 pub use state::Gap;
 pub use transport::{AdvisoryTransport, CountingTransport, ReqwestTransport};
+
+/// Serializes tests that set/remove `MSP_ADVISORY_KEY_FILE` (protocol
+/// review advisory A-4: parallel tokio tests in one binary race the
+/// process env; the assistant leg added more env-riding tests, so the
+/// guard is now load-bearing). Take this lock around every env mutation.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// The arming decision for one installation: an armed plane has
 /// `enabled=true`, a readable key file, an https endpoint, and a model
@@ -176,7 +187,11 @@ mod tests {
     /// `tests/advisory_chat_wall.rs` and the desktop swarm paths ride
     /// the desktop tauri-shell suite.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: the guard must
+                                         // span the awaits (the node start READS the env inside); the A-4
+                                         // serial guard trades this lint for race-free env tests.
     async fn chat_wall_success_path_records_zero_advisory_calls() {
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(config::ADVISORY_CONFIG_FILE),
@@ -249,12 +264,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate (see above).
     async fn armed_plane_runs_a_cycle_and_the_double_records_it() {
         // The counter-sensitivity control for the chat-wall suite: with
         // the plane armed and fed past the threshold, the counting
         // double DOES record calls — proving "zero calls" assertions in
         // the wall tests are meaningful (a dead counter would pass
         // vacuously).
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(config::ADVISORY_CONFIG_FILE),

@@ -380,9 +380,11 @@ fn skip_char_or_lifetime(text: &str, i: usize) -> usize {
     {
         if let Some(close) = text[i + 4..].find('}') {
             let after = i + 4 + close + 1;
-            return (bytes.get(after) == Some(&b'\''))
-                .then_some(after + 1)
-                .unwrap_or(after);
+            return if bytes.get(after) == Some(&b'\'') {
+                after + 1
+            } else {
+                after
+            };
         }
         return i + 1;
     }
@@ -489,6 +491,14 @@ const ADVISORY_NAMES: &[&str] = &[
     "DIGEST_SYSTEM_PROMPT",
     "advisory-egress",
     "advisory-clamp-table",
+    // The assistant surface's names (ADR-037 §7 step 3): same rules —
+    // they live only in the advisory module, the sanctioned desktop
+    // assistant module, and tests.
+    "AssistantPlane",
+    "AssistantState",
+    "AssistantRuntimeCaps",
+    "ASSISTANT_SYSTEM_PROMPT",
+    "advisory-assistant",
 ];
 
 fn find_hits(sources: &BTreeMap<PathBuf, String>, needle: &str) -> Vec<String> {
@@ -598,19 +608,22 @@ fn layer1_decision_crates_do_not_depend_on_the_advisory_host() {
 fn layer2_advisory_names_live_only_in_the_advisory_module_and_tests() {
     let root = workspace_root();
     let advisory_dir = root.join("crates/modelswarm-node/src/advisory");
-    // The module's sanctioned homes: the advisory module itself and the
-    // node's lib.rs — the daemon COMPOSITION file whose Node::start
-    // wires the plane (§9.4: "the advisory client lands … in
-    // crates/modelswarm-node::advisory", hosted by this crate). Every
-    // other crate source must be clean. (The desktop display renderer
-    // is a sanctioned FUTURE consumer per ADR-037 §4.5 — at THIS leg no
-    // exemption exists; the assistant leg's review adds it, and
-    // modelswarm-bench's §9.2(6) exemption is for the shadow LEDGER,
-    // which at this leg touches no advisory name.)
+    // The module's sanctioned homes: the advisory module itself, the
+    // node's lib.rs (the daemon COMPOSITION file whose Node::start
+    // wires the plane — §9.4: "the advisory client lands … in
+    // crates/modelswarm-node::advisory", hosted by this crate), and —
+    // since the ADR-037 §7 step-3 leg — the desktop's assistant module
+    // (`crates/modelswarm-desktop/src/app/assistant.rs`), the §4.5
+    // sanctioned home of the panel/IPC/renderer/static-help/disclosure
+    // surface. app.rs itself stays UNEXEMPTED: the chat scopes live
+    // there and must not know the plane exists (the test below).
     let composition_host = root.join("crates/modelswarm-node/src/lib.rs");
+    let desktop_assistant = root.join("crates/modelswarm-desktop/src/app/assistant.rs");
     let crates = root.join("crates");
     let mut sources = rust_sources_under(&crates, None);
-    sources.retain(|path, _| !path.starts_with(&advisory_dir) && *path != composition_host);
+    sources.retain(|path, _| {
+        !path.starts_with(&advisory_dir) && *path != composition_host && *path != desktop_assistant
+    });
     for name in ADVISORY_NAMES {
         let hits = find_hits(&sources, name);
         assert!(
@@ -720,11 +733,15 @@ fn layer2_request_builder_modules_reference_no_chat_or_carrier_types() {
 
 #[test]
 fn layer2_the_provider_call_executes_from_exactly_one_site() {
-    // The enumerated-call-sites pin (W2): at this leg the ONLY producer
-    // of provider calls is the digest timer. Asserted by source scan:
-    // `transport.send(` executes solely in the runner; `advisory::wire(`
-    // is invoked solely from Node::start; `runner::spawn`/`advisory::
-    // spawn` appear only in their own definitions/wiring.
+    // The enumerated-call-sites pin (W2), extended by ADR-037 §7 step 3:
+    // the advisory client has exactly TWO entry classes — the
+    // timer-driven digest cycle (runner.rs) and the user-triggered
+    // assistant turn (assistant.rs). Asserted by source scan:
+    // `transport.send(&request` executes solely in those two files;
+    // `advisory::wire(` is invoked solely from Node::start;
+    // `ReqwestTransport::new(` only inside the advisory module (the
+    // desktop assistant module goes through `AssistantPlane::spawn`).
+    // A THIRD call site requires an ADR-037 amendment.
     let root = workspace_root();
     let node_src = root.join("crates/modelswarm-node/src");
     let desktop_src = root.join("crates/modelswarm-desktop/src");
@@ -733,11 +750,12 @@ fn layer2_the_provider_call_executes_from_exactly_one_site() {
         production.insert(path, text);
     }
     let send_hits = find_hits(&production, ".send(&request");
+    let expected_assistant = node_src.join("advisory").join("assistant.rs");
     let expected_runner = node_src.join("advisory").join("runner.rs");
     assert_eq!(
         send_hits.iter().map(Path::new).collect::<Vec<_>>(),
-        vec![expected_runner.as_path()],
-        "the ONE transport execution site is the digest timer's runner"
+        vec![expected_assistant.as_path(), expected_runner.as_path()],
+        "the ONLY transport execution sites are the assistant turn runner and the digest timer's runner (W2's two entry classes)"
     );
     let wire_hits = find_hits(&production, "advisory::wire(");
     let expected_lib = node_src.join("lib.rs");

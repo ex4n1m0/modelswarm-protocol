@@ -411,6 +411,11 @@ mod tests {
 
     #[test]
     fn key_resolution_order_env_config_default() {
+        // The whole test rides the advisory env lock (A-4): while other
+        // tests hold the lock with the env var set, even the LOCK-FREE
+        // assertions below must not run (resolve_key_file consults the
+        // process env).
+        let _env = super::super::env_lock();
         let cfg = AdvisoryConfig::default();
         // Config override wins over platform default.
         let with_cfg = AdvisoryConfig {
@@ -422,9 +427,7 @@ mod tests {
             PathBuf::from("/tmp/owner-key.txt")
         );
         assert_eq!(resolve_key_file(&cfg), default_key_file());
-        // Env wins over both when set (scoped: env mutations race other
-        // tests in this process, so assert only the priority order via a
-        // distinct var snapshot — set, check, remove).
+        // Env wins over both when set.
         std::env::set_var(ENV_ADVISORY_KEY_FILE, "/env-first.txt");
         assert_eq!(resolve_key_file(&with_cfg), PathBuf::from("/env-first.txt"));
         std::env::remove_var(ENV_ADVISORY_KEY_FILE);

@@ -1,6 +1,6 @@
 {
   "schema": "advisory-egress/1",
-  "frozen_by": "ADR-033 revision 2 (2026-10-12), created by the first advisory implementation session under that revision's authority (ADR-033 §9.4); changes only by ADR-033 amendment. This initial content is the DIGEST-PLANE field set; the ADR-037 §4.2 rows (assistant context-block fields, the plane enum, assistant.turn.* event names, the peer_pattern_note/catalog_presentation_hint suggestion types, and the rate_limited/request_oversized gap values) land with the assistant leg and are NOT present here yet.",
+  "frozen_by": "ADR-033 revision 2 (2026-10-12), created by the first advisory implementation session under that revision's authority (ADR-033 §9.4); changes only by ADR-033 amendment. This initial content is the DIGEST-PLANE field set, EXTENDED by the ADR-037 §4.2 assistant-leg edit (2026-10-14, one edit per the protocol review's assumption 3): the assistant context-block section, the plane enum, the assistant.turn.* event names (plane_own), the advisory_gap values rate_limited/request_oversized (14 values, §4.3), and the assistant context vocabularies (family_state, family_off_reason, family_engage_label, governor_verdict, governor_gap, family_probe_verdict, hosting_listener_state, engine_backend, capacity_class, os_platform, picker_fit). The peer_pattern_note/catalog_presentation_hint suggestion types land with ADR-037 §7 step 4 (the management-additions leg), not this one.",
   "contract": {
     "one_gate": "Every field leaving the process for the advisory endpoint passes this value-typed allowlist (the content gate), then the shipped modelswarm-telemetry Redactor as a secondary scrub net. A field failing the allowlist is dropped and counted, never sent.",
     "value_types": {
@@ -69,7 +69,7 @@
       ]
     },
     "advisory_gap": {
-      "copied_from": "ADR-033 §6 (12 values at this leg; ADR-037 §4.3 adds rate_limited and request_oversized with the assistant leg)",
+      "copied_from": "ADR-033 §6 (12 digest-plane values) as extended by ADR-037 §4.3 (rate_limited = the assistant hourly burst bound; request_oversized = the assistant body over cap even at zero history) — 14 values; a further value needs an ADR-037 amendment",
       "values": [
         "disabled",
         "no_key",
@@ -82,7 +82,9 @@
         "quota",
         "response_oversized",
         "schema",
-        "late"
+        "late",
+        "rate_limited",
+        "request_oversized"
       ]
     },
     "suggestion_type": {
@@ -123,7 +125,155 @@
         "bad_frame",
         "executor_error"
       ]
+    },
+    "family_state": {
+      "copied_from": "the desktop FamilyStatus.state label (crates/modelswarm-desktop/src/app.rs, ADR-032 disclosure rule)",
+      "values": [
+        "on",
+        "off"
+      ]
+    },
+    "family_off_reason": {
+      "copied_from": "the desktop FamilyStatus stable off-reason labels (crates/modelswarm-desktop/src/app.rs:170-204; every value must keep a static-help entry — ADR-037 §3.6)",
+      "values": [
+        "family_prompt_unpinned",
+        "engine_bridge_failed",
+        "engine_bridge_not_compiled",
+        "verifier_identity_unavailable",
+        "pairing_disabled",
+        "listener_bind_failed",
+        "resource_ceiling"
+      ]
+    },
+    "family_engage_label": {
+      "copied_from": "the desktop family_engage_reason ladder plus the elected_fell_back terminal label (crates/modelswarm-desktop/src/app.rs family_engage_reason; pinned by family_engage_reason_ladder_is_stable)",
+      "values": [
+        "capability_unknown",
+        "capability_false",
+        "backend_mismatch",
+        "gate_unmeasured",
+        "gate_no_win",
+        "blocked_content_contract",
+        "gate_misconfigured",
+        "elected_fell_back"
+      ]
+    },
+    "governor_verdict": {
+      "copied_from": "modelswarm-resource DegradeReason labels (crates/modelswarm-resource/src/governor.rs:151-158)",
+      "values": [
+        "ram_ceiling",
+        "vram_ceiling",
+        "ram_unobservable",
+        "vram_unobservable",
+        "vram_total_unknown",
+        "weights_not_positive"
+      ]
+    },
+    "governor_gap": {
+      "copied_from": "modelswarm-resource KnowledgeGap labels (crates/modelswarm-resource/src/governor.rs:217-219)",
+      "values": [
+        "kv_unmodeled"
+      ]
+    },
+    "family_probe_verdict": {
+      "copied_from": "the desktop pairing_verdict labels (crates/modelswarm-desktop/src/app.rs, ADR-034 rule 6b — count-based, no token id can appear)",
+      "values": [
+        "pairing_confirmed",
+        "pin_mismatch"
+      ]
+    },
+    "hosting_listener_state": {
+      "copied_from": "the desktop listener_addr disclosure (bound vs no listener — the honest beta-boundary label)",
+      "values": [
+        "bound",
+        "none"
+      ]
+    },
+    "engine_backend": {
+      "copied_from": "the node's engine backend labels (cpu | vulkan — the dual-engine Windows staging, ADR-024)",
+      "values": [
+        "cpu",
+        "vulkan"
+      ]
+    },
+    "capacity_class": {
+      "copied_from": "the msp-v1 §3.3 capacityClass vocabulary (ADR-012; self-reported labels off the challenge/complete response)",
+      "values": [
+        "cpu",
+        "gpu_entry",
+        "gpu_mid",
+        "gpu_high"
+      ]
+    },
+    "os_platform": {
+      "copied_from": "std::env::consts::OS over the three shipped platforms (Windows NSIS, deb/AppImage, macOS dmg — one release train)",
+      "values": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    },
+    "picker_fit": {
+      "copied_from": "the desktop Fit labels (fit_and_score, crates/modelswarm-desktop/src/app.rs:1403-1411)",
+      "values": [
+        "gpu_full",
+        "gpu_partial",
+        "ram_only"
+      ]
     }
+  },
+  "plane_enum": {
+    "note": "which plane a plane-own telemetry row belongs to (ADR-037 §4.2): advisory.* rows are the digest plane, assistant.* rows are the assistant plane. Both are excluded from digest aggregation (RC-4).",
+    "values": [
+      "digest",
+      "assistant"
+    ]
+  },
+  "assistant_context_block": {
+    "note": "ADR-037 §3.5: the assistant-plane typed context block. Every field is value-typed against THIS section; a name not listed here never enters an assistant request, and adding a field is an ADR-037 amendment. There is deliberately NO free-text field type: the user's assistant-channel text is the one disclosed exception and rides the request's turn/history members, never the context block. Chat transcripts, serving frames, and ADR-036 carrier payloads have no field type here and no parse path into the builder (the W3 data wall).",
+    "value_types": {
+      "integer": "64-bit signed integer, JSON number without fraction",
+      "boolean": "JSON true/false",
+      "enum": "string VALUE-matched against the frozen vocabulary named after the colon in the field's type",
+      "display_name_string": "bounded string: max 128 chars, no control chars — the signed catalog/candidate display-name class (ADR-033 RC-11 owner-controlled strings)",
+      "gpu_name_string": "bounded string: max 128 chars, no control chars — drawn from the engine's device-listing text",
+      "version_string": "bounded string: max 32 chars, charset [A-Za-z0-9.+-]",
+      "vocab_count_map": "object whose keys VALUE-match the frozen vocabulary named after the colon, values integers",
+      "picker_row": "object with exactly the picker_row_fields keys, each value-typed per its declared type"
+    },
+    "fields": {
+      "hw.logical_cpus": "integer",
+      "hw.total_ram_mb": "integer",
+      "hw.gpu.name": "gpu_name_string",
+      "hw.gpu.vram_mb": "integer",
+      "picker.rows": "picker_row[]",
+      "family.state": "enum:family_state",
+      "family.off_reason": "enum:family_off_reason",
+      "family.engage_last": "enum:family_engage_label",
+      "family.governor_verdict": "enum:governor_verdict",
+      "family.governor_gap": "enum:governor_gap",
+      "family.probe_verdict": "enum:family_probe_verdict",
+      "hosting.on": "boolean",
+      "hosting.listener": "enum:hosting_listener_state",
+      "serving.backend": "enum:engine_backend",
+      "capacity.class": "enum:capacity_class",
+      "app.version": "version_string",
+      "app.os": "enum:os_platform",
+      "status.error_counts": "vocab_count_map:msp_v1_section_6_5_error_registry",
+      "status.finish_reason_counts": "vocab_count_map:finish_reason",
+      "status.advisory_gap_counts": "vocab_count_map:advisory_gap"
+    },
+    "picker_row_fields": {
+      "display_name": "display_name_string",
+      "quant_method": "display_name_string",
+      "quant_bits": "integer",
+      "download_mb": "integer",
+      "ram_mb_est": "integer",
+      "fit": "enum:picker_fit",
+      "recommended": "boolean",
+      "census_peers": "integer"
+    },
+    "max_picker_rows": 8
   },
   "reduction_rules": [
     {
@@ -255,7 +405,9 @@
       "sched.shadow.realized": "excluded",
       "advisory.cycle.sent": "plane_own",
       "advisory.cycle.gap": "plane_own",
-      "advisory.suggestion.recorded": "plane_own"
+      "advisory.suggestion.recorded": "plane_own",
+      "assistant.turn.sent": "plane_own",
+      "assistant.turn.gap": "plane_own"
     }
   }
 }

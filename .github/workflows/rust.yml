@@ -153,7 +153,15 @@ jobs:
           python tests/fixtures/advisory-egress/scan_emit_sites.py
       # ADR-037 §4.4 item 10 layer 1, CI-native: the advisory host's
       # dependency direction (chat/serving surfaces can never reach the
-      # provider client through the crate graph).
+      # provider client through the crate graph). T/R review fix
+      # 2026-10-14: the original step matched d.get('package') — a key
+      # cargo metadata only sets for RENAMED deps, so `dependents` was
+      # always EMPTY and the assert could never fire (vacuously green,
+      # printing "dependents []"). Match on d['name'] with the same kind
+      # semantics as the in-tree layer-1 test (normal deps only; the
+      # decision crates' dev-dep ban is governed there) and require the
+      # expected set exactly, so the step also reds if the graph LOSES a
+      # dependent.
       - name: Chat wall layer 1 (dependency direction)
         run: |
           cargo metadata --no-deps --format-version 1 > /tmp/meta.json
@@ -164,10 +172,14 @@ jobs:
           node = by_name.get('modelswarm-node')
           assert node, 'modelswarm-node missing'
           dependents = {p['name'] for p in meta['packages']
-                        if any(d.get('package') == 'modelswarm-node' for d in p['dependencies'])}
-          allowed = {'modelswarm-desktop', 'modelswarm-bench'}
-          extra = dependents - allowed
-          assert not extra, f'advisory host gained unexpected dependents: {extra}'
+                        if any(d.get('name') == 'modelswarm-node'
+                               and d.get('kind', 'normal') != 'dev'
+                               for d in p['dependencies'])}
+          expected = {'modelswarm-desktop', 'modelswarm-bench'}
+          assert dependents == expected, (
+              f'advisory host dependents drifted: {sorted(dependents)} '
+              f'(expected exactly {sorted(expected)}; bench is the sanctioned '
+              'ADR-033 9.2(6) shadow-ledger exemption)')
           assert 'modelswarm-advisory' not in by_name, 'dedicated advisory crate not sanctioned'
           print(f'chat-wall layer 1 OK: dependents {sorted(dependents)}')
           PY
@@ -224,6 +236,28 @@ jobs:
           for ipc in set_content_carriage set_family_verified_chat; do
             if ! grep -q "$ipc" crates/modelswarm-desktop/ui/index.html; then
               echo "::error::ADR-036 IPC '$ipc' no longer referenced by the webview (the carriage/election toggles must write through)"
+              exit 1
+            fi
+          done
+      # ADR-037 §3.6/§4.5 (added at the T/R review 2026-10-14, same
+      # string-level drift class as the ADR-036 step above): the assistant
+      # panel's own section/input/event namespace, the disclosure +
+      # acknowledge button, the provenance chip, and all four IPC names
+      # must EXIST in the webview markup. Verbatim texts and behavior are
+      # pinned by the desktop tauri-shell suite + the rendered 1152x648
+      # harness (a review-seat pass); this catches a UI refactor dropping
+      # the surfaces while every Rust test stays green.
+      - name: ADR-037 assistant surfaces exist in the webview
+        run: |
+          for id in assistant-section assistant-mode assistant-disclosure assistant-ack assistant-facts assistant-transcript assistant-form assistant-input assistant-chip assistant-switch; do
+            if ! grep -q "\"$id\"" crates/modelswarm-desktop/ui/index.html; then
+              echo "::error::ADR-037 UI surface '$id' missing from crates/modelswarm-desktop/ui/index.html (the assistant panel contract)"
+              exit 1
+            fi
+          done
+          for ipc in assistant_turn assistant_reset assistant_acknowledge set_assistant_enabled; do
+            if ! grep -q "$ipc" crates/modelswarm-desktop/ui/index.html; then
+              echo "::error::ADR-037 IPC '$ipc' no longer referenced by the webview (the assistant panel must write through)"
               exit 1
             fi
           done

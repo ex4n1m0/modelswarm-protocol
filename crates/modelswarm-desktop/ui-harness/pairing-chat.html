@@ -155,8 +155,13 @@
       rows.push({ label: "geometry: transcript keeps >= 80px minimum",
         pass: doc.getElementById("transcript").clientHeight >= 80,
         detail: doc.getElementById("transcript").clientHeight + "px" });
+      // Bound raised 260 -> 420 at the ADR-037 T/R review (2026-10-14):
+      // the Setup section legitimately gained the Cloud-assistant toggle
+      // row (ADR-037 §3.6 Settings opt-out) — measured 375px at 1152x648
+      // in Edge 155. The bound stays a runaway-growth drift detector,
+      // not a pixel-exact pin.
       rows.push({ label: "geometry: setup section measured (toggle row cost) — recorded for the handoff",
-        pass: setupSection.offsetHeight > 0 && setupSection.offsetHeight < 260,
+        pass: setupSection.offsetHeight > 0 && setupSection.offsetHeight < 420,
         detail: setupSection.offsetHeight + "px" });
       frame.remove();
 

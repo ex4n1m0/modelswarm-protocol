@@ -99,16 +99,37 @@
       return { doc, frame };
     }
 
+    // Results render via textContent ONLY: `detail` carries PAGE-DERIVED
+    // text (transcript excerpts), and scenario B deliberately feeds the
+    // panel a markup-hostile reply. The harness's first render()
+    // interpolated that detail into innerHTML — the browser parsed the
+    // literal `<img src=x onerror=alert(1)>` text, fetched /ui-harness/x,
+    // and the alert() BLOCKING MODAL wedged the tab's main thread in a
+    // real browser (jsdom never loads images, so it passed there). A
+    // harness that parses the hostile bytes it is testing for
+    // non-parsing is self-inflicting the exact sink the product avoids.
     function render(rows) {
       const table = document.createElement("table");
       for (const { label, pass, detail } of rows) {
         const tr = document.createElement("tr");
-        tr.innerHTML = `<td class="${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</td><td>${label}</td><td><code>${detail ?? ""}</code></td>`;
+        const td1 = document.createElement("td");
+        td1.className = pass ? "pass" : "fail";
+        td1.textContent = pass ? "PASS" : "FAIL";
+        const td2 = document.createElement("td");
+        td2.textContent = label;
+        const td3 = document.createElement("td");
+        const code = document.createElement("code");
+        code.textContent = detail ?? "";
+        td3.appendChild(code);
+        tr.append(td1, td2, td3);
         table.appendChild(tr);
       }
       const all = rows.every((r) => r.pass);
       const summary = document.createElement("p");
-      summary.innerHTML = `<strong class="${all ? "pass" : "fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
+      const strong = document.createElement("strong");
+      strong.className = all ? "pass" : "fail";
+      strong.textContent = `${rows.filter((r) => r.pass).length}/${rows.length} checks pass`;
+      summary.appendChild(strong);
       document.getElementById("results").replaceChildren(summary, table);
       document.title = all ? "ALL PASS" : "FAILURES";
     }
@@ -178,10 +199,14 @@
           pass: doc.getElementById("assistant-facts").textContent.includes("local facts")
             && doc.getElementById("assistant-facts").textContent.includes("pairing_disabled"),
           detail: doc.getElementById("assistant-facts").textContent });
-        // The 4000-char display cap.
+        // The 4000-char display cap. Read the REPLY TEXT NODE, not the
+        // whole last child: assistantAdd appends a meta div after the
+        // reply text, so .textContent of the container would count the
+        // meta line too (4012 + 38 = 4050 — the first real-browser run
+        // failed exactly there).
         turnPayload = { kind: "reply", reply: "y".repeat(5000), conversation_id: "0123456789abcdef", turn: 2, hints: [], hints_discarded: 0, chip: CHIP };
         await submit(doc, "long reply please");
-        const capped = doc.getElementById("assistant-transcript").lastElementChild.textContent;
+        const capped = doc.getElementById("assistant-transcript").lastElementChild.childNodes[0].nodeValue;
         rows.push({ label: "B: a >4000-char reply clips at the display cap with the honest marker",
           pass: capped.length === 4000 + "…[truncated]".length && capped.endsWith("…[truncated]"),
           detail: capped.length + " chars" });

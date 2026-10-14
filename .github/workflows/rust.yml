@@ -178,3 +178,26 @@ jobs:
             echo "::error::tauri.conf.json bundle.resources drifted: $ACTUAL (expected $EXPECTED)"
             exit 1
           fi
+      # ADR-036 §3.1 (normative UI contract, added at the T/R review
+      # 2026-10-14): the always-visible disclosure surfaces must EXIST in
+      # the webview markup. The daemon-side §3.1 texts are pinned verbatim
+      # by the desktop tauri-shell tests; this catches the OTHER drift — a
+      # UI refactor dropping the #carriage-line / #verified-chat-line
+      # elements or their toggle IPC wiring while every Rust test stays
+      # green (CI runs no browser; the rendered 1152x648 harness stays a
+      # review-seat pass). String-level drift detection only — honest
+      # about what it can and cannot see.
+      - name: ADR-036 disclosure surfaces exist in the webview
+        run: |
+          for id in carriage-line carriage-switch verified-chat-line verified-chat-switch; do
+            if ! grep -q "\"$id\"" crates/modelswarm-desktop/ui/index.html; then
+              echo "::error::ADR-036 UI surface '$id' missing from crates/modelswarm-desktop/ui/index.html (the always-visible disclosure contract)"
+              exit 1
+            fi
+          done
+          for ipc in set_content_carriage set_family_verified_chat; do
+            if ! grep -q "$ipc" crates/modelswarm-desktop/ui/index.html; then
+              echo "::error::ADR-036 IPC '$ipc' no longer referenced by the webview (the carriage/election toggles must write through)"
+              exit 1
+            fi
+          done

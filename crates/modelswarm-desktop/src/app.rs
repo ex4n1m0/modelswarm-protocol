@@ -7171,6 +7171,13 @@ mod tests {
             Arc<CountingTransport>,
             tokio::sync::watch::Sender<bool>,
         ) {
+            // A-4 (protocol review): parallel tests in this binary share
+            // the process env — the set→wire→remove window over
+            // MSP_ADVISORY_KEY_FILE serializes through ONE lock (the CI
+            // race: a sibling test's remove lands between this set and
+            // wire's read; local runs passed on timing luck).
+            static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             std::fs::write(
                 data_dir.join("advisory.json"),
                 r#"{"enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"test-model"}"#,

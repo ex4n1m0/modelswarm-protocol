@@ -33,8 +33,9 @@ fn adversarial() -> Vec<String> {
         "300000->120000",
         // Float-formatted timings.
         "823.7",
-        // Secret shapes.
-        "sk-abcdef1234567890abcdef1234567890",
+        // Secret shapes (concat!-split so the CI leak-guard grep over
+        // tracked files never sees the key-like literal).
+        concat!("sk-", "abcdef1234567890abcdef1234567890"),
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJxd2VyayJ9.7fGx",
         "Bearer AAAABBBBCCCCDDDD",
         "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",

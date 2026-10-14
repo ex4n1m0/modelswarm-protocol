@@ -7171,28 +7171,28 @@ mod tests {
             Arc<CountingTransport>,
             tokio::sync::watch::Sender<bool>,
         ) {
-            // A-4 (protocol review): parallel tests in this binary share
-            // the process env — the set→wire→remove window over
-            // MSP_ADVISORY_KEY_FILE serializes through ONE lock (the CI
-            // race: a sibling test's remove lands between this set and
-            // wire's read; local runs passed on timing luck).
-            static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            std::fs::write(
-                data_dir.join("advisory.json"),
-                r#"{"enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"test-model"}"#,
-            )
-            .unwrap();
+            // Key resolution rides the config's `key_file`, NEVER the
+            // process-global `MSP_ADVISORY_KEY_FILE`: parallel tests in
+            // this binary race any set→read→remove window over the env
+            // var (549dd18's per-helper lock still lost the cross-helper
+            // race 5/15 runs under a CI-like profile; deleting the shared
+            // state beats locking it — the A3 sweep's discipline).
             let key = data_dir.join("advisory-key.txt");
             std::fs::write(&key, "test-key-local-double\n").unwrap();
-            std::env::set_var("MSP_ADVISORY_KEY_FILE", &key);
+            std::fs::write(
+                data_dir.join("advisory.json"),
+                format!(
+                    r#"{{"enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"test-model","key_file":"{}"}}"#,
+                    key.to_string_lossy().replace('\\', "/")
+                ),
+            )
+            .unwrap();
             let (telemetry, _sink) = Telemetry::memory();
             let double = Arc::new(CountingTransport::always_ok());
             let as_trait: Arc<dyn AdvisoryTransport> = double.clone();
             let (tx, rx) = tokio::sync::watch::channel(false);
             let handle = advisory::wire(data_dir, &Arc::new(telemetry), rx, Some(as_trait))
                 .expect("the plane arms (enabled + key + https endpoint + model)");
-            std::env::remove_var("MSP_ADVISORY_KEY_FILE");
             for _ in 0..250 {
                 handle
                     .accumulators
@@ -7438,16 +7438,21 @@ mod tests {
             dir: &std::path::Path,
             double: Arc<CountingTransport>,
         ) -> Option<assistant::Plane> {
+            // Same discipline as armed_plane: the key rides the config's
+            // `key_file`, never the process-global env var.
+            std::fs::write(dir.join("advisory-key.txt"), "test-key-local-double\n").unwrap();
             std::fs::write(
                 dir.join("advisory.json"),
-                r#"{"assistant.enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"test-model"}"#,
+                format!(
+                    r#"{{"assistant.enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"test-model","key_file":"{}"}}"#,
+                    dir.join("advisory-key.txt")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                ),
             )
             .unwrap();
-            std::fs::write(dir.join("advisory-key.txt"), "test-key-local-double\n").unwrap();
-            std::env::set_var("MSP_ADVISORY_KEY_FILE", dir.join("advisory-key.txt"));
             let (plane, _) =
                 assistant::Plane::spawn_with_double(dir, double as Arc<dyn AdvisoryTransport>);
-            std::env::remove_var("MSP_ADVISORY_KEY_FILE");
             plane
         }
 

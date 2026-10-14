@@ -2,10 +2,24 @@
 
 Seat: Test and Release Engineer (ADR-036 §6 review gate; the ownership map's
 required reviewer for the Windows Product leg).
-Reviewed: HEAD `a9b9ca3` — implementation commits `2e9e468` → `39a8850` →
-`7aa22f2` (the ADR/protocol seat `1e371ed`/`2d3d060` is already merged
-beneath them). No Security-seat commits landed concurrently (git log checked
-at review start and end; HEAD unmoved).
+Reviewed: implementation commits `2e9e468` → `39a8850` → `7aa22f2` at base
+`a9b9ca3` (the ADR/protocol seat `1e371ed`/`2d3d060` is already merged
+beneath them). **Sequencing note (corrected in the follow-up commit):** the
+Security seat's review `21c3dc0` (verdict APPROVE; threat-model rows + 3
+adversarial pins) landed on the shared tree WHILE this review ran. This
+seat's full gate matrix below executed at `a9b9ca3` — proven by the exact
+suite counts (589/0/7 vf+lp, which EXCLUDES the Security commit's 3 new
+tests; at `21c3dc0` the same venue counts 592). After `21c3dc0` landed,
+this seat re-verified its additions at the new HEAD: `cargo fmt --all
+--check` clean; `cargo test -p modelswarm-node --features
+verifydrafts,libp2p-backend --test verifydrafts_pin_carrier_security` →
+**3/3 ok** (offer↔carrier session-id binding, both-keys discriminant,
+commitment self-consistency); `cargo clippy -p modelswarm-node
+--all-targets --features verifydrafts,libp2p-backend -- -D warnings`
+clean. The Security commit touches only the threat model, its review doc,
+and the new test file — no overlap with any surface this review re-ran at
+`a9b9ca3`, so the matrix below stands as the verification of the Windows
+Product implementation exactly as handed off.
 
 ## VERDICT: APPROVE-WITH-REQUIRED-CHANGES
 
@@ -302,8 +316,13 @@ No production behavior was modified by this seat.
 
 ## 5. Carrier-traffic gate statement
 
-T/R seat: **APPROVED conditional on R1 landing** (Redactor extension +
-test + the `token_count` field rename). Combined with the Security seat's
-approval, carrier traffic is unblocked once R1 is merged; recommend the
-Integrator lands R1 and then routes the first cross-machine carrier chat
-(handoff §5.5) with the probe as the pairing diagnostic.
+Security seat: **APPROVED** (`21c3dc0`, 2026-10-14 — findings F1–F3 all
+LOW/advisory; this seat independently re-ran the 3 new adversarial pins,
+3/3 ok).
+T/R seat: **APPROVED conditional on R1 landing** (the Redactor extension:
+the two carrier field names + the shape-based token-array scrub + pin
+tests, per §2.4). Carrier traffic is unblocked once the Integrator merges
+R1 — that is the LAST open condition. Recommended order: R1 → re-run
+`cargo test -p modelswarm-telemetry` + the workspace default suite →
+the first cross-machine carrier chat (handoff §5.5) with the probe as the
+pairing diagnostic.

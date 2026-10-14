@@ -2335,6 +2335,9 @@ async fn set_hosting_inner(
         engine_gpu_binary: gpu_engine,
         engine_model: Some(ensured.path.clone()),
         engine_threads: None,
+        // Production wiring: the advisory plane uses its own pinned
+        // reqwest transport (the test seam stays None outside tests).
+        advisory_transport: None,
     };
     let handle = match Node::start(config.clone(), shutdown_tx.subscribe()).await {
         Ok(handle) => handle,
@@ -6825,5 +6828,156 @@ mod tests {
             family_engage_reason(Some(&cap(true, "CPU")), Some("cpu"), None, None),
             "gate_unmeasured"
         );
+    }
+
+    // ---- Chat wall (ADR-037 §3.1 W1–W6 / §4.4 item 10): the DESKTOP leg --
+    //
+    // The behavioral chat-wall test for this crate's own chat orchestration:
+    // with the advisory plane ARMED and KEYED in-process over a counting
+    // transport double (fed past the digest threshold — plenty to digest,
+    // still silent), every headlessly-drivable `try_swarm_chat` failure
+    // path records ZERO advisory calls. The success path and the
+    // runtime-less gateway failures ride the node crate's suites
+    // (`crates/modelswarm-node` `chat_wall_success_path_records_zero_...`
+    // and `tests/advisory_chat_wall.rs`); layers 1–2 (dependency graph and
+    // source scope) ride `crates/modelswarm-node/tests/advisory_chat_wall.rs`
+    // and scan THIS file too.
+    mod chat_wall {
+        use super::*;
+        use modelswarm_gateway::{
+            ExecutorError, ExecutorStream, InferenceExecutor, NormalizedRequest,
+        };
+        use modelswarm_node::advisory::{self, AdvisoryTransport, CountingTransport};
+        use std::sync::Arc;
+
+        /// A never-called local executor (the failure paths below end before
+        /// the local executor is reached; the swarm executor seam still
+        /// needs SOMETHING to exist).
+        struct UnusedExecutor;
+        #[async_trait::async_trait]
+        impl InferenceExecutor for UnusedExecutor {
+            async fn execute(
+                &self,
+                _request: NormalizedRequest,
+            ) -> Result<ExecutorStream, ExecutorError> {
+                Err(ExecutorError::Fatal {
+                    code: "runtime_error".into(),
+                })
+            }
+        }
+
+        /// Arms the advisory plane in-process over a counting double and
+        /// feeds it past the digest threshold.
+        fn armed_plane(
+            data_dir: &std::path::Path,
+        ) -> (
+            advisory::AdvisoryHandle,
+            Arc<CountingTransport>,
+            tokio::sync::watch::Sender<bool>,
+        ) {
+            std::fs::write(
+                data_dir.join("advisory.json"),
+                r#"{"enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"test-model"}"#,
+            )
+            .unwrap();
+            let key = data_dir.join("advisory-key.txt");
+            std::fs::write(&key, "test-key-local-double\n").unwrap();
+            std::env::set_var("MSP_ADVISORY_KEY_FILE", &key);
+            let (telemetry, _sink) = Telemetry::memory();
+            let double = Arc::new(CountingTransport::always_ok());
+            let as_trait: Arc<dyn AdvisoryTransport> = double.clone();
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let handle = advisory::wire(data_dir, &Arc::new(telemetry), rx, Some(as_trait))
+                .expect("the plane arms (enabled + key + https endpoint + model)");
+            std::env::remove_var("MSP_ADVISORY_KEY_FILE");
+            for _ in 0..250 {
+                handle
+                    .accumulators
+                    .lock()
+                    .unwrap()
+                    .record_event("serving.clamped");
+            }
+            (handle, double, tx)
+        }
+
+        #[tokio::test]
+        async fn chat_wall_try_swarm_chat_failure_paths_record_zero_advisory_calls() {
+            let dir = tempfile::tempdir().unwrap();
+            let (telemetry, _sink) = Telemetry::memory();
+            let telemetry = Arc::new(telemetry);
+            let (_plane, double, _tx) = armed_plane(dir.path());
+            let inner = tokio::sync::Mutex::new(test_inner(
+                dir.path(),
+                "http://127.0.0.1:9",
+                Some("msp1:wall"),
+            ));
+            let executor: Arc<dyn InferenceExecutor> = Arc::new(UnusedExecutor);
+            let log = vec![ChatTurn {
+                role: "user".into(),
+                content: "wall canary".into(),
+            }];
+            let noop = |_: &str| {};
+
+            // Failure path 1 — tracker unreachable: tracker_client builds,
+            // lookup fails, honest shadow-failure row, None.
+            let reply = try_swarm_chat(
+                &inner,
+                "http://127.0.0.1:9",
+                dir.path(),
+                &telemetry,
+                "msp1:wall",
+                executor.clone(),
+                &log,
+                Some(8),
+                0.0,
+                None,
+                &noop,
+            )
+            .await;
+            assert!(reply.is_none(), "unreachable tracker = honest failure");
+            assert_eq!(double.count(), 0, "W1: no advisory call from a chat turn");
+
+            // Failure path 2 — no eligible peer: a local mock tracker with
+            // an EMPTY roster answers lookup; the candidate predicate finds
+            // nothing; None with a no_eligible_peer shadow row.
+            let app = axum::Router::new().route(
+                "/api/v1/peers",
+                axum::routing::get(
+                    || async move { axum::Json(serde_json::json!({ "peers": [] })) },
+                ),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            let tracker_url = format!("http://{addr}");
+            // A session token file short-circuits enrollment (the mock
+            // serves the roster route unauthenticated).
+            std::fs::write(dir.path().join("session.token"), "wall-test-session").unwrap();
+            let reply = try_swarm_chat(
+                &inner,
+                &tracker_url,
+                dir.path(),
+                &telemetry,
+                "msp1:wall",
+                executor.clone(),
+                &log,
+                Some(8),
+                0.0,
+                None,
+                &noop,
+            )
+            .await;
+            assert!(
+                reply.is_none(),
+                "empty roster = honest no-eligible-peer failure"
+            );
+            assert_eq!(double.count(), 0, "W1: still zero advisory calls");
+
+            // The wall holds across every drivable path, the plane was ARMED
+            // (non-vacuous: armed_plane asserted Some), and nothing was ever
+            // presented to any provider transport.
+            assert!(double.bodies().is_empty());
+            assert!(double.presented_keys().is_empty());
+        }
     }
 }

@@ -59,6 +59,7 @@ pub async fn run(data_dir: &Path, port: u16) -> Result<SelfTestReport, String> {
         engine_gpu_binary: None,
         engine_model: None,
         engine_threads: None,
+        advisory_transport: None,
     };
     let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = Node::start(config, shutdown_rx)

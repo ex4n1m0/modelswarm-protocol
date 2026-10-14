@@ -90,7 +90,7 @@ modelswarm-scheduler = { path = "../modelswarm-scheduler", optional = true }
 # 2026-10-12): live CPU/RAM/working-set/GPU/VRAM sampling, read-only and
 # advisory — never an enforcement mechanism (the M2 governor is separate).
 modelswarm-resource = { path = "../modelswarm-resource", optional = true }
-tokio = { version = "1", optional = true, features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1", optional = true, features = ["macros", "rt", "sync", "time", "net"] }
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 # "stream": incremental SSE consumption for the per-delta chat path (P1).
@@ -108,6 +108,10 @@ tauri-build = { version = "2", optional = true, default-features = false , featu
 
 [dev-dependencies]
 tempfile = "3"
+# The chat-wall suite's behavioral leg (ADR-037 §4.4 item 10): a local
+# loopback mock tracker for try_swarm_chat's no-eligible-peer failure
+# path. Test-only.
+axum = "0.8"
 
 [lints]
 workspace = true

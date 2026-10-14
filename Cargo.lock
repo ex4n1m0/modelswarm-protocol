@@ -3465,6 +3465,7 @@ name = "modelswarm-desktop"
 version = "0.2.23"
 dependencies = [
  "async-trait",
+ "axum",
  "futures-util",
  "hex",
  "modelswarm-gateway",

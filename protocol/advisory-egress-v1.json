@@ -1,0 +1,166 @@
+{
+  "schema": "advisory-egress/1",
+  "frozen_by": "ADR-033 revision 2 (2026-10-12), created by the first advisory implementation session under that revision's authority (ADR-033 §9.4); changes only by ADR-033 amendment. This initial content is the DIGEST-PLANE field set; the ADR-037 §4.2 rows (assistant context-block fields, the plane enum, assistant.turn.* event names, the peer_pattern_note/catalog_presentation_hint suggestion types, and the rate_limited/request_oversized gap values) land with the assistant leg and are NOT present here yet.",
+  "contract": {
+    "one_gate": "Every field leaving the process for the advisory endpoint passes this value-typed allowlist (the content gate), then the shipped modelswarm-telemetry Redactor as a secondary scrub net. A field failing the allowlist is dropped and counted, never sent.",
+    "value_types": {
+      "integer": "64-bit signed integer, JSON number without fraction",
+      "boolean": "JSON true/false",
+      "timestamp_utc": "ISO-8601 UTC timestamp string (RFC 3339, Z)",
+      "enum": "string VALUE-matched against a frozen vocabulary named in this artifact",
+      "peer_ref_16hex": "exactly 16 lowercase hex chars: the first 16 hex of SHA-256 over the full base58btc PeerId string (ADR-033 RC-1; the raw base58 PeerId is never emitted)",
+      "profile_ref_16hex": "exactly 16 lowercase hex chars: the 16 hex following the msp1: prefix of a ModelProfileId"
+    },
+    "zero_surviving_fields": "a request with zero surviving fields is not sent (gap empty_after_redaction)",
+    "choke_point": "exactly one function constructs the request body; before CALL the final serialized body is re-parsed, every value must re-match this allowlist, and the bytes must pass scrub_content unchanged — any failure is gap empty_after_redaction and nothing is sent (ADR-033 RC-3)"
+  },
+  "vocabularies": {
+    "msp_v1_section_6_5_error_registry": {
+      "copied_from": "protocol/msp-v1.md §6.5 as amended by ADR-028 §5 (COPIED, not referenced — drift in the source document never changes this vocabulary, and vice versa)",
+      "values": [
+        "handshake_failed",
+        "incompatible_protocol",
+        "profile_mismatch",
+        "invalid_token",
+        "expired_token",
+        "revoked_token",
+        "replayed_request",
+        "overloaded",
+        "deadline_exceeded",
+        "payload_too_large",
+        "runtime_error",
+        "cancelled_by_peer",
+        "interrupted",
+        "invalid_lease",
+        "bad_frame",
+        "executor_error"
+      ]
+    },
+    "finish_reason": {
+      "copied_from": "protocol/msp-v1.md §6.3 (finishReason)",
+      "values": ["stop", "length", "cancelled", "error"]
+    },
+    "served_by": {
+      "copied_from": "the shipped chat reply provenance labels (desktop send_chat/try_swarm_chat; ADR-032 §7 light-up)",
+      "values": ["local", "swarm", "failed"]
+    },
+    "divergence_verdict": {
+      "copied_from": "the cooperative-namespace audit verdict enum (AuditVerdict, msp-cooperative-v1 family)",
+      "values": ["match", "divergence"]
+    },
+    "cancel_round_reason": {
+      "copied_from": "CancelRound reasons (ADR-032 §2 frozen strings)",
+      "values": ["parent_mismatch", "round_mismatch", "commit_mismatch"]
+    },
+    "advisory_gap": {
+      "copied_from": "ADR-033 §6 (12 values at this leg; ADR-037 §4.3 adds rate_limited and request_oversized with the assistant leg)",
+      "values": [
+        "disabled",
+        "no_key",
+        "no_config",
+        "cap_reached",
+        "interval",
+        "empty_after_redaction",
+        "timeout",
+        "http_error",
+        "quota",
+        "response_oversized",
+        "schema",
+        "late"
+      ]
+    },
+    "suggestion_type": {
+      "copied_from": "ADR-033 §2 (four digest-plane classes; ADR-037 §3.3 adds peer_pattern_note and catalog_presentation_hint with the assistant leg)",
+      "values": ["triage_summary", "tuning_hint", "catalog_note", "digest"]
+    },
+    "confidence": {
+      "copied_from": "ADR-033 §4 suggestion schema",
+      "values": ["low", "medium", "high"]
+    },
+    "serving_session_ended_code": {
+      "rule": "match the prefix before the first ':' against this frozen code set; no match => drop and count",
+      "values": [
+        "recv",
+        "invalid_lease",
+        "handshake_failed",
+        "incompatible_protocol",
+        "profile_mismatch",
+        "invalid_token",
+        "expired_token",
+        "revoked_token",
+        "replayed_request",
+        "overloaded",
+        "deadline_exceeded",
+        "payload_too_large",
+        "runtime_error",
+        "cancelled_by_peer",
+        "interrupted",
+        "bad_frame",
+        "executor_error"
+      ]
+    }
+  },
+  "reduction_rules": [
+    {
+      "field": ["error", "detail"],
+      "sites": ["gateway", "engine", "executor", "family", "chat.swarm", "net.metrics"],
+      "rule": "drop_by_default",
+      "per_site_code_sets": "initially EMPTY: a site's errors enter a digest only via a frozen code set added to this artifact by ADR-033 amendment; until then every such field drops with a count"
+    },
+    {
+      "field": "code",
+      "site": "serving.session_ended",
+      "rule": "prefix_match_frozen_codes_else_drop_count",
+      "vocabulary": "serving_session_ended_code"
+    },
+    {
+      "field": ["deadline_ms", "max_tokens"],
+      "site": "serving.clamped",
+      "rule": "decompose_x_to_y_integer_pairs",
+      "note": "composite \"X->Y\" becomes deadline_ms_requested/deadline_ms_clamped (and the max_tokens pair) as integers; the composite string itself never enters the digest"
+    },
+    {
+      "field": ["probe_p50_ms", "ttft_ewma_ms", "total_ewma_ms", "pick_predicted_ms"],
+      "rule": "integer_ms_from_typed_accumulators",
+      "note": "typed accumulators emit integers (rounded ms); the honest sentinels none/unmeasured/unknown map to null on every timing field"
+    },
+    {
+      "field": "decision",
+      "site": "sched.shadow.decision",
+      "rule": "drop",
+      "note": "stringified JSON blob; decompose into typed fields via amendment if ever needed"
+    },
+    {
+      "field": "session",
+      "site": "verifydrafts.*",
+      "rule": "drop",
+      "note": "opaque requester-generated string (peer-chosen bytes); correlation rides the peer reference plus integer round"
+    },
+    {
+      "field": "addr",
+      "sites": ["chat.swarm", "listener.bound"],
+      "rule": "drop",
+      "note": "peer-registered multiaddr"
+    },
+    {
+      "field": ["backend", "base", "file", "port", "gateway_addr", "version", "name", "preset"],
+      "rule": "drop",
+      "note": "local disclosure strings; no per-field vocabulary is authorized at this leg"
+    }
+  ],
+  "aggregation_event_allowlist": {
+    "note": "the enumerated event-type set whose typed accumulators may feed a digest; EXCLUDES every row whose name starts with advisory. (the plane's own telemetry never feeds the next cycle) — ADR-033 §3.2/RC-4",
+    "events": [
+      "serving.session_ended",
+      "serving.clamped",
+      "serving.refused",
+      "verifydrafts.verifier_divergence",
+      "engine.gpu_fallback"
+    ]
+  },
+  "plane_telemetry_events": [
+    "advisory.cycle.sent",
+    "advisory.cycle.gap",
+    "advisory.suggestion.recorded"
+  ]
+}

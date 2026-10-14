@@ -2,6 +2,10 @@
 
 Status: Phase 0 draft, owned by the Architect with QA/Security review.
 Scope: MSP v0.1 prototype (Windows nodes + Vercel tracker hub).
+Updated 2026-10-14 (ADR-036 §6 Security-seat rows: the §3 adversary-B
+restatement under default-on carriage, the §4.2 carrier-exposure and
+open-exchange rows, the §4.3 KV-residency row, the §5.2 extension, and
+the §6 ADR-036 abuse-test index).
 
 ## 1. System under analysis
 
@@ -32,6 +36,25 @@ A. **Casual free-rider** — wants inference without hosting. Not sophisticated;
    core rule.
 B. **Malicious serving peer** — joined legitimately, now returns wrong/garbage
    tokens, records prompts, exaggerates metrics, or stalls streams.
+   ADR-036 restatement (owner directive 2026-10-13, default-on carriage):
+   under the elected family-verified chat mode, a serving peer that
+   admits a pin-carrier session receives the requesting user's WHOLE
+   conversation as token ids and can read, log, or repurpose it — EVERY
+   cohort member of the elected session, not one peer. The owner accepts
+   this ("the idea of a swarm is that all agents work together, privacy
+   is not a concern at this moment"). Remaining mitigations, stated
+   without overstatement: transport encryption only (token ids are not
+   encryption — a peer hosting the same exact profile holds the tokenizer
+   and reads them trivially), no hub visibility (the carrier rides P2P
+   QUIC only; the hub is content-blind unconditionally), invite-only
+   population, teardown-bounded KV residency, honest always-visible
+   disclosures on both ends, and NO confidential-computing claim. The
+   consent-UX surface is downgraded per the same posture: no consent
+   modal exists to phish; the residual is a user tricked into opting OUT,
+   or a peer misrepresenting its carriage posture — the refusal label
+   (`content_carriage_refused`) is honest either way, and no roster or
+   wire field carries the posture, so a posture cannot be verified
+   before dialing (ADR-036 §3.1's stated honest boundary).
 C. **Malicious requesting peer** — floods a host, sends oversized payloads,
    replays/copies tokens, ignores limits.
 D. **Network observer / on-path attacker** — reads or tampers P2P or hub
@@ -76,6 +99,9 @@ notes), not cryptographic, in v0.1.
 | Unbounded concurrent requests | Per-peer admission control + serving-slot cap |
 | Replay of request frames | Request id + nonce; serving peer rejects duplicates |
 | DoS via connection flooding | Rate-limited admission; circuit breakers per peer |
+| ADR-036 carrier exposure: an elected family-verified chat sends the requesting user's conversation (token ids) to every cohort member, default-on at every serving peer | Owner-accepted by directive (2026-10-13); serving-side opt-out refuses honestly (`content_carriage_refused` — a refusal label, never a mislabeled `pin_mismatch`); always-visible §3.1 disclosures on both ends; token ids are readable by any peer hosting the same exact profile (tokenization is not encryption); the hub stays content-blind — the carrier rides P2P QUIC only; counts-only telemetry (token COUNT yes; arrays and content-derived hashes, including the pin commitment, never) |
+| Malformed / partial / forged pin carrier at session open | Strict `deny_unknown_fields` schema parsed by the session-open reader only (never the frame router); first-failure admission table (schema → signature/sender binding → carriage → profile → params → commitment bind → prefill fit → clamped deadline), signature = Ed25519 over the signature-omitted canonical JSON with the sender bound to the QUIC-authenticated PeerId's key; oversize carriers refused before parse (256 KiB frame limit, transport-enforced); fixed open order `lease? → pin? → offer`, deviations are bad_frame-class session ends; the carrier's `session_id` must equal the offer's (mismatch ends the session before any accept) |
+| Carrier replay/reorder at open (ADR-036 review focus) | The carrier seeds the session gate's seq baseline and nonce ledger (frame reuse → `replayed_request`); the ledger is per-session by contract — cross-session replay requires the coordinator's own signing key, which is the authorized sender; rounds in carrier sessions are ≥ 1 by construction (the carrier's `round: 0` is the session-open marker) |
 
 ### 4.3 Local node
 
@@ -85,6 +111,7 @@ notes), not cryptographic, in v0.1.
 | Key theft from disk | Windows Credential Manager/DPAPI; never in webview or config files |
 | Malicious local app using the gateway | Gateway is loopback-only; v0.1 accepts any local client (documented limitation; local auth token is a candidate hardening) |
 | Log leakage of prompts | `modelswarm-telemetry` redaction is mandatory; QA test asserts absence |
+| Conversation KV outliving its session (ADR-036 carrier sessions) | The carrier session's family engine is constructed per-session with the conversation as the prefilled root and torn down at session end (drop-counted at the engine seam); the coordinator's self-check engine is dropped at turn end; the cache-cold discipline (ADR-032 §3) and the routed dribble-residence lifetime-ceiling advisory apply; `prompt_tokens` never enter logs, telemetry, rejections, receipts, or the webview (token counts only) |
 | Malicious GGUF/runtime | Only catalog-approved, digest-pinned artifacts from HF; pinned llama.cpp build with checksum |
 
 ### 4.4 Supply chain
@@ -142,8 +169,10 @@ Residual risks, accepted for v0.2.x (invite-only tester population):
    hosting, or serve while paused. The capability-token system raises effort
    and creates auditable evidence; it does not eliminate lying.
 2. **No confidential computing.** The serving peer reads every prompt it
-   serves. The UI discloses this at onboarding; the swarm is invite-only in
-   v0.1.
+   serves — and, since ADR-036 (owner directive 2026-10-13, default-on
+   carriage), every verifying peer of an elected family-verified chat
+   reads the whole conversation it verifies. The UI discloses both on
+   their always-visible lines; the swarm is invite-only in v0.1.
 3. **No Sybil resistance** beyond invite-only accounts + per-account limits.
 4. **No universal NAT traversal.** Direct failure is possible and must be
    reported honestly; relay/DCUtR is a later milestone.
@@ -172,3 +201,17 @@ prompt-redaction gate in every phase whose code first touches prompt text
 - Draining/paused host still trying to consume.
 - Metrics inflation attempt (advertise huge decode rate; verify scheduler
   ignores self-reports when measurements disagree).
+- ADR-036 carrier abuse (added 2026-10-14): golden-vector replay of all
+  three pin-carrier fixtures through the admission table, the pairwise
+  first-failure order sweep, the fixed open-sequence order (4 valid
+  shapes + deviation classes + oversize-before-parse), carrier nonce/seq
+  replay over the real staged transport, codes-only reject frames, the
+  commitment's pure self-consistency, the offer↔carrier session-id
+  binding, the both-keys discriminant rule, and the engine-teardown
+  KV-residency bound
+  (`crates/modelswarm-node/tests/verifydrafts_pin_carrier.rs`,
+  `crates/modelswarm-node/tests/verifydrafts_pin_carrier_security.rs`,
+  `crates/modelswarm-session/tests/pin_carrier_property.rs`,
+  `crates/modelswarm-session/tests/verifydrafts_vectors.rs`; the
+  desktop-level redaction and disclosure pins live in
+  `crates/modelswarm-desktop/src/app.rs` tests under `tauri-shell`).

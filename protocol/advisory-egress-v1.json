@@ -38,19 +38,35 @@
     },
     "finish_reason": {
       "copied_from": "protocol/msp-v1.md §6.3 (finishReason)",
-      "values": ["stop", "length", "cancelled", "error"]
+      "values": [
+        "stop",
+        "length",
+        "cancelled",
+        "error"
+      ]
     },
     "served_by": {
       "copied_from": "the shipped chat reply provenance labels (desktop send_chat/try_swarm_chat; ADR-032 §7 light-up)",
-      "values": ["local", "swarm", "failed"]
+      "values": [
+        "local",
+        "swarm",
+        "failed"
+      ]
     },
     "divergence_verdict": {
       "copied_from": "the cooperative-namespace audit verdict enum (AuditVerdict, msp-cooperative-v1 family)",
-      "values": ["match", "divergence"]
+      "values": [
+        "match",
+        "divergence"
+      ]
     },
     "cancel_round_reason": {
       "copied_from": "CancelRound reasons (ADR-032 §2 frozen strings)",
-      "values": ["parent_mismatch", "round_mismatch", "commit_mismatch"]
+      "values": [
+        "parent_mismatch",
+        "round_mismatch",
+        "commit_mismatch"
+      ]
     },
     "advisory_gap": {
       "copied_from": "ADR-033 §6 (12 values at this leg; ADR-037 §4.3 adds rate_limited and request_oversized with the assistant leg)",
@@ -71,11 +87,20 @@
     },
     "suggestion_type": {
       "copied_from": "ADR-033 §2 (four digest-plane classes; ADR-037 §3.3 adds peer_pattern_note and catalog_presentation_hint with the assistant leg)",
-      "values": ["triage_summary", "tuning_hint", "catalog_note", "digest"]
+      "values": [
+        "triage_summary",
+        "tuning_hint",
+        "catalog_note",
+        "digest"
+      ]
     },
     "confidence": {
       "copied_from": "ADR-033 §4 suggestion schema",
-      "values": ["low", "medium", "high"]
+      "values": [
+        "low",
+        "medium",
+        "high"
+      ]
     },
     "serving_session_ended_code": {
       "rule": "match the prefix before the first ':' against this frozen code set; no match => drop and count",
@@ -102,8 +127,18 @@
   },
   "reduction_rules": [
     {
-      "field": ["error", "detail"],
-      "sites": ["gateway", "engine", "executor", "family", "chat.swarm", "net.metrics"],
+      "field": [
+        "error",
+        "detail"
+      ],
+      "sites": [
+        "gateway",
+        "engine",
+        "executor",
+        "family",
+        "chat.swarm",
+        "net.metrics"
+      ],
       "rule": "drop_by_default",
       "per_site_code_sets": "initially EMPTY: a site's errors enter a digest only via a frozen code set added to this artifact by ADR-033 amendment; until then every such field drops with a count"
     },
@@ -114,13 +149,21 @@
       "vocabulary": "serving_session_ended_code"
     },
     {
-      "field": ["deadline_ms", "max_tokens"],
+      "field": [
+        "deadline_ms",
+        "max_tokens"
+      ],
       "site": "serving.clamped",
       "rule": "decompose_x_to_y_integer_pairs",
       "note": "composite \"X->Y\" becomes deadline_ms_requested/deadline_ms_clamped (and the max_tokens pair) as integers; the composite string itself never enters the digest"
     },
     {
-      "field": ["probe_p50_ms", "ttft_ewma_ms", "total_ewma_ms", "pick_predicted_ms"],
+      "field": [
+        "probe_p50_ms",
+        "ttft_ewma_ms",
+        "total_ewma_ms",
+        "pick_predicted_ms"
+      ],
       "rule": "integer_ms_from_typed_accumulators",
       "note": "typed accumulators emit integers (rounded ms); the honest sentinels none/unmeasured/unknown map to null on every timing field"
     },
@@ -138,12 +181,24 @@
     },
     {
       "field": "addr",
-      "sites": ["chat.swarm", "listener.bound"],
+      "sites": [
+        "chat.swarm",
+        "listener.bound"
+      ],
       "rule": "drop",
       "note": "peer-registered multiaddr"
     },
     {
-      "field": ["backend", "base", "file", "port", "gateway_addr", "version", "name", "preset"],
+      "field": [
+        "backend",
+        "base",
+        "file",
+        "port",
+        "gateway_addr",
+        "version",
+        "name",
+        "preset"
+      ],
       "rule": "drop",
       "note": "local disclosure strings; no per-field vocabulary is authorized at this leg"
     }
@@ -162,5 +217,45 @@
     "advisory.cycle.sent",
     "advisory.cycle.gap",
     "advisory.suggestion.recorded"
-  ]
+  ],
+  "emit_site_events": {
+    "note": "EXHAUSTIVE event-name vocabulary over the node/desktop production telemetry emit sites (R-1: the guards completeness tie diffs the source emit-site vocabulary against this section AND the tests/fixtures/advisory-egress/ manifest - a source event name without a row here, or a row here without a source emit site, is a red build). Classification: feeds_digest (also listed in aggregation_event_allowlist.events) | excluded (never feeds a digest at this leg) | plane_own (advisory.* - excluded from aggregation by RC-4). Reclassification or a new row is an ADR-033 amendment.",
+    "events": {
+      "serving.session_ended": "feeds_digest",
+      "serving.clamped": "feeds_digest",
+      "serving.refused": "feeds_digest",
+      "verifydrafts.verifier_divergence": "feeds_digest",
+      "engine.gpu_fallback": "feeds_digest",
+      "serving.stopped": "excluded",
+      "verifydrafts.verify_ms_lie": "excluded",
+      "verifydrafts.budget_refused": "excluded",
+      "net.metrics.store_unavailable": "excluded",
+      "net.metrics.invalid_key": "excluded",
+      "net.metrics.persist_failed": "excluded",
+      "store.opened": "excluded",
+      "tracker.configured": "excluded",
+      "gateway.failed": "excluded",
+      "identity.loaded": "excluded",
+      "identity.created": "excluded",
+      "listener.error": "excluded",
+      "listener.bound": "excluded",
+      "family.pin": "excluded",
+      "family.fallback": "excluded",
+      "family.engine_ready": "excluded",
+      "family.enabled": "excluded",
+      "family.probe": "excluded",
+      "family.engage": "excluded",
+      "chat.cleared": "excluded",
+      "chat.swarm.error": "excluded",
+      "chat.swarm.fallback": "excluded",
+      "chat.swarm.empty": "excluded",
+      "lease.earn": "excluded",
+      "sched.shadow.policy": "excluded",
+      "sched.shadow.decision": "excluded",
+      "sched.shadow.realized": "excluded",
+      "advisory.cycle.sent": "plane_own",
+      "advisory.cycle.gap": "plane_own",
+      "advisory.suggestion.recorded": "plane_own"
+    }
+  }
 }

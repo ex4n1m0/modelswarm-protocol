@@ -66,6 +66,9 @@ impl ScriptedEngine {
     }
 
     /// How many engine passes ran (the "engine untouched on refusal" pin).
+    /// Gated with its callers (the QUIC lease tests need libp2p-backend;
+    /// under verifydrafts alone this would be dead code).
+    #[cfg(feature = "libp2p-backend")]
     fn calls(&self) -> usize {
         *self.calls.lock().expect("calls lock")
     }

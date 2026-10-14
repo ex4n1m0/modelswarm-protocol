@@ -44,6 +44,22 @@ pub struct EgressVocabulary {
     pub plane_telemetry_events: Vec<String>,
     #[serde(default, rename = "reduction_rules")]
     pub reduction_rules: Vec<ReductionRule>,
+    /// ADR-033 R-1 (protocol review 2026-10-14): the EXHAUSTIVE emit-site
+    /// event vocabulary — event name -> feeds_digest | excluded | plane_own.
+    /// The guards completeness tie diffs the source emit-site vocabulary
+    /// against this map (and the fixture manifest) in both directions.
+    #[serde(default, rename = "emit_site_events")]
+    pub emit_site_events: EmitSiteEventsSection,
+}
+
+/// The R-1 exhaustive emit-site vocabulary section: the tie note plus the
+/// event -> classification map.
+#[derive(Debug, Default, Deserialize)]
+pub struct EmitSiteEventsSection {
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub events: std::collections::BTreeMap<String, String>,
 }
 
 /// One row of the §3.2 stringly-field reduction table, carried
@@ -627,5 +643,92 @@ mod tests {
             clamp_hint("MSP_SOMETHING_NEW", 5.0),
             HintAdmission::RequiresAdr
         );
+    }
+}
+
+#[cfg(test)]
+mod emit_site_events_tie_tests {
+    use super::*;
+
+    /// ADR-033 R-1 (protocol review 2026-10-14): the artifact's
+    /// `emit_site_events` is the EXHAUSTIVE emit-site vocabulary — every
+    /// `feeds_digest` row is an aggregation allowlist event, every
+    /// `plane_own` row is a plane telemetry event, classifications are
+    /// from the frozen trio, and the verified source set is pinned so a
+    /// source event added without a row (or a row without a source) is a
+    /// red build once T/R's two-sided mirror lands.
+    #[test]
+    fn emit_site_events_tie_the_allowlists_and_the_source_set() {
+        let vocab = vocabulary();
+        let emit = &vocab.emit_site_events.events;
+        assert!(
+            emit.len() >= 35,
+            "the verified source set is ~34 events + any additions: {emit:?}"
+        );
+        for (event, class) in emit {
+            assert!(
+                matches!(class.as_str(), "feeds_digest" | "excluded" | "plane_own"),
+                "unknown classification {class} on {event}"
+            );
+        }
+        for event in &vocab.aggregation.events {
+            assert_eq!(
+                emit.get(event).map(String::as_str),
+                Some("feeds_digest"),
+                "aggregation event {event} must classify feeds_digest"
+            );
+        }
+        for event in &vocab.plane_telemetry_events {
+            assert_eq!(
+                emit.get(event).map(String::as_str),
+                Some("plane_own"),
+                "plane event {event} must classify plane_own"
+            );
+        }
+        // The verified source set (protocol review §1; the mechanical
+        // source scan T/R's tie performs extends this in the same
+        // confirmation edit — after freeze, by amendment).
+        for event in [
+            "store.opened",
+            "tracker.configured",
+            "gateway.failed",
+            "engine.gpu_fallback",
+            "identity.loaded",
+            "identity.created",
+            "serving.session_ended",
+            "serving.clamped",
+            "serving.refused",
+            "serving.stopped",
+            "verifydrafts.verify_ms_lie",
+            "verifydrafts.verifier_divergence",
+            "verifydrafts.budget_refused",
+            "net.metrics.store_unavailable",
+            "net.metrics.invalid_key",
+            "net.metrics.persist_failed",
+            "listener.error",
+            "listener.bound",
+            "family.pin",
+            "family.fallback",
+            "family.engine_ready",
+            "family.enabled",
+            "family.probe",
+            "family.engage",
+            "chat.cleared",
+            "chat.swarm.error",
+            "chat.swarm.fallback",
+            "chat.swarm.empty",
+            "lease.earn",
+            "sched.shadow.policy",
+            "sched.shadow.decision",
+            "sched.shadow.realized",
+            "advisory.cycle.sent",
+            "advisory.cycle.gap",
+            "advisory.suggestion.recorded",
+        ] {
+            assert!(
+                emit.contains_key(event),
+                "source event {event} missing a row"
+            );
+        }
     }
 }

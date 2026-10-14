@@ -145,6 +145,32 @@ jobs:
             echo "::error::API-key pattern (sk-<32 hex>) found in tracked files — keys live only in local client config, never in the repo: $LEAK"
             exit 1
           fi
+      # ADR-033 R-1 two-sided emit-site tie (ADR-037 §4.4): every telemetry
+      # event the production source emits has a row in the frozen egress
+      # artifact AND the fixture inventory — both directions red on drift.
+      - name: Advisory egress vocabulary is complete (R-1 two-sided tie)
+        run: |
+          python tests/fixtures/advisory-egress/scan_emit_sites.py
+      # ADR-037 §4.4 item 10 layer 1, CI-native: the advisory host's
+      # dependency direction (chat/serving surfaces can never reach the
+      # provider client through the crate graph).
+      - name: Chat wall layer 1 (dependency direction)
+        run: |
+          cargo metadata --no-deps --format-version 1 > /tmp/meta.json
+          python - <<'PY'
+          import json
+          meta = json.load(open('/tmp/meta.json'))
+          by_name = {p['name']: p for p in meta['packages']}
+          node = by_name.get('modelswarm-node')
+          assert node, 'modelswarm-node missing'
+          dependents = {p['name'] for p in meta['packages']
+                        if any(d.get('package') == 'modelswarm-node' for d in p['dependencies'])}
+          allowed = {'modelswarm-desktop', 'modelswarm-bench'}
+          extra = dependents - allowed
+          assert not extra, f'advisory host gained unexpected dependents: {extra}'
+          assert 'modelswarm-advisory' not in by_name, 'dedicated advisory crate not sanctioned'
+          print(f'chat-wall layer 1 OK: dependents {sorted(dependents)}')
+          PY
       - name: Version is single-sourced
         run: |
           if jq -e 'has("version")' crates/modelswarm-desktop/tauri.conf.json; then

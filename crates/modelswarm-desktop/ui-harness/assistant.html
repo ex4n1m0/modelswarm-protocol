@@ -20,8 +20,10 @@
   literal, nothing is parsed) and clip at the 4000-char display cap; degraded mode renders built-in help
   with the honest gap label; the Settings opt-out toggle writes through; the assistant lives on its OWN
   <code>assistant-*</code> event namespace and its output NEVER reaches the swarm chat transcript; AD-3
-  local-facts pairing stays under the replies. Rendered geometry is measured at the app's default window
-  size (the owner's standing rule).</p>
+  local-facts pairing stays under the replies. Since the 2026-10-15 nav-menu reorg the panel opens from
+  Help → Setup assistant and the opt-out toggle from Settings → Cloud assistant — both are opened
+  BEHAVIORALLY (menu button click → menu item click) before asserting. Rendered geometry is measured at
+  the app's default window size (the owner's standing rule).</p>
   <p><strong>Run:</strong> serve the crate root over http — e.g.
   <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> — then open
   <code>http://127.0.0.1:4817/ui-harness/assistant.html</code>.</p>
@@ -99,6 +101,19 @@
       return { doc, frame };
     }
 
+    // The 2026-10-15 nav-menu reorg moved the assistant panel behind
+    // Help → Setup assistant (and its opt-out toggle behind Settings →
+    // Cloud assistant). Open panels the way a user does: click the owning
+    // menu button, then the menu item with data-panel=<id>.
+    function openPanel(doc, id) {
+      const item = doc.querySelector(`.menu-item[data-panel="${id}"]`);
+      if (!item) return false;
+      item.closest(".menu").querySelector(".menu-btn").click();
+      item.click();
+      const panel = doc.getElementById(id);
+      return !doc.getElementById("sheet").hidden && panel && !panel.hidden;
+    }
+
     // Results render via textContent ONLY: `detail` carries PAGE-DERIVED
     // text (transcript excerpts), and scenario B deliberately feeds the
     // panel a markup-hostile reply. The harness's first render()
@@ -149,6 +164,8 @@
       {
         const { doc, frame } = await runScenario(ui);
         await new Promise((r) => setTimeout(r, 300));
+        rows.push({ label: "A: the panel opens behaviorally from Help → Setup assistant",
+          pass: openPanel(doc, "assistant-section"), detail: "sheet visible" });
         const box = doc.getElementById("assistant-disclosure");
         rows.push({ label: "A: the §3.6 first-use disclosure is visible before the first call",
           pass: !!box && !box.hidden, detail: box ? (box.hidden ? "hidden" : "visible") : "missing" });
@@ -182,6 +199,7 @@
       {
         const { doc, frame } = await runScenario(ui);
         await new Promise((r) => setTimeout(r, 300));
+        openPanel(doc, "assistant-section");
         rows.push({ label: "B: acknowledged — the disclosure is hidden",
           pass: doc.getElementById("assistant-disclosure").hidden, detail: "hidden" });
         // Markup-looking reply stays literal; nothing parses.
@@ -218,6 +236,7 @@
       {
         const { doc, frame } = await runScenario(ui);
         await new Promise((r) => setTimeout(r, 300));
+        openPanel(doc, "assistant-section");
         rows.push({ label: "C: the mode line states built-in help WITH the gap label",
           pass: doc.getElementById("assistant-mode").textContent === DEGRADED("no_key"),
           detail: doc.getElementById("assistant-mode").textContent });
@@ -236,6 +255,8 @@
       {
         const { doc, frame } = await runScenario(ui);
         await new Promise((r) => setTimeout(r, 300));
+        rows.push({ label: "D: the Settings panel opens behaviorally (Settings → Cloud assistant)",
+          pass: openPanel(doc, "panel-assistant-settings"), detail: "sheet visible" });
         const sw = doc.getElementById("assistant-switch");
         rows.push({ label: "D: the Settings cloud-assistant toggle is present, default ON",
           pass: !!sw && sw.dataset.on === "true" && sw.getAttribute("aria-checked") === "true",
@@ -253,6 +274,7 @@
       {
         const { doc, frame } = await runScenario(ui);
         await new Promise((r) => setTimeout(r, 300));
+        openPanel(doc, "assistant-section");
         rows.push({ label: "E: the page registered the assistant-turn listener",
           pass: !!window.__listens["assistant-turn"], detail: Object.keys(window.__listens).join(",") });
         rows.push({ label: "E: the page registered the assistant-reset listener",

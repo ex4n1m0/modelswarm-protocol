@@ -14,13 +14,15 @@
 <body>
   <h1>Auto-update status line stub harness</h1>
   <p>Loads the REAL <code>../ui/index.html</code> into a same-origin 1152×648 iframe with a
-  stubbed <code>window.__TAURI__</code> bridge, then checks the header's update status note
-  (owner request 2026-10-12: "clients update and restart when we ship a new client"): the
-  daemon-provided <code>updater.line</code> renders <strong>VERBATIM</strong> in every phase —
-  available → downloading → ready/restarting, the two failure edges (check failed / install
-  failed with the running version intact), and the dev opt-out — a missing payload degrades to
-  the placeholder without breaking the rest of the header, and the extra note never overflows
-  the header at the app's default window width. The status machine itself (transitions,
+  stubbed <code>window.__TAURI__</code> bridge, then checks the update status note (owner
+  request 2026-10-12: "clients update and restart when we ship a new client"; Help-menu item
+  since the 2026-10-15 nav-menu reorg — the note opens with the Help dropdown, which the
+  harness clicks open behaviorally before measuring): the daemon-provided
+  <code>updater.line</code> renders <strong>VERBATIM</strong> in every phase — available →
+  downloading → ready/restarting, the two failure edges (check failed / install failed with
+  the running version intact), and the dev opt-out — a missing payload degrades to the
+  placeholder without breaking anything else, and neither the navbar nor the open Help
+  dropdown overflows the app's default window. The status machine itself (transitions,
   terminal Ready, ignored stale events, env opt-out) is pinned by the Rust unit tests in
   <code>src/app/updater.rs</code>; this harness pins the render contract.</p>
   <p><strong>Run:</strong> serve the crate root over http — e.g.
@@ -65,7 +67,9 @@
 
     // Loads the UI with the given updater payload and waits for the first
     // refresh() render of the note (the stub resolves in a microtask; the
-    // placeholder text "update: …" is the not-yet-rendered marker).
+    // placeholder text "update: …" is the not-yet-rendered marker). The
+    // note is a Help-menu item since the 2026-10-15 reorg: open the
+    // dropdown behaviorally, then measure it.
     async function scenario(ui, updater) {
       window.__updater = updater;
       const frame = document.createElement("iframe");
@@ -84,13 +88,20 @@
         if (doc && updater === null && doc.getElementById("conn-note").textContent === "live") break;
       }
       const note = doc.getElementById("update-note");
-      const header = note.closest("header");
+      // Open the Help dropdown the way a user does.
+      const helpBtn = doc.getElementById("help-menu-btn");
+      helpBtn.click();
+      const dropdown = doc.getElementById("help-menu-panel");
+      const nav = doc.querySelector("nav#navbar");
+      const dBox = dropdown.getBoundingClientRect();
       const out = {
         text: note.textContent,
         role: note.getAttribute("role"),
-        // The extra header note must not force horizontal overflow at the
-        // app's default 1152px window.
-        headerFits: header.scrollWidth <= header.clientWidth + 1,
+        dropdownOpen: !dropdown.hidden && helpBtn.getAttribute("aria-expanded") === "true",
+        // The note inside the open dropdown must actually render inside
+        // the 1152×648 viewport, and the navbar must not overflow.
+        dropdownFits: dBox.width > 0 && dBox.right <= 1152 + 1 && dBox.bottom <= 648 + 1,
+        navFits: nav.scrollWidth <= nav.clientWidth + 1,
         connStillLive: doc.getElementById("conn-note").textContent === "live",
       };
       frame.remove();
@@ -109,6 +120,8 @@
       summary.innerHTML = `<strong class="${all ? "pass" : "fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
       document.getElementById("results").replaceChildren(summary, table);
       window.__harnessResults = { all, rows };
+      // The harness family's ALL PASS title convention (self-checking).
+      document.title = all ? "ALL PASS" : "FAILURES";
     }
 
     (async () => {
@@ -117,22 +130,22 @@
       for (const phase of PHASES) {
         const out = await scenario(ui, phase.updater);
         rows.push({
-          label: `${phase.label}: line renders verbatim in the header status note`,
+          label: `${phase.label}: line renders verbatim in the Help-menu status note`,
           pass: out.text === phase.updater.line && out.role === "status",
           detail: out.text,
         });
         rows.push({
-          label: `${phase.label}: header fits 1152px and the connection note stays live (a failure never blocks the app)`,
-          pass: out.headerFits && out.connStillLive,
-          detail: `fits=${out.headerFits} conn=${out.connStillLive}`,
+          label: `${phase.label}: Help dropdown opens and fits 1152×648; navbar fits; the connection note stays live (a failure never blocks the app)`,
+          pass: out.dropdownOpen && out.dropdownFits && out.navFits && out.connStillLive,
+          detail: `open=${out.dropdownOpen} fits=${out.dropdownFits} nav=${out.navFits} conn=${out.connStillLive}`,
         });
       }
       // No updater payload yet (e.g. first poll before the supervisor's
       // first write): the placeholder stays, nothing breaks.
       const none = await scenario(ui, null);
       rows.push({
-        label: "missing updater payload: placeholder kept, header healthy",
-        pass: none.text === "update: …" && none.connStillLive && none.headerFits,
+        label: "missing updater payload: placeholder kept, navbar + dropdown healthy",
+        pass: none.text === "update: …" && none.connStillLive && none.navFits && none.dropdownFits,
         detail: none.text,
       });
       render(rows);

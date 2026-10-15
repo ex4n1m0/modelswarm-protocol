@@ -12,13 +12,16 @@
   </style>
 </head>
 <body>
-  <h1>Pairing toggle + chat controls stub harness (v0.2.23 batch)</h1>
+  <h1>Pairing toggle + chat controls stub harness (v0.2.23 batch; reorged 2026-10-15)</h1>
   <p>Loads the REAL <code>../ui/index.html</code> into a same-origin 1152×648 iframe with a stubbed
-  <code>window.__TAURI__</code> bridge, then asserts: the Setup "allow swarm pairing" toggle renders
-  the daemon's honest posture (on/off + the off note), the remote-serve chip and the family line
-  carry the exact degrade reason/detail, the chat box gains the clear button + temperature control,
-  <code>send_chat</code> receives the temperature, and <code>clear_chat</code> empties the transcript.
-  Rendered geometry is MEASURED at the app's default window size (the owner's standing rule).</p>
+  <code>window.__TAURI__</code> bridge, then asserts: the "allow swarm pairing" toggle (Settings →
+  Swarm pairing &amp; content carriage since the 2026-10-15 nav-menu reorg; opened behaviorally via
+  menu button + menu item clicks) renders the daemon's honest posture (on/off + the off note), the
+  remote-serve chip and the family line (Help → Diagnostics) carry the exact degrade reason/detail,
+  the temperature control (Settings → Chat temperature) defaults to greedy, the clear-conversation
+  action lives in the File menu, <code>send_chat</code> receives the temperature, and
+  <code>clear_chat</code> empties the transcript. Rendered geometry is MEASURED at the app's default
+  window size (the owner's standing rule).</p>
   <p><strong>Run:</strong> serve the crate root over http — e.g.
   <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> — then open
   <code>http://127.0.0.1:4817/ui-harness/pairing-chat.html</code>.</p>
@@ -84,6 +87,18 @@
       return out;
     }
 
+    // The 2026-10-15 nav-menu reorg moved the asserted surfaces behind the
+    // nav menus. Open a panel the way a user does: click the owning menu
+    // button, then the menu item with data-panel=<id>.
+    function openPanel(doc, id) {
+      const item = doc.querySelector(`.menu-item[data-panel="${id}"]`);
+      if (!item) return false;
+      item.closest(".menu").querySelector(".menu-btn").click();
+      item.click();
+      const panel = doc.getElementById(id);
+      return !doc.getElementById("sheet").hidden && panel && !panel.hidden;
+    }
+
     const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
     function render(rows) {
       const table = document.createElement("table");
@@ -105,6 +120,8 @@
       // ---- Scenario A: default posture (toggle on) ---------------------
       window.__mode = "on";
       let { doc, frame } = await runScenario(ui);
+      rows.push({ label: "menu: Settings → pairing & carriage panel opens behaviorally",
+        pass: openPanel(doc, "panel-serving"), detail: "sheet visible" });
       const sw = doc.getElementById("pairing-switch");
       rows.push({ label: "setup: pairing toggle present, ON by default (role=switch, aria-checked)",
         pass: !!sw && sw.dataset.on === "true" && sw.getAttribute("aria-checked") === "true",
@@ -112,16 +129,16 @@
       rows.push({ label: "setup: the ON note states what the toggle governs",
         pass: (doc.getElementById("pairing-note").textContent || "").includes("listener + family verify engine"),
         detail: doc.getElementById("pairing-note").textContent });
-      rows.push({ label: "chat: temperature control present, default 0 (greedy), range note visible",
+      rows.push({ label: "menu: Settings → Chat temperature panel opens behaviorally",
+        pass: openPanel(doc, "panel-temp"), detail: "sheet visible" });
+      rows.push({ label: "chat: temperature control present, default 0 (greedy), determinism note visible in the panel",
         pass: doc.getElementById("chat-temp").value === "0"
           && doc.getElementById("chat-temp-val").textContent.includes("greedy")
-          && (doc.querySelector("#chat + p.note, section p.note") || doc.body).textContent.length > 0
-          && [...doc.querySelectorAll("p.note")].some((p) => p.textContent.includes("pairing/verification stays greedy")),
+          && [...doc.querySelectorAll("#panel-temp p.note")].some((p) => p.textContent.includes("pairing/verification stays greedy")),
         detail: doc.getElementById("chat-temp").value + " / " + doc.getElementById("chat-temp-val").textContent });
-      rows.push({ label: "chat: clear button present",
-        pass: !!doc.getElementById("clear-chat"), detail: String(!!doc.getElementById("clear-chat")) });
       // Send a chat turn: temperature 0.55 must ride send_chat; the meta
-      // line renders the family engage reason + temp.
+      // line renders the family engage reason + temp. The chat box itself
+      // stays on the main page — no panel needed to operate it.
       doc.getElementById("chat-temp").value = "0.55";
       doc.getElementById("chat-temp").oninput();
       doc.getElementById("chat-input").value = "hello";
@@ -136,38 +153,41 @@
         pass: !!lastMeta && lastMeta.textContent.includes("family: not engaged (capability_unknown)")
           && lastMeta.textContent.includes("temp 0.55"),
         detail: lastMeta ? lastMeta.textContent : "(none)" });
-      // Clear: transcript empties + the daemon command fired.
-      doc.getElementById("clear-chat").onclick();
+      // Clear: a File-menu action now. Click the File menu open, then the
+      // item; transcript empties + the daemon command fired.
+      doc.getElementById("file-menu-btn").click();
+      doc.getElementById("clear-chat").click();
       await new Promise((r) => setTimeout(r, 200));
-      rows.push({ label: "chat: clear empties the transcript and calls clear_chat",
+      rows.push({ label: "File menu: clear conversation empties the transcript and calls clear_chat",
         pass: calls.clear_chat === 1 && doc.getElementById("transcript").children.length === 0,
         detail: "calls=" + calls.clear_chat + " left=" + doc.getElementById("transcript").children.length });
-      // GEOMETRY at 1152x648: the chat controls row must not blow the
-      // layout (chat section stays within the column; transcript keeps a
-      // sane minimum) and the Setup section height grows only by the
-      // toggle row.
+      // GEOMETRY at 1152x648 (single-column main since the reorg): the
+      // chat section fills the column without forcing overflow and the
+      // transcript keeps its floor; the pairing panel (re-opened — the
+      // temperature panel replaced it above) stays a bounded sheet.
       const chatSection = doc.querySelector("section[aria-labelledby='chat-h']");
-      const setupSection = doc.querySelector("section[aria-labelledby='setup-h']");
-      const rightCol = doc.querySelector("main > .col:last-child");
-      rows.push({ label: "geometry: chat section fits the column (clientHeight <= column, no forced overflow)",
-        pass: chatSection.clientHeight <= rightCol.clientHeight + 1,
-        detail: `chat ${chatSection.clientHeight}px vs col ${rightCol.clientHeight}px` });
+      const mainEl = doc.querySelector("main");
+      openPanel(doc, "panel-serving");
+      const servingSection = doc.getElementById("panel-serving");
+      rows.push({ label: "geometry: main page fits (no clip) with the sheet open at 1152×648",
+        pass: mainEl.scrollHeight <= mainEl.clientHeight + 1,
+        detail: `main ${mainEl.scrollHeight}/${mainEl.clientHeight}px` });
       rows.push({ label: "geometry: transcript keeps >= 80px minimum",
         pass: doc.getElementById("transcript").clientHeight >= 80,
         detail: doc.getElementById("transcript").clientHeight + "px" });
-      // Bound raised 260 -> 420 at the ADR-037 T/R review (2026-10-14):
-      // the Setup section legitimately gained the Cloud-assistant toggle
-      // row (ADR-037 §3.6 Settings opt-out) — measured 375px at 1152x648
-      // in Edge 155. The bound stays a runaway-growth drift detector,
-      // not a pixel-exact pin.
-      rows.push({ label: "geometry: setup section measured (toggle row cost) — recorded for the handoff",
-        pass: setupSection.offsetHeight > 0 && setupSection.offsetHeight < 420,
-        detail: setupSection.offsetHeight + "px" });
+      // Bound carried over from the two-column era (raised to 420 at the
+      // ADR-037 T/R review 2026-10-14). The panel is now a sheet section
+      // holding the two consent toggles — measured for the handoff; the
+      // bound stays a runaway-growth drift detector, not a pixel pin.
+      rows.push({ label: "geometry: pairing & carriage panel measured (toggle row cost) — recorded for the handoff",
+        pass: servingSection.offsetHeight > 0 && servingSection.offsetHeight < 420,
+        detail: servingSection.offsetHeight + "px" });
       frame.remove();
 
       // ---- Scenario B: toggle off + degraded family -------------------
       window.__mode = "off";
       ({ doc, frame } = await runScenario(ui));
+      openPanel(doc, "panel-serving");
       const sw2 = doc.getElementById("pairing-switch");
       rows.push({ label: "setup: toggle renders OFF from get_status (posture from the daemon, never a guess)",
         pass: sw2.dataset.on === "false" && sw2.getAttribute("aria-checked") === "false",
@@ -175,9 +195,10 @@
       rows.push({ label: "setup: the OFF note names locally-only serving",
         pass: doc.getElementById("pairing-note").textContent.includes("only serves locally"),
         detail: doc.getElementById("pairing-note").textContent });
-      rows.push({ label: "chip: remote serve off cites the Setup toggle",
-        pass: doc.getElementById("chip-direct").textContent.includes("swarm pairing off in Setup"),
+      rows.push({ label: "chip: remote serve off cites the Settings menu (the toggle's home since the reorg)",
+        pass: doc.getElementById("chip-direct").textContent.includes("swarm pairing off in Settings"),
         detail: doc.getElementById("chip-direct").textContent });
+      openPanel(doc, "panel-diagnostics");
       const famLine = doc.getElementById("family-line").textContent;
       rows.push({ label: "family line: exact reason AND detail (never a silent off)",
         pass: famLine.includes("pairing_disabled") && famLine.includes("the allow-swarm-pairing setting is off"),

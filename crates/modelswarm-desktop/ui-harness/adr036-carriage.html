@@ -12,16 +12,19 @@
   </style>
 </head>
 <body>
-  <h1>ADR-036 harness — the carriage disclosure + the family-verified-chat election</h1>
+  <h1>ADR-036 harness — the carriage disclosure + always-on family-verified chat</h1>
   <p>Loads the REAL <code>../ui/index.html</code> into a same-origin 1152×648 iframe with a stubbed
-  <code>window.__TAURI__</code> bridge, then asserts (ADR-036 §3.1, normative UI contract): the
-  serving-side carriage disclosure is ALWAYS VISIBLE while family serving is enabled and renders the
-  daemon's text VERBATIM (hidden while off / opted-out states honest); the Setup carriage toggle is
-  default ON and writes through <code>set_content_carriage</code>; the chat-surface election toggle
-  is default OFF (the user's choice — only the serving side is default-on), and while ELECTED the
-  §3.1 requester disclosure is always visible with the ACTUAL cohort count N and the honest cost;
-  an engaged reply names its cohort. Rendered geometry is measured at the app's default window
-  size (the owner's standing rule).</p>
+  <code>window.__TAURI__</code> bridge, then asserts (ADR-036 §3.1, normative UI contract; owner
+  directive 2026-10-15: the election is ALWAYS ON, the toggle retired): the serving-side carriage
+  disclosure is ALWAYS VISIBLE while family serving is enabled and renders the daemon's text
+  VERBATIM (hidden while off / opted-out states honest) — it stays on the MAIN page under the
+  hosting switch even after the nav-menu reorg; the Settings carriage toggle (menu: Settings →
+  Swarm pairing &amp; content carriage) is default ON and writes through
+  <code>set_content_carriage</code>; the requester §3.1 disclosure is PERMANENTLY visible directly
+  under the chat box with the ACTUAL cohort count N and the honest cost; the retired election
+  toggle stays ABSENT (negative control); an engaged reply names its cohort. Panels hidden behind
+  the nav menus are opened BEHAVIORALLY (menu button click → menu item click) before asserting.
+  Rendered geometry is measured at the app's default window size (the owner's standing rule).</p>
   <p><strong>Run:</strong> serve the crate root over http — e.g.
   <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> — then open
   <code>http://127.0.0.1:4817/ui-harness/adr036-carriage.html</code>.</p>
@@ -112,6 +115,18 @@
       return { doc, frame };
     }
 
+    // The 2026-10-15 nav-menu reorg moved the carriage toggle behind
+    // Settings → Swarm pairing & content carriage. Open it the way a user
+    // does: click the menu button, then the menu item.
+    function openPanel(doc, id) {
+      const item = doc.querySelector(`.menu-item[data-panel="${id}"]`);
+      if (!item) return false;
+      item.closest(".menu").querySelector(".menu-btn").click();
+      item.click();
+      const panel = doc.getElementById(id);
+      return !doc.getElementById("sheet").hidden && panel && !panel.hidden;
+    }
+
     function render(rows) {
       const table = document.createElement("table");
       for (const { label, pass, detail } of rows) {
@@ -136,10 +151,20 @@
         const { doc, frame } = await runScenario(ui);
         await new Promise((r) => setTimeout(r, 300));
         const line = doc.getElementById("carriage-line");
-        rows.push({ label: "serving: the §3.1 disclosure is ALWAYS VISIBLE while family serving is on",
+        rows.push({ label: "serving: the §3.1 disclosure is ALWAYS VISIBLE while family serving is on (stays on the MAIN page — a menu must never hide it)",
           pass: !!line && !line.hidden, detail: line ? (line.hidden ? "hidden" : "visible") : "missing" });
         rows.push({ label: "serving: the disclosure text is the daemon’s, VERBATIM (§3.1)",
           pass: !!line && line.textContent === SERVING_TEXT, detail: line ? line.textContent.slice(0, 60) + "…" : "missing" });
+        // The serving disclosure must be visible WITHOUT opening anything.
+        const mainBox = doc.querySelector("main").getBoundingClientRect();
+        const lineBox = line.getBoundingClientRect();
+        rows.push({ label: "serving: the disclosure renders inside the main page at 1152×648 (real height, on-screen)",
+          pass: lineBox.height > 8 && lineBox.bottom <= mainBox.bottom + 1,
+          detail: lineBox.height.toFixed(1) + "px, bottom " + lineBox.bottom.toFixed(0) + " vs main " + mainBox.bottom.toFixed(0) });
+        // The toggle now lives behind Settings → Swarm pairing & content
+        // carriage; open the panel behaviorally, then assert + click.
+        rows.push({ label: "menu: Settings → pairing & carriage panel opens behaviorally (menu button + item clicks)",
+          pass: openPanel(doc, "panel-serving"), detail: "sheet visible" });
         const sw = doc.getElementById("carriage-switch");
         rows.push({ label: "setup: the carriage toggle is present, default ON",
           pass: !!sw && sw.dataset.on === "true" && sw.getAttribute("aria-checked") === "true",
@@ -150,17 +175,14 @@
         rows.push({ label: "setup: the toggle writes set_content_carriage(false)",
           pass: !!calls.set_content_carriage && calls.set_content_carriage.allowed === false,
           detail: JSON.stringify(calls.set_content_carriage) });
-        // The election: default OFF, disclosure hidden.
-        const elect = doc.getElementById("verified-chat-switch");
-        rows.push({ label: "chat: the election toggle is present, default OFF (the user’s choice)",
-          pass: !!elect && elect.dataset.on === "false", detail: elect ? elect.dataset.on : "missing" });
-        rows.push({ label: "chat: the requester disclosure is HIDDEN while not elected",
-          pass: doc.getElementById("verified-chat-line").hidden, detail: "hidden" });
-        // Geometry: the disclosure line occupies real rendered space (not
-        // display:none’d by a rogue style).
-        const box = line.getBoundingClientRect();
-        rows.push({ label: "geometry: the disclosure line renders with real height at 1152×648",
-          pass: box.height > 8, detail: box.height.toFixed(1) + "px" });
+        // Always-on (owner directive 2026-10-15): no election toggle
+        // exists anywhere, and the requester disclosure is ALWAYS visible.
+        rows.push({ label: "chat: the retired election toggle is ABSENT (negative control)",
+          pass: !doc.getElementById("verified-chat-switch"), detail: "absent" });
+        const req = doc.getElementById("verified-chat-line");
+        rows.push({ label: "chat: the requester disclosure is ALWAYS VISIBLE (null-disclosure fallback path, N=1)",
+          pass: !!req && !req.hidden && req.textContent === REQUESTER_TEXT(1),
+          detail: req ? req.textContent.slice(0, 60) + "…" : "missing" });
         frame.remove();
       }
 
@@ -172,8 +194,9 @@
         const line = doc.getElementById("carriage-line");
         rows.push({ label: "opt-out: the disclosure stays visible with the HONEST off statement",
           pass: !!line && !line.hidden && OFF_TEXT.test(line.textContent), detail: line ? line.textContent.slice(0, 60) + "…" : "missing" });
+        openPanel(doc, "panel-serving");
         const sw = doc.getElementById("carriage-switch");
-        rows.push({ label: "opt-out: the toggle renders OFF",
+        rows.push({ label: "opt-out: the toggle renders OFF (opened from the Settings menu)",
           pass: sw.dataset.on === "false", detail: sw.dataset.on });
         frame.remove();
       }
@@ -188,13 +211,13 @@
         frame.remove();
       }
 
-      // ---- Scenario D: elected, cohort 1 -------------------------------
+      // ---- Scenario D: elected (always on), cohort 1 -------------------
       mode = "elected";
       {
         const { doc, frame } = await runScenario(ui);
         await new Promise((r) => setTimeout(r, 300));
         const line = doc.getElementById("verified-chat-line");
-        rows.push({ label: "elected: the §3.1 requester disclosure is ALWAYS VISIBLE",
+        rows.push({ label: "elected: the §3.1 requester disclosure is ALWAYS VISIBLE (directly under the chat box)",
           pass: !!line && !line.hidden, detail: line ? (line.hidden ? "hidden" : "visible") : "missing" });
         rows.push({ label: "elected: the disclosure renders the daemon’s text VERBATIM with N=1",
           pass: !!line && line.textContent === REQUESTER_TEXT(1), detail: line ? line.textContent.slice(0, 70) + "…" : "missing" });
@@ -204,6 +227,11 @@
           pass: !!line && line.textContent.includes("never sees any of it"), detail: "" });
         rows.push({ label: "always-on: the retired election toggle is ABSENT from the UI",
           pass: !doc.getElementById("verified-chat-switch"), detail: doc.getElementById("verified-chat-switch") ? "still present" : "absent" });
+        // Geometry: the requester disclosure occupies real rendered space
+        // inside the chat section (not display:none’d by a rogue style).
+        const chatBox = line.getBoundingClientRect();
+        rows.push({ label: "geometry: the requester disclosure renders with real height at 1152×648",
+          pass: chatBox.height > 8, detail: chatBox.height.toFixed(1) + "px" });
         frame.remove();
       }
 

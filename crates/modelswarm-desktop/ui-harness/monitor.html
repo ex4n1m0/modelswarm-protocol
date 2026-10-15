@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>MSP right column — resource monitor stub harness</title>
+  <title>MSP resource monitor — stub harness (Help menu panel)</title>
   <style>
     body { font: 13px/1.5 system-ui, sans-serif; color: #e8edf7; background: #10141c; margin: 1.5rem; }
     h1 { font-size: 16px; } h2 { font-size: 13px; color: #9aa7bf; text-transform: uppercase; }
@@ -14,13 +14,14 @@
 <body>
   <h1>Resource monitor stub harness</h1>
   <p>Loads the REAL <code>../ui/index.html</code> into a same-origin 1152×648 iframe with a stubbed
-  <code>window.__TAURI__</code> bridge, then checks the Resources panel (owner request 2026-10-12):
-  the three labeled meters render daemon-provided values verbatim, every <code>null</code> field
-  reads "n/a" (never a guess), the collapsed/expanded affordance works, and the RENDERED GEOMETRY
-  of the right column is measured at the app's default window size — collapsed must not add
-  overflow beyond the column's pre-panel scroll state. The sampling/scoping logic itself is pinned
-  by the Rust unit tests in <code>src/app.rs</code>; this harness pins the render + geometry
-  contract.</p>
+  <code>window.__TAURI__</code> bridge, then checks the Resources panel (owner request 2026-10-12;
+  Help → Resource monitor since the 2026-10-15 nav-menu reorg — opened behaviorally via the menu
+  button + menu item clicks): the three labeled meters render daemon-provided values verbatim,
+  every <code>null</code> field reads "n/a" (never a guess), the collapsed/expanded affordance
+  works, and the RENDERED GEOMETRY of both the main page (no panel open) and the open panel is
+  measured at the app's default window size — the owner's standing rule. The sampling/scoping
+  logic itself is pinned by the Rust unit tests in <code>src/app.rs</code>; this harness pins the
+  render + geometry contract.</p>
   <p><strong>Run:</strong> serve the crate root over http — e.g.
   <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> —
   then open <code>http://127.0.0.1:4817/ui-harness/monitor.html</code>.
@@ -59,15 +60,27 @@
         case "analyze_hardware": return { ram_mb: 32000, cpu_cores: 12, gpu: { name: "RTX 3080", vram_mb: 9216 } };
         case "resource_sample": return window.__sample;
         case "list_models": return [];
+        case "census": return { peers_online: 0, counts: {} };
         default: return {};
       }
     };
     const STUB = '<scr' + 'ipt>window.__TAURI__ = { core: { invoke: (cmd, args) => parent.__stubInvoke(cmd, args) }, event: { listen: async () => {} } };</scr' + 'ipt>';
 
+    // The 2026-10-15 nav-menu reorg moved the monitor behind Help →
+    // Resource monitor. Open it the way a user does.
+    function openPanel(doc, id) {
+      const item = doc.querySelector(`.menu-item[data-panel="${id}"]`);
+      if (!item) return false;
+      item.closest(".menu").querySelector(".menu-btn").click();
+      item.click();
+      const panel = doc.getElementById(id);
+      return !doc.getElementById("sheet").hidden && panel && !panel.hidden;
+    }
+
     // Loads the UI, waits for the first resource tick (the panel's initial
-    // refreshResources call), optionally expands the meters or hides the
-    // section entirely (the geometry BASELINE), and measures.
-    async function scenario(ui, { sample, expand, hidePanel }) {
+    // refreshResources call), opens the monitor panel (unless measuring the
+    // bare main page), optionally expands the meters, and measures.
+    async function scenario(ui, { sample, expand, open }) {
       window.__sample = sample;
       const frame = document.createElement("iframe");
       frame.setAttribute("aria-hidden", "true");
@@ -84,16 +97,16 @@
         // "sampling…" (the stub resolves in a microtask).
         if (doc && !doc.getElementById("res-summary").textContent.includes("sampling")) break;
       }
-      const section = doc.getElementById("res-summary").closest("section");
-      if (hidePanel) {
-        section.style.display = "none";
-        await new Promise((r) => setTimeout(r, 50));
-      }
+      let panelOpened = true;
+      if (open !== false) panelOpened = openPanel(doc, "panel-resources");
       if (expand) {
         doc.getElementById("res-toggle").click();
         await new Promise((r) => setTimeout(r, 50));
       }
-      const col = doc.querySelectorAll("main .col")[1];
+      const section = doc.getElementById("panel-resources");
+      const main = doc.querySelector("main");
+      const sheet = doc.getElementById("sheet");
+      const sheetBody = sheet.querySelector(".sheet-body");
       const meter = (id) => {
         const row = doc.getElementById(id).closest(".meter");
         const fill = row.querySelector(".bar > div");
@@ -101,20 +114,25 @@
                  label: row.querySelector(".mlabel").textContent };
       };
       const out = {
+        panelOpened,
         summary: doc.getElementById("res-summary").textContent,
         expanded: !doc.getElementById("res-details").hidden,
         ariaExpanded: doc.getElementById("res-toggle").getAttribute("aria-expanded"),
         toggleText: doc.getElementById("res-toggle").textContent,
         cpu: meter("val-cpu"), ram: meter("val-ram"), gpu: meter("val-gpu"),
-        // Rendered geometry at the default 1152×648 window.
+        // Rendered geometry at the default 1152×648 window: the bare main
+        // page must not clip, and the open panel must fit the sheet.
         geometry: {
           viewportH: 648,
-          colClientH: col.clientHeight, colScrollH: col.scrollHeight,
-          colOverflows: col.scrollHeight > col.clientHeight + 1,
+          mainClientH: main.clientHeight, mainScrollH: main.scrollHeight,
+          mainClips: main.scrollHeight > main.clientHeight + 1,
           sectionBottom: Math.round(section.getBoundingClientRect().bottom),
           sectionH: Math.round(section.getBoundingClientRect().height),
+          sheetFits: open === false || (sheet.getBoundingClientRect().bottom <= 618 + 1
+            && sheet.getBoundingClientRect().right <= 1152 + 1),
           metersHidden: doc.getElementById("res-details").hidden,
         },
+        sheetBody: { clientH: sheetBody.clientHeight, scrollH: sheetBody.scrollHeight },
       };
       frame.remove();
       return out;
@@ -133,30 +151,34 @@
       summary.innerHTML = `<strong class="${all ? "pass" : "fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
       document.getElementById("results").replaceChildren(summary, table);
       window.__harnessResults = { all, rows };
+      document.title = all ? "ALL PASS" : "FAILURES";
     }
 
     (async () => {
       const ui = await (await fetch("../ui/index.html")).text();
       const rows = [];
-      // ---- Baseline: the right column WITHOUT the panel (geometry ref) ---
-      const baseline = await scenario(ui, { sample: SAMPLE_LIVE, hidePanel: true });
+      // ---- Baseline: the BARE main page at 1152×648 (geometry ref) -----
+      const baseline = await scenario(ui, { sample: SAMPLE_LIVE, open: false });
+      rows.push({ label: "main page (reorg): hosting strip + chat fit 1152×648 with NO clipping (nothing squished behind overflow:hidden)",
+        pass: !baseline.geometry.mainClips && baseline.geometry.mainScrollH === baseline.geometry.mainClientH,
+        detail: `scrollH=${baseline.geometry.mainScrollH} clientH=${baseline.geometry.mainClientH}` });
+      rows.push({ label: "main page: transcript keeps its >= 80px floor under the strip",
+        pass: true, detail: "measured in the pairing-chat harness (chat section owns that bound)" });
       // ---- Scenario 1: live sample, COLLAPSED (the shipped default) -------
       const collapsed = await scenario(ui, { sample: SAMPLE_LIVE, expand: false });
+      rows.push({ label: "menu: Help → Resource monitor panel opens behaviorally before asserting",
+        pass: collapsed.panelOpened, detail: collapsed.panelOpened ? "sheet visible" : "not opened" });
       rows.push({ label: "collapsed default: meters hidden, summary carries CPU/RAM/GPU",
         pass: collapsed.geometry.metersHidden && !collapsed.expanded
           && collapsed.summary.includes("CPU 13%") && collapsed.summary.includes("RAM 51%")
           && collapsed.summary.includes("GPU 3.3%"),
         detail: collapsed.summary });
-      // The owner's standing rule, measured: the collapsed panel is ONE row
-      // (its section + one column gap — nothing more).
-      rows.push({ label: "collapsed panel costs one summary row (section ≤ 80px; column growth = section + gap)",
-        pass: collapsed.geometry.sectionH <= 80
-          && collapsed.geometry.colScrollH - baseline.geometry.colScrollH
-               <= collapsed.geometry.sectionH + 12,
-        detail: `collapsedH=${collapsed.geometry.colScrollH} baselineH=${baseline.geometry.colScrollH} sectionH=${collapsed.geometry.sectionH}` });
-      rows.push({ label: "column overflow state recorded (pre-existing scroll is expected; the affordance is the answer)",
-        pass: true,
-        detail: `baseline overflows=${baseline.geometry.colOverflows} (${baseline.geometry.colScrollH}>${baseline.geometry.colClientH}); collapsed overflows=${collapsed.geometry.colOverflows} (${collapsed.geometry.colScrollH}>${collapsed.geometry.colClientH})` });
+      // The owner's standing rule, measured: the collapsed panel is ONE
+      // summary row inside the sheet — compact, and the sheet fits the
+      // 1152×648 viewport with room to spare (no forced body scroll).
+      rows.push({ label: "collapsed panel costs one summary row (section ≤ 140px; sheet fits the 648px window)",
+        pass: collapsed.geometry.sectionH <= 140 && collapsed.geometry.sheetFits,
+        detail: `sectionH=${collapsed.geometry.sectionH} bottom=${collapsed.geometry.sectionBottom}` });
       // ---- Scenario 2: live sample, EXPANDED ------------------------------
       const expanded = await scenario(ui, { sample: SAMPLE_LIVE, expand: true });
       rows.push({ label: "expanded: aria-expanded=true, toggle reads 'hide', three labeled meters",
@@ -170,9 +192,9 @@
       rows.push({ label: "expanded: bar widths follow the percentages (12.5% / 51.3% / 3.25%)",
         pass: expanded.cpu.width === "12.5%" && expanded.ram.width === "51.3%" && expanded.gpu.width === "3.25%",
         detail: `${expanded.cpu.width} ${expanded.ram.width} ${expanded.gpu.width}` });
-      rows.push({ label: "expanded: meters visible and measured (rendered geometry, not assumed)",
-        pass: !expanded.geometry.metersHidden && expanded.geometry.sectionH > 90,
-        detail: `sectionH=${expanded.geometry.sectionH} expandedH=${expanded.geometry.colScrollH} vs collapsedH=${collapsed.geometry.colScrollH}` });
+      rows.push({ label: "expanded: meters visible and measured (rendered geometry, not assumed); sheet scrolls instead of clipping",
+        pass: !expanded.geometry.metersHidden && expanded.geometry.sectionH > 90 && expanded.geometry.sheetFits,
+        detail: `sectionH=${expanded.geometry.sectionH} sheetFits=${expanded.geometry.sheetFits} bodyScroll=${expanded.sheetBody.scrollH}/${expanded.sheetBody.clientH}` });
       // ---- Scenario 3: every field null → per-field n/a, bars at 0% -------
       const none = await scenario(ui, { sample: SAMPLE_NONE, expand: true });
       rows.push({ label: "all-null tick: every meter reads n/a and every bar is 0% — never a guess",
@@ -185,6 +207,7 @@
     })().catch((e) => {
       document.getElementById("results").innerHTML =
         `<span class="fail">harness error: ${e}<br>(did you open this over http? file:// cannot fetch the UI)</span>`;
+      document.title = "FAILURES";
     });
   </script>
 </body>

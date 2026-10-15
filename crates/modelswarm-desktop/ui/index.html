@@ -10,18 +10,32 @@
       --muted: #9aa7bf; --accent: #5aa2ff; --ok: #43c78f; --warn: #e0a93e;
       --err: #e06565; --idle: #5b6779; --border: #2c3850;
       --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+      --nav-h: 40px; --strip-h: 30px;
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
     body { margin: 0; font: 13.5px/1.45 system-ui, "Segoe UI", sans-serif; color: var(--ink); background: var(--bg); display: flex; flex-direction: column; }
-    header { display: flex; align-items: center; gap: 12px; padding: 8px 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
-    header h1 { font-size: 15px; margin: 0; }
-    .build-tag { font-family: var(--mono); font-size: 11px; color: var(--warn); border: 1px solid var(--warn); border-radius: 4px; padding: 1px 6px; }
-    /* Two-column board: primary workflow left, status/telemetry right.
-       Designed to fit the 1152×648 default window without page scroll. */
-    main { padding: 12px 14px; display: grid; grid-template-columns: minmax(0, 58fr) minmax(0, 42fr); gap: 12px; align-items: stretch; flex: 1 1 auto; min-height: 0; overflow: hidden; }
-    main > .banner { grid-column: 1 / -1; }
-    .col { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow-y: auto; padding-right: 2px; }
+    [hidden] { display: none !important; }
+
+    /* ---- Navigation bar (owner directive 2026-10-15): File / Settings /
+       Help dropdown menus. Everything the user does not need to operate
+       lives behind these; the main page below keeps only the operating
+       surface (hosting + model picker + chat) and the status strip. */
+    nav#navbar { display: flex; align-items: center; gap: 12px; height: var(--nav-h); flex: none; padding: 0 12px; background: var(--panel); border-bottom: 1px solid var(--border); }
+    nav#navbar .brand { font-weight: 700; font-size: 14px; }
+    .build-tag { font-family: var(--mono); font-size: 11px; color: var(--warn); border: 1px solid var(--warn); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
+    .menus { display: flex; gap: 2px; }
+    .menu { position: relative; }
+    button.menu-btn { background: transparent; color: var(--ink); border: 0; border-radius: 6px; padding: 5px 12px; font-weight: 500; font-size: 13px; }
+    button.menu-btn:hover, button.menu-btn[aria-expanded="true"] { background: var(--panel-2); }
+    .menu-panel { position: absolute; top: calc(100% + 4px); left: 0; z-index: 60; min-width: 300px; max-width: min(420px, 92vw); background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 6px; box-shadow: 0 10px 28px rgba(0,0,0,.5); }
+    .menu-panel .menu-note { display: block; padding: 6px 10px 8px; color: var(--muted); font-size: 11px; font-family: var(--mono); border-bottom: 1px solid var(--border); margin-bottom: 4px; overflow-wrap: anywhere; }
+    button.menu-item { display: block; width: 100%; text-align: left; background: transparent; color: var(--ink); border: 0; border-radius: 6px; padding: 7px 10px; font-weight: 400; font-size: 13px; }
+    button.menu-item:hover, button.menu-item:focus-visible { background: var(--accent); color: #0b1220; }
+
+    /* ---- Main page: the operating surface only. Single column, chat
+       fills the height; the 1152×648 default window never page-scrolls. */
+    main { display: flex; flex-direction: column; gap: 10px; flex: 1 1 auto; min-height: 0; padding: 10px 14px; overflow: hidden; }
     section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin: 0; }
     section.fill { flex: 1; min-height: 0; display: flex; flex-direction: column; }
     h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 6px; }
@@ -32,10 +46,11 @@
     button.ghost { background: transparent; border: 1px solid var(--border); color: var(--ink); font-weight: 500; }
     button.stop { background: var(--err); color: #fff; }
     input[type=text] { background: var(--bg); color: var(--ink); border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; width: 100%; font-family: var(--mono); font-size: 12.5px; }
+    select { background: var(--bg); color: var(--ink); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font: 12.5px var(--mono); max-width: 340px; }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .bar { flex: 1; height: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
     .bar > div { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--ok)); transition: width .2s; }
-    .hosting-row { display: flex; align-items: center; gap: 10px; }
+    .hosting-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     button.switch { background: var(--idle); color: #fff; border: 1px solid var(--border); width: 44px; height: 24px; border-radius: 12px; position: relative; cursor: pointer; flex: none; padding: 0; min-width: 44px; min-height: 32px; }
     button.switch .knob { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: left .15s ease; pointer-events: none; }
     button.switch[data-on="true"] { background: var(--ok); } button.switch[data-on="true"] .knob { left: 23px; }
@@ -51,10 +66,10 @@
     .chips { display: flex; flex-wrap: wrap; gap: 6px; }
     .chip { font-size: 11.5px; font-family: var(--mono); padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
     .chip[data-state="active"] { color: var(--warn); border-color: var(--warn); background: rgba(224,169,62,.12); }
-    /* Resource monitor (owner request 2026-10-12): three labeled meters in
-       the right column. Collapsed by default (one summary line) so the
-       panel never forces the 648px window into overflow; "details" expands
-       the meters. Every unmeasurable field renders n/a, never a guess. */
+    .chip.relay { color: var(--accent); border-color: var(--accent); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* Resource monitor (owner request 2026-10-12), now in Help → Resource
+       monitor: three labeled meters. Collapsed by default (one summary
+       line); every unmeasurable field renders n/a, never a guess. */
     .meter { display: grid; grid-template-columns: 30px 1fr max-content; gap: 8px; align-items: center; margin-top: 6px; }
     .meter .mlabel { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
     .meter .mval { font-family: var(--mono); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
@@ -78,21 +93,68 @@
     .card .meta { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
     .card .meta:last-child { color: var(--ok); }
     pre.snippet { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; font-family: var(--mono); font-size: 10.5px; overflow-x: auto; margin: 4px 0 0; white-space: pre; }
-    footer { color: var(--muted); font-size: 10.5px; padding: 6px 16px 12px; text-align: center; }
-    @media (max-width: 980px) {
-      main { grid-template-columns: 1fr; overflow-y: auto; }
-      #transcript { max-height: 240px; }
+
+    /* ---- Status strip (bottom): version, peers online / census count,
+       relay chip while a reservation holds it. Compact truth, always on. */
+    footer#status-strip { display: flex; align-items: center; gap: 10px; height: var(--strip-h); flex: none; padding: 0 14px; background: var(--panel); border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; overflow: hidden; }
+    footer#status-strip .footnote { margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* ---- Panel sheet (right drawer): the one surface every nav menu
+       opens. Only one panel is visible at a time; the navbar stays
+       reachable so panels can be switched without closing first. */
+    #sheet { position: fixed; top: var(--nav-h); right: 0; bottom: var(--strip-h); width: min(560px, 94vw); z-index: 40; display: flex; flex-direction: column; background: var(--panel); border-left: 1px solid var(--border); box-shadow: -12px 0 32px rgba(0,0,0,.5); }
+    #sheet .sheet-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); flex: none; background: var(--panel-2); border-radius: 8px 8px 0 0; }
+    #sheet .sheet-bar h2 { margin: 0; }
+    #sheet .sheet-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+    #sheet .sheet-body > section, #sheet .sheet-body > div.panel { background: transparent; border: 0; padding: 0; }
+    #sheet .sheet-body section section, #sheet .sheet-body div.panel section { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+
+    @media (max-width: 900px) {
+      main { padding: 8px 10px; gap: 8px; }
+      nav#navbar { gap: 8px; }
+      select { max-width: 200px; }
+      #sheet { width: 100vw; }
+      footer#status-strip .footnote { display: none; }
     }
   </style>
 </head>
 <body>
-  <header>
-    <h1>ModelSwarm</h1>
+  <nav id="navbar" aria-label="Main menu bar">
+    <span class="brand">ModelSwarm</span>
     <span class="build-tag" id="version-tag" role="note" aria-label="Client version">v…</span>
-    <span class="build-tag" role="note" aria-label="Build label">INTERNAL TEST BUILD — UNSIGNED</span>
+    <div class="menus">
+      <div class="menu" id="menu-file">
+        <button type="button" class="menu-btn" id="file-menu-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="file-menu-panel">File</button>
+        <div class="menu-panel" id="file-menu-panel" role="menu" aria-label="File menu" hidden>
+          <button type="button" class="menu-item" id="clear-chat" role="menuitem" title="Clear the conversation (resets the model's rendered history)">Clear conversation</button>
+          <button type="button" class="menu-item" id="exit-app" role="menuitem">Exit</button>
+        </div>
+      </div>
+      <div class="menu" id="menu-settings">
+        <button type="button" class="menu-btn" id="settings-menu-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="settings-menu-panel">Settings</button>
+        <div class="menu-panel" id="settings-menu-panel" role="menu" aria-label="Settings menu" hidden>
+          <button type="button" class="menu-item" data-panel="panel-models" role="menuitem">Models — browse, download &amp; request…</button>
+          <button type="button" class="menu-item" data-panel="panel-setup" role="menuitem">Tracker, engine &amp; device approval…</button>
+          <button type="button" class="menu-item" data-panel="panel-serving" role="menuitem">Swarm pairing &amp; content carriage…</button>
+          <button type="button" class="menu-item" data-panel="panel-temp" role="menuitem">Chat temperature…</button>
+          <button type="button" class="menu-item" data-panel="panel-assistant-settings" role="menuitem">Cloud assistant…</button>
+        </div>
+      </div>
+      <div class="menu" id="menu-help">
+        <button type="button" class="menu-btn" id="help-menu-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="help-menu-panel">Help</button>
+        <div class="menu-panel" id="help-menu-panel" role="menu" aria-label="Help menu" hidden>
+          <span class="menu-note" id="update-note" role="status" aria-label="Update status">update: …</span>
+          <button type="button" class="menu-item" data-panel="assistant-section" role="menuitem">Setup assistant…</button>
+          <button type="button" class="menu-item" data-panel="panel-privacy" role="menuitem">Privacy disclosures…</button>
+          <button type="button" class="menu-item" data-panel="panel-resources" role="menuitem">Resource monitor…</button>
+          <button type="button" class="menu-item" data-panel="panel-census" role="menuitem">Census detail…</button>
+          <button type="button" class="menu-item" data-panel="panel-diagnostics" role="menuitem">Diagnostics &amp; local API…</button>
+          <button type="button" class="menu-item" data-panel="panel-about" role="menuitem">About…</button>
+        </div>
+      </div>
+    </div>
     <span class="note" id="conn-note" role="status">connecting…</span>
-    <span class="note" id="update-note" role="status" aria-label="Update status">update: …</span>
-  </header>
+  </nav>
 
   <main>
     <div class="banner gate" id="privacy-gate" role="alert" aria-label="First-run privacy warning" hidden>
@@ -107,18 +169,72 @@
     </div>
     <div class="banner error" id="error-banner" role="alert"></div>
 
-    <div class="col grow">
-      <section aria-labelledby="models-h">
+    <!-- THE OPERATING SURFACE: hosting on/off, the current model with a
+         compact picker, the chat box with its permanent family-verification
+         disclosure directly under it. Nothing else stays on this page. -->
+    <section aria-labelledby="hosting-h">
+      <h2 id="hosting-h">Host</h2>
+      <div class="hosting-row">
+        <button type="button" class="switch" id="hosting-switch" data-on="false" role="switch" aria-checked="false" aria-label="Hosting toggle"><span class="knob"></span></button>
+        <span class="state-word" id="hosting-word" data-on="false">OFF</span>
+        <label class="note" for="model-select" style="margin:0;font-style:normal">model</label>
+        <select id="model-select" aria-label="Current model — pick to start or switch"><option>loading…</option></select>
+        <button type="button" class="ghost" id="browse-models" data-panel="panel-models">browse all models…</button>
+        <div class="bar" style="min-width:120px" aria-hidden="true"><div id="dl-progress"></div></div>
+        <span class="note" id="dl-label" style="margin:0"></span>
+      </div>
+      <!-- ADR-036 §3.1 (normative UI contract): the serving-side carriage
+           disclosure — ALWAYS VISIBLE while family serving is enabled,
+           rendered VERBATIM from the daemon; hidden only while nothing is
+           being carried (hosting off / family off). -->
+      <p class="note" id="carriage-line" hidden style="margin:6px 0 0;font-size:11.5px"></p>
+    </section>
+
+    <section aria-labelledby="chat-h" class="fill">
+      <h2 id="chat-h">Test box — chat with the hosted model</h2>
+      <div id="chat">
+        <div id="transcript" aria-live="polite"></div>
+        <form id="chat-form">
+          <input type="text" id="chat-input" placeholder="Ask the hosted model…" aria-label="Message" autocomplete="off" maxlength="4000">
+          <button type="submit" id="send-btn">send</button>
+        </form>
+        <div class="row" style="flex-wrap:nowrap;gap:8px;align-items:center">
+          <span class="note" style="margin:0">family-verified chat — always on: peers hosting the same exact model cross-check every reply. Slower by design, not faster.</span>
+        </div>
+        <!-- ADR-036 §3.1, permanently visible (owner directive 2026-10-15:
+             the election is ALWAYS ON): the requester-side disclosure with
+             the ACTUAL cohort count N and the honest cost, rendered
+             VERBATIM from the daemon's field. Directly under the chat box. -->
+        <p class="note" id="verified-chat-line" hidden style="margin:6px 0 0;font-size:11.5px"></p>
+      </div>
+    </section>
+  </main>
+
+  <footer id="status-strip">
+    <span>ModelSwarm <span id="foot-version" role="note" aria-label="Client version">v…</span></span>
+    <span class="build-tag" role="note" aria-label="Build label">INTERNAL TEST BUILD — UNSIGNED</span>
+    <span id="census-strip" role="status" aria-label="Swarm census">peers online: …</span>
+    <span class="chip relay" id="relay-chip" hidden title="">relay reserved</span>
+    <span class="note footnote">every number in this UI is measured, never theoretical</span>
+  </footer>
+
+  <!-- The panel sheet: one surface, opened by the nav menus (and the
+       "browse all models…" button). Each panel keeps its stable ids —
+       the harnesses drive these by id after opening them behaviorally. -->
+  <div id="sheet" role="region" aria-label="Panel" hidden>
+    <div class="sheet-bar">
+      <h2 id="sheet-title">Panel</h2>
+      <button type="button" class="ghost" id="sheet-close" aria-label="Close panel">close</button>
+    </div>
+    <div class="sheet-body">
+
+      <section id="panel-models" data-title="Models — browse, download &amp; request" aria-labelledby="models-h" hidden>
         <h2 id="models-h">Models</h2>
         <p class="note" id="hw-line" style="margin:0 0 8px"></p>
         <div id="model-cards" class="cards" role="listbox" aria-label="Recommended model profiles for this machine">
           <div class="note">loading catalog…</div>
         </div>
         <div id="more-models" hidden><button type="button" class="ghost" id="show-all-models"></button></div>
-        <div class="row" style="margin-top:8px">
-          <div class="bar" aria-hidden="true"><div id="dl-progress"></div></div>
-          <span class="note" id="dl-label"></span>
-        </div>
         <details id="hf-picker" style="margin-top:8px">
           <summary style="cursor:pointer;color:var(--muted);font-size:11.5px">＋ more models — search Hugging Face &amp; request one for the swarm</summary>
           <p class="note" style="margin:6px 0">Requests are reviewed before they join the catalog — an approved model
@@ -131,51 +247,21 @@
         </details>
       </section>
 
-      <section aria-labelledby="hosting-h">
-        <h2 id="hosting-h">Hosting</h2>
-        <div class="hosting-row">
-          <button type="button" class="switch" id="hosting-switch" data-on="false" role="switch" aria-checked="false" aria-label="Hosting toggle"><span class="knob"></span></button>
-          <span class="state-word" id="hosting-word" data-on="false">OFF</span>
-        </div>
-        <dl class="kv" style="margin-top:8px">
-          <dt>Model</dt><dd id="model-name-line">—</dd>
-          <dt>Compute</dt><dd id="compute-line">—</dd>
-          <dt>Profile id</dt><dd id="profile-line">—</dd>
-          <dt>Gateway</dt><dd id="gateway-line">—</dd>
-          <dt>Installation</dt><dd id="install-line">—</dd>
-        </dl>
-        <p class="note" style="margin:4px 0 0">Beta boundary, never hidden: this build hosts and serves <strong>locally</strong>; remote peers can't be served until the Phase F listener ships.</p>
-      </section>
-
-      <section aria-labelledby="chat-h" class="fill">
-        <h2 id="chat-h">Test box — chat with the hosted model</h2>
-        <div id="chat">
-          <div id="transcript" aria-live="polite"></div>
-          <div class="row" style="justify-content:space-between;align-items:center;gap:8px">
-            <label class="note" for="chat-temp" style="margin:0;white-space:nowrap">temp <span id="chat-temp-val" style="font-family:var(--mono)">0 (greedy)</span></label>
-            <input type="range" id="chat-temp" min="0" max="1" step="0.05" value="0" style="flex:1;min-width:80px" aria-label="Chat temperature">
-            <button type="button" class="ghost" id="clear-chat" title="Clear the conversation (resets the model's rendered history)">clear chat</button>
-          </div>
-          <div class="row" style="flex-wrap:nowrap;gap:8px;align-items:center;margin-top:6px">
-            <span class="note" style="margin:0">family-verified chat — always on: peers hosting the same exact model cross-check every reply. Slower by design, not faster.</span>
-          </div>
-          <p class="note" id="verified-chat-line" hidden style="margin:6px 0 0;font-size:11.5px"></p>
-          <form id="chat-form">
-            <input type="text" id="chat-input" placeholder="Ask the hosted model…" aria-label="Message" autocomplete="off" maxlength="4000">
-            <button type="submit" id="send-btn">send</button>
-          </form>
-          <p class="note" style="margin:0">temperature applies to chat replies only — pairing/verification stays greedy (its determinism contract).</p>
-        </div>
-      </section>
-    </div>
-
-    <div class="col">
-      <section aria-labelledby="setup-h">
+      <section id="panel-setup" data-title="Tracker, engine &amp; device approval" aria-labelledby="setup-h" hidden>
         <h2 id="setup-h">Setup</h2>
         <dl class="kv">
           <dt>Tracker</dt><dd><input type="text" id="tracker-url" aria-label="Tracker base URL"></dd>
           <dt>Engine</dt><dd id="engine-line">—</dd>
           <dt>Device approval</dt><dd><span id="enroll-line">—</span> <button class="ghost" id="enroll-open" hidden>approve this device…</button></dd>
+        </dl>
+        <div class="row" style="margin-top:8px">
+          <button class="ghost" id="save-tracker">save tracker</button>
+        </div>
+      </section>
+
+      <section id="panel-serving" data-title="Swarm pairing &amp; content carriage" hidden>
+        <h2>Serving consent</h2>
+        <dl class="kv">
           <dt>Swarm pairing</dt><dd class="row" style="flex-wrap:nowrap;gap:8px;align-items:center">
             <button type="button" class="switch" id="pairing-switch" data-on="true" role="switch" aria-checked="true" aria-label="Allow swarm pairing toggle"><span class="knob"></span></button>
             <span class="note" id="pairing-note" style="margin:0">allow — the serving listener + family verify engine start with hosting</span>
@@ -184,52 +270,36 @@
             <button type="button" class="switch" id="carriage-switch" data-on="true" role="switch" aria-checked="true" aria-label="Carry other users' conversations through family verification toggle"><span class="knob"></span></button>
             <span class="note" id="carriage-note" style="margin:0">on by default — this computer carries other users&rsquo; conversations (as token ids it can read) through family verification; requesting peers are refused honestly when you turn it off. Applies at the next hosting start.</span>
           </dd>
+        </dl>
+      </section>
+
+      <section id="panel-temp" data-title="Chat temperature" hidden>
+        <h2>Chat temperature</h2>
+        <div class="row" style="flex-wrap:nowrap;gap:8px;align-items:center">
+          <label class="note" for="chat-temp" style="margin:0;white-space:nowrap">temp <span id="chat-temp-val" style="font-family:var(--mono)">0 (greedy)</span></label>
+          <input type="range" id="chat-temp" min="0" max="1" step="0.05" value="0" style="flex:1;min-width:80px" aria-label="Chat temperature">
+        </div>
+        <p class="note" style="margin:6px 0 0">temperature applies to chat replies only — pairing/verification stays greedy (its determinism contract).</p>
+      </section>
+
+      <section id="panel-assistant-settings" data-title="Cloud assistant (Settings)" hidden>
+        <h2>Cloud assistant</h2>
+        <dl class="kv">
           <dt>Cloud assistant</dt><dd class="row" style="flex-wrap:nowrap;gap:8px;align-items:center">
             <button type="button" class="switch" id="assistant-switch" data-on="true" role="switch" aria-checked="true" aria-label="Cloud assistant toggle"><span class="knob"></span></button>
             <span class="note" id="assistant-note" style="margin:0">the setup assistant's cloud mode — turn it off any time; built-in help keeps working either way.</span>
           </dd>
         </dl>
-        <div class="row" style="margin-top:8px">
-          <button class="ghost" id="save-tracker">save tracker</button>
-        </div>
+        <p class="note" style="margin:6px 0 0">the assistant itself lives in Help → Setup assistant.</p>
       </section>
 
-      <section aria-labelledby="peers-h">
-        <h2 id="peers-h">Peers &amp; NAT path</h2>
-        <table aria-label="Peer roster">
-          <thead><tr><th scope="col">Peer</th><th scope="col">Capacity</th><th scope="col">Path</th></tr></thead>
-          <tbody id="peer-rows"><tr><td colspan="3" class="note">hosting off — roster empty</td></tr></tbody>
-        </table>
-      </section>
-
-      <section aria-labelledby="api-h">
-        <h2 id="api-h">Local API — integrate anywhere</h2>
-        <p class="note" style="margin:0 0 4px">OpenAI-compatible endpoint served by your node on loopback:</p>
-        <div class="row"><code id="api-base" style="font-family:var(--mono);font-size:12px">—</code></div>
-        <pre class="snippet" id="api-snippet">curl <span id="curl-url">http://127.0.0.1:11435/v1/chat/completions</span>   -H "content-type: application/json"   -d '{"model": "<span id="curl-model">msp1:…</span>", "messages": [{"role": "user", "content": "Hello"}]}'</pre>
-      </section>
-
-      <section aria-labelledby="deg-h">
-        <h2 id="deg-h">Degraded states</h2>
-        <div class="chips" role="list" aria-label="Degraded state chips">
-          <span class="chip" role="listitem" id="chip-tracker" data-state="inactive">tracker unreachable</span>
-          <span class="chip" role="listitem" id="chip-engine" data-state="inactive">engine missing</span>
-          <span class="chip" role="listitem" id="chip-model" data-state="inactive">model missing</span>
-          <span class="chip" role="listitem" id="chip-direct" data-state="inactive">direct-connect fail (no listener)</span>
-          <span class="chip" role="listitem" id="chip-hosting" data-state="inactive">not hosting</span>
-        </div>
-        <p class="note" id="family-line" style="margin:6px 0 0;font-size:11.5px">batch-verify family: unknown</p>
-        <p class="note" id="carriage-line" hidden style="margin:6px 0 0;font-size:11.5px"></p>
-        <div class="row" style="margin-top:6px">
-          <button class="ghost" id="family-probe">test family pairing (presents this machine's lease)</button>
-        </div>
-        <p class="note" id="family-probe-line" style="margin:4px 0 0;font-size:11.5px">family pairing: not tested</p>
-      </section>
-
-      <section aria-labelledby="assistant-h" id="assistant-section">
+      <!-- ADR-037 §3.6/§4.5: the assistant panel keeps its OWN section,
+           input, and assistant-* event namespace (chat wall W4) — now
+           opened from the Help menu. Plain text only (§3.7). -->
+      <section id="assistant-section" data-title="Setup assistant" aria-labelledby="assistant-h" hidden>
         <h2 id="assistant-h">Setup assistant</h2>
         <p class="note" id="assistant-mode" style="margin:0 0 4px">built-in help</p>
-        <div id="assistant-disclosure" class="banner" hidden style="margin:0 0 6px;padding:8px">
+        <div id="assistant-disclosure" class="banner" hidden style="margin:0 0 6px;padding:8px;background:var(--panel-2)">
           <p id="assistant-disclosure-text" style="margin:0 0 6px"></p>
           <button class="ghost" id="assistant-ack" type="button">I understand — enable the cloud assistant</button>
         </div>
@@ -245,7 +315,7 @@
         </div>
       </section>
 
-      <section aria-labelledby="priv-h">
+      <section id="panel-privacy" data-title="Privacy disclosures" aria-labelledby="priv-h" hidden>
         <h2 id="priv-h">Privacy</h2>
         <ul style="margin:0;padding-left:18px;font-size:11.5px;line-height:1.45">
           <li>Prompts/completions are structurally redacted from all node logs.</li>
@@ -253,9 +323,10 @@
           <li>Secrets (identity seed, engine key, lease tokens) stay in the node process — never in this UI.</li>
           <li>Serving peers read the prompts they serve; family-verified chat (always on — the disclosure below states the cost every turn) additionally sends the conversation — in a form the verifying peers can read — to every verification peer. Transport is encrypted; there is no confidential-computing claim.</li>
         </ul>
+        <p class="note" style="margin:8px 0 0">full document: docs/privacy.md (shipped with the app).</p>
       </section>
 
-      <section aria-labelledby="res-h">
+      <section id="panel-resources" data-title="Resource monitor" aria-labelledby="res-h" hidden>
         <h2 id="res-h">Resources</h2>
         <div class="row" style="justify-content:space-between;align-items:center">
           <span class="note" id="res-summary" style="margin:0">sampling…</span>
@@ -268,10 +339,74 @@
           <p class="note" style="margin:6px 0 0">CPU + working set: this app + supervised engines · RAM %: whole system · GPU: busiest adapter. n/a = not measurable this tick.</p>
         </div>
       </section>
-    </div>
-  </main>
 
-  <footer>ModelSwarm <span id="foot-version">v…</span> internal test shell — every number in this UI is measured, never theoretical.</footer>
+      <section id="panel-census" data-title="Census detail" aria-labelledby="census-h" hidden>
+        <h2 id="census-h">Census</h2>
+        <p class="note" id="census-total" style="margin:0 0 6px">…</p>
+        <table aria-label="Live per-profile hosting census">
+          <thead><tr><th scope="col">Model profile</th><th scope="col">Live peers</th></tr></thead>
+          <tbody id="census-rows"><tr><td colspan="2" class="note">census not fetched yet…</td></tr></tbody>
+        </table>
+        <p class="note" style="margin:6px 0 0">source: the tracker's public stats (the same counts the website census shows), refreshed every 30 s. A failed poll reads census n/a everywhere — no stale counts are ever shown.</p>
+      </section>
+
+      <div class="panel" id="panel-diagnostics" data-title="Diagnostics &amp; local API" hidden>
+        <section aria-labelledby="deg-h">
+          <h2 id="deg-h">Degraded states</h2>
+          <div class="chips" role="list" aria-label="Degraded state chips">
+            <span class="chip" role="listitem" id="chip-tracker" data-state="inactive">tracker unreachable</span>
+            <span class="chip" role="listitem" id="chip-engine" data-state="inactive">engine missing</span>
+            <span class="chip" role="listitem" id="chip-model" data-state="inactive">model missing</span>
+            <span class="chip" role="listitem" id="chip-direct" data-state="inactive">direct-connect fail (no listener)</span>
+            <span class="chip" role="listitem" id="chip-hosting" data-state="inactive">not hosting</span>
+          </div>
+          <p class="note" id="family-line" style="margin:6px 0 0;font-size:11.5px">batch-verify family: unknown</p>
+          <div class="row" style="margin-top:6px">
+            <button class="ghost" id="family-probe">test family pairing (presents this machine's lease)</button>
+          </div>
+          <p class="note" id="family-probe-line" style="margin:4px 0 0;font-size:11.5px">family pairing: not tested</p>
+        </section>
+
+        <section aria-labelledby="hostdet-h">
+          <h2 id="hostdet-h">Hosting detail</h2>
+          <dl class="kv">
+            <dt>Model</dt><dd id="model-name-line">—</dd>
+            <dt>Compute</dt><dd id="compute-line">—</dd>
+            <dt>Profile id</dt><dd id="profile-line">—</dd>
+            <dt>Gateway</dt><dd id="gateway-line">—</dd>
+            <dt>Installation</dt><dd id="install-line">—</dd>
+          </dl>
+          <p class="note" style="margin:4px 0 0">Beta boundary, never hidden: remote serving uses direct QUIC first with an honest relay fallback (F2B); no universal NAT-traversal claim is made — a failed dial is reported, never hidden.</p>
+        </section>
+
+        <section aria-labelledby="peers-h">
+          <h2 id="peers-h">Peers &amp; NAT path</h2>
+          <table aria-label="Peer roster">
+            <thead><tr><th scope="col">Peer</th><th scope="col">Capacity</th><th scope="col">Path</th></tr></thead>
+            <tbody id="peer-rows"><tr><td colspan="3" class="note">hosting off — roster empty</td></tr></tbody>
+          </table>
+        </section>
+
+        <section aria-labelledby="api-h">
+          <h2 id="api-h">Local API — integrate anywhere</h2>
+          <p class="note" style="margin:0 0 4px">OpenAI-compatible endpoint served by your node on loopback:</p>
+          <div class="row"><code id="api-base" style="font-family:var(--mono);font-size:12px">—</code></div>
+          <pre class="snippet" id="api-snippet">curl <span id="curl-url">http://127.0.0.1:11435/v1/chat/completions</span>   -H "content-type: application/json"   -d '{"model": "<span id="curl-model">msp1:…</span>", "messages": [{"role": "user", "content": "Hello"}]}'</pre>
+        </section>
+      </div>
+
+      <section id="panel-about" data-title="About" aria-labelledby="about-h" hidden>
+        <h2 id="about-h">About</h2>
+        <dl class="kv">
+          <dt>App</dt><dd>ModelSwarm desktop — internal test shell</dd>
+          <dt>Version</dt><dd id="about-version">—</dd>
+          <dt>Control plane</dt><dd>modelswarm.deepflux.space (content-blind: never carries models, prompts, or completions)</dd>
+        </dl>
+        <p class="note" style="margin:8px 0 0">every number in this UI is measured, never theoretical. Diagnostics and logs live in your data directory; prompts and completions are redacted from all of them.</p>
+      </section>
+
+    </div>
+  </div>
 
   <script>
     const { invoke } = window.__TAURI__.core;
@@ -280,6 +415,46 @@
     let hostingOn = false, busy = false, pendingEnroll = null;
 
     function error(msg) { const b = $("error-banner"); b.textContent = msg; b.style.display = msg ? "block" : "none"; }
+
+    // ---- Navigation bar menus + panel sheet (owner directive
+    // 2026-10-15: "everything else goes into menus on the navigation bar").
+    // The dropdowns are pure navigation; every control lives in a panel so
+    // nothing interactive is trapped inside a transient dropdown.
+    const menuButtons = [...document.querySelectorAll(".menu-btn")];
+    function closeMenus() {
+      for (const b of menuButtons) {
+        b.setAttribute("aria-expanded", "false");
+        $(b.getAttribute("aria-controls")).hidden = true;
+      }
+    }
+    for (const b of menuButtons) {
+      b.onclick = (e) => {
+        e.stopPropagation();
+        const panel = $(b.getAttribute("aria-controls"));
+        const opening = panel.hidden;
+        closeMenus();
+        panel.hidden = !opening;
+        b.setAttribute("aria-expanded", String(opening));
+      };
+    }
+    document.addEventListener("click", (e) => { if (!e.target.closest(".menu")) closeMenus(); });
+    function openPanel(id) {
+      closeMenus();
+      const target = document.getElementById(id);
+      if (!target) return;
+      for (const p of document.querySelectorAll("#sheet .sheet-body > section, #sheet .sheet-body > div.panel")) {
+        p.hidden = p.id !== id;
+      }
+      $("sheet-title").textContent = target.dataset.title || target.id;
+      $("sheet").hidden = false;
+    }
+    for (const item of document.querySelectorAll(".menu-item[data-panel], #browse-models[data-panel]")) {
+      item.onclick = () => openPanel(item.dataset.panel);
+    }
+    $("sheet-close").onclick = () => { $("sheet").hidden = true; };
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { closeMenus(); $("sheet").hidden = true; }
+    });
 
     const FIT_BADGE = { gpu_full: "● GPU", gpu_partial: "◐ GPU+CPU", ram_only: "◍ CPU" };
     let showAll = false;
@@ -292,12 +467,32 @@
     // `census_chip` ("N peers" / "first peer" / "census n/a") and the
     // canonical order (shortlist -> fit tier -> peers -> name). This file
     // renders both verbatim and recomputes nothing — no mirror to drift.
-    let lastModels = null, lastHw = null;
+    // The same poll now also feeds the status strip (peers online) and
+    // the Help → Census detail table; a failed poll degrades BOTH to an
+    // honest "census n/a" — never yesterday's counts.
+    let lastModels = null, lastHw = null, lastCensus = null;
+    function renderCensus() {
+      const strip = $("census-strip"), total = $("census-total"), rows = $("census-rows");
+      if (!lastCensus) {
+        strip.textContent = "peers online: census n/a";
+        total.textContent = "census n/a — the tracker stats poll failed (or has not completed yet); no stale counts are shown.";
+        rows.innerHTML = '<tr><td colspan="2" class="note">census n/a</td></tr>';
+        return;
+      }
+      const peersOnline = lastCensus.peers_online ?? 0;
+      const entries = Object.entries(lastCensus.counts || {});
+      strip.textContent = "peers online: " + peersOnline + " · " + entries.length + " hosted profile" + (entries.length === 1 ? "" : "s");
+      total.textContent = peersOnline + " peers online across " + entries.length + " hosted profile" + (entries.length === 1 ? "" : "s") + " — public tracker stats, 30 s refresh.";
+      rows.innerHTML = entries.length
+        ? entries.map(([id, n]) => '<tr><td class="mono">' + id + '</td><td>' + (n === 0 ? "first peer" : n + (n === 1 ? " peer" : " peers")) + "</td></tr>").join("")
+        : '<tr><td colspan="2" class="note">no profiles are being hosted right now — yours can be the first.</td></tr>';
+    }
     async function refreshCensus() {
       // Never blocks the picker: whatever the outcome, we just re-pull the
       // catalog; a failed poll means the daemon dropped its cache and the
       // next render reads "census n/a" everywhere.
-      try { await invoke("census"); } catch { /* honest n/a on next render */ }
+      try { lastCensus = await invoke("census"); } catch { lastCensus = null; }
+      renderCensus();
       refreshModels();
     }
 
@@ -331,6 +526,25 @@
       $("more-models").hidden = !(hidden > 0);
       if (hidden > 0) $("show-all-models").textContent = `show all ${models.length} models (${hidden} more)`;
       $("show-all-models").onclick = () => { showAll = true; $("more-models").hidden = true; refreshModels(); };
+      // The compact picker on the main page: the FULL catalog in the
+      // daemon's canonical order, the selected model preselected; the
+      // census rides each option as a suffix. Choosing an option goes
+      // through the exact same selectModel path as a card click.
+      const sel = $("model-select");
+      if (models.length) {
+        sel.disabled = busy;
+        const selModel = models.find(m => m.selected);
+        sel.innerHTML = '<option value="" disabled hidden' + (selModel ? "" : " selected") + '>choose a model…</option>'
+          + models.map(m => {
+            const peers = m.peers == null ? "" : (m.peers >= 1 ? " · " + m.peers + (m.peers === 1 ? " peer" : " peers") : "");
+            const dl = m.downloaded ? " · downloaded" : "";
+            return `<option value="${m.profile_id}"${m.selected ? " selected" : ""}>${m.display_name} (${m.quantization})${peers}${dl}</option>`;
+          }).join("");
+        sel.onchange = () => { if (sel.value) selectModel(sel.value); };
+      } else {
+        sel.innerHTML = '<option>no models available — check Settings → Tracker</option>';
+        sel.disabled = true;
+      }
       $("model-cards").innerHTML = visible.map(m => {
         const running = hostingOn && m.selected;
         const badge = running
@@ -361,8 +575,8 @@
       for (const btn of document.querySelectorAll("[data-stop]")) {
         btn.onclick = () => stopHosting();
       }
-      const sel = models.find(m => m.selected);
-      if (sel) $("model-name-line").textContent = sel.display_name + " · " + sel.quantization;
+      const selModel = models.find(m => m.selected);
+      if (selModel) $("model-name-line").textContent = selModel.display_name + " · " + selModel.quantization;
     }
 
     async function refreshModels() {
@@ -468,12 +682,14 @@
       $("tracker-url").value = s.tracker;
       $("version-tag").textContent = "v" + s.version;
       $("foot-version").textContent = "v" + s.version + " ";
-      // Auto-update status (owner request 2026-10-12): the daemon's honest
-      // line, rendered VERBATIM — "update available → v…", "downloading
-      // v… N%", "v… ready, restarting…", or the exact failure ("update
-      // check failed — …" / "update failed — this version keeps running
-      // (…)"). A failed check NEVER blocks the app: this is a status line,
-      // nothing more. No mirror logic here — the daemon owns the wording.
+      $("about-version").textContent = "v" + s.version + " (internal test build)";
+      // Auto-update status (owner request 2026-10-12; Help-menu item since
+      // the 2026-10-15 reorg): the daemon's honest line, rendered VERBATIM —
+      // "update available → v…", "downloading v… N%", "v… ready,
+      // restarting…", or the exact failure ("update check failed — …" /
+      // "update failed — this version keeps running (…)"). A failed check
+      // NEVER blocks the app: this is a status line, nothing more. No
+      // mirror logic here — the daemon owns the wording.
       if (s.updater && s.updater.line) $("update-note").textContent = s.updater.line;
       $("engine-line").textContent = s.engine_available
         ? "pinned llama.cpp — present"
@@ -500,7 +716,8 @@
       // The "allow swarm pairing" toggle (owner directive 2026-10-13):
       // get_status carries the daemon's honest current posture; the note
       // states what the toggle governs and that it applies at the NEXT
-      // hosting start.
+      // hosting start. (Lives in Settings → Swarm pairing & content
+      // carriage since the 2026-10-15 reorg.)
       const pairingAllowed = s.pairing_allowed !== false;
       $("pairing-switch").dataset.on = pairingAllowed;
       $("pairing-switch").setAttribute("aria-checked", pairingAllowed);
@@ -536,6 +753,15 @@
       $("profile-line").textContent = s.profile_id || "—";
       $("gateway-line").textContent = s.node.running ? s.node.gateway_addr : "—";
       $("install-line").textContent = s.node.installation_id || "—";
+      // Status strip (owner directive 2026-10-15): the relay chip shows
+      // ONLY while a live reservation holds a circuit address — same
+      // serving truth the remote-serve chip carries, no separate switch.
+      const relayChip = $("relay-chip");
+      relayChip.hidden = !s.node.relay_circuit_addr;
+      if (s.node.relay_circuit_addr) {
+        relayChip.textContent = "relay: " + s.node.relay_circuit_addr;
+        relayChip.title = s.node.relay_circuit_addr;
+      }
       $("chip-engine").dataset.state = s.engine_available ? "inactive" : "active";
       // "hosting" and "direct-connect" are STATES, not degradations — text
       // carries the state, color stays neutral so amber always means fault.
@@ -555,7 +781,7 @@
         ? "remote serve: on (" + listener + (relay ? " + relay" : "") + ")"
         : pairingAllowed
           ? "remote serve: off (bind failed — see family line)"
-          : "remote serve: off (swarm pairing off in Setup)";
+          : "remote serve: off (swarm pairing off in Settings)";
       // ADR-032 family: the daemon's own verdict with its real engine
       // geometry — on (cpu|vulkan, batch window) / off (exact reason) /
       // null while not hosting. Never a static label. Since the
@@ -585,7 +811,9 @@
       // ADR-036 §3.1 (normative UI contract): the serving-side carriage
       // disclosure — ALWAYS VISIBLE while family serving is enabled,
       // rendered VERBATIM from the daemon (the exact §3.1 text while
-      // carriage is on; the honest opt-out statement when off).
+      // carriage is on; the honest opt-out statement when off). It stays
+      // on the MAIN page under the hosting switch — a menu must never
+      // hide a standing consent disclosure.
       const carriageLine = $("carriage-line");
       if (s.node.running && fam && fam.state === "on" && fam.carriage) {
         carriageLine.hidden = false;
@@ -616,10 +844,10 @@
             : '<tr><td colspan="3" class="note">registered — no other exact-profile peers seen yet</td></tr>';
         } catch (e) { $("chip-tracker").dataset.state = "active"; }
       } else {
-        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">pick a model above — the swarm starts on selection</td></tr>';
+        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">pick a model on the main page — the swarm starts on selection</td></tr>';
       }
       if (hostingOn && s.node.enrollment && s.node.enrollment.phase === "pending") {
-        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">device approval pending (code ' + s.node.enrollment.user_code + ') — use "approve this device…" in Setup; the roster joins automatically once approved</td></tr>';
+        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">device approval pending (code ' + s.node.enrollment.user_code + ') — use "approve this device…" in Settings → Tracker, engine & device; the roster joins automatically once approved</td></tr>';
       }
     }
 
@@ -643,27 +871,42 @@
       catch (e) { error(String(e)); }
       refresh();
     };
-    // Clear conversation (owner directive 2026-10-13): resets the daemon's
-    // rendered history AND the transcript — the language-drift escape
-    // hatch without an app restart.
+    // Clear conversation (owner directive 2026-10-13; File menu item since
+    // the 2026-10-15 reorg): resets the daemon's rendered history AND the
+    // transcript — the language-drift escape hatch without an app restart.
     $("clear-chat").onclick = async () => {
+      closeMenus();
       if (busy) return;
       try { await invoke("clear_chat"); } catch (e) { error(String(e)); return; }
       $("transcript").replaceChildren();
       clearLiveBubble();
     };
+    // File → Exit (owner directive 2026-10-15): closes the window (the
+    // daemon and its supervised engines live in this process and are torn
+    // down with it — the winjob kill-on-close object guarantees the
+    // sidecar dies too). Uses the window bridge, not a new IPC handler.
+    $("exit-app").onclick = async () => {
+      closeMenus();
+      try {
+        const bridge = window.__TAURI__ && window.__TAURI__.window;
+        if (bridge && bridge.getCurrentWindow) { await bridge.getCurrentWindow().close(); return; }
+        error("exit unavailable — no window bridge in this build");
+      } catch (e) { error("exit failed: " + e); }
+    };
     listen("chat-cleared", () => { $("transcript").replaceChildren(); clearLiveBubble(); });
-    // Temperature control: greedy 0 is the default; the value label is
+    // Temperature control (Settings → Chat temperature since the
+    // 2026-10-15 reorg): greedy 0 is the default; the value label is
     // live and the choice rides send_chat (chat replies only — never the
     // pairing draft path).
     $("chat-temp").oninput = () => {
       const t = parseFloat($("chat-temp").value);
       $("chat-temp-val").textContent = t === 0 ? "0 (greedy)" : t.toFixed(2);
     };
-    // The two-desktop pairing diagnostic (ADR-032 §2): opens one real
-    // family session presenting this machine's earned lease. The outcome
-    // is the daemon's own truth — opened (peer, real disclosure) or the
-    // exact honest reason; never a lease, key, or token.
+    // The two-desktop pairing diagnostic (ADR-032 §2; Help → Diagnostics):
+    // opens one real family session presenting this machine's earned
+    // lease. The outcome is the daemon's own truth — opened (peer, real
+    // disclosure) or the exact honest reason; never a lease, key, or
+    // token.
     $("family-probe").onclick = async () => {
       if (!hostingOn) { $("family-probe-line").textContent = "family pairing: hosting is off"; return; }
       $("family-probe-line").textContent = "family pairing: opening a session (challenge + lease + dial)…";
@@ -713,13 +956,13 @@
       busy = false; refresh();
     };
 
-    // ---- Resource monitor panel (owner request 2026-10-12): a
-    // task-manager-style CPU/GPU/RAM readout. The daemon owns the sampling
-    // (one `resource_sample` poll, 1 Hz, one timer — never per frame);
-    // this file renders the returned fields verbatim with per-field
-    // honesty: null = "n/a", never a guessed number (the degraded-chips
-    // pattern). Collapsed by default so the right column keeps fitting
-    // the 1152×648 window; "details" expands the three meters.
+    // ---- Resource monitor panel (owner request 2026-10-12; Help →
+    // Resource monitor since the reorg): a task-manager-style CPU/GPU/RAM
+    // readout. The daemon owns the sampling (one `resource_sample` poll,
+    // 1 Hz, one timer — never per frame); this file renders the returned
+    // fields verbatim with per-field honesty: null = "n/a", never a
+    // guessed number (the degraded-chips pattern). Collapsed by default;
+    // "details" expands the three meters.
     const fmtBytes = (b) => b == null ? null : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(0) + " MB" : Math.round(b) + " B";
     const pctText = (v) => v == null ? null : v.toFixed(v < 10 ? 1 : 0) + "%";
     function setMeter(barId, valId, pct, text) {
@@ -811,10 +1054,11 @@
     };
 
     // ---- Assistant panel (ADR-037 §3.6/§4.5): its OWN section, its OWN
-    // input, its OWN assistant-* event namespace. It never renders into
-    // the swarm chat transcript and the chat box never feeds it (W4).
-    // Plain text only: every render below uses textContent — no markdown,
-    // no HTML interpretation, no clickable/auto-linkable URLs (§3.7).
+    // input, its OWN assistant-* event namespace (Help → Setup assistant
+    // since the reorg). It never renders into the swarm chat transcript
+    // and the chat box never feeds it (W4). Plain text only: every render
+    // below uses textContent — no markdown, no HTML interpretation, no
+    // clickable/auto-linkable URLs (§3.7).
     const ASSISTANT_DISPLAY_CAP = 4000;
     const clipAssistant = (text) =>
       Array.from(text ?? "").slice(0, ASSISTANT_DISPLAY_CAP).join("") +
@@ -942,6 +1186,7 @@
     listen("assistant-turn", (e) => renderAssistantPayload(e.payload));
     listen("assistant-reset", () => { $("assistant-transcript").replaceChildren(); });
 
+    renderCensus();
     refresh(); refreshModels(); refreshCensus(); refreshResources();
     setInterval(refresh, 2000); setInterval(refreshModels, 15000); setInterval(refreshCensus, 30000); setInterval(refreshResources, 1000);
   </script>

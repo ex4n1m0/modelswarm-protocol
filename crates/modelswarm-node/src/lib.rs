@@ -55,6 +55,8 @@ mod executor;
 #[cfg(feature = "libp2p-backend")]
 pub mod measure;
 #[cfg(feature = "libp2p-backend")]
+pub mod relay_ticket_cache;
+#[cfg(feature = "libp2p-backend")]
 pub mod remote;
 #[cfg(feature = "libp2p-backend")]
 pub mod serving;

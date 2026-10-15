@@ -172,6 +172,14 @@ struct Inner {
         String,
         std::sync::Arc<modelswarm_node::remote::RemoteExecutor>,
     )>,
+    /// ADR-038 §6.4 row 8: the relay admission ticket cache, alive while
+    /// hosting (the heartbeat task writes it every successful heartbeat;
+    /// the relay reservation supervisor and the swarm chat's remote
+    /// executor read it through the transport's ticket seam). NOTHING
+    /// user-facing rides it — no switch, no UI element, no status field
+    /// (the owner's everything-on-by-design directive; the ticket rides
+    /// the heartbeat invisibly). `None` while not hosting.
+    relay_tickets: Option<std::sync::Arc<modelswarm_node::relay_ticket_cache::RelayTicketCache>>,
     /// F15 shadow measurements (per-peer RTT EWMA, completion
     /// distributions): lazily opened store-backed recorder shared by the
     /// swarm executors. Shadow data only — nothing selects peers yet.
@@ -487,6 +495,7 @@ impl DesktopState {
                 family_engine: None,
                 swarm_lease: None,
                 swarm_executor: None,
+                relay_tickets: None,
                 peer_metrics: None,
                 listener_addr: None,
                 family: None,
@@ -801,15 +810,22 @@ async fn bind_serving_listener(
 /// Errors carry the exact transport text — the relay's own status
 /// vocabulary (`no_reservation(204)`, …) rides it verbatim. Callers log
 /// through the EXISTING `listener.error` event (phase `relay_reserve`);
-/// no new event names.
+/// no new event names. ADR-038 §6.4 row 8: the attempt presents the
+/// cached admission ticket (the transport's pre-flight) — an empty
+/// cache honestly keeps the pre-wiring behavior.
 async fn reserve_relay_attempt(
     data_dir: &Path,
     telemetry: &Telemetry,
     relay_addr: &str,
+    tickets: &std::sync::Arc<modelswarm_node::relay_ticket_cache::RelayTicketCache>,
 ) -> Result<modelswarm_transport::relay_client::RelayReservation, String> {
     let identity = load_or_create_identity(data_dir, telemetry).map_err(|e| e.to_string())?;
     let backend = modelswarm_transport::libp2p_backend::Libp2pTransport::new(&identity)
         .map_err(|e| format!("transport backend: {e}"))?;
+    // ADR-038 §6.4 row 8: fresh supply into the transport's ticket seam
+    // (read at pre-flight time, so heartbeat refreshes between attempts
+    // reach the next reservation without rebuilding anything here).
+    tickets.attach_to(&backend);
     backend
         .reserve_relay(relay_addr, Duration::from_secs(10))
         .await
@@ -823,16 +839,21 @@ async fn reserve_relay_attempt(
 /// reservation holds it); the heartbeat re-registers on any list change.
 /// Reservation RENEWAL itself is the transport's own driver (re-reserve
 /// at 3/4 of each lease) — this task only acquires and re-acquires.
+/// ADR-038 §6.4 row 8: every attempt presents the heartbeat-supplied
+/// admission ticket through the transport's seam (empty cache = the
+/// documented pre-wiring behavior — no pre-flight offer).
 /// Failures log through the EXISTING `listener.error` event (phase
 /// `relay_reserve`), throttled to the first and every 20th retry (10 min,
 /// the roster-failure cadence); success logs `listener.bound` with the
 /// circuit address (a relayed serving path IS a bound serving path).
+#[allow(clippy::too_many_arguments)]
 async fn relay_reservation_supervisor(
     data_dir: PathBuf,
     relay_addr: String,
     slot: modelswarm_node::serving::RelaySlot,
     advertised: tokio::sync::watch::Sender<Vec<String>>,
     direct_addr: String,
+    tickets: std::sync::Arc<modelswarm_node::relay_ticket_cache::RelayTicketCache>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     telemetry: std::sync::Arc<Telemetry>,
 ) {
@@ -842,7 +863,7 @@ async fn relay_reservation_supervisor(
             set_advertised_addrs(&advertised, &direct_addr, slot.circuit_addr().await);
         } else {
             set_advertised_addrs(&advertised, &direct_addr, None);
-            match reserve_relay_attempt(&data_dir, &telemetry, &relay_addr).await {
+            match reserve_relay_attempt(&data_dir, &telemetry, &relay_addr, &tickets).await {
                 Ok(reservation) => {
                     failures = 0;
                     let circuit = reservation.circuit_addr();
@@ -2673,6 +2694,13 @@ async fn set_hosting_inner(
         }
         inner.listener_addr = None;
         inner.family = None;
+        // ADR-038 §6.4 row 8: hosting off = no heartbeat = no fresh
+        // tickets — drop the cache with the node (a stale ticket would
+        // only earn an honest `expired` refusal at a relay's gate) and
+        // retire the pooled swarm executor so the next turn rebuilds it
+        // ticket-less instead of presenting the dead cache forever.
+        inner.relay_tickets = None;
+        inner.swarm_executor = None;
         // 2026-10-15: hosting off = no model backing — the assistant
         // returns to the static floor with the honest label (its
         // conversation state dies with the backing that served it).
@@ -2767,6 +2795,19 @@ async fn set_hosting_inner(
     // listener; a bind failure surfaces its exact reason in the family
     // line.
     let hardware = hardware_of(app, state).await;
+    // ADR-038 §6.4 row 8: the relay admission ticket cache for this
+    // hosting session — written by the heartbeat task below (every
+    // successful heartbeat replaces the cached ticket), read by the
+    // relay reservation supervisor and (via `Inner`) the swarm chat's
+    // remote executor through the transport's ticket seam. Invisible by
+    // design: no switch, no UI element (the owner's directive).
+    let relay_tickets =
+        std::sync::Arc::new(modelswarm_node::relay_ticket_cache::RelayTicketCache::new());
+    inner.relay_tickets = Some(std::sync::Arc::clone(&relay_tickets));
+    // The pooled swarm executor (if any) predates this cache — retire it
+    // so the next swarm turn rebuilds with the ticket attached (mirrored
+    // by the hosting-off reset above).
+    inner.swarm_executor = None;
     // F2B: the heartbeat's advertised address list — direct first, the
     // relay circuit address while a live reservation holds it. The relay
     // supervisor (below) owns changes; the heartbeat re-registers on
@@ -2809,6 +2850,7 @@ async fn set_hosting_inner(
                     relay_slot.clone(),
                     advertised_tx.clone(),
                     addr.clone(),
+                    std::sync::Arc::clone(&relay_tickets),
                     handle.shutdown_rx.clone(),
                     std::sync::Arc::clone(&state.telemetry),
                 ));
@@ -2919,6 +2961,9 @@ async fn set_hosting_inner(
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
     let hb_data_dir = inner.data_dir.clone();
     let hb_telemetry = std::sync::Arc::clone(&state.telemetry);
+    // ADR-038 §3.3/§6.4 row 8: the heartbeat response's `relayTicket`
+    // populates the cache the relay paths present (moved into the task).
+    let hb_relay_tickets = relay_tickets;
     let enrollment_view = Arc::new(tokio::sync::RwLock::new(EnrollmentView {
         phase: "enrolling".into(),
         ..EnrollmentView::default()
@@ -3077,7 +3122,17 @@ async fn set_hosting_inner(
                     Some(id) => heartbeat_tracker
                         .heartbeat(id, std::slice::from_ref(&profile_id), 1, 0, false)
                         .await
-                        .map(|_| ())
+                        .map(|response| {
+                            // ADR-038 §3.3/§6.4 row 8: cache the freshest
+                            // relay admission ticket — replace, never
+                            // accumulate. Absent (old tracker deploy) keeps
+                            // the previous value; malformed is dropped with
+                            // the last good kept (the cache's own honesty
+                            // rules; nothing is logged — no frozen
+                            // counts-only event name fits, per the
+                            // ticket-cache handoff).
+                            let _ = hb_relay_tickets.store_heartbeat(&response);
+                        })
                         .or_else(|_| {
                             // Lease lost (expiry/revocation): re-register next tick.
                             lease_id = None;
@@ -4948,10 +5003,17 @@ async fn try_swarm_chat(
         match &inner_state.swarm_executor {
             Some((k, exec)) if k == &key => std::sync::Arc::clone(exec),
             _ => {
-                let exec = std::sync::Arc::new(
-                    modelswarm_node::remote::RemoteExecutor::new(peer, identity)
-                        .with_metrics(metrics),
-                );
+                // ADR-038 §6.4 row 8: the requester dial presents the
+                // heartbeat-cached admission ticket on relay legs (read at
+                // dial time, so heartbeat refreshes reach this pooled
+                // executor too). `None` while not hosting — the documented
+                // pre-wiring behavior.
+                let mut executor = modelswarm_node::remote::RemoteExecutor::new(peer, identity)
+                    .with_metrics(metrics);
+                if let Some(tickets) = inner_state.relay_tickets.clone() {
+                    executor = executor.with_relay_tickets(tickets);
+                }
+                let exec = std::sync::Arc::new(executor);
                 inner_state.swarm_executor = Some((key, std::sync::Arc::clone(&exec)));
                 exec
             }
@@ -6871,6 +6933,7 @@ mod tests {
             census_counts: None,
             swarm_lease: None,
             swarm_executor: None,
+            relay_tickets: None,
             peer_metrics: None,
             license_accepted: true,
             artifact: None,

@@ -52,6 +52,7 @@ use modelswarm_transport::message::{
 use modelswarm_transport::observe::{CompletionObservation, CompletionOutcome, UsageDigest};
 
 use crate::measure::PeerMetrics;
+use crate::relay_ticket_cache::RelayTicketCache;
 
 /// F2B: per-attempt budget for DIRECT candidates — deliberately SHORT:
 /// a blackholed cross-NAT QUIC dial burns the whole per-attempt budget,
@@ -113,6 +114,13 @@ pub struct RemoteExecutor {
     /// F2B: the per-attempt failures of the most recent dial (the honest
     /// report callers fold into their existing dial-failure surfaces).
     last_attempts: StdMutex<Vec<DialAttempt>>,
+    /// ADR-038 §6.4 row 8: the node's relay admission ticket cache.
+    /// `None` (all pre-row-8 callers) keeps the documented pre-wiring
+    /// behavior — no pre-flight offer, third-party relays dial directly,
+    /// an MSP relay's gate refuses the hop exchange with the upstream
+    /// verbatim label. When attached, every FRESH dial transport
+    /// presents the cached ticket on its relay legs.
+    relay_tickets: Option<Arc<RelayTicketCache>>,
 }
 
 impl RemoteExecutor {
@@ -126,6 +134,7 @@ impl RemoteExecutor {
             candidate_addrs: StdMutex::new(Vec::new()),
             pooled_path: StdMutex::new(None),
             last_attempts: StdMutex::new(Vec::new()),
+            relay_tickets: None,
         }
     }
 
@@ -133,6 +142,17 @@ impl RemoteExecutor {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<PeerMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attaches the node's relay admission ticket cache (ADR-038 §6.4
+    /// row 8): every dial transport this executor constructs carries the
+    /// cached ticket into the `/msp/relay-ticket/1` pre-flight on relay
+    /// legs. The cache is READ at dial time — heartbeat refreshes keep
+    /// reaching sessions dialed later, no rebuild needed.
+    #[must_use]
+    pub fn with_relay_tickets(mut self, tickets: Arc<RelayTicketCache>) -> Self {
+        self.relay_tickets = Some(tickets);
         self
     }
 
@@ -514,6 +534,13 @@ impl InferenceExecutor for RemoteExecutor {
                     Libp2pTransport::new(&self.identity).map_err(|e| ExecutorError::Fatal {
                         code: format!("transport: {e}"),
                     })?;
+                // ADR-038 §6.4 row 8: hand the cached admission ticket to
+                // this fresh dial transport BEFORE any relay leg — the
+                // pre-flight then presents it (or skips the offer while
+                // the cache is empty, the documented pre-wiring posture).
+                if let Some(tickets) = &self.relay_tickets {
+                    tickets.attach_to(&client);
+                }
                 // F2B (ADR-014): direct-first over ALL advertised
                 // candidates, honest relay fallback. The two phases below
                 // split only the per-attempt BUDGET (short for direct so
@@ -820,6 +847,62 @@ mod failover_tests {
         let text = collect(fo.execute(request("msp1:fo")).await.unwrap()).await;
         assert_eq!(text, "LOCAL");
         assert_eq!(local.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// ADR-038 §6.4 row 8: an attached ticket cache changes NOTHING on a
+    /// direct dial — the admission pre-flight lives on RELAY legs only,
+    /// so a direct candidate never offers `/msp/relay-ticket/1`. The
+    /// cached token is the golden accept vector's (fixture-signed, long
+    /// expired by wall clock): even a stale ticket must not perturb the
+    /// direct path, because the node's supply is read only when a relay
+    /// leg exists (`dial_with_fallback`'s circuit phase).
+    #[tokio::test]
+    async fn attached_relay_tickets_leave_direct_dials_untouched() {
+        let server_identity = InstallationIdentity::from_bytes(&[93u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[94u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let listener = server.listen("127.0.0.1:0").await.unwrap();
+        let peer = RemotePeer {
+            addr: listener.bound_addr().to_string(),
+            peer_id: server.peer_id().to_string(),
+        };
+        let client_peer_id = Libp2pTransport::new(&client_identity)
+            .unwrap()
+            .peer_id()
+            .to_string();
+        let profile = crate::serving::lease_helpers::TEST_PROFILE;
+        let (policy, token) =
+            crate::serving::lease_helpers::policy_and_lease(profile, &client_peer_id);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_sessions(
+            listener,
+            Arc::new(CountingExecutor {
+                label: "REMOTE",
+                calls: AtomicUsize::new(0),
+            }),
+            profile.into(),
+            policy,
+            std::sync::Arc::new(modelswarm_telemetry::Telemetry::memory().0),
+            rx,
+        ));
+
+        // The cache holds the golden vector token (read from
+        // protocol/vectors/relay-ticket-1.json, never inlined).
+        let vector_path = format!(
+            "{}/../../protocol/vectors/relay-ticket-1.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let vector: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&vector_path).expect("vector file"))
+                .expect("vector JSON");
+        let cache = std::sync::Arc::new(crate::relay_ticket_cache::RelayTicketCache::new());
+        cache.store(vector["token"].as_str().expect("token"));
+
+        let mut with_lease = request(profile);
+        with_lease.capability_token = Some(token);
+        let remote = RemoteExecutor::new(peer, client_identity).with_relay_tickets(cache);
+        let text = collect(remote.execute(with_lease).await.unwrap()).await;
+        assert_eq!(text, "REMOTE", "direct dial must not see the pre-flight");
     }
 }
 

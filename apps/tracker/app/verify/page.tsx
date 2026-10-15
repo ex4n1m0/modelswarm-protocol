@@ -52,23 +52,23 @@ export default function VerifyPage() {
   }
 
   return (
-    <main style={{ background: "#00060f", color: "#e8f4ff", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: 'ui-monospace, "Cascadia Code", Consolas, monospace' }}>
+    <main style={{ background: "#080C14", color: "#F3F6FC", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif' }}>
       <form
         onSubmit={submit}
-        style={{ width: "min(92vw, 480px)", border: "1px solid #1c2b52", background: "#0a1030", borderRadius: 14, padding: "1.6rem" }}
+        style={{ width: "min(92vw, 480px)", border: "1px solid #24334C", background: "#111927", borderRadius: 14, padding: "1.6rem" }}
       >
-        <a href="/" style={{ color: "#2fd4ff", fontSize: "0.8rem", textDecoration: "none" }}>← modelswarm.deepflux.space</a>
-        <h1 style={{ fontSize: "1.05rem", letterSpacing: "0.12em", textTransform: "uppercase", color: "#2fd4ff", margin: "0.9rem 0 0.4rem" }}>
+        <a href="/" style={{ color: "#38D9F5", fontSize: "0.8rem", textDecoration: "none" }}>← modelswarm.deepflux.space</a>
+        <h1 style={{ fontSize: "1.05rem", letterSpacing: "0.12em", textTransform: "uppercase", color: "#38D9F5", fontFamily: 'ui-monospace, "Cascadia Code", Consolas, monospace', margin: "0.9rem 0 0.4rem" }}>
           Approve a device
         </h1>
-        <p style={{ color: "#9fb8d8", fontSize: "0.85rem", lineHeight: 1.6, margin: "0 0 1.1rem" }}>
+        <p style={{ color: "#B2BDCD", fontSize: "0.85rem", lineHeight: 1.6, margin: "0 0 1.1rem" }}>
           New installations normally enroll automatically (zero-click). This page
           is the owner fallback: if a client shows a pairing code — beyond the
           auto-approval cap or with the flag off — enter it below with the owner
           token to approve it.
         </p>
 
-        <label style={{ display: "block", fontSize: "0.72rem", letterSpacing: "0.1em", color: "#9fb8d8", marginBottom: 4 }}>
+        <label style={{ display: "block", fontSize: "0.72rem", letterSpacing: "0.1em", color: "#8CA0BC", marginBottom: 4 }}>
           PAIRING CODE
           <input
             value={userCode}
@@ -77,12 +77,12 @@ export default function VerifyPage() {
             autoComplete="off"
             required
             maxLength={8}
-            style={{ width: "100%", marginTop: 4, background: "#00060f", color: "#e8f4ff", border: "1px solid #1c2b52", borderRadius: 8, padding: "0.6rem 0.7rem", fontSize: "1rem", letterSpacing: "0.2em", fontFamily: "inherit" }}
+            style={{ width: "100%", marginTop: 4, background: "#080C14", color: "#F3F6FC", border: "1px solid #31435F", borderRadius: 8, padding: "0.6rem 0.7rem", fontSize: "1rem", letterSpacing: "0.2em", fontFamily: 'ui-monospace, "Cascadia Code", Consolas, monospace' }}
           />
         </label>
-        <p style={{ color: "#5c729a", fontSize: "0.7rem", margin: "4px 0 12px" }}>{CODE_HINT}</p>
+        <p style={{ color: "#8CA0BC", fontSize: "0.7rem", margin: "4px 0 12px" }}>{CODE_HINT}</p>
 
-        <label style={{ display: "block", fontSize: "0.72rem", letterSpacing: "0.1em", color: "#9fb8d8", marginBottom: 14 }}>
+        <label style={{ display: "block", fontSize: "0.72rem", letterSpacing: "0.1em", color: "#8CA0BC", marginBottom: 14 }}>
           OWNER TOKEN
           <input
             ref={tokenRef}
@@ -91,20 +91,20 @@ export default function VerifyPage() {
             onChange={(e) => setAdminToken(e.target.value)}
             autoComplete="off"
             required
-            style={{ width: "100%", marginTop: 4, background: "#00060f", color: "#e8f4ff", border: "1px solid #1c2b52", borderRadius: 8, padding: "0.6rem 0.7rem", fontSize: "0.9rem", fontFamily: "inherit" }}
+            style={{ width: "100%", marginTop: 4, background: "#080C14", color: "#F3F6FC", border: "1px solid #31435F", borderRadius: 8, padding: "0.6rem 0.7rem", fontSize: "0.9rem", fontFamily: "inherit" }}
           />
         </label>
 
         <button
           type="submit"
           disabled={busy}
-          style={{ width: "100%", background: "#2fd4ff", color: "#001018", border: 0, borderRadius: 8, padding: "0.65rem", fontWeight: 700, fontSize: "0.9rem", cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1 }}
+          style={{ width: "100%", background: "#38D9F5", color: "#06131D", border: 0, borderRadius: 8, padding: "0.65rem", fontWeight: 700, fontSize: "0.9rem", cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1 }}
         >
           {busy ? "approving…" : "approve device"}
         </button>
 
         {result && (
-          <p role="status" style={{ margin: "14px 0 0", fontSize: "0.82rem", color: result.ok ? "#43c78f" : "#e06565" }}>
+          <p role="status" style={{ margin: "14px 0 0", fontSize: "0.82rem", color: result.ok ? "#7FE0B8" : "#E07A7A" }}>
             {result.text}
           </p>
         )}

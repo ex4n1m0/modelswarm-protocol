@@ -22,6 +22,8 @@
 //   UNCHANGED. Download links carry v0.2.25 from release-train commit 96adf68
 //   (the train parked this redesign mid-flight and restored the tree to HEAD;
 //   this re-application folds its 0.2.24->0.2.25 retarget in).
+// - 2026-10-15 (later): v0.2.26 retarget (release train — the language-pin
+//   fix); 5 functional replacements, same copy rules.
 
 // Protocol-level execution presets (ADR-029 §1; master prompt §3).
 const PRESETS: Array<{ name: string; allows: string; correctness: string }> = [
@@ -224,7 +226,7 @@ export default function Home() {
         <section id="get" aria-labelledby="get-heading">
           <h2 id="get-heading">Desktop app</h2>
           <div className="rule">
-            <b>v0.2.25</b> — test builds, unsigned. This build keeps
+            <b>v0.2.26</b> — test builds, unsigned. This build keeps
             itself current: it checks for updates on start and every six
             hours, verifies each update against a key built into the
             app, and restarts to install — this is the last manual
@@ -234,19 +236,19 @@ export default function Home() {
             network; the app reports honest status for anything not engaged.
             <ul style={{ margin: "0.8rem 0 0", padding: "0 0 0 1.15rem" }}>
               <li>
-                <a href="/api/download/ModelSwarm-Setup-0.2.25-windows-x64.exe">
+                <a href="/api/download/ModelSwarm-Setup-0.2.26-windows-x64.exe">
                   Windows installer (.exe)
                 </a>
               </li>
               <li>
-                <a href="/api/download/ModelSwarm-0.2.25-linux-amd64.deb">Linux (.deb)</a>
+                <a href="/api/download/ModelSwarm-0.2.26-linux-amd64.deb">Linux (.deb)</a>
                 {" · "}
-                <a href="/api/download/ModelSwarm-0.2.25-linux-amd64.AppImage">
+                <a href="/api/download/ModelSwarm-0.2.26-linux-amd64.AppImage">
                   AppImage (self-updating)
                 </a>
               </li>
               <li>
-                <a href="/api/download/ModelSwarm-0.2.25-macos-arm64.dmg">
+                <a href="/api/download/ModelSwarm-0.2.26-macos-arm64.dmg">
                   macOS (Apple Silicon, .dmg)
                 </a>
               </li>

@@ -287,3 +287,23 @@ it is NOT part of this staging and ships only after its own rendered-
 geometry verification per the standing rule. Owner rulings in force:
 unsigned by decision; updater key rotation deferred (the DeepSeek advisory
 key, separately, is removed by this release — different key, different fate).
+
+## v0.2.26 staging rehearsal (2026-10-15, late night — the language-lock fix)
+
+Artifacts from desktop-installer run 38756562713 — AUTO-TRIGGERED on the bump
+commit (0.2.26; no dispatch). NOTE the bump's `check` job hit the known
+~1-in-3 winjob flake (`close_all_retained_jobs_kills_every_supervised_child`)
+on top of the expected guards window-red; local full-workspace at the
+regeneration head = 0 failures, and the vector-regeneration commit ddab269
+between bump and staging is TESTS-ONLY (zero production delta — the
+b1c2234/549dd18 precedent), so the bump-commit artifacts are valid. Hash
+chains verified per-artifact (the linux artifact needed the API-zip route —
+gh run download stalled twice on the 144 MB archive; sizes byte-exact).
+0.2.25 binaries removed. Staged: win exe 4327b5ec…dbc79; deb
+f133b3f3…c99ad; AppImage 35801ba1…1379; dmg eb945088…206e. Signed
+--app-version 0.2.26 (key path only; 4/4). Manifest sig = .sig text
+VERBATIM; rehearsal verdict ALL THREE PLATFORM SIGNATURES VERIFY, signed
+version == 0.2.26, sha256 match, first-try. page.tsx retarget: 5 functional
+replacements (the redesign grew two historical comment mentions — left
+as-is with an appended changelog line); typecheck clean, build green.
+Unsigned by owner ruling.

@@ -1,0 +1,43 @@
+{
+  "name": "relay-admission-frame-1",
+  "description": "ADR-038 §6.2 frame vector: byte-pinned protobuf frames of the /msp/relay-ticket/1 pre-flight protocol (§3.2). A second implementation (TS or Rust) must reproduce identical bytes and identical verdicts. Encodings are proto2 wire format: field 1 varint (type), field 2 length-delimited bytes (ticket), field 3 varint (code), uvarint length prefixes as noted.",
+  "adr": "ADR-038 §3.2/§6.2",
+  "protocol_name": "/msp/relay-ticket/1",
+  "present_frame_hex": "080012920365794a6c65484270636d567a58324630496a6f694d6a41794e6930784d4330784e5651784d6a6f784d446f774d4334774d444261496977696157357a64474673624746306157397558326c6b496a6f69596a55344c576c75633352686247786864476c76626931795a577868655330774d4441784969776961584e7a6457566b58324630496a6f694d6a41794e6930784d4330784e5651784d6a6f774d446f774d4334774d44426149697769626d3975593255694f694a684d574979597a4e6b4e4755315a6a5a684e324934597a6c6b4d4755785a6a4a684d324930597a566b4e694973496e426c5a584a66615751694f6949784d6b517a5332397656314e795332354e576c566a5533684c4f45633364323143596c686b56546875526b566d5630646f5448553253446834616d34345447314455307069496e302e7779534b4779614c515f5878685f4b5641775961696a6d4e495f6a4c56683659483836497636713172574548454e703877304b4b6655477a49783432455150356a74515878466e755a4b617867767944496169324467",
+  "present_frame_notes": "0800 = field1 varint PRESENT(0); 12 92 03 = field2 length-delimited, uvarint length 402; then the relay-ticket-1 token bytes (UTF-8)",
+  "status_frames_hex": {
+    "ok_100": "08011864",
+    "resource_limit_exceeded_201": "080118c901",
+    "permission_denied_202": "080118ca01",
+    "malformed_message_400": "0801189003"
+  },
+  "status_frame_notes": "0801 = field1 varint STATUS(1); 18 <uvarint> = field3 varint code (100=0x64, 201=0xc9 01, 202=0xca 01, 400=0x90 03)",
+  "length_prefix_rule": "each frame body is uvarint-length-prefixed on the wire AFTER protocol negotiation; the 4096-byte cap is validated before allocation",
+  "malformed_corpus": [
+    {
+      "id": "field_zero",
+      "hex": "0001",
+      "why": "tag byte 0x00 is field 0 — invalid in protobuf"
+    },
+    {
+      "id": "length_overrun",
+      "hex": "12ff0f6162",
+      "why": "field2 announces 2047 bytes but only 2 follow (uvarint ff 0f = 2047)"
+    },
+    {
+      "id": "unknown_type_value",
+      "hex": "0805",
+      "why": "field1 varint value 5 is neither PRESENT(0) nor STATUS(1)"
+    },
+    {
+      "id": "truncated_tag",
+      "hex": "12",
+      "why": "field2 tag with no length byte — truncation"
+    },
+    {
+      "id": "wrong_wire_type",
+      "hex": "1001",
+      "why": "field2 varint (wire type 0) where bytes (wire type 2) is required"
+    }
+  ]
+}

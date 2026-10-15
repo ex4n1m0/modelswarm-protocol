@@ -1,0 +1,15 @@
+{
+  "name": "relay-ticket-2-expired",
+  "description": "ADR-038 §6.2 expiry vector: the relay-ticket-1 token presented AFTER its expiry window. verify_at is past expires_at by more than the ±120 s skew grace (12:10:00 + 120 s = 12:12:00 < 12:20:00), so the outcome is permission_denied(202) with reason expired. Signature is still VALID — this pins that expiry, not signature, is the failure.",
+  "adr": "ADR-038 §3.4 check 6 / §6.2",
+  "signing_seed_hex": "3838383838383838383838383838383838383838383838383838383838383838",
+  "signing_public_key_hex": "76d81b33ba721df89b8e0b0ef26c34eb72e978951044798cd608a4f6dbf2e6d6",
+  "verify_at": "2026-10-15T12:20:00Z",
+  "token": "eyJleHBpcmVzX2F0IjoiMjAyNi0xMC0xNVQxMjoxMDowMC4wMDBaIiwiaW5zdGFsbGF0aW9uX2lkIjoiYjU4LWluc3RhbGxhdGlvbi1yZWxheS0wMDAxIiwiaXNzdWVkX2F0IjoiMjAyNi0xMC0xNVQxMjowMDowMC4wMDBaIiwibm9uY2UiOiJhMWIyYzNkNGU1ZjZhN2I4YzlkMGUxZjJhM2I0YzVkNiIsInBlZXJfaWQiOiIxMkQzS29vV1NyS25NWlVjU3hLOEc3d21CYlhkVThuRkVmV0doTHU2SDh4am44TG1DU0piIn0.wySKGyaLQ_Xxh_KVAwYaijmNI_jLVh6YH86Iv6q1rWEHENp8w0KKfUGzIx42EQP5jtQXxFnuZKaxgvyDIai2Dg",
+  "expires_at": "2026-10-15T12:10:00.000Z",
+  "skew_grace_secs": 120,
+  "expected_outcome": {
+    "status": "permission_denied(202)",
+    "reason": "expired"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "relay-ticket-1",
+  "description": "ADR-038 §6.2 accept vector: a content-blind relay admission ticket at mid-life. Signed by the fixture key recorded below — NOT the production hub key. TS (apps/tracker lib/relay-ticket.ts issueRelayAdmissionTicket) and Rust (modelswarm_eligibility::relay_ticket from_wire + verify) must both accept this exact token at verify_at. Pins: the canonical-JSON bytes + sha256; the signature preimage (the signature-omitted canonical form); the exactly-600 s TTL delta; the wire form; the admission deadline computation (expires_at + 120 s); outcome ok(100).",
+  "adr": "ADR-038 §3.1/§3.4/§6.2",
+  "signing_seed_hex": "3838383838383838383838383838383838383838383838383838383838383838",
+  "signing_public_key_hex": "76d81b33ba721df89b8e0b0ef26c34eb72e978951044798cd608a4f6dbf2e6d6",
+  "verify_at": "2026-10-15T12:05:00Z",
+  "fields": {
+    "installation_id": "b58-installation-relay-0001",
+    "peer_id": "12D3KooWSrKnMZUcSxK8G7wmBbXdU8nFEfWGhLu6H8xjn8LmCSJb",
+    "issued_at": "2026-10-15T12:00:00.000Z",
+    "expires_at": "2026-10-15T12:10:00.000Z",
+    "nonce": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+  },
+  "canonical_json": "{\"expires_at\":\"2026-10-15T12:10:00.000Z\",\"installation_id\":\"b58-installation-relay-0001\",\"issued_at\":\"2026-10-15T12:00:00.000Z\",\"nonce\":\"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\",\"peer_id\":\"12D3KooWSrKnMZUcSxK8G7wmBbXdU8nFEfWGhLu6H8xjn8LmCSJb\"}",
+  "canonical_json_sha256": "39089a78a1e4a41be0affce414d10938d838dce1863be3ccc7b3fb73fe909c8b",
+  "token": "eyJleHBpcmVzX2F0IjoiMjAyNi0xMC0xNVQxMjoxMDowMC4wMDBaIiwiaW5zdGFsbGF0aW9uX2lkIjoiYjU4LWluc3RhbGxhdGlvbi1yZWxheS0wMDAxIiwiaXNzdWVkX2F0IjoiMjAyNi0xMC0xNVQxMjowMDowMC4wMDBaIiwibm9uY2UiOiJhMWIyYzNkNGU1ZjZhN2I4YzlkMGUxZjJhM2I0YzVkNiIsInBlZXJfaWQiOiIxMkQzS29vV1NyS25NWlVjU3hLOEc3d21CYlhkVThuRkVmV0doTHU2SDh4am44TG1DU0piIn0.wySKGyaLQ_Xxh_KVAwYaijmNI_jLVh6YH86Iv6q1rWEHENp8w0KKfUGzIx42EQP5jtQXxFnuZKaxgvyDIai2Dg",
+  "expected_admission_deadline": "2026-10-15T12:12:00Z",
+  "expected_outcome": {
+    "status": "ok(100)",
+    "reason": null
+  }
+}

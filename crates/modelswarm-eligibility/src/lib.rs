@@ -16,6 +16,7 @@
 pub mod canonical;
 pub mod lease;
 pub mod policy;
+pub mod relay_ticket;
 
 pub use lease::{
     CapacityClass, EligibilityLease, LeaseError, EXPIRY_CLOCK_SKEW_SECS, LEASE_CAP_GRACE_SECS,
@@ -23,4 +24,8 @@ pub use lease::{
 pub use policy::{
     backoff_for_streak, suspension, PolicyEvent, SuspensionDecision, CLEAN_EVENTS_FOR_DECAY,
     SUSPENDED_SLOTS, SUSPENSION_BACKOFF_WINDOWS_SECS,
+};
+pub use relay_ticket::{
+    canonical_payload, sign_ticket, verify_wire, RelayAdmissionTicket, TicketError,
+    RELAY_TICKET_MAX_SERIALIZED_LEN, RELAY_TICKET_SKEW_GRACE_SECS, RELAY_TICKET_TTL_SECS,
 };

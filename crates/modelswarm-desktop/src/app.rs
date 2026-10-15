@@ -5292,6 +5292,31 @@ async fn try_swarm_chat(
     Some(reply)
 }
 
+/// Neutral language pin for chat completions — see `chat_request_log`.
+/// Constrains the reply language only: no persona, no topics, no
+/// formatting. (Owner directive 2026-10-15, the Chinese-lock evening:
+/// one Chinese assistant turn flips every later reply Chinese at ANY
+/// temperature, reproduced against the shipped model+engine.)
+const CHAT_LANGUAGE_PIN: &str = "Reply in the same language as the user's latest message.";
+
+/// Builds the outgoing chat request copy: the visible log (already
+/// capped at 20 turns by `send_chat`) plus the language pin as a leading
+/// system turn. The pin never enters the persisted `chat_log` — every
+/// request is rebuilt from the clean log, so the transcript stays
+/// exactly what the user wrote and saw. The `{role, content}` wire
+/// shape carries the system turn through both the swarm path (the
+/// remote peer's executor renders it verbatim in ChatML) and the local
+/// loopback gateway.
+fn chat_request_log(log: &[ChatTurn]) -> Vec<ChatTurn> {
+    let mut out = Vec::with_capacity(log.len() + 1);
+    out.push(ChatTurn {
+        role: "system".into(),
+        content: CHAT_LANGUAGE_PIN.into(),
+    });
+    out.extend(log.iter().cloned());
+    out
+}
+
 #[tauri::command]
 async fn send_chat(
     state: tauri::State<'_, DesktopState>,
@@ -5343,6 +5368,18 @@ async fn send_chat(
         log.drain(0..drop);
     }
 
+    // Language pin (owner directive 2026-10-15, the Chinese-lock evening):
+    // one Chinese assistant turn in the rendered history flips every later
+    // reply to Chinese at ANY temperature (reproduced against the shipped
+    // model+engine; a fresh conversation answers English). A neutral
+    // system instruction rides the REQUEST copy only — never the persisted
+    // chat_log — so the swarm path (remote peer renders the wire messages)
+    // and the local path both carry it while the visible transcript stays
+    // exactly what the user wrote and saw. Chat completions only: the
+    // pairing draft path and family verification keep their pinned greedy
+    // contracts; the instruction constrains language, nothing else.
+    let request_log = chat_request_log(&log);
+
     // F1(3): SWARM FIRST — if another peer is verifiably hosting this
     // exact profile with a real address, ask it before this machine's
     // local engine; FailoverExecutor degrades to the local executor on
@@ -5375,7 +5412,7 @@ async fn send_chat(
                 &state.telemetry,
                 &profile,
                 executor.clone(),
-                &log,
+                &request_log,
                 max_tokens,
                 temperature,
                 lease,
@@ -5402,8 +5439,8 @@ async fn send_chat(
     }
 
     // Plain {role, content} turns — the serving executor applies ChatML
-    // exactly once (ADR-025).
-    let turns: Vec<serde_json::Value> = log
+    // exactly once (ADR-025). The request copy carries the language pin.
+    let turns: Vec<serde_json::Value> = request_log
         .iter()
         .map(|t| serde_json::json!({ "role": t.role, "content": t.content }))
         .collect();
@@ -7550,6 +7587,42 @@ mod tests {
             family_engage_reason(Some(&cap(true, "CPU")), Some("cpu"), None, None),
             "gate_unmeasured"
         );
+    }
+
+    #[test]
+    fn chat_request_log_prepends_language_pin_without_touching_the_log() {
+        // The rendered-history Chinese lock (owner directive 2026-10-15,
+        // reproduced against the shipped model+engine): the outgoing
+        // request must carry the pin as the FIRST turn so ChatML renders
+        // it as the system block, on both the swarm and local paths.
+        let turn = |role: &str, content: &str| ChatTurn {
+            role: role.into(),
+            content: content.into(),
+        };
+        let log = vec![
+            turn("user", "hello"),
+            turn("assistant", "你好！我是Qwen语言模型。"),
+            turn("user", "what is ModelSwarm?"),
+        ];
+        let request = chat_request_log(&log);
+        assert_eq!(request.len(), log.len() + 1);
+        assert_eq!(request[0].role, "system");
+        assert_eq!(request[0].content, CHAT_LANGUAGE_PIN);
+        // The rest of the request is the visible log, order intact — the
+        // remote peer and the local executor see exactly the transcript
+        // plus the pin.
+        for (req, vis) in request[1..].iter().zip(log.iter()) {
+            assert_eq!(req.role, vis.role);
+            assert_eq!(req.content, vis.content);
+        }
+        // The input log is untouched — the pin must never reach the
+        // persisted chat_log (the transcript stays what the user wrote
+        // and saw; requests are rebuilt per send).
+        assert_eq!(log.len(), 3);
+        assert_ne!(log[0].role, "system");
+        // The pin constrains language only — no persona, no topics.
+        assert!(CHAT_LANGUAGE_PIN.to_lowercase().contains("language"));
+        assert!(!CHAT_LANGUAGE_PIN.to_lowercase().contains("you are"));
     }
 
     // ---- Chat wall (ADR-037 §3.1 W1–W6 / §4.4 item 10): the DESKTOP leg --

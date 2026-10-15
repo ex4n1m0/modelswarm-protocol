@@ -12,7 +12,8 @@
       "profile_ref_16hex": "exactly 16 lowercase hex chars: the 16 hex following the msp1: prefix of a ModelProfileId"
     },
     "zero_surviving_fields": "a request with zero surviving fields is not sent (gap empty_after_redaction)",
-    "choke_point": "exactly one function constructs the request body; before CALL the final serialized body is re-parsed, every value must re-match this allowlist, and the bytes must pass scrub_content unchanged — any failure is gap empty_after_redaction and nothing is sent (ADR-033 RC-3)"
+    "choke_point": "exactly one function constructs the request body; before CALL the final serialized body is re-parsed, every value must re-match this allowlist, and the bytes must pass scrub_content unchanged — any failure is gap empty_after_redaction and nothing is sent (ADR-033 RC-3)",
+    "history": "2026-10-15 (owner directive, verbatim: \"how about we remove this deepseek key completely, and make the helper use the hosted model when hosted\"): the digest-plane half of the gate, the feeds_digest classifications, the advisory.cycle.* emit-site rows, and the reduction_rules section are DELETED with the provider surface. The assistant context-block gate is the whole gate; the advisory_gap vocabulary is the 12-value post-collapse set (no_key, interval, quota removed as unemittable; not_hosting added as the static-floor reason)."
   },
   "vocabularies": {
     "msp_v1_section_6_5_error_registry": {
@@ -72,14 +73,12 @@
       "copied_from": "ADR-033 §6 (12 digest-plane values) as extended by ADR-037 §4.3 (rate_limited = the assistant hourly burst bound; request_oversized = the assistant body over cap even at zero history) — 14 values; a further value needs an ADR-037 amendment",
       "values": [
         "disabled",
-        "no_key",
+        "not_hosting",
         "no_config",
         "cap_reached",
-        "interval",
         "empty_after_redaction",
         "timeout",
         "http_error",
-        "quota",
         "response_oversized",
         "schema",
         "late",
@@ -223,9 +222,8 @@
     }
   },
   "plane_enum": {
-    "note": "which plane a plane-own telemetry row belongs to (ADR-037 §4.2): advisory.* rows are the digest plane, assistant.* rows are the assistant plane. Both are excluded from digest aggregation (RC-4).",
+    "note": "which plane a plane-own telemetry row belongs to (ADR-037 §4.2, collapsed by the 2026-10-15 owner directive): only the assistant plane remains; the digest plane died with the provider surface. Plane rows are excluded from any future aggregation by construction (RC-4).",
     "values": [
-      "digest",
       "assistant"
     ]
   },
@@ -275,107 +273,22 @@
     },
     "max_picker_rows": 8
   },
-  "reduction_rules": [
-    {
-      "field": [
-        "error",
-        "detail"
-      ],
-      "sites": [
-        "gateway",
-        "engine",
-        "executor",
-        "family",
-        "chat.swarm",
-        "net.metrics"
-      ],
-      "rule": "drop_by_default",
-      "per_site_code_sets": "initially EMPTY: a site's errors enter a digest only via a frozen code set added to this artifact by ADR-033 amendment; until then every such field drops with a count"
-    },
-    {
-      "field": "code",
-      "site": "serving.session_ended",
-      "rule": "prefix_match_frozen_codes_else_drop_count",
-      "vocabulary": "serving_session_ended_code"
-    },
-    {
-      "field": [
-        "deadline_ms",
-        "max_tokens"
-      ],
-      "site": "serving.clamped",
-      "rule": "decompose_x_to_y_integer_pairs",
-      "note": "composite \"X->Y\" becomes deadline_ms_requested/deadline_ms_clamped (and the max_tokens pair) as integers; the composite string itself never enters the digest"
-    },
-    {
-      "field": [
-        "probe_p50_ms",
-        "ttft_ewma_ms",
-        "total_ewma_ms",
-        "pick_predicted_ms"
-      ],
-      "rule": "integer_ms_from_typed_accumulators",
-      "note": "typed accumulators emit integers (rounded ms); the honest sentinels none/unmeasured/unknown map to null on every timing field"
-    },
-    {
-      "field": "decision",
-      "site": "sched.shadow.decision",
-      "rule": "drop",
-      "note": "stringified JSON blob; decompose into typed fields via amendment if ever needed"
-    },
-    {
-      "field": "session",
-      "site": "verifydrafts.*",
-      "rule": "drop",
-      "note": "opaque requester-generated string (peer-chosen bytes); correlation rides the peer reference plus integer round"
-    },
-    {
-      "field": "addr",
-      "sites": [
-        "chat.swarm",
-        "listener.bound"
-      ],
-      "rule": "drop",
-      "note": "peer-registered multiaddr"
-    },
-    {
-      "field": [
-        "backend",
-        "base",
-        "file",
-        "port",
-        "gateway_addr",
-        "version",
-        "name",
-        "preset"
-      ],
-      "rule": "drop",
-      "note": "local disclosure strings; no per-field vocabulary is authorized at this leg"
-    }
-  ],
   "aggregation_event_allowlist": {
-    "note": "the enumerated event-type set whose typed accumulators may feed a digest; EXCLUDES every row whose name starts with advisory. (the plane's own telemetry never feeds the next cycle) — ADR-033 §3.2/RC-4",
-    "events": [
-      "serving.session_ended",
-      "serving.clamped",
-      "serving.refused",
-      "verifydrafts.verifier_divergence",
-      "engine.gpu_fallback"
-    ]
+    "note": "RETIRED-EMPTY by the 2026-10-15 owner directive (the provider-key era ended; the digest plane and its typed accumulators are deleted). The section stays so the R-1 tie's classification consistency keeps holding mechanically: no event feeds a digest anymore, and the feeds_digest classification appears nowhere.",
+    "events": []
   },
   "plane_telemetry_events": [
-    "advisory.cycle.sent",
-    "advisory.cycle.gap",
-    "advisory.suggestion.recorded"
+    "assistant.turn.sent",
+    "assistant.turn.gap"
   ],
   "emit_site_events": {
     "note": "EXHAUSTIVE event-name vocabulary over the node/desktop production telemetry emit sites (R-1: the guards completeness tie diffs the source emit-site vocabulary against this section AND the tests/fixtures/advisory-egress/ manifest - a source event name without a row here, or a row here without a source emit site, is a red build). Classification: feeds_digest (also listed in aggregation_event_allowlist.events) | excluded (never feeds a digest at this leg) | plane_own (advisory.*/assistant.* - excluded from aggregation by RC-4). Reclassification or a new row is an ADR-033 amendment. COMPLETING-CONFIRMATION EDIT (2026-10-14, Test and Release, per the protocol review R-1's own rule that 'any name the [mechanical source] scan finds beyond this list is added as excluded in the same confirmation edit'): the scan found 54 emit-site event names beyond the 37-row protocol seed - the desktop catalog/census/roster/enroll/settings/updater/chat-local surfaces and the node engine/executor/measure/runtime/verifydrafts-serve surfaces - all added as excluded (feeds_digest and plane_own rows are unchanged). Completing count: 91 rows. Protocol-seat countersign requested in docs/reviews/review-adr037-assistant-testrelease-2026-10-14.md; after that, this section changes only by ADR-033 amendment.",
     "events": {
-      "serving.session_ended": "feeds_digest",
-      "serving.clamped": "feeds_digest",
-      "serving.refused": "feeds_digest",
-      "verifydrafts.verifier_divergence": "feeds_digest",
-      "engine.gpu_fallback": "feeds_digest",
+      "serving.session_ended": "excluded",
+      "serving.clamped": "excluded",
+      "serving.refused": "excluded",
+      "verifydrafts.verifier_divergence": "excluded",
+      "engine.gpu_fallback": "excluded",
       "serving.stopped": "excluded",
       "verifydrafts.verify_ms_lie": "excluded",
       "verifydrafts.budget_refused": "excluded",
@@ -456,9 +369,6 @@
       "verifydrafts.sign_failed": "excluded",
       "verifydrafts.unexpected_frame": "excluded",
       "verifydrafts.wire_failure": "excluded",
-      "advisory.cycle.sent": "plane_own",
-      "advisory.cycle.gap": "plane_own",
-      "advisory.suggestion.recorded": "plane_own",
       "assistant.turn.sent": "plane_own",
       "assistant.turn.gap": "plane_own"
     }

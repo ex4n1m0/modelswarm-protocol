@@ -27,26 +27,20 @@ use modelswarm_node::advisory::{AdvisoryTransport, CountingTransport};
 const CANARY_TRANSCRIPT: &str = "WALL-CANARY-swarm-transcript-0123456789abcdef";
 const CANARY_CARRIER: &str = "WALL-CANARY-carrier-payload-fedcba9876543210";
 
-/// Serializes this binary's env mutations (`MSP_ADVISORY_KEY_FILE` is
-/// process-global; parallel tokio tests race it — protocol review
-/// advisory A-4).
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Boots the armed plane over a counting double for `dir` (the env var
-/// is set and removed INSIDE the serial lock).
+/// Boots the armed plane over a counting double for `dir` — the
+/// hosted-model posture over the double (never a real engine; never a
+/// provider: the 2026-10-15 owner directive removed that surface
+/// whole, so there is no key file and no env var to serialize over
+/// anymore).
 fn boot(dir: &std::path::Path, double: Arc<CountingTransport>) -> AssistantPlane {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    std::fs::write(
-        dir.join("advisory.json"),
-        r#"{"assistant.enabled":true,"endpoint_url":"https://advisor.invalid/v1/chat/completions","model":"test-model"}"#,
-    )
-    .unwrap();
-    let key = dir.join("advisory-key.txt");
-    std::fs::write(&key, "test-key-local-double\n").unwrap();
-    std::env::set_var("MSP_ADVISORY_KEY_FILE", &key);
+    std::fs::write(dir.join("advisory.json"), r#"{"assistant.enabled":true}"#).unwrap();
     let as_trait: Arc<dyn AdvisoryTransport> = double;
-    let (plane, _) = AssistantPlane::spawn(dir, Some(as_trait));
-    std::env::remove_var("MSP_ADVISORY_KEY_FILE");
+    let (plane, gap) = AssistantPlane::spawn(dir, None, Some(as_trait));
+    assert_eq!(
+        gap.as_str(),
+        "not_hosting",
+        "armed spawn reports no degrade"
+    );
     plane.expect("the assistant plane arms over the double")
 }
 
@@ -161,14 +155,12 @@ async fn canary_bytes_reach_no_serialized_assistant_request() {
         let ctx = serde_json::to_string(&parsed["context"]).unwrap();
         assert!(choke_point_rescan_assistant(&body, 49_152).is_ok());
         assert!(ctx.contains("logical_cpus"), "the clean context survived");
-        // No key material anywhere in the body.
-        assert!(!body.contains("test-key-local-double"));
     }
     // The plane's own telemetry: counts/labels only, assistant.* rows
-    // only, no reply text, no key.
+    // only, no reply text, no user text.
     for line in sink.snapshot() {
         assert!(line.contains("\"event\":\"assistant."), "{line}");
-        assert!(!line.contains("test-key-local-double"), "{line}");
+        assert!(!line.contains("which model fits"), "{line}");
     }
 }
 
@@ -277,7 +269,10 @@ async fn failing_turns_are_honest_gaps_and_the_next_turn_retries() {
     let rows = sink.snapshot().join("\n");
     assert!(rows.contains("\"event\":\"assistant.turn.gap\""));
     assert!(rows.contains("\"reason\":\"http_error\""));
-    assert!(!rows.contains("test-key-local-double"));
+    assert!(
+        !rows.contains("hello?"),
+        "user text never reaches telemetry"
+    );
     // The next user turn IS the retry.
     let _ = plane.run_turn(&telemetry, "again", typed_context()).await;
     assert_eq!(double.count(), 2);

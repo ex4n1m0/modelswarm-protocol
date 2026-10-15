@@ -1,18 +1,29 @@
-//! The assistant-plane client (ADR-037 §3.7): the user-facing setup
-//! helper riding the SAME pure injectable core discipline as the digest
-//! plane — `step(state, input) -> (state, effects)` over an injected
-//! clock and an injected transport (TR-RC-4/TR-AD-2), NO reqwest, wall
-//! clock, or RNG inside the machine.
+//! The assistant-plane client (ADR-037 §3.7, as rewired by the
+//! 2026-10-15 owner directive: "how about we remove this deepseek key
+//! completely, and make the helper use the hosted model when hosted"):
+//! the user-facing setup helper riding the SAME pure injectable core
+//! discipline — `step(state, input) -> (state, effects)` over an
+//! injected clock and an injected transport (TR-RC-4/TR-AD-2), NO
+//! reqwest, wall clock, or RNG inside the machine.
 //!
 //! States per the ADR's diagram: `IDLE → BUILD → SCRUB → CALL → PARSE →
 //! RECORD → IDLE`. BUILD/SCRUB/PARSE/RECORD are pure computations inside
 //! `step`; the waiting phases are `Idle` and `AwaitingCall`.
 //!
-//! What may be sent (ADR-037 §3.5, the privacy contract): the user's
-//! assistant-channel text (the ONE deliberate free-text exception,
-//! Redactor-scrubbed and byte-capped) plus the TYPED context block
-//! (frozen field set in the egress artifact) plus the trailing
-//! `history_turns_sent` completed turns. This module is structurally
+//! The backing is the machine's OWN hosted model: when the node is
+//! hosting, the CALL goes to the LOCAL loopback gateway — the same
+//! OpenAI-compatible path chat uses, so queueing/governor fairness
+//! applies to assistant turns exactly as to chat turns. When the
+//! machine is not hosting there is NO backing: the surface renders the
+//! frozen static-help corpus, honestly labeled (`not_hosting`). There
+//! is no provider, no key, and no external egress anywhere in the
+//! plane anymore.
+//!
+//! What may be sent (ADR-037 §3.5, the privacy contract, retargeted to
+//! the local seam): the user's assistant-channel text (Redactor-scrubbed
+//! and byte-capped) plus the TYPED context block (frozen field set in
+//! the egress artifact) plus the trailing `history_turns_sent` completed
+//! turns — to the machine's own gateway. This module is structurally
 //! unable to name a swarm transcript, a serving frame, or a carrier
 //! payload (W3 — pinned by the chat-wall suite's layer-2 scan).
 //!
@@ -21,43 +32,46 @@
 //! tokens, 45 s timeout. UTC-day and UTC-hour windows; failed calls
 //! consume budget; NO in-turn retry — the next user turn is the retry.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
 use modelswarm_telemetry::redact::Redactor;
 use modelswarm_telemetry::Telemetry;
 
-use super::config::{self, AdvisoryConfig};
+use super::config::AdvisoryConfig;
 use super::egress::{self, ContextField};
 use super::state::{parse_one_suggestion, ProviderRequest, RecordedSuggestion, TransportFailure};
-use super::transport::AdvisoryTransport;
+use super::transport::{AdvisoryTransport, LocalGatewayTransport};
 use super::Gap;
 
 /// The fixed, repo-versioned assistant system prompt (ADR-037 §3.2c
-/// extended): the honesty contract to the model. The typed context gate
+/// extended; retargeted to the hosted-model backing by the 2026-10-15
+/// directive): the honesty contract to the model. The typed context gate
 /// runs regardless of the prompt — the structural gate, not prompt
 /// compliance, is the defense.
 pub const ASSISTANT_SYSTEM_PROMPT: &str = "\
 You are the setup and troubleshooting assistant of a decentralized \
-inference swarm desktop app. You receive machine and setup metadata (a \
-hardware profile, model-catalog rows, and status labels and counts) plus \
-this conversation — never the user's swarm conversations, serving \
-content, or secrets. Help with model choice for this machine, \
-installation, and troubleshooting. Say \"I don't know\" when unsure. \
-Never invent product behavior, version numbers, settings, or protocol \
-rules; answer those only from the context block you are given. This \
-app's deterministic rules decide everything — your advice never \
-changes any decision and you must not claim otherwise. Reply with ONE \
-JSON object exactly of the shape {\"schema\":\"advisory-assistant/v1\",\
-\"conversation_id\":\"<echo the given conversation_id>\",\"turn\":<echo \
-the given turn number>,\"reply\":\"<plain-text answer for the user>\",\
-\"hints\":[{\"type\":\"triage_summary|catalog_note|digest\",\
-\"target\":\"fleet or a 16-hex profile prefix\",\"confidence\":\
-\"low|medium|high\",\"rationale\":\"short display text\"}]} where hints \
-may be an empty array. The reply is display-only plain text.";
+inference swarm desktop app, running as the user's OWN hosted model on \
+their own machine. You receive machine and setup metadata (a hardware \
+profile, model-catalog rows, and status labels and counts) plus this \
+conversation — never the user's swarm conversations, serving content, \
+or secrets. Help with model choice for this machine, installation, and \
+troubleshooting. Say \"I don't know\" when unsure. Never invent product \
+behavior, version numbers, settings, or protocol rules; answer those \
+only from the context block you are given. This app's deterministic \
+rules decide everything — your advice never changes any decision and \
+you must not claim otherwise. Reply with ONE JSON object exactly of the \
+shape {\"schema\":\"advisory-assistant/v1\",\"conversation_id\":\"<echo \
+the given conversation_id>\",\"turn\":<echo the given turn number>,\
+\"reply\":\"<plain-text answer for the user>\",\"hints\":[{\"type\":\
+\"triage_summary|catalog_note|digest\",\"target\":\"fleet or a 16-hex \
+profile prefix\",\"confidence\":\"low|medium|high\",\"rationale\":\
+\"short display text\"}]} where hints may be an empty array. The reply \
+is display-only plain text.";
 
 /// The shared response body cap (ADR-037 §3.7: `max_response_bytes`
-/// 65 536, shared with the digest plane).
+/// 65 536).
 pub const MAX_RESPONSE_BYTES: usize = 65_536;
 
 // ---------------------------------------------------------------------------
@@ -69,8 +83,6 @@ pub const MAX_RESPONSE_BYTES: usize = 65_536;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AssistantRuntimeCaps {
     pub enabled: bool,
-    pub key_present: bool,
-    pub endpoint_configured: bool,
     pub max_calls_per_day: u32,
     pub max_calls_per_hour: u32,
     pub max_turns_per_conversation: u32,
@@ -84,12 +96,10 @@ pub struct AssistantRuntimeCaps {
 
 impl AssistantRuntimeCaps {
     /// The armed defaults used by tests: the nine ADR-037 §3.4 frozen
-    /// defaults plus a resolved key/endpoint.
+    /// defaults over a resolved hosted-model backing.
     pub fn armed_defaults() -> Self {
         Self {
             enabled: true,
-            key_present: true,
-            endpoint_configured: true,
             max_calls_per_day: 300,
             max_calls_per_hour: 60,
             max_turns_per_conversation: 40,
@@ -103,31 +113,47 @@ impl AssistantRuntimeCaps {
     }
 }
 
-/// The assistant-plane arming decision. The §3.4 `assistant.enabled`
-/// master switch is INDEPENDENT of the digest plane's `enabled`: an
-/// owner may run either plane alone.
+/// The hosted-model backing facts (the 2026-10-15 owner directive's
+/// arming input): the RUNNING node's bound loopback gateway address and
+/// the hosted profile id. Supplied by the composition when hosting is
+/// on; absent while it is not.
+#[derive(Debug, Clone)]
+pub struct HostedBacking {
+    pub gateway_addr: SocketAddr,
+    pub profile: String,
+}
+
+/// The assistant-plane arming decision (the ADR-033 §3.1 shape,
+/// collapsed by the 2026-10-15 directive — there is no key and no
+/// endpoint anymore): `Hosted` while the machine hosts the model the
+/// assistant runs on, the honest static floor otherwise. The §3.4
+/// `assistant.enabled` master switch is INDEPENDENT of hosting: the
+/// owner may pin the helper to the static corpus even while hosting.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssistantArm {
-    Armed {
-        key: String,
-    },
-    NotArmed {
-        reason: Gap,
-    },
+    /// Armed over the machine's own loopback gateway.
+    Hosted,
+    /// Not armed; `not_hosting` (no model backing) or `no_config`
+    /// (malformed advisory.json — fail closed, never a guess).
+    Static { reason: Gap },
     /// `assistant.enabled=false` (the shipped default): static-help mode,
     /// silent — the `disabled` gap fires only inside a driven machine.
     Disabled,
 }
 
-/// Resolves the assistant arming decision for a data dir (reads
-/// `advisory.json` and the key file; no I/O beyond those, no network).
-pub fn assistant_arm(data_dir: &Path) -> (AdvisoryConfig, AssistantArm) {
+/// Resolves the assistant arming decision for a data dir plus the
+/// caller-supplied hosting facts (reads `advisory.json` only; no
+/// network, no key file — none exists).
+pub fn assistant_arm(
+    data_dir: &Path,
+    backing: Option<&HostedBacking>,
+) -> (AdvisoryConfig, AssistantArm) {
     let advisory = match AdvisoryConfig::load(data_dir) {
         Ok(cfg) => cfg,
         Err(_) => {
             return (
                 AdvisoryConfig::default(),
-                AssistantArm::NotArmed {
+                AssistantArm::Static {
                     reason: Gap::NoConfig,
                 },
             )
@@ -136,27 +162,17 @@ pub fn assistant_arm(data_dir: &Path) -> (AdvisoryConfig, AssistantArm) {
     if !advisory.assistant.enabled {
         return (advisory, AssistantArm::Disabled);
     }
-    let key = config::read_key(&config::resolve_key_file(&advisory))
-        .ok()
-        .flatten();
-    let Some(key) = key else {
-        return (advisory, AssistantArm::NotArmed { reason: Gap::NoKey });
-    };
-    let endpoint_ok = advisory
-        .endpoint_url
-        .as_deref()
-        .map(config::is_https_endpoint)
-        .unwrap_or(false);
-    let model_ok = advisory.model.as_deref().is_some_and(|m| !m.is_empty());
-    if !endpoint_ok || !model_ok {
-        return (
+    match backing {
+        // The transport is constructed by `spawn`; the arm decision
+        // only needs the FACT of a hosted backing.
+        Some(_) => (advisory, AssistantArm::Hosted),
+        None => (
             advisory,
-            AssistantArm::NotArmed {
-                reason: Gap::NoConfig,
+            AssistantArm::Static {
+                reason: Gap::NotHosting,
             },
-        );
+        ),
     }
-    (advisory, AssistantArm::Armed { key })
 }
 
 // ---------------------------------------------------------------------------
@@ -206,11 +222,10 @@ pub enum AssistantEffect {
         reason: Gap,
         conversation_id: Option<String>,
     },
-    /// Execute one HTTPS call via the injected transport; feed the
-    /// outcome back as [`AssistantInput::CallOutcome`]. Together with
-    /// the digest timer's runner this is one of exactly TWO transport
-    /// execution sites in the process (W2, pinned by the chat-wall
-    /// suite).
+    /// Execute one local-gateway call via the injected transport; feed
+    /// the outcome back as [`AssistantInput::CallOutcome`]. This is the
+    /// plane's ONE transport execution site (W2, pinned by the
+    /// chat-wall suite).
     Call(ProviderRequest),
     /// `assistant.turn.sent` — RECORD's completed-turn summary; the
     /// reply and hints ride the effect (display-only; telemetry emits
@@ -391,17 +406,12 @@ fn step_user_turn(
         state.calls_this_hour = 0;
     }
 
-    // IDLE gates (ADR-037 §3.7 diagram, first failure wins).
+    // IDLE gates (ADR-037 §3.7 diagram, first failure wins). The
+    // provider-era `no_key`/`no_config` gates are GONE — arming is
+    // hosting (the caller never constructs an unarmed machine with
+    // `armed=true`).
     if !state.caps.enabled || !state.armed {
         state.record_gap(effects, Gap::Disabled, None);
-        return;
-    }
-    if !state.caps.key_present {
-        state.record_gap(effects, Gap::NoKey, None);
-        return;
-    }
-    if !state.caps.endpoint_configured {
-        state.record_gap(effects, Gap::NoConfig, None);
         return;
     }
     if state.caps.max_calls_per_day == 0 || state.calls_today >= state.caps.max_calls_per_day {
@@ -440,7 +450,7 @@ fn step_user_turn(
         None => {
             let id: String = turn_nonce.chars().take(16).collect();
             if id.len() != 16 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                // A malformed nonce is a config-side defect: fail closed.
+                // A malformed nonce is a caller-side defect: fail closed.
                 state.record_gap(effects, Gap::EmptyAfterRedaction, None);
                 return;
             }
@@ -457,7 +467,9 @@ fn step_user_turn(
     }
 
     // SCRUB: the user text through the Redactor net (keys, JWTs, Bearer,
-    // hex runs >= 32) — the ONE disclosed free-text exception.
+    // hex runs >= 32) — the one free-text channel, scrubbed even though
+    // it now only ever reaches the machine's own gateway (the same
+    // discipline telemetry applies locally).
     let redactor = Redactor::default();
     let user_text = redactor.scrub_content(&text);
     if user_text.trim().is_empty() {
@@ -568,7 +580,6 @@ fn step_call_outcome(
         Err(failure) => {
             let gap = match failure {
                 TransportFailure::Deadline => Gap::Timeout,
-                TransportFailure::HttpStatus(402) => Gap::Quota,
                 TransportFailure::HttpStatus(_) => Gap::HttpError,
                 TransportFailure::ResponseOversized => Gap::ResponseOversized,
                 TransportFailure::Network(_) => Gap::HttpError,
@@ -651,7 +662,7 @@ fn parse_response(
     let mut hints_discarded = 0usize;
     if let Some(raw_hints) = obj.get("hints").and_then(|h| h.as_array()) {
         for raw in raw_hints {
-            // §3.3's digest-plane-only rule: a provider conversation must
+            // §3.3's digest-plane-only rule: a model conversation must
             // not be able to mint tuning hints — that CLASS is discarded
             // and counted before any parsing; the reply still renders.
             let kind = raw.get("type").and_then(|t| t.as_str());
@@ -673,8 +684,8 @@ fn parse_response(
 }
 
 // ---------------------------------------------------------------------------
-// The plane handle (the user-triggered execution site — W2's second and
-// final entry class)
+// The plane handle (the user-triggered execution site — W2's one and
+// only entry class)
 // ---------------------------------------------------------------------------
 
 /// One assistant turn's outcome, as the surface renders it.
@@ -693,49 +704,64 @@ pub enum TurnOutcome {
     },
 }
 
-/// The armed assistant plane: holds the key, the injected transport, and
+/// The armed assistant plane: holds the loopback-pinned transport and
 /// the pure machine's state. [`AssistantPlane::run_turn`] is the ONLY
-/// assistant execution site of [`AdvisoryTransport::send`] (the digest
-/// timer's runner is the other one — W2's enumerated call sites).
+/// assistant execution site of [`AdvisoryTransport::send`] (W2's
+/// enumerated call sites).
 pub struct AssistantPlane {
-    key: String,
     transport: Arc<dyn AdvisoryTransport>,
     state: std::sync::Mutex<AssistantState>,
 }
 
 impl AssistantPlane {
-    /// Arms the assistant plane for a data dir. `transport_override` is
-    /// a TEST seam (the redaction/cadence suites inject a counting
-    /// double); production passes `None` and gets the pinned reqwest
-    /// adapter. Returns the plane plus the honest degrade gap when the
-    /// plane is absent (`disabled` | `no_key` | `no_config`).
+    /// Arms the assistant plane for a data dir. `backing` is the
+    /// hosted-model fact pair (the running node's gateway address +
+    /// the hosted profile) — present while hosting, absent otherwise.
+    /// `transport_override` is a TEST seam (the redaction/cadence
+    /// suites inject a counting double that STANDS IN for the hosted
+    /// model — never a real engine); production passes `None` and gets
+    /// the pinned loopback adapter. Returns the plane plus the honest
+    /// static-floor gap when the plane is absent (`not_hosting` |
+    /// `disabled` | `no_config`).
     pub fn spawn(
         data_dir: &Path,
+        backing: Option<&HostedBacking>,
         transport_override: Option<Arc<dyn AdvisoryTransport>>,
     ) -> (Option<Self>, Gap) {
-        let (advisory, arm_result) = assistant_arm(data_dir);
-        let AssistantArm::Armed { key } = arm_result else {
-            let reason = match arm_result {
-                AssistantArm::NotArmed { reason } => reason,
-                AssistantArm::Disabled => Gap::Disabled,
-                AssistantArm::Armed { .. } => unreachable!(),
-            };
-            return (None, reason);
-        };
+        let (advisory, arm_result) = assistant_arm(data_dir, backing);
+        match arm_result {
+            AssistantArm::Disabled => return (None, Gap::Disabled),
+            // A malformed advisory.json fails closed even for the test
+            // seam — the caps would be guesses.
+            AssistantArm::Static {
+                reason: Gap::NoConfig,
+            } => return (None, Gap::NoConfig),
+            // Without a model backing there is no plane — unless the
+            // TEST seam supplies the double that stands in for the
+            // hosted model.
+            AssistantArm::Static {
+                reason: Gap::NotHosting,
+            } if transport_override.is_none() => return (None, Gap::NotHosting),
+            _ => {}
+        }
         let transport: Arc<dyn AdvisoryTransport> = match transport_override {
             Some(double) => double,
-            None => match super::transport::ReqwestTransport::new(
-                advisory.endpoint_url.as_deref().unwrap_or_default(),
-                advisory.model.as_deref().unwrap_or_default(),
-            ) {
-                Ok(adapter) => Arc::new(adapter),
-                Err(_) => return (None, Gap::NoConfig),
-            },
+            None => {
+                let Some(backing) = backing else {
+                    return (None, Gap::NotHosting);
+                };
+                match LocalGatewayTransport::new(backing.gateway_addr, &backing.profile) {
+                    Ok(adapter) => Arc::new(adapter),
+                    // The node's bound address is loopback by
+                    // construction; a non-loopback backing is a
+                    // composition defect — fail closed to the static
+                    // floor with the honest label.
+                    Err(_) => return (None, Gap::NoConfig),
+                }
+            }
         };
         let caps = AssistantRuntimeCaps {
             enabled: true,
-            key_present: true,
-            endpoint_configured: true,
             max_calls_per_day: advisory.assistant.max_calls_per_day,
             max_calls_per_hour: advisory.assistant.max_calls_per_hour,
             max_turns_per_conversation: advisory.assistant.max_turns_per_conversation,
@@ -744,17 +770,16 @@ impl AssistantPlane {
             max_request_bytes: advisory.assistant.max_request_bytes,
             max_completion_tokens: advisory.assistant.max_completion_tokens,
             request_timeout_ms: advisory.assistant.request_timeout_ms,
-            // ADR-037 §3.7: the response cap is SHARED with the digest
-            // plane (65 536) — never the request cap.
+            // ADR-037 §3.7: the response cap is 65 536 — never the
+            // request cap.
             max_response_bytes: MAX_RESPONSE_BYTES,
         };
         let now = system_now_ms();
         let plane = Self {
-            key,
             transport,
             state: std::sync::Mutex::new(AssistantState::new(caps, true, now)),
         };
-        (Some(plane), Gap::Disabled)
+        (Some(plane), Gap::NotHosting)
     }
 
     /// Runs one user-triggered assistant turn end to end (BUILD → SCRUB
@@ -824,7 +849,7 @@ impl AssistantPlane {
                     // diagnostic fires from the timed_out window).
                     let result = tokio::time::timeout(
                         std::time::Duration::from_millis(request.timeout_ms),
-                        self.transport.send(&request, &self.key),
+                        self.transport.send(&request),
                     )
                     .await
                     .map_err(|_| TransportFailure::Deadline)
@@ -968,6 +993,13 @@ mod tests {
             r#"{{"schema":"advisory-assistant/v1","conversation_id":"{conversation_id}","turn":{turn},"reply":"{reply}","hints":[]}}"#
         )
         .into_bytes()
+    }
+
+    fn backing() -> HostedBacking {
+        HostedBacking {
+            gateway_addr: "127.0.0.1:11435".parse().unwrap(),
+            profile: "msp1:hosted".to_string(),
+        }
     }
 
     #[test]
@@ -1121,8 +1153,8 @@ mod tests {
             (TransportFailure::Deadline, Gap::Timeout),
             (TransportFailure::HttpStatus(500), Gap::HttpError),
             (TransportFailure::HttpStatus(302), Gap::HttpError),
-            (TransportFailure::HttpStatus(402), Gap::Quota),
-            (TransportFailure::Network("dns".into()), Gap::HttpError),
+            (TransportFailure::HttpStatus(503), Gap::HttpError),
+            (TransportFailure::Network("dial".into()), Gap::HttpError),
         ] {
             let s = armed(1_000);
             let (s, _) = step(s, turn(1_000, "q"));
@@ -1410,7 +1442,7 @@ mod tests {
                 // Feed an outcome — adversarially failing: budget is
                 // consumed, no retry this turn.
                 let failure = if i % 3 == 0 {
-                    TransportFailure::HttpStatus(500)
+                    TransportFailure::HttpStatus(503)
                 } else {
                     TransportFailure::Deadline
                 };
@@ -1475,44 +1507,109 @@ mod tests {
         }
     }
 
-    /// The arm resolution: assistant.enabled is independent of the
-    /// digest plane's enabled.
+    /// The 2026-10-15 arming postures: the shipped default (no
+    /// advisory.json, `assistant.enabled` on since the collapse) plus
+    /// no hosting is the honest `not_hosting` static floor; hosting
+    /// arms; an explicit opt-out is `disabled`; a malformed file is
+    /// `no_config` — there is NO `no_key` path anymore (no key exists).
     #[test]
-    fn assistant_arming_is_independent_of_the_digest_switch() {
-        let _env = super::super::env_lock();
+    fn arming_is_hosted_model_vs_static_floor() {
         let dir = tempfile::tempdir().unwrap();
-        // assistant on, digest OFF: the assistant plane arms.
-        std::fs::write(
-            dir.path().join(config::ADVISORY_CONFIG_FILE),
-            r#"{"enabled":false,"assistant.enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"m"}"#,
-        )
-        .unwrap();
-        let key = dir.path().join("k.txt");
-        std::fs::write(&key, "test-key-local-double\n").unwrap();
-        std::env::set_var(config::ENV_ADVISORY_KEY_FILE, &key);
-        let (_, arm_result) = assistant_arm(dir.path());
-        std::env::remove_var(config::ENV_ADVISORY_KEY_FILE);
-        assert!(
-            matches!(arm_result, AssistantArm::Armed { .. }),
-            "{arm_result:?}"
+        // No advisory.json + no hosting: the static floor with the
+        // honest not_hosting label (the shipped default posture).
+        let (_, arm) = assistant_arm(dir.path(), None);
+        assert_eq!(
+            arm,
+            AssistantArm::Static {
+                reason: Gap::NotHosting
+            }
         );
-        // assistant OFF, digest on: the assistant plane does not arm.
+        // Enabled + HOSTING: armed over the machine's own backing.
         std::fs::write(
-            dir.path().join(config::ADVISORY_CONFIG_FILE),
-            r#"{"enabled":true,"assistant.enabled":false,"endpoint_url":"https://advisor.invalid/v1","model":"m"}"#,
+            dir.path()
+                .join(crate::advisory::config::ADVISORY_CONFIG_FILE),
+            r#"{"assistant.enabled":true}"#,
         )
         .unwrap();
-        let (_, arm_result) = assistant_arm(dir.path());
-        assert_eq!(arm_result, AssistantArm::Disabled);
-        // assistant on, no key: honest no_key.
+        let (_, arm) = assistant_arm(dir.path(), Some(&backing()));
+        assert_eq!(arm, AssistantArm::Hosted);
+        // Enabled but NOT hosting: the honest not_hosting floor.
+        let (_, arm) = assistant_arm(dir.path(), None);
+        assert_eq!(
+            arm,
+            AssistantArm::Static {
+                reason: Gap::NotHosting
+            }
+        );
+        // A malformed advisory.json: fail closed, never a guess.
         std::fs::write(
-            dir.path().join(config::ADVISORY_CONFIG_FILE),
-            r#"{"assistant.enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"m"}"#,
+            dir.path()
+                .join(crate::advisory::config::ADVISORY_CONFIG_FILE),
+            "{bad",
         )
         .unwrap();
-        std::env::set_var(config::ENV_ADVISORY_KEY_FILE, dir.path().join("absent.txt"));
-        let (_, arm_result) = assistant_arm(dir.path());
-        std::env::remove_var(config::ENV_ADVISORY_KEY_FILE);
-        assert_eq!(arm_result, AssistantArm::NotArmed { reason: Gap::NoKey });
+        let (_, arm) = assistant_arm(dir.path(), Some(&backing()));
+        assert_eq!(
+            arm,
+            AssistantArm::Static {
+                reason: Gap::NoConfig
+            }
+        );
+        // And an OLD-ERA file (provider rows, enabled=true) parses and
+        // arms over the hosted backing — the retired rows are inert.
+        std::fs::write(
+            dir.path().join(crate::advisory::config::ADVISORY_CONFIG_FILE),
+            r#"{"enabled":true,"assistant.enabled":true,"endpoint_url":"https://old.invalid","model":"DeepSeek-V4.1-Flash","key_file":"C:/old.txt"}"#,
+        )
+        .unwrap();
+        let (_, arm) = assistant_arm(dir.path(), Some(&backing()));
+        assert_eq!(arm, AssistantArm::Hosted);
+    }
+
+    /// The spawn seam end to end over a counting double: enabled +
+    /// double-backed = a live plane; not hosting without a double = the
+    /// static floor with `not_hosting`.
+    #[tokio::test]
+    async fn spawn_arms_over_the_double_and_degrades_to_not_hosting() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join(crate::advisory::config::ADVISORY_CONFIG_FILE),
+            r#"{"assistant.enabled":true}"#,
+        )
+        .unwrap();
+        let double = Arc::new(super::super::transport::CountingTransport::assistant_echo(
+            "hosted advice".into(),
+        ));
+        let (plane, gap) = AssistantPlane::spawn(
+            dir.path(),
+            None,
+            Some(double.clone() as Arc<dyn AdvisoryTransport>),
+        );
+        assert_eq!(
+            gap.as_str(),
+            "not_hosting",
+            "spawn reports no degrade while armed"
+        );
+        let plane = plane.expect("the plane arms over the double");
+        let (telemetry, _sink) = modelswarm_telemetry::Telemetry::memory();
+        let outcome = plane.run_turn(&telemetry, "which model?", vec![]).await;
+        assert!(matches!(outcome, TurnOutcome::Reply { .. }));
+        assert_eq!(double.count(), 1, "the hosted-model double answered");
+
+        // Without hosting and without a double: the static floor.
+        let (plane, gap) = AssistantPlane::spawn(dir.path(), None, None);
+        assert!(plane.is_none());
+        assert_eq!(gap.as_str(), "not_hosting");
+        // Disabled master switch: silent static floor.
+        std::fs::write(
+            dir.path()
+                .join(crate::advisory::config::ADVISORY_CONFIG_FILE),
+            r#"{"assistant.enabled":false}"#,
+        )
+        .unwrap();
+        let (plane, gap) = AssistantPlane::spawn(dir.path(), Some(&backing()), None);
+        assert!(plane.is_none());
+        assert_eq!(gap.as_str(), "disabled");
     }
 }

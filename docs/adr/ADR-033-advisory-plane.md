@@ -845,6 +845,76 @@ Integrator (`modelswarm-telemetry`) — a promotion-decision precondition
 (§5), not an advisory-egress precondition (§3.2 typed accumulators). The
 promotion checker and verdict artifact are Scheduler
 (`crates/modelswarm-bench`), with Protocol and T/R review.
+
+## Revision note (2026-10-15, owner directive): the provider-key era ends
+
+The owner ruled, verbatim: **"how about we remove this deepseek key
+completely, and make the helper use the hosted model when hosted."**
+Amended, exactly and only as follows.
+
+**The provider-key era ends.** The funded-key decision record above is
+history: no provider key exists anywhere in the product, and the
+content-egress-to-provider surface is DELETED with it, not defaulted
+off. Concretely, in the implementation of record
+(`crates/modelswarm-node/src/advisory/`):
+
+- The timer-driven digest cycle — the whole §4 state machine, its typed
+  accumulators (RC-4's `accum` module), its runner, and the §5
+  shadow-promotion consumer path — is deleted. Its only reason to exist
+  was the metadata-egress-to-provider brain; with no provider there is
+  no digest. Invariant (c) — full function without the plane — becomes
+  the ONLY mode: the deterministic local policy set (frozen cost model,
+  EWMAs, engage gate, divergence ledger, rule-6 guard) is all there is,
+  and A3's filtered-stream discipline now pins the assistant plane's
+  rows alone.
+- The transport's provider legs are deleted: `ReqwestTransport` (the
+  provider HTTP client), the §3.3 https-endpoint arming
+  (`is_https_endpoint`, `endpoint_url`), and the entire §3.4 key
+  surface — `MSP_ADVISORY_KEY_FILE`, the config `key_file` row, and the
+  platform-default key path. No key resolution code exists; the
+  guards `sk-<32 hex>` tracked-file scan remains as the standing
+  backstop it always was. The RC-9 transport pinning survives in its
+  loopback form (below).
+- `advisory.json` collapses to what remains real: the ADR-037 §3.4
+  `assistant.*` rows plus the enable posture. Old keys (the digest
+  caps, the provider rows) are ignored and preserved on disk, never
+  fatal, never rewritten. The §4 config table's digest-plane rows are
+  RETIRED; the ADR-037 §3.4 assistant table is the whole table.
+- The §6 gap vocabulary is the 12-value post-collapse set:
+  `no_key`, `interval`, and `quota` are REMOVED as unemittable (their
+  emitting surfaces are gone), and `not_hosting` is ADDED as the honest
+  static-floor reason (the assistant's model backing is the machine's
+  own hosted model; without hosting there is no backing). A further
+  value still needs an ADR-037 amendment.
+
+**The egress contract artifact** (`protocol/advisory-egress-v1.json`)
+is synced mechanically in the same change, per the R-1 two-sided tie
+(the count legitimately changed): the `advisory.cycle.*` and
+`advisory.suggestion.recorded` emit-site rows are removed (their emit
+sites are deleted), the five former `feeds_digest` classifications
+become `excluded`, `aggregation_event_allowlist` is retired-empty,
+`plane_telemetry_events` carries the two `assistant.turn.*` rows,
+`plane_enum` is `assistant`, the `reduction_rules` section is removed
+(its consumer was the deleted accumulator gate), and `advisory_gap` is
+the 12-value set above. The fixture inventory under
+`tests/fixtures/advisory-egress/` regenerated via the committed
+scanner; the tie verifies 87/87/87 (was 90/90/90).
+
+**What is NOT amended:** the §1 invariants stand retargeted to the
+local seam — the plane's only egress is the assistant request body to
+the machine's OWN loopback gateway (the one value-typed context gate
+still defends it, W3 unchanged); advisory-only/no-authority is
+unchanged (nothing applies anything, and the hint payload stays
+opaque outside its sanctioned consumers); measured-before-trusted is
+moot-but-standing for any future surface. The clamp table
+(`protocol/advisory-clamp-table-v1.json`) is unchanged. The frozen
+protocol surfaces remain byte-identical. The ADR-037 chat wall is
+unchanged and now also structurally stronger: the node daemon
+composition wires NO advisory machinery at all — the assistant plane
+is constructed by the desktop against the running node's own gateway,
+and the layer-2 pin asserts the transport executes from exactly one
+site (the assistant turn runner).
+
 ## Consequences
 
 + The operator gets token-cheap triage, tuning proposals, curation

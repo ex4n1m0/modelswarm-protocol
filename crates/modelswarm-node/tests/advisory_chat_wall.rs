@@ -3,7 +3,7 @@
 //! assistant-surface code exists (ADR-037 §7 step 2). The mock-runtime
 //! success-path behavioral test lives in the advisory module's unit
 //! tests (`crates/modelswarm-node/src/advisory/mod.rs`,
-//! `chat_wall_success_path_records_zero_advisory_calls` — the mock
+//! `chat_wall_success_path_records_zero_assistant_calls` — the mock
 //! runtime compiles under `cfg(test)` there); the desktop
 //! `try_swarm_chat` failure-path leg lives in the desktop tauri-shell
 //! suite.
@@ -11,23 +11,30 @@
 //! - **Layer 1 (dependency graph)**: `cargo metadata --no-deps` — the
 //!   frozen decision-crate set depends on NO advisory host, and
 //!   `modelswarm-node` (the crate hosting `modelswarm-node::advisory`)
-//!   is depended on ONLY by `modelswarm-desktop`.
+//!   is depended on ONLY by `modelswarm-desktop` (+bench, the sanctioned
+//!   shadow-ledger exemption).
 //! - **Layer 2 (source scope, directional)**: advisory client type
 //!   names appear ONLY in the advisory module and tests — never in the
 //!   gateway crate, the node serving/verifydrafts modules, or the
 //!   `send_chat`/`try_swarm_chat` scopes; the advisory (request
 //!   builder) modules reference no chat/serving/carrier types; the
-//!   provider call executes from exactly ONE site (the digest timer).
-//! - **Layer 3 (behavioral, this file)**: with the plane ARMED and
-//!   KEYED and a counting transport double injected, chat turns through
-//!   the loopback gateway record ZERO advisory calls — here the
-//!   runtime-less failure paths (no_peer); the success path and the
-//!   desktop swarm paths ride the suites named above.
+//!   transport call executes from exactly ONE site (the assistant
+//!   turn runner); the node composition wires NO plane at all (the
+//!   2026-10-15 collapse deleted the digest wiring).
+//! - **Layer 3 (behavioral, this file)**: with the assistant plane
+//!   ARMED in-process over a counting transport double (the
+//!   hosted-model stand-in), chat turns through the loopback gateway
+//!   record ZERO assistant calls — here the runtime-less failure paths
+//!   (no_peer); the success path and the desktop swarm paths ride the
+//!   suites named above.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use modelswarm_node::advisory::{AdvisoryTransport, CountingTransport};
+use modelswarm_node::advisory::{
+    AdvisoryTransport, AssistantPlane, CountingTransport, TurnOutcome,
+};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -475,7 +482,10 @@ fn rust_sources_under(dir: &Path, skip: Option<&Path>) -> BTreeMap<PathBuf, Stri
 }
 
 /// Advisory client type names + the module path prefix (the layer-2
-/// vocabulary of record; extend ONLY via an ADR-037 amendment).
+/// vocabulary of record; extend ONLY via an ADR-037 amendment). The
+/// 2026-10-15 collapse renamed the production transport to the
+/// loopback-only `LocalGatewayTransport` and deleted `ReqwestTransport`
+/// with the provider surface.
 const ADVISORY_NAMES: &[&str] = &[
     "modelswarm_node::advisory",
     "advisory::wire",
@@ -485,10 +495,11 @@ const ADVISORY_NAMES: &[&str] = &[
     "AdvisoryTransport",
     "AdvisoryHandle",
     "CountingTransport",
-    "ReqwestTransport",
+    "LocalGatewayTransport",
+    "HostedBacking",
+    "AssistantArm",
     "RecordedSuggestion",
     "ProviderRequest",
-    "DIGEST_SYSTEM_PROMPT",
     "advisory-egress",
     "advisory-clamp-table",
     // The assistant surface's names (ADR-037 §7 step 3): same rules —
@@ -732,16 +743,17 @@ fn layer2_request_builder_modules_reference_no_chat_or_carrier_types() {
 }
 
 #[test]
-fn layer2_the_provider_call_executes_from_exactly_one_site() {
-    // The enumerated-call-sites pin (W2), extended by ADR-037 §7 step 3:
-    // the advisory client has exactly TWO entry classes — the
-    // timer-driven digest cycle (runner.rs) and the user-triggered
-    // assistant turn (assistant.rs). Asserted by source scan:
-    // `transport.send(&request` executes solely in those two files;
-    // `advisory::wire(` is invoked solely from Node::start;
-    // `ReqwestTransport::new(` only inside the advisory module (the
-    // desktop assistant module goes through `AssistantPlane::spawn`).
-    // A THIRD call site requires an ADR-037 amendment.
+fn layer2_the_transport_call_executes_from_exactly_one_site() {
+    // The enumerated-call-sites pin (W2), collapsed by the 2026-10-15
+    // owner directive: the plane has exactly ONE entry class — the
+    // user-triggered assistant turn (assistant.rs). The timer-driven
+    // digest cycle died with the provider surface. Asserted by source
+    // scan: `transport.send(&request` executes solely in assistant.rs;
+    // `advisory::wire(` appears NOWHERE (the node composition hosts no
+    // plane at all — a resurrected wiring needs an ADR); the
+    // loopback-pinned production transport is constructed only inside
+    // the advisory module (the desktop goes through
+    // `AssistantPlane::spawn`).
     let root = workspace_root();
     let node_src = root.join("crates/modelswarm-node/src");
     let desktop_src = root.join("crates/modelswarm-desktop/src");
@@ -751,80 +763,78 @@ fn layer2_the_provider_call_executes_from_exactly_one_site() {
     }
     let send_hits = find_hits(&production, ".send(&request");
     let expected_assistant = node_src.join("advisory").join("assistant.rs");
-    let expected_runner = node_src.join("advisory").join("runner.rs");
     assert_eq!(
         send_hits.iter().map(Path::new).collect::<Vec<_>>(),
-        vec![expected_assistant.as_path(), expected_runner.as_path()],
-        "the ONLY transport execution sites are the assistant turn runner and the digest timer's runner (W2's two entry classes)"
+        vec![expected_assistant.as_path()],
+        "the ONLY transport execution site is the assistant turn runner (W2's one entry class)"
     );
     let wire_hits = find_hits(&production, "advisory::wire(");
-    let expected_lib = node_src.join("lib.rs");
-    assert_eq!(
-        wire_hits.iter().map(Path::new).collect::<Vec<_>>(),
-        vec![expected_lib.as_path()],
-        "advisory::wire is called exactly once — the Node::start composition"
+    assert!(
+        wire_hits.is_empty(),
+        "advisory::wire must not exist — the node composition wires no plane (2026-10-15): {wire_hits:?}"
     );
     let advisory_dir = node_src.join("advisory");
-    let reqwest_hits = find_hits(&production, "ReqwestTransport::new(");
+    let backing_hits = find_hits(&production, "LocalGatewayTransport::new(");
     assert!(
-        !reqwest_hits.is_empty()
-            && reqwest_hits
+        !backing_hits.is_empty()
+            && backing_hits
                 .iter()
                 .all(|hit| Path::new(hit).starts_with(&advisory_dir)),
-        "the production transport is constructed only inside the advisory module: {reqwest_hits:?}"
+        "the loopback-only production transport is constructed only inside the advisory module: {backing_hits:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Layer 3 (behavioral, runtime-less legs) — armed plane + counting
-// double; chat turns through the loopback gateway record ZERO calls.
+// Layer 3 (behavioral, runtime-less legs) — an ARMED assistant plane
+// (the hosted-model posture over a counting double) alive in the
+// process; chat turns through the loopback gateway record ZERO calls.
 // ---------------------------------------------------------------------------
 
-/// Boots a node with the advisory plane ARMED over a counting double,
-/// then drives chat turns through the loopback gateway — the exact
-/// surface `send_chat`'s local fallback posts to.
-async fn armed_node_with_double(
+/// Arms the assistant plane in-process over a counting double (the
+/// hosted-model stand-in — never a real engine) for `data_dir`, and
+/// boots the runtime-less node whose gateway the chat turns ride.
+async fn armed_plane_with_node(
     data_dir: &Path,
 ) -> (
+    AssistantPlane,
     modelswarm_node::NodeHandle,
-    std::sync::Arc<CountingTransport>,
+    Arc<CountingTransport>,
     tokio::sync::watch::Sender<bool>,
 ) {
     std::fs::write(
         data_dir.join("advisory.json"),
-        r#"{"enabled":true,"endpoint_url":"https://advisor.invalid/v1/chat/completions","model":"test-model"}"#,
+        r#"{"assistant.enabled":true}"#,
     )
     .unwrap();
-    let key = data_dir.join("advisory-key.txt");
-    std::fs::write(&key, "test-key-local-double\n").unwrap();
-    std::env::set_var("MSP_ADVISORY_KEY_FILE", &key);
-    let double = std::sync::Arc::new(CountingTransport::always_ok());
-    let as_trait: std::sync::Arc<dyn AdvisoryTransport> = double.clone();
+    let double = Arc::new(CountingTransport::assistant_echo("unused".into()));
+    let (plane, gap) = AssistantPlane::spawn(
+        data_dir,
+        None,
+        Some(double.clone() as Arc<dyn AdvisoryTransport>),
+    );
+    assert_eq!(
+        gap.as_str(),
+        "not_hosting",
+        "armed spawn reports no degrade"
+    );
+    let plane = plane.expect("the assistant plane arms over the double");
     let (tx, rx) = tokio::sync::watch::channel(false);
     let config = modelswarm_node::NodeConfig {
         gateway_port: 0,
         data_dir: data_dir.to_path_buf(),
         profile_id: Some("msp1:chatwall".to_string()),
-        advisory_transport: Some(as_trait),
         ..modelswarm_node::NodeConfig::default()
     };
     let handle = modelswarm_node::Node::start(config, rx)
         .await
         .expect("node starts");
-    std::env::remove_var("MSP_ADVISORY_KEY_FILE");
-    // The plane must actually be ARMED in this process — otherwise the
-    // zero-call assertion below would pass vacuously.
-    assert!(
-        handle.advisory.is_some(),
-        "the advisory plane must be armed (enabled + key + https endpoint + model)"
-    );
-    (handle, double, tx)
+    (plane, handle, double, tx)
 }
 
 #[tokio::test]
-async fn chat_wall_runtimeless_failure_paths_record_zero_advisory_calls() {
+async fn chat_wall_runtimeless_failure_paths_record_zero_assistant_calls() {
     let dir = tempfile::tempdir().unwrap();
-    let (handle, double, tx) = armed_node_with_double(dir.path()).await;
+    let (plane, handle, double, tx) = armed_plane_with_node(dir.path()).await;
     let addr = handle.local_addr;
 
     // Failure path 1: no runtime (no engine, no sidecar) — the gateway
@@ -845,7 +855,7 @@ async fn chat_wall_runtimeless_failure_paths_record_zero_advisory_calls() {
         "runtime-less node fails honestly"
     );
 
-    // Failure path 2: unknown profile — 404/400, still no advisory call.
+    // Failure path 2: unknown profile — 404/400, still no assistant call.
     let reply = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&serde_json::json!({
@@ -858,17 +868,20 @@ async fn chat_wall_runtimeless_failure_paths_record_zero_advisory_calls() {
         .expect("gateway responds");
     assert!(!reply.status().is_success());
 
-    // The wall: ZERO advisory calls from any chat turn (the counting
-    // double's sensitivity control is the unit test
-    // `armed_plane_runs_a_cycle_and_the_double_records_it`).
+    // The wall: ZERO assistant calls from any chat turn.
     assert_eq!(
         double.count(),
         0,
-        "a chat turn must never reach the advisory plane (W1)"
+        "a chat turn must never reach the assistant plane (W1)"
     );
     assert!(double.bodies().is_empty());
-    // And no key material was ever presented to any transport call.
-    assert!(double.presented_keys().is_empty());
+
+    // Sensitivity control (the zero is not vacuous): driving the ARMED
+    // plane with an assistant turn DOES call the double.
+    let (telemetry, _sink) = modelswarm_telemetry::Telemetry::memory();
+    let outcome = plane.run_turn(&telemetry, "which model?", vec![]).await;
+    assert!(matches!(outcome, TurnOutcome::Reply { .. }));
+    assert_eq!(double.count(), 1, "the counter is alive");
 
     tx.send(true).unwrap();
     handle.stopped().await;

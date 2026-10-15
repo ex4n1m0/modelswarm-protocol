@@ -630,3 +630,72 @@ the config writer pins :6239-6341), `crates/modelswarm-resource/src/governor.rs`
 `1549678`) and `.github/workflows/tracker.yml` (wire-compat,
 unaffected) · the owner directives of 2026-10-07/10-12/10-13 cited in
 the code above.
+
+## Revision note (2026-10-15, owner directive): the assistant's backing is the hosted model + the static floor
+
+The owner ruled, verbatim: **"how about we remove this deepseek key
+completely, and make the helper use the hosted model when hosted."**
+The ADR-033 revision note of the same date records the provider-side
+collapse; this note amends THIS ADR's surface, exactly and only as
+follows.
+
+**The backing (§3.2's substrate, replaced).** The assistant is backed
+by the machine's OWN hosted model: while the node is hosting, assistant
+turns call the LOCAL loopback gateway — the same OpenAI-compatible
+path chat uses, so queueing/governor fairness applies to assistant
+turns exactly as to chat turns — through a loopback-pinned transport
+constructed from the running node's bound address and the hosted
+profile (refuses any non-loopback backing; redirects never followed —
+RC-9's loopback form). When the machine is not hosting there is NO
+backing: the panel serves the frozen static-help corpus, honestly
+labeled `not_hosting`. No provider, no key, and no external egress
+exists anywhere in the surface. The desktop re-arms the plane at
+hosting start and returns it to the static floor at hosting stop.
+
+**The disclosure/ack gate (§3.6) folds away.** The first-use
+disclosure existed to consent to CLOUD EGRESS; nothing external is
+called anymore, so there is nothing to consent to and NO turn is ever
+blocked. What remains is the honest helper-identity line: a
+first-use, DISMISSIBLE identity banner (the persisted
+`assistant_acknowledge` IPC now records only the banner dismissal)
+and the always-adjacent chip on every model-backed reply —
+"Hosted-model assistant — your machine's model answers; this app's
+rules decide." The §3.6 verbatim texts are replaced by these pinned
+texts; the guards webview-surface check (element ids
+`assistant-disclosure`/`assistant-ack`, the four IPC names) keeps
+holding over the new semantics with real behavior behind every
+surface.
+
+**Unchanged:** the chat wall W1–W6 in full (the helper still never
+sees swarm chat content — the layer-1/2/3 suite is stronger now: the
+node daemon composition wires NO advisory machinery at all, and the
+transport executes from exactly one site, the assistant turn runner);
+the §3.4 caps (300/day, 60/hour, 40 turns/conversation, 15-min idle
+reset, 12 history turns, 48 KiB request cap, 1024 completion tokens,
+45 s timeout — failed calls consume budget, UTC windows, no in-turn
+retry); the typed context-block builders (hardware/picker/status
+inputs, W3); the §3.7 response schema, malformed table, and
+rendering contract (plain text, 4000-char display cap, the §3.3
+digest-plane-only `tuning_hint` discard); and the static-help corpus
+coverage discipline (updated for the 12-value gap vocabulary:
+`no_key`/`quota`/`interval` entries removed, `not_hosting` added).
+
+**Two config-level amendments:** (1) `assistant.enabled` defaults to
+ON — its default-off existed because cloud mode spent the owner's
+money per call, and the hosted-model backing costs nothing external
+and egresses nothing off-machine; an explicit `false` still pins the
+helper to the static floor. (2) `advisory.json` is read for the nine
+`assistant.*` rows only; old provider/digest keys are ignored and
+preserved, never fatal (see the ADR-033 note).
+
+**Test postures (§4.4):** the A3 proof's two postures are
+HOSTED-MODEL-BACKED vs STATIC-ONLY (was plane-absent vs
+armed-erroring) — decision outputs byte-identical, telemetry
+byte-identical after filtering `assistant.*`; the hosted-backed
+posture drives real turns over a transport double standing in for the
+hosted model (never a real engine — the standing venue rule), with
+the plane's rows genuinely interleaved into the compared stream so
+the filter removes real rows. Items (10)–(13) stand with their
+key-era mechanics removed (`presented_keys` assertions are moot:
+no key exists) and item (13) retargeted to the identity texts, the
+no-gate first turn, and the opt-out.

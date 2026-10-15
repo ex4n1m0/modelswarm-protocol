@@ -1,40 +1,53 @@
-//! The assistant PANEL surface (ADR-037 §3.2/§3.6/§4.5 — Windows
-//! Product): the typed context-block builders, the §3.6 verbatim UI
-//! texts, the label-keyed STATIC HELP CORPUS, the reply renderer
-//! (plain text, 4000-char display cap, provenance chip), and the
-//! turn/reset drivers behind the `assistant_turn`/`assistant_reset`
-//! IPC commands. This file is one of the chat-wall suite's sanctioned
-//! advisory-name homes (ADR-037 §4.5 routing); `app.rs` itself stays
-//! advisory-name-free — the chat scopes live there (W1/W4).
+//! The assistant PANEL surface (ADR-033/037 as rewired by the 2026-10-15
+//! owner directive — Windows Product): the typed context-block builders,
+//! the honest helper-identity texts, the label-keyed STATIC HELP CORPUS,
+//! the reply renderer (plain text, 4000-char display cap, identity chip
+//! adjacent), and the turn/reset drivers behind the
+//! `assistant_turn`/`assistant_reset` IPC commands. This file is one of
+//! the chat-wall suite's sanctioned advisory-name homes (ADR-037 §4.5
+//! routing); `app.rs` itself stays advisory-name-free — the chat scopes
+//! live there (W1/W4).
 //!
 //! W4 (UI wall): everything here renders into the assistant's OWN
 //! section with its own input and its own `assistant-*` webview event
 //! namespace; nothing feeds or reads the swarm chat transcript, and no
 //! chat surface renders assistant output.
+//!
+//! The 2026-10-15 backing: the machine's OWN hosted model behind the
+//! node's loopback gateway while hosting; the frozen static floor
+//! otherwise. The cloud-era first-use disclosure/ack GATE folded away
+//! (nothing external is called anymore — there is no egress to consent
+//! to); what remains is the honest helper-identity line, always
+//! adjacent to model-backed replies, plus a dismissible first-use
+//! identity banner that never blocks a turn.
 
-use modelswarm_node::advisory::assistant::{AssistantPlane, TurnOutcome};
+use modelswarm_node::advisory::assistant::{AssistantPlane, HostedBacking, TurnOutcome};
 use modelswarm_node::advisory::egress::{ContextField, ContextPickerRow, ContextValue};
 use modelswarm_telemetry::Telemetry;
 
 use super::{FamilyStatus, HardwareInfo};
 
-/// ADR-037 §3.6 (NORMATIVE UI CONTRACT — verbatim): the first-use
-/// disclosure, shown before the FIRST cloud call on an install; the
-/// call is BLOCKED until acknowledged.
-pub const FIRST_USE_DISCLOSURE: &str = "This assistant sends what you type here, plus facts \
-     about your machine and setup (hardware, model list, status labels — never your swarm \
-     chats), to a cloud service (DeepSeek) using a key configured on this machine. It is \
-     advice only — it cannot change any decision this app makes. You can turn it off any \
-     time in Settings.";
+/// The 2026-10-15 helper-identity banner (first-use, DISMISSIBLE, never
+/// a gate): states plainly what the assistant IS now that the cloud is
+/// gone. Rendered verbatim; dismissing it persists through
+/// `assistant_acknowledge` and only hides the banner.
+pub const FIRST_USE_IDENTITY: &str = "This assistant answers with the model \
+     this machine hosts, running on your own hardware through the same local \
+     engine chat uses — it never sends anything off this machine, never sees \
+     your swarm chats, and cannot change any decision this app makes. You can \
+     turn it off any time in Settings.";
 
-/// ADR-037 §3.6 (verbatim): the persistent provenance chip, always
-/// adjacent to any displayed cloud reply.
-pub const PROVENANCE_CHIP: &str = "Cloud assistant — advice only; this app's rules decide.";
+/// The persistent helper-identity chip, always adjacent to any displayed
+/// model-backed reply (the RC-5 provenance discipline, retargeted from
+/// the cloud to the hosted model).
+pub const IDENTITY_CHIP: &str =
+    "Hosted-model assistant — your machine's model answers; this app's rules decide.";
 
-/// ADR-037 §3.6 (verbatim): the degraded-mode line, with the honest gap
-/// label from the frozen vocabulary.
+/// The static-floor line, with the honest gap label from the frozen
+/// vocabulary (`not_hosting` while no model is hosted, `disabled` while
+/// opted out, `no_config` for a malformed advisory.json).
 pub fn degraded_line(gap_label: &str) -> String {
-    format!("Built-in help — the cloud assistant is off/unreachable ({gap_label}).")
+    format!("Built-in help — the model-backed assistant is off/unavailable ({gap_label}).")
 }
 
 /// The reply display cap (ADR-037 §3.7 rendering contract).
@@ -275,20 +288,18 @@ pub static HELP_CORPUS: &[HelpEntry] = &[
     HelpEntry { label: "gpu_partial", text: "Some layers fit in VRAM and the rest stay in system RAM (partial offload). Faster than CPU-only, slower than a full fit; a smaller quantization may fully fit." },
     HelpEntry { label: "ram_only", text: "No usable GPU (or none detected), so the model runs on the CPU. The responsive zone for CPU decode is around 8 GB of weights; giant dense models run but are not recommendation material." },
     // ---- The gap vocabulary (the degraded line's labels) ------------
-    HelpEntry { label: "disabled", text: "The cloud assistant is switched off (its master switch in advisory.json or the Settings toggle). Built-in help still works and the deterministic recommendation is always live." },
-    HelpEntry { label: "no_key", text: "No provider key file is configured on this machine, so the cloud assistant cannot run. Built-in help still works." },
-    HelpEntry { label: "no_config", text: "The advisory configuration is missing or incomplete (endpoint or model), so the cloud assistant cannot run." },
+    HelpEntry { label: "disabled", text: "The model-backed assistant is switched off (its master switch in advisory.json or the Settings toggle). Built-in help still works and the deterministic recommendation is always live." },
+    HelpEntry { label: "not_hosting", text: "The assistant answers with the model THIS machine hosts — start hosting a model and the assistant rides it; until then built-in help serves. No cloud, no key: the backing is your own engine." },
+    HelpEntry { label: "no_config", text: "The advisory configuration file (advisory.json) is present but unparseable, so the assistant stays on the built-in floor rather than guess caps. Fix or remove the file." },
     HelpEntry { label: "cap_reached", text: "The daily call cap (300 by default) or the conversation turn cap (40) is spent. The caps are the contract; the counters reset with the UTC day, a 15-minute idle, or 'reset'." },
     HelpEntry { label: "rate_limited", text: "The hourly burst bound (60 calls per UTC hour) is spent. Wait for the hour to roll over; the next user turn retries." },
     HelpEntry { label: "empty_after_redaction", text: "Nothing survived the egress gate for this turn (the text was empty or entirely redactable material). Nothing was sent; rephrase and retry." },
-    HelpEntry { label: "timeout", text: "The provider did not answer within the 45-second deadline. Nothing was sent beyond the request; the next user turn retries." },
-    HelpEntry { label: "http_error", text: "The provider answered with a transport or HTTP error. The turn failed honestly; the next user turn retries." },
-    HelpEntry { label: "quota", text: "The provider account's quota is exhausted (HTTP 402). The cloud assistant pauses; built-in help still works." },
-    HelpEntry { label: "response_oversized", text: "The provider's reply exceeded the 64 KiB response cap and was discarded whole." },
-    HelpEntry { label: "schema", text: "The provider's reply did not match the assistant response schema (or did not echo this conversation), so it was discarded whole — never partially trusted." },
+    HelpEntry { label: "timeout", text: "The local engine did not answer within the deadline. The turn failed honestly; the next user turn retries." },
+    HelpEntry { label: "http_error", text: "The local gateway answered with a transport or HTTP error (for example the engine failing mid-turn). Restart hosting if it persists; the next user turn retries." },
+    HelpEntry { label: "response_oversized", text: "The engine's reply exceeded the 64 KiB response cap and was discarded whole." },
+    HelpEntry { label: "schema", text: "The model's reply did not match the assistant response schema (or did not echo this conversation), so it was discarded whole — never partially trusted. Small local models miss the JSON shape sometimes; rephrase and retry." },
     HelpEntry { label: "request_oversized", text: "The request body exceeded the 48 KiB cap even with no history. Nothing was sent; shorten the question." },
-    HelpEntry { label: "late", text: "A late provider response arrived after its turn had already timed out; it was discarded." },
-    HelpEntry { label: "interval", text: "The digest-plane minimum interval (15 minutes) has not elapsed. This label never applies to assistant turns." },
+    HelpEntry { label: "late", text: "A late engine response arrived after its turn had already timed out; it was discarded." },
 ];
 
 /// Deterministic static lookup: every frozen label whose text appears
@@ -321,21 +332,44 @@ pub struct Plane {
 }
 
 impl Plane {
-    /// Arms the plane for a data dir (production: the pinned reqwest
-    /// transport). `None` = not armed; the caller keeps the honest
-    /// degrade gap for the built-in-help mode line.
-    pub fn spawn(data_dir: &std::path::Path) -> (Option<Self>, String) {
-        let (plane, gap) = AssistantPlane::spawn(data_dir, None);
+    /// Arms the plane for a data dir + the hosted-model backing (the
+    /// running node's gateway address and the hosted profile — present
+    /// while hosting). `None` = the static floor; the caller keeps the
+    /// honest degrade gap for the built-in-help mode line.
+    pub fn spawn(
+        data_dir: &std::path::Path,
+        backing: Option<&HostedBacking>,
+    ) -> (Option<Self>, String) {
+        let (plane, gap) = AssistantPlane::spawn(data_dir, backing, None);
         (plane.map(|inner| Self { inner }), gap.as_str().to_string())
     }
 
-    /// The test seam: arms over an injected transport double.
+    /// The composition seam `set_hosting` calls when a model is hosted:
+    /// arms the plane against the RUNNING node's loopback gateway and
+    /// the hosted profile. Kept HERE (not at the call site) so `app.rs`
+    /// never names an advisory type — the chat-wall layer-2 scan keeps
+    /// the composition file clean while this module is the §4.5
+    /// sanctioned home.
+    pub fn spawn_hosted(
+        data_dir: &std::path::Path,
+        gateway_addr: std::net::SocketAddr,
+        hosted_profile: &str,
+    ) -> (Option<Self>, String) {
+        let backing = HostedBacking {
+            gateway_addr,
+            profile: hosted_profile.to_string(),
+        };
+        Self::spawn(data_dir, Some(&backing))
+    }
+
+    /// The test seam: arms over an injected transport double (the
+    /// hosted-model stand-in — never a real engine).
     #[cfg(test)]
     pub fn spawn_with_double(
         data_dir: &std::path::Path,
         double: std::sync::Arc<dyn modelswarm_node::advisory::AdvisoryTransport>,
     ) -> (Option<Self>, String) {
-        let (plane, gap) = AssistantPlane::spawn(data_dir, Some(double));
+        let (plane, gap) = AssistantPlane::spawn(data_dir, None, Some(double));
         (plane.map(|inner| Self { inner }), gap.as_str().to_string())
     }
 
@@ -357,14 +391,14 @@ impl Plane {
                 reply,
                 hints,
                 hints_discarded,
-            } => PanelOutcome::CloudReply {
+            } => PanelOutcome::ModelReply {
                 reply: render_reply(&reply),
                 conversation_id,
                 turn,
                 hints: hints.iter().map(|h| h.to_string()).collect(),
                 hints_discarded,
             },
-            TurnOutcome::Gap { reason, .. } => PanelOutcome::CloudGap {
+            TurnOutcome::Gap { reason, .. } => PanelOutcome::ModelGap {
                 gap: reason.as_str().to_string(),
             },
         }
@@ -374,26 +408,22 @@ impl Plane {
 /// What the panel renders for one `assistant_turn`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PanelOutcome {
-    /// Cloud mode is armed but the §3.6 disclosure is not yet
-    /// acknowledged — the call is BLOCKED (the UI shows the disclosure
-    /// verbatim with its acknowledge button).
-    NeedsAcknowledgement,
-    /// A cloud reply: display-only plain text (already capped), the
-    /// provenance chip is always adjacent, and any hints are
+    /// A model-backed reply: display-only plain text (already capped),
+    /// the helper-identity chip is always adjacent, and any hints are
     /// display-only labels.
-    CloudReply {
+    ModelReply {
         reply: String,
         conversation_id: String,
         turn: u32,
         hints: Vec<String>,
         hints_discarded: usize,
     },
-    /// A cloud turn failed honestly: the gap label renders in the
+    /// A model-backed turn failed honestly: the gap label renders in the
     /// panel; history is retained; the next user turn retries.
-    CloudGap { gap: String },
-    /// Built-in help (the plane is off/opted out/unconfigured, or the
-    /// question is being answered statically): the corpus entries plus
-    /// the honest mode line.
+    ModelGap { gap: String },
+    /// Built-in help (no model backing, opted out, or the question is
+    /// being answered statically): the corpus entries plus the honest
+    /// mode line.
     StaticHelp {
         entries: Vec<&'static HelpEntry>,
         line: String,
@@ -404,12 +434,10 @@ pub enum PanelOutcome {
 /// construct these directly; the IPC command builds them from
 /// `DesktopState`).
 pub struct TurnDeps<'a> {
-    /// The armed plane, when the master switch + key + config armed it.
+    /// The armed plane, when hosting (or the test double) armed it.
     pub plane: Option<&'a Plane>,
     /// The honest degrade gap label when `plane` is None.
     pub degrade_gap: &'a str,
-    /// The §3.6 first-use disclosure acknowledgement (persisted).
-    pub acknowledged: bool,
     /// The Settings opt-out toggle (persisted; `false` = opted out).
     pub opt_out: bool,
     pub telemetry: &'a Telemetry,
@@ -419,9 +447,11 @@ pub struct TurnDeps<'a> {
 /// Runs one assistant turn for the panel. The W6 rule: assistant
 /// absence, failure, or refusal changes nothing about any other
 /// surface — this function touches only its own plane and telemetry.
+/// (The cloud-era first-use ack GATE is gone — nothing external is
+/// called; the identity banner is dismissible, never blocking.)
 pub async fn turn(deps: TurnDeps<'_>, question: &str) -> PanelOutcome {
     let Some(plane) = deps.plane else {
-        // The plane is not armed: static help with the honest gap.
+        // No model backing: static help with the honest gap.
         return PanelOutcome::StaticHelp {
             entries: static_help_lookup(question),
             line: degraded_line(deps.degrade_gap),
@@ -432,10 +462,6 @@ pub async fn turn(deps: TurnDeps<'_>, question: &str) -> PanelOutcome {
             entries: static_help_lookup(question),
             line: degraded_line("disabled"),
         };
-    }
-    // §3.6: the call is BLOCKED until the disclosure is acknowledged.
-    if !deps.acknowledged {
-        return PanelOutcome::NeedsAcknowledgement;
     }
     plane.run(deps.telemetry, question, deps.inputs).await
 }
@@ -594,6 +620,8 @@ mod tests {
         // Substrings do not match (word boundaries).
         assert!(static_help_lookup("ram_ceilingXXX").is_empty());
         assert!(static_help_lookup("what model should I pick?").is_empty());
+        // The new static-floor label resolves.
+        assert_eq!(static_help_lookup("not_hosting")[0].label, "not_hosting");
     }
 
     /// §3.7 rendering contract: plain text preserved, cap enforced with
@@ -614,20 +642,29 @@ mod tests {
         assert!(!render_reply(&exact).contains("truncated"));
     }
 
-    /// §3.6 texts are VERBATIM (the ADR is the contract; drift is a UI
-    /// defect).
+    /// The helper-identity texts are pinned (the panel contract; drift
+    /// is a UI defect). The cloud-era disclosure is GONE — these are
+    /// the 2026-10-15 replacements.
     #[test]
-    fn disclosure_and_chip_are_verbatim() {
-        assert!(FIRST_USE_DISCLOSURE.starts_with("This assistant sends what you type here"));
-        assert!(FIRST_USE_DISCLOSURE.contains("never your swarm chats"));
-        assert!(FIRST_USE_DISCLOSURE.ends_with("You can turn it off any time in Settings."));
+    fn identity_texts_are_pinned_and_cloud_free() {
+        assert!(FIRST_USE_IDENTITY.starts_with("This assistant answers with the model"));
+        assert!(FIRST_USE_IDENTITY.contains("never sends anything off this machine"));
+        assert!(FIRST_USE_IDENTITY.contains("never sees your swarm chats"));
+        assert!(FIRST_USE_IDENTITY.ends_with("You can turn it off any time in Settings."));
         assert_eq!(
-            PROVENANCE_CHIP,
-            "Cloud assistant — advice only; this app's rules decide."
+            IDENTITY_CHIP,
+            "Hosted-model assistant — your machine's model answers; this app's rules decide."
         );
         assert_eq!(
-            degraded_line("no_key"),
-            "Built-in help — the cloud assistant is off/unreachable (no_key)."
+            degraded_line("not_hosting"),
+            "Built-in help — the model-backed assistant is off/unavailable (not_hosting)."
         );
+        // No cloud-era vocabulary survives in the pinned texts.
+        for text in [FIRST_USE_IDENTITY, IDENTITY_CHIP] {
+            let lower = text.to_lowercase();
+            assert!(!lower.contains("cloud"), "{text}");
+            assert!(!lower.contains("deepseek"), "{text}");
+            assert!(!lower.contains("key"), "{text}");
+        }
     }
 }

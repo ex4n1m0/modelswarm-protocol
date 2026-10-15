@@ -1,39 +1,42 @@
-//! The advisory transport seam: an injectable trait (the state machine's
-//! doubles implement it; the pinned reqwest adapter is the production
-//! implementation) and the ADR-033 §3.3 transport pinning (RC-9):
-//! **https-only, redirects NEVER followed**.
+//! The advisory transport seam (ADR-033 as amended by the 2026-10-15
+//! owner directive): an injectable trait — the state machine's doubles
+//! implement it; the pinned LOCAL-GATEWAY adapter is the production
+//! implementation.
 //!
-//! The state logic ([`crate::advisory::state`]) has NO reqwest
-//! dependency and never performs I/O — a CALL is an `Effect`; the runner
-//! executes it through this seam and feeds the outcome back. A 3xx
-//! response is `HttpStatus(3xx)` (gap `http_error`): the request —
-//! including the Authorization header — is never re-sent to any other
-//! host.
+//! The provider client is GONE. The directive ("how about we remove
+//! this deepseek key completely, and make the helper use the hosted
+//! model when hosted") deleted `ReqwestTransport`, the https-endpoint
+//! arming, and every key surface: the assistant's only production
+//! backing is THIS machine's loopback gateway — the SAME
+//! OpenAI-compatible path chat uses, so queueing/governor fairness
+//! applies to assistant turns exactly as it does to chat turns.
 //!
-//! Key handling: the key reaches ONLY the Authorization header, added
-//! here from the runner-supplied value. It never appears in a request
-//! payload (the egress allowlist has no key-bearing field type), in
-//! state, or in telemetry (the Redactor `sk-` scrub). No rotation
-//! anywhere (ADR-037 §3.6 standing owner directive).
+//! Transport pinning (the RC-9 discipline, retargeted to loopback):
+//! **loopback-only, redirects NEVER followed**. The adapter is
+//! constructed from a bound loopback `SocketAddr` and refuses anything
+//! else; the HTTP client does not follow redirects — a 3xx response is
+//! `HttpStatus(3xx)` (gap `http_error`) and the request is never
+//! re-sent anywhere. There is no Authorization header to protect
+//! anymore, and no key exists anywhere in the plane.
 
 use async_trait::async_trait;
+use std::net::SocketAddr;
 
 use super::state::{ProviderRequest, TransportFailure};
 
-/// One advisory HTTPS call. Implementations return the model's reply
-/// CONTENT bytes on HTTP 2xx (the provider envelope is stripped by the
-/// implementation; the pure state machine parses only the strict
-/// suggestion schema).
+/// One assistant-plane call. Implementations return the model's reply
+/// CONTENT bytes on HTTP 2xx (the gateway's OpenAI envelope is stripped
+/// by the implementation; the pure state machine parses only the strict
+/// `advisory-assistant/v1` schema).
 #[async_trait]
 pub trait AdvisoryTransport: Send + Sync + std::fmt::Debug {
-    async fn send(&self, request: &ProviderRequest, key: &str)
-        -> Result<Vec<u8>, TransportFailure>;
+    async fn send(&self, request: &ProviderRequest) -> Result<Vec<u8>, TransportFailure>;
 }
 
 /// The pinned reqwest client: **no redirects** (a 3xx comes back as the
-/// response; the caller maps it to gap `http_error`), rustls TLS. The
-/// SAME builder serves the adapter and the redirect tests, so the pin
-/// cannot drift between them.
+/// response; the caller maps it to gap `http_error`). The SAME builder
+/// serves the adapter and the redirect test, so the pin cannot drift
+/// between them.
 pub fn pinned_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -41,66 +44,45 @@ pub fn pinned_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
-/// The production transport: https-only (the constructor refuses any
-/// non-`https://` endpoint), no redirects, bearer key in the
-/// Authorization header only. The endpoint AND the model id are pinned
-/// HERE at construction (from `advisory.json`) — a request cannot name
-/// another host or model.
+/// The production transport: the machine's OWN local loopback gateway
+/// (ADR-002 posture — loopback only), serving the hosted profile
+/// through the same OpenAI-compatible path chat uses. The gateway
+/// address and the profile id are pinned HERE at construction from the
+/// RUNNING node's bound address — a request cannot name another host,
+/// another port, or another model.
 #[derive(Debug)]
-pub struct ReqwestTransport {
+pub struct LocalGatewayTransport {
     http: reqwest::Client,
-    endpoint_url: String,
+    endpoint: String,
     model: String,
 }
 
-impl ReqwestTransport {
-    /// Fails for a non-https endpoint (ADR-033 §3.3 — the caller records
-    /// gap `no_config`; the client never speaks plain http).
-    pub fn new(endpoint_url: &str, model: &str) -> Result<Self, TransportFailure> {
-        if !super::config::is_https_endpoint(endpoint_url) {
+impl LocalGatewayTransport {
+    /// Fails for any non-loopback address (the assistant never leaves
+    /// this machine — the owner directive's whole point). IPv4 and IPv6
+    /// loopback are both accepted; everything else is refused.
+    pub fn new(gateway_addr: SocketAddr, hosted_profile: &str) -> Result<Self, TransportFailure> {
+        if !gateway_addr.ip().is_loopback() {
             return Err(TransportFailure::Network(format!(
-                "endpoint must be https://, refusing: {endpoint_url:?}"
+                "the assistant backing is the LOCAL gateway; refusing non-loopback {gateway_addr}"
             )));
         }
         Ok(Self {
             http: pinned_client(),
-            endpoint_url: endpoint_url.to_string(),
-            model: model.to_string(),
+            endpoint: format!("http://{gateway_addr}/v1/chat/completions"),
+            model: hosted_profile.to_string(),
         })
     }
 }
 
-/// The fixed, repo-versioned digest system prompt (ADR-033 §3.2): no
-/// secrets, no user content, and it states the metadata-only contract.
-/// The allowlist runs regardless of the prompt — the structural gate,
-/// not prompt compliance, is the defense.
-pub const DIGEST_SYSTEM_PROMPT: &str = "\
-You are the management brain of a decentralized inference swarm. You \
-receive ONLY operational metadata: counts, integer timings, frozen \
-reason codes, and 16-hex peer/profile prefixes. You never receive or \
-request prompts, completions, chat content, token ids, keys, or file \
-paths. Reply with ONE JSON object exactly of the shape \
-{\"schema\":\"advisory-suggestion/v1\",\"cycle_id\":\"<echo the given \
-cycle_id>\",\"suggestions\":[{\"type\":\"triage_summary|tuning_hint|\
-catalog_note|digest\",\"target\":\"fleet or a 16-hex profile \
-prefix\",\"hint\":{parameter:number},\"confidence\":\"low|medium|high\",\
-\"rationale\":\"short display text\"}]}. Numeric hint parameters may \
-only be MSP_SHADOW_QUEUE_ADVERTISED_WEIGHT, \
-MSP_SHADOW_QUEUE_MEASURED_WEIGHT, or MSP_SHADOW_QUEUE_CAP_MS; anything \
-else is recorded as requiring an architecture decision. Your output is \
-advice only: it never changes any protocol decision.";
-
 #[async_trait]
-impl AdvisoryTransport for ReqwestTransport {
-    async fn send(
-        &self,
-        request: &ProviderRequest,
-        key: &str,
-    ) -> Result<Vec<u8>, TransportFailure> {
+impl AdvisoryTransport for LocalGatewayTransport {
+    async fn send(&self, request: &ProviderRequest) -> Result<Vec<u8>, TransportFailure> {
         // The system prompt is a repo-versioned constant pinned to the
-        // plane (`digest` default, the assistant plane's override) —
-        // never caller text.
-        let system = request.system_prompt.unwrap_or(DIGEST_SYSTEM_PROMPT);
+        // plane — never caller text.
+        let system = request
+            .system_prompt
+            .unwrap_or(crate::advisory::assistant::ASSISTANT_SYSTEM_PROMPT);
         let body = serde_json::json!({
             "model": self.model,
             "messages": [
@@ -112,9 +94,8 @@ impl AdvisoryTransport for ReqwestTransport {
         });
         let result = self
             .http
-            .post(&self.endpoint_url)
+            .post(&self.endpoint)
             .timeout(std::time::Duration::from_millis(request.timeout_ms))
-            .bearer_auth(key)
             .json(&body)
             .send()
             .await;
@@ -125,8 +106,8 @@ impl AdvisoryTransport for ReqwestTransport {
         };
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            // 3xx included: no redirect is ever followed (RC-9) — the
-            // request, Authorization included, dies here.
+            // 3xx included: no redirect is ever followed — the request
+            // dies here (the RC-9 discipline, loopback form).
             return Err(TransportFailure::HttpStatus(status));
         }
         // Response body cap: stream and refuse to buffer beyond the
@@ -143,27 +124,31 @@ impl AdvisoryTransport for ReqwestTransport {
                 return Err(TransportFailure::ResponseOversized);
             }
         }
-        // The provider envelope is stripped here: choices[0].message.content.
+        // The gateway's OpenAI envelope is stripped here:
+        // choices[0].message.content — the hosted model's reply, which
+        // must itself be the strict assistant JSON (the system prompt
+        // says so; anything else fails the state machine's parse with
+        // gap `schema`, fail-closed).
         let parsed: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| TransportFailure::Network(format!("provider envelope: {e}")))?;
+            .map_err(|e| TransportFailure::Network(format!("gateway envelope: {e}")))?;
         let content = parsed
             .get("choices")
             .and_then(|c| c.get(0))
             .and_then(|c| c.get("message"))
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
-            .ok_or_else(|| TransportFailure::Network("provider envelope: no content".into()))?;
+            .ok_or_else(|| TransportFailure::Network("gateway envelope: no content".into()))?;
         Ok(content.as_bytes().to_vec())
     }
 }
 
 /// A counting transport double (TEST-ONLY; the chat-wall and cadence
 /// suites ride it — production code never constructs it). Records every
-/// attempted call and replays a programmed outcome per call.
+/// attempted call and replays a programmed outcome per call. There is
+/// no key parameter to capture: no key exists in the plane anymore.
 #[derive(Debug)]
 pub struct CountingTransport {
     calls: std::sync::Mutex<Vec<ProviderRequest>>,
-    keys: std::sync::Mutex<Vec<String>>,
     /// Replayed per call in order; the last entry repeats.
     script: std::sync::Mutex<Vec<Result<Vec<u8>, TransportFailure>>>,
     /// When set, every call is answered with a valid assistant reply
@@ -175,7 +160,6 @@ impl CountingTransport {
     pub fn new(script: Vec<Result<Vec<u8>, TransportFailure>>) -> Self {
         Self {
             calls: std::sync::Mutex::new(Vec::new()),
-            keys: std::sync::Mutex::new(Vec::new()),
             script: std::sync::Mutex::new(script),
             assistant_echo: None,
         }
@@ -224,23 +208,12 @@ impl CountingTransport {
             .map(|r| r.body.clone())
             .collect()
     }
-
-    /// The keys presented per call (the key must appear ONLY in the
-    /// header; the double captures it for the wall assertions).
-    pub fn presented_keys(&self) -> Vec<String> {
-        self.keys.lock().unwrap().clone()
-    }
 }
 
 #[async_trait]
 impl AdvisoryTransport for CountingTransport {
-    async fn send(
-        &self,
-        request: &ProviderRequest,
-        key: &str,
-    ) -> Result<Vec<u8>, TransportFailure> {
+    async fn send(&self, request: &ProviderRequest) -> Result<Vec<u8>, TransportFailure> {
         self.calls.lock().unwrap().push(request.clone());
-        self.keys.lock().unwrap().push(key.to_string());
         if let Some(reply) = &self.assistant_echo {
             // Echo the request's own turn (a canned body could not know
             // the plane's internally-generated conversation id).
@@ -277,32 +250,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adapter_refuses_non_https_endpoints() {
-        assert!(ReqwestTransport::new("https://api.example.test/v1", "model-x").is_ok());
-        for refused in [
-            "http://api.example.test/v1",
-            "ftp://x",
-            "https://",
-            "",
-            "https://evil.example/@other",
-        ] {
-            assert!(
-                ReqwestTransport::new(refused, "model-x").is_err(),
-                "{refused}"
-            );
-        }
+    fn adapter_refuses_non_loopback_backings() {
+        let off_machine: std::net::SocketAddr = "192.168.1.9:11435".parse().unwrap();
+        assert!(LocalGatewayTransport::new(off_machine, "msp1:x").is_err());
+        let public: std::net::SocketAddr = "8.8.8.8:443".parse().unwrap();
+        assert!(LocalGatewayTransport::new(public, "msp1:x").is_err());
+        let v6_loopback: std::net::SocketAddr = "[::1]:11435".parse().unwrap();
+        assert!(LocalGatewayTransport::new(v6_loopback, "msp1:x").is_ok());
     }
 
-    /// RC-9 (mock venue; live-endpoint confirmation is owner-local
-    /// only): the pinned client does NOT follow redirects — a 302 comes
-    /// back as the 302. Served over plain http against a loopback
-    /// listener purely to exercise the client's redirect policy; the
-    /// ADAPTER itself still refuses non-https endpoints (test above).
+    /// A full round trip against a mock OpenAI-shaped loopback gateway:
+    /// the request carries the pinned system prompt as the system
+    /// message and the verified body as the user message; the reply's
+    /// `choices[0].message.content` is what comes back; a non-2xx maps
+    /// to `HttpStatus`; an over-cap body maps to `ResponseOversized`.
     #[tokio::test]
-    async fn pinned_client_never_follows_redirects() {
-        use axum::routing::get;
-        let app =
-            axum::Router::new().route(
+    async fn adapter_round_trips_through_the_loopback_gateway_shape() {
+        use axum::routing::{get, post};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let seen_post = seen.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |body: String| {
+                    let seen = seen_post.clone();
+                    async move {
+                        seen.lock().unwrap().push(
+                            serde_json::from_str(&body)
+                                .expect("the assistant posts a valid gateway body"),
+                        );
+                        axum::Json(serde_json::json!({
+                            "choices": [{"message": {"role": "assistant",
+                                "content": "{\"schema\":\"advisory-assistant/v1\"}"}}]
+                        }))
+                    }
+                }),
+            )
+            .route(
                 "/redirect",
                 get(|| async move {
                     axum::response::Redirect::temporary("http://127.0.0.1:1/elsewhere")
@@ -311,17 +295,104 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let adapter =
+            LocalGatewayTransport::new(addr, "msp1:hosted").expect("loopback backing accepted");
+        let request = ProviderRequest {
+            body: r#"{"context":{},"history":[],"turn":{"conversation_id":"0123456789abcdef","turn":1,"text":"q"}}"#.into(),
+            timeout_ms: 5_000,
+            max_completion_tokens: 64,
+            max_response_bytes: 65_536,
+            system_prompt: None,
+        };
+        let content = adapter.send(&request).await.expect("round trip");
+        assert_eq!(
+            String::from_utf8(content).unwrap(),
+            "{\"schema\":\"advisory-assistant/v1\"}"
+        );
+        // The gateway request pinned the hosted model, carried the
+        // assistant system prompt, and was non-streaming.
+        let posted = seen.lock().unwrap().pop().unwrap();
+        assert_eq!(posted["model"], "msp1:hosted");
+        assert_eq!(posted["stream"], false);
+        assert_eq!(
+            posted["messages"][0]["role"], "system",
+            "the system message leads"
+        );
+        assert_eq!(
+            posted["messages"][0]["content"],
+            crate::advisory::assistant::ASSISTANT_SYSTEM_PROMPT
+        );
+        assert_eq!(posted["messages"][1]["role"], "user");
+        assert_eq!(posted["max_tokens"], 64);
+
+        // The pinned client does NOT follow redirects — a 3xx comes
+        // back as the 3xx (the loopback form of RC-9).
         let client = pinned_client();
         let response = client
             .get(format!("http://{addr}/redirect"))
             .send()
             .await
             .expect("redirect response arrives");
-        assert_eq!(
-            response.status().as_u16(),
-            307,
-            "the 3xx is returned, not followed"
-        );
+        assert_eq!(response.status().as_u16(), 307, "returned, not followed");
         assert!(response.headers().get("location").is_some());
+    }
+
+    /// The adapter maps a non-2xx gateway answer to `HttpStatus` and an
+    /// over-cap body to `ResponseOversized` (the state machine turns
+    /// these into the honest `http_error`/`response_oversized` gaps).
+    #[tokio::test]
+    async fn adapter_maps_gateway_failures_honestly() {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({"error": {"code": "no_peer"}})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let adapter = LocalGatewayTransport::new(addr, "msp1:hosted").unwrap();
+        let request = ProviderRequest {
+            body: "{}".into(),
+            timeout_ms: 5_000,
+            max_completion_tokens: 8,
+            max_response_bytes: 65_536,
+            system_prompt: None,
+        };
+        assert_eq!(
+            adapter.send(&request).await,
+            Err(TransportFailure::HttpStatus(503))
+        );
+
+        // Response cap: a valid envelope whose content exceeds the
+        // request's cap is refused while buffering.
+        let huge = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "choices": [{"message": {"content": "x".repeat(10_000)}}]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, huge).await });
+        let adapter = LocalGatewayTransport::new(addr, "msp1:hosted").unwrap();
+        let request = ProviderRequest {
+            body: "{}".into(),
+            timeout_ms: 5_000,
+            max_completion_tokens: 8,
+            max_response_bytes: 512,
+            system_prompt: None,
+        };
+        assert_eq!(
+            adapter.send(&request).await,
+            Err(TransportFailure::ResponseOversized)
+        );
     }
 }

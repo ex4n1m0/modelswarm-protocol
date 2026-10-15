@@ -52,12 +52,14 @@ use tokio::sync::Mutex;
 /// renders one status line from it and nothing else.
 mod updater;
 
-/// The assistant PANEL surface (ADR-037 §3.6/§4.5): the setup-helper
-/// panel's typed context builders, verbatim disclosure texts, static
-/// help corpus, reply renderer, and the `assistant_turn`/`
-/// `assistant_reset` cores. Its own section, its own input, its own
-/// `assistant-*` webview events — never the swarm chat transcript
-/// (the chat wall, W1/W4).
+/// The assistant PANEL surface (ADR-037 §3.6/§4.5 as rewired by the
+/// 2026-10-15 owner directive — the helper runs on the machine's OWN
+/// hosted model, with the frozen static floor otherwise): the
+/// setup-helper panel's typed context builders, honest helper-identity
+/// texts, static help corpus, reply renderer, and the
+/// `assistant_turn`/`assistant_reset` cores. Its own section, its own
+/// input, its own `assistant-*` webview events — never the swarm chat
+/// transcript (the chat wall, W1/W4).
 mod assistant;
 
 /// The registered no-listener-yet multiaddr: present in the roster, fails
@@ -222,14 +224,19 @@ struct Inner {
     /// `get_status`. A failure here is a status line, never a block on
     /// app usage.
     updater: updater::UpdaterStatus,
-    /// ADR-037 §3.6: the armed assistant plane. `None` = built-in help
-    /// mode, with the honest gap label in `assistant_degrade_gap` (never
-    /// a blank box, never a spinner that hides absence).
+    /// ADR-037 §3.6 as rewired 2026-10-15: the armed assistant plane —
+    /// backed by THIS machine's hosted model behind the node's loopback
+    /// gateway while hosting. `None` = built-in help mode, with the
+    /// honest gap label in `assistant_degrade_gap` (never a blank box,
+    /// never a spinner that hides absence).
     assistant_plane: Option<assistant::Plane>,
-    /// The honest degrade gap label while `assistant_plane` is None.
+    /// The honest degrade gap label while `assistant_plane` is None
+    /// (`not_hosting` while no model is hosted).
     assistant_degrade_gap: String,
-    /// The §3.6 first-use disclosure acknowledgement (persisted; the
-    /// first cloud call is BLOCKED until true).
+    /// The first-use helper-identity banner dismissal (persisted). Since
+    /// the 2026-10-15 collapse this is COSMETIC ONLY — nothing external
+    /// is called, so no turn is ever blocked on it; dismissing just
+    /// hides the banner.
     assistant_acknowledged: bool,
     /// The Settings opt-out toggle (persisted; both this AND the owner's
     /// `assistant.enabled` master switch must be on for cloud mode).
@@ -452,7 +459,10 @@ impl DesktopState {
         let config = read_config(&data_dir);
         let license_accepted = license_accepted(&config.tracker, &data_dir).await;
         let telemetry = std::sync::Arc::new(open_node_telemetry(&data_dir));
-        let (assistant_plane, assistant_degrade_gap) = assistant::Plane::spawn(&data_dir);
+        // 2026-10-15: no hosting at startup — the assistant starts on
+        // the static floor; `set_hosting` re-arms it against the node's
+        // own gateway the moment a model is hosted.
+        let (assistant_plane, assistant_degrade_gap) = assistant::Plane::spawn(&data_dir, None);
         Self {
             hardware: tokio::sync::OnceCell::new(),
             telemetry,
@@ -1879,11 +1889,13 @@ async fn get_status(
         // request 2026-10-12). Never a block on app usage.
         "updater": inner.updater.view(),
         "chat_turns": inner.chat_log.len(),
-        // ADR-037 §3.6: the assistant panel's honest mode facts — which
-        // mode it is in and why (labels only; the disclosure text rides
-        // the panel, the reply rides assistant-turn events).
+        // ADR-037 §3.6 as rewired 2026-10-15: the assistant panel's
+        // honest mode facts — which mode it is in and why (labels only;
+        // the helper-identity banner text rides the panel, the reply
+        // rides assistant-turn events). `hosted` = the machine's own
+        // model backs the assistant right now; nothing external exists.
         "assistant": {
-            "cloud": inner.assistant_plane.is_some() && inner.assistant_enabled,
+            "hosted": inner.assistant_plane.is_some() && inner.assistant_enabled,
             "gap": if inner.assistant_plane.is_none() {
                 inner.assistant_degrade_gap.clone()
             } else if !inner.assistant_enabled {
@@ -1893,11 +1905,11 @@ async fn get_status(
             },
             "acknowledged": inner.assistant_acknowledged,
             "enabled": inner.assistant_enabled,
-            "disclosure": if inner.assistant_plane.is_some()
+            "identity": if inner.assistant_plane.is_some()
                 && inner.assistant_enabled
                 && !inner.assistant_acknowledged
             {
-                Some(assistant::FIRST_USE_DISCLOSURE)
+                Some(assistant::FIRST_USE_IDENTITY)
             } else {
                 None
             },
@@ -2004,9 +2016,9 @@ async fn clear_chat(
 
 /// One assistant panel turn: user-triggered UI only. Builds the typed
 /// context from the app's own facts (hardware, picker cache, family
-/// status labels), drives the plane, and renders the outcome — cloud
-/// reply (provenance chip always adjacent), honest gap, first-use
-/// disclosure gate, or built-in static help. Emits `assistant-turn`.
+/// status labels), drives the plane, and renders the outcome — a
+/// hosted-model reply (identity chip always adjacent), an honest gap,
+/// or built-in static help. Emits `assistant-turn`.
 #[tauri::command]
 async fn assistant_turn(
     app: tauri::AppHandle,
@@ -2039,7 +2051,6 @@ async fn assistant_turn(
     let deps = assistant::TurnDeps {
         plane: inner.assistant_plane.as_ref(),
         degrade_gap: &inner.assistant_degrade_gap,
-        acknowledged: inner.assistant_acknowledged,
         opt_out: !inner.assistant_enabled,
         telemetry: state.telemetry.as_ref(),
         inputs: &inputs,
@@ -2067,8 +2078,10 @@ async fn assistant_reset(
     Ok(serde_json::json!({ "reset": true }))
 }
 
-/// Records the §3.6 first-use disclosure acknowledgement (persisted).
-/// The first cloud call is blocked until this lands.
+/// Records the first-use helper-identity banner dismissal (persisted).
+/// Since the 2026-10-15 collapse this is cosmetic only — nothing
+/// external is called, so no turn is ever blocked on it; dismissing
+/// just hides the banner.
 #[tauri::command]
 async fn assistant_acknowledge(state: tauri::State<'_, DesktopState>) -> Result<(), String> {
     let mut inner = state.inner.lock().await;
@@ -2088,14 +2101,11 @@ async fn set_assistant_enabled(
 }
 
 /// Renders one [`assistant::PanelOutcome`] for the webview (labels and
-/// display text only — the provenance chip and AD-3 facts pairing are
+/// display text only — the identity chip and AD-3 facts pairing are
 /// rendered by the panel around this).
 fn assistant_outcome_json(outcome: &assistant::PanelOutcome) -> serde_json::Value {
     match outcome {
-        assistant::PanelOutcome::NeedsAcknowledgement => {
-            serde_json::json!({ "kind": "needs_ack", "disclosure": assistant::FIRST_USE_DISCLOSURE })
-        }
-        assistant::PanelOutcome::CloudReply {
+        assistant::PanelOutcome::ModelReply {
             reply,
             conversation_id,
             turn,
@@ -2108,10 +2118,10 @@ fn assistant_outcome_json(outcome: &assistant::PanelOutcome) -> serde_json::Valu
             "turn": turn,
             "hints": hints,
             "hints_discarded": hints_discarded,
-            "chip": assistant::PROVENANCE_CHIP,
+            "chip": assistant::IDENTITY_CHIP,
         }),
-        assistant::PanelOutcome::CloudGap { gap } => {
-            serde_json::json!({ "kind": "gap", "gap": gap, "chip": assistant::PROVENANCE_CHIP })
+        assistant::PanelOutcome::ModelGap { gap } => {
+            serde_json::json!({ "kind": "gap", "gap": gap, "chip": assistant::IDENTITY_CHIP })
         }
         assistant::PanelOutcome::StaticHelp { entries, line } => serde_json::json!({
             "kind": "static",
@@ -2663,6 +2673,11 @@ async fn set_hosting_inner(
         }
         inner.listener_addr = None;
         inner.family = None;
+        // 2026-10-15: hosting off = no model backing — the assistant
+        // returns to the static floor with the honest label (its
+        // conversation state dies with the backing that served it).
+        inner.assistant_plane = None;
+        inner.assistant_degrade_gap = "not_hosting".to_string();
         #[cfg(feature = "verifydrafts")]
         {
             inner.family_engine = None;
@@ -2714,9 +2729,6 @@ async fn set_hosting_inner(
         engine_gpu_binary: gpu_engine,
         engine_model: Some(ensured.path.clone()),
         engine_threads: None,
-        // Production wiring: the advisory plane uses its own pinned
-        // reqwest transport (the test seam stays None outside tests).
-        advisory_transport: None,
     };
     let handle = match Node::start(config.clone(), shutdown_tx.subscribe()).await {
         Ok(handle) => handle,
@@ -2727,6 +2739,18 @@ async fn set_hosting_inner(
                 .map_err(|e| e.to_string())?
         }
     };
+
+    // 2026-10-15 owner directive: the helper uses the hosted model when
+    // hosted — arm the assistant plane against THIS node's own loopback
+    // gateway (the same OpenAI-compatible path chat uses, so
+    // queueing/governor fairness applies). Not hosting = the static
+    // floor; the honest gap rides `assistant_degrade_gap`.
+    {
+        let (plane, gap) =
+            assistant::Plane::spawn_hosted(&inner.data_dir, handle.local_addr, &listing.profile_id);
+        inner.assistant_plane = plane;
+        inner.assistant_degrade_gap = gap;
+    }
 
     // F0(3) + the ADR-032 light-up: attach the serving bridge to the
     // node's executor. The bridge dies with the node via the shared
@@ -7468,13 +7492,14 @@ mod tests {
     // ---- Chat wall (ADR-037 §3.1 W1–W6 / §4.4 item 10): the DESKTOP leg --
     //
     // The behavioral chat-wall test for this crate's own chat orchestration:
-    // with the advisory plane ARMED and KEYED in-process over a counting
-    // transport double (fed past the digest threshold — plenty to digest,
-    // still silent), every headlessly-drivable `try_swarm_chat` failure
-    // path records ZERO advisory calls. The success path and the
-    // runtime-less gateway failures ride the node crate's suites
-    // (`crates/modelswarm-node` `chat_wall_success_path_records_zero_...`
-    // and `tests/advisory_chat_wall.rs`); layers 1–2 (dependency graph and
+    // with the assistant plane ARMED in-process over a counting transport
+    // double (the hosted-model posture — the double stands in for the
+    // machine's model, never a real engine), every headlessly-drivable
+    // `try_swarm_chat` failure path records ZERO assistant calls. The
+    // success path and the runtime-less gateway failures ride the node
+    // crate's suites (`crates/modelswarm-node`
+    // `chat_wall_success_path_records_zero_assistant_calls` and
+    // `tests/advisory_chat_wall.rs`); layers 1–2 (dependency graph and
     // source scope) ride `crates/modelswarm-node/tests/advisory_chat_wall.rs`
     // and scan THIS file too.
     mod chat_wall {
@@ -7482,7 +7507,7 @@ mod tests {
         use modelswarm_gateway::{
             ExecutorError, ExecutorEvent, ExecutorStream, InferenceExecutor, NormalizedRequest,
         };
-        use modelswarm_node::advisory::{self, AdvisoryTransport, CountingTransport};
+        use modelswarm_node::advisory::{AdvisoryTransport, AssistantPlane, CountingTransport};
         use std::sync::Arc;
 
         /// A never-called local executor (the failure paths below end before
@@ -7501,53 +7526,39 @@ mod tests {
             }
         }
 
-        /// Arms the advisory plane in-process over a counting double and
-        /// feeds it past the digest threshold.
-        fn armed_plane(
-            data_dir: &std::path::Path,
-        ) -> (
-            advisory::AdvisoryHandle,
-            Arc<CountingTransport>,
-            tokio::sync::watch::Sender<bool>,
-        ) {
-            // Key resolution rides the config's `key_file`, NEVER the
-            // process-global `MSP_ADVISORY_KEY_FILE`: parallel tests in
-            // this binary race any set→read→remove window over the env
-            // var (549dd18's per-helper lock still lost the cross-helper
-            // race 5/15 runs under a CI-like profile; deleting the shared
-            // state beats locking it — the A3 sweep's discipline).
-            let key = data_dir.join("advisory-key.txt");
-            std::fs::write(&key, "test-key-local-double\n").unwrap();
+        /// Arms the assistant plane in-process over a counting double —
+        /// the hosted-model posture (2026-10-15: no key, no endpoint, no
+        /// env var; arming rides advisory.json's `assistant.enabled` plus
+        /// the double standing in for the hosted model).
+        fn armed_plane(data_dir: &std::path::Path) -> (AssistantPlane, Arc<CountingTransport>) {
             std::fs::write(
                 data_dir.join("advisory.json"),
-                format!(
-                    r#"{{"enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"test-model","key_file":"{}"}}"#,
-                    key.to_string_lossy().replace('\\', "/")
-                ),
+                r#"{"assistant.enabled":true}"#,
             )
             .unwrap();
-            let (telemetry, _sink) = Telemetry::memory();
-            let double = Arc::new(CountingTransport::always_ok());
-            let as_trait: Arc<dyn AdvisoryTransport> = double.clone();
-            let (tx, rx) = tokio::sync::watch::channel(false);
-            let handle = advisory::wire(data_dir, &Arc::new(telemetry), rx, Some(as_trait))
-                .expect("the plane arms (enabled + key + https endpoint + model)");
-            for _ in 0..250 {
-                handle
-                    .accumulators
-                    .lock()
-                    .unwrap()
-                    .record_event("serving.clamped");
-            }
-            (handle, double, tx)
+            let double = Arc::new(CountingTransport::assistant_echo("unused".into()));
+            let (plane, gap) = AssistantPlane::spawn(
+                data_dir,
+                None,
+                Some(double.clone() as Arc<dyn AdvisoryTransport>),
+            );
+            assert_eq!(
+                gap.as_str(),
+                "not_hosting",
+                "armed spawn reports no degrade"
+            );
+            (
+                plane.expect("the assistant plane arms over the double"),
+                double,
+            )
         }
 
         #[tokio::test]
-        async fn chat_wall_try_swarm_chat_failure_paths_record_zero_advisory_calls() {
+        async fn chat_wall_try_swarm_chat_failure_paths_record_zero_assistant_calls() {
             let dir = tempfile::tempdir().unwrap();
             let (telemetry, _sink) = Telemetry::memory();
             let telemetry = Arc::new(telemetry);
-            let (_plane, double, _tx) = armed_plane(dir.path());
+            let (_plane, double) = armed_plane(dir.path());
             let inner = tokio::sync::Mutex::new(test_inner(
                 dir.path(),
                 "http://127.0.0.1:9",
@@ -7577,7 +7588,7 @@ mod tests {
             )
             .await;
             assert!(reply.is_none(), "unreachable tracker = honest failure");
-            assert_eq!(double.count(), 0, "W1: no advisory call from a chat turn");
+            assert_eq!(double.count(), 0, "W1: no assistant call from a chat turn");
 
             // Failure path 2 — no eligible peer: a local mock tracker with
             // an EMPTY roster answers lookup; the candidate predicate finds
@@ -7613,13 +7624,12 @@ mod tests {
                 reply.is_none(),
                 "empty roster = honest no-eligible-peer failure"
             );
-            assert_eq!(double.count(), 0, "W1: still zero advisory calls");
+            assert_eq!(double.count(), 0, "W1: still zero assistant calls");
 
-            // The wall holds across every drivable path, the plane was ARMED
-            // (non-vacuous: armed_plane asserted Some), and nothing was ever
-            // presented to any provider transport.
+            // The wall holds across every drivable path, the plane was
+            // ARMED (non-vacuous: armed_plane asserted the plane), and
+            // nothing was ever sent through the backing.
             assert!(double.bodies().is_empty());
-            assert!(double.presented_keys().is_empty());
         }
 
         /// The protocol review's recorded follow-up, closed with this
@@ -7629,11 +7639,11 @@ mod tests {
         /// fallback serves, and the plane records ZERO calls (item 10's
         /// "every failure path" letter).
         #[tokio::test]
-        async fn chat_wall_quic_dial_failure_records_zero_advisory_calls() {
+        async fn chat_wall_quic_dial_failure_records_zero_assistant_calls() {
             let dir = tempfile::tempdir().unwrap();
             let (telemetry, _sink) = Telemetry::memory();
             let telemetry = Arc::new(telemetry);
-            let (_plane, double, _tx) = armed_plane(dir.path());
+            let (_plane, double) = armed_plane(dir.path());
 
             // The mock tracker: one FOREIGN peer with free slots and a
             // real QUIC multiaddr pointing at a dead loopback port.
@@ -7715,15 +7725,16 @@ mod tests {
                 reply["mode"]
             );
             // THE WALL: the dial-failure turn never reached the plane.
-            assert_eq!(double.count(), 0, "W1: zero advisory calls");
+            assert_eq!(double.count(), 0, "W1: zero assistant calls");
             assert!(double.bodies().is_empty());
-            assert!(double.presented_keys().is_empty());
         }
     }
 
-    /// ADR-037 §4.4 items (11 desktop half), (13), (14): the assistant
-    /// panel's disclosure/consent, opt-out, degraded mode, renderer,
-    /// canary, and A3 discipline.
+    /// ADR-037 §4.4 items (11 desktop half), (13), (14) as rewired by
+    /// the 2026-10-15 owner directive: the assistant panel's opt-out,
+    /// static floor, renderer, canary, and A3 discipline over the TWO
+    /// postures (hosted-model-backed vs static-only). The cloud-era
+    /// disclosure/consent gate folded away with the cloud.
     mod assistant_panel {
         use super::super::*;
         use std::sync::Arc;
@@ -7773,32 +7784,27 @@ mod tests {
             }
         }
 
-        fn boot_cloud(
+        /// Arms the plane over the hosted-model stand-in double (the
+        /// 2026-10-15 posture: no key, no endpoint — the double IS the
+        /// backing; never a real engine).
+        fn boot_hosted_backed(
             dir: &std::path::Path,
             double: Arc<CountingTransport>,
         ) -> Option<assistant::Plane> {
-            // Same discipline as armed_plane: the key rides the config's
-            // `key_file`, never the process-global env var.
-            std::fs::write(dir.join("advisory-key.txt"), "test-key-local-double\n").unwrap();
-            std::fs::write(
-                dir.join("advisory.json"),
-                format!(
-                    r#"{{"assistant.enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"test-model","key_file":"{}"}}"#,
-                    dir.join("advisory-key.txt")
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                ),
-            )
-            .unwrap();
-            let (plane, _) =
+            std::fs::write(dir.join("advisory.json"), r#"{"assistant.enabled":true}"#).unwrap();
+            let (plane, gap) =
                 assistant::Plane::spawn_with_double(dir, double as Arc<dyn AdvisoryTransport>);
+            assert_eq!(
+                gap.as_str(),
+                "not_hosting",
+                "armed spawn reports no degrade"
+            );
             plane
         }
 
         fn deps<'a>(
             plane: Option<&'a assistant::Plane>,
             degrade_gap: &'a str,
-            acknowledged: bool,
             opt_out: bool,
             telemetry: &'a Telemetry,
             inputs: &'a assistant::ContextInputs<'a>,
@@ -7806,47 +7812,37 @@ mod tests {
             TurnDeps {
                 plane,
                 degrade_gap,
-                acknowledged,
                 opt_out,
                 telemetry,
                 inputs,
             }
         }
 
-        /// §4.4 item (13): the first cloud call is BLOCKED until the
-        /// disclosure is acknowledged — then it runs, with the
-        /// provenance chip riding the outcome.
+        /// §4.4 item (13), 2026-10-15 form: the turn is NEVER blocked —
+        /// the identity banner folds into a dismissible line, and the
+        /// first turn already answers through the hosted model.
         #[tokio::test]
-        async fn disclosure_blocks_the_first_cloud_call_until_acknowledged() {
+        async fn the_first_turn_answers_without_any_gate() {
             let dir = tempfile::tempdir().unwrap();
             let double = Arc::new(CountingTransport::assistant_echo("short advice".into()));
-            let plane = boot_cloud(dir.path(), double.clone());
+            let plane = boot_hosted_backed(dir.path(), double.clone());
             let plane = plane.expect("the plane arms");
             let (telemetry, _sink) = Telemetry::memory();
             let hardware = hw();
             let picker = cards();
             let ctx = inputs(&hardware, &picker);
 
-            // NOT acknowledged: the turn is blocked, ZERO calls.
+            // The very first turn runs and the reply renders.
             let outcome = assistant::turn(
-                deps(Some(&plane), "none", false, false, &telemetry, &ctx),
-                "which model?",
-            )
-            .await;
-            assert_eq!(outcome, PanelOutcome::NeedsAcknowledgement);
-            assert_eq!(double.count(), 0, "the call is BLOCKED until acknowledged");
-
-            // Acknowledged: the turn runs and the reply renders.
-            let outcome = assistant::turn(
-                deps(Some(&plane), "none", true, false, &telemetry, &ctx),
+                deps(Some(&plane), "none", false, &telemetry, &ctx),
                 "which model?",
             )
             .await;
             match outcome {
-                PanelOutcome::CloudReply { reply, .. } => assert_eq!(reply, "short advice"),
+                PanelOutcome::ModelReply { reply, .. } => assert_eq!(reply, "short advice"),
                 other => panic!("{other:?}"),
             }
-            assert_eq!(double.count(), 1);
+            assert_eq!(double.count(), 1, "no gate stands before the first turn");
         }
 
         /// §4.4 item (13): opt-out yields ZERO calls (counting double)
@@ -7855,14 +7851,14 @@ mod tests {
         async fn opt_out_yields_zero_calls_and_static_help() {
             let dir = tempfile::tempdir().unwrap();
             let double = Arc::new(CountingTransport::assistant_echo("never".into()));
-            let plane = boot_cloud(dir.path(), double.clone());
+            let plane = boot_hosted_backed(dir.path(), double.clone());
             let plane = plane.expect("the plane arms");
             let (telemetry, _sink) = Telemetry::memory();
             let hardware = hw();
             let picker = cards();
             let ctx = inputs(&hardware, &picker);
             let outcome = assistant::turn(
-                deps(Some(&plane), "none", true, true, &telemetry, &ctx),
+                deps(Some(&plane), "none", true, &telemetry, &ctx),
                 "what does resource_ceiling mean?",
             )
             .await;
@@ -7870,7 +7866,7 @@ mod tests {
                 PanelOutcome::StaticHelp { entries, line } => {
                     assert_eq!(
                         line,
-                        "Built-in help — the cloud assistant is off/unreachable (disabled)."
+                        "Built-in help — the model-backed assistant is off/unavailable (disabled)."
                     );
                     assert_eq!(entries.len(), 1);
                     assert_eq!(entries[0].label, "resource_ceiling");
@@ -7880,17 +7876,18 @@ mod tests {
             assert_eq!(double.count(), 0, "opt-out = zero calls");
         }
 
-        /// §4.4 item (13): degraded mode renders static help with the
-        /// honest gap label — never a blank box, never a spinner.
+        /// §4.4 item (13): the static floor (no model backing) renders
+        /// static help with the honest gap label — never a blank box,
+        /// never a spinner. `not_hosting` is the shipped default label.
         #[tokio::test]
-        async fn degraded_mode_renders_static_help_with_the_gap_label() {
+        async fn static_floor_renders_help_with_the_gap_label() {
             let _dir = tempfile::tempdir().unwrap();
             let (telemetry, _sink) = Telemetry::memory();
             let hardware = hw();
             let picker = cards();
             let ctx = inputs(&hardware, &picker);
             let outcome = assistant::turn(
-                deps(None, "no_key", false, false, &telemetry, &ctx),
+                deps(None, "not_hosting", false, &telemetry, &ctx),
                 "why is family off (pairing_disabled)?",
             )
             .await;
@@ -7898,7 +7895,7 @@ mod tests {
                 PanelOutcome::StaticHelp { entries, line } => {
                     assert_eq!(
                         line,
-                        "Built-in help — the cloud assistant is off/unreachable (no_key)."
+                        "Built-in help — the model-backed assistant is off/unavailable (not_hosting)."
                     );
                     assert_eq!(entries.len(), 1);
                     assert_eq!(entries[0].label, "pairing_disabled");
@@ -7907,26 +7904,23 @@ mod tests {
             }
         }
 
-        /// §3.7 rendering contract end-to-end: a >4000-char provider
-        /// reply renders TRUNCATED at the display cap.
+        /// §3.7 rendering contract end-to-end: a >4000-char model reply
+        /// renders TRUNCATED at the display cap.
         #[tokio::test]
         async fn reply_renders_capped_at_the_display_cap() {
             let dir = tempfile::tempdir().unwrap();
             let long: String = "x".repeat(5_000);
             let double = Arc::new(CountingTransport::assistant_echo(long));
-            let plane = boot_cloud(dir.path(), double.clone());
+            let plane = boot_hosted_backed(dir.path(), double.clone());
             let plane = plane.expect("the plane arms");
             let (telemetry, _sink) = Telemetry::memory();
             let hardware = hw();
             let picker = cards();
             let ctx = inputs(&hardware, &picker);
-            let outcome = assistant::turn(
-                deps(Some(&plane), "none", true, false, &telemetry, &ctx),
-                "q",
-            )
-            .await;
+            let outcome =
+                assistant::turn(deps(Some(&plane), "none", false, &telemetry, &ctx), "q").await;
             match outcome {
-                PanelOutcome::CloudReply { reply, .. } => {
+                PanelOutcome::ModelReply { reply, .. } => {
                     assert_eq!(
                         reply.chars().count(),
                         4_000 + "…[truncated]".chars().count()
@@ -7947,7 +7941,7 @@ mod tests {
         async fn desktop_canary_suite_transcript_and_carrier_absent() {
             let dir = tempfile::tempdir().unwrap();
             let double = Arc::new(CountingTransport::assistant_echo("advice".into()));
-            let plane = boot_cloud(dir.path(), double.clone());
+            let plane = boot_hosted_backed(dir.path(), double.clone());
             let plane = plane.expect("the plane arms");
             let (telemetry, _sink) = Telemetry::memory();
 
@@ -7978,34 +7972,34 @@ mod tests {
             let picker = cards();
             let ctx = inputs(&hardware, &picker);
             let outcome = assistant::turn(
-                deps(Some(&plane), "none", true, false, &telemetry, &ctx),
+                deps(Some(&plane), "none", false, &telemetry, &ctx),
                 "which model fits my machine?",
             )
             .await;
-            assert!(matches!(outcome, PanelOutcome::CloudReply { .. }));
+            assert!(matches!(outcome, PanelOutcome::ModelReply { .. }));
             assert!(!double.bodies().is_empty());
             for body in double.bodies() {
                 assert!(
                     !body.contains(CANARY_TRANSCRIPT),
-                    "transcript canary reached the provider"
+                    "transcript canary reached the model backing"
                 );
                 assert!(
                     !body.contains(CANARY_CARRIER),
-                    "carrier canary reached the provider"
+                    "carrier canary reached the model backing"
                 );
                 assert!(!body.contains("promptTokens"));
-                assert!(!body.contains("test-key-local-double"));
             }
         }
 
-        /// §4.4 item (14), the A3 extension: with the assistant plane
-        /// ABSENT vs ENABLED-WITH-ERRORING-TRANSPORT, the deterministic
-        /// surfaces are byte-identical (the picker pipeline's pure
-        /// functions; the engage ladder is pinned by its own golden
-        /// test), and the telemetry streams are byte-identical after
-        /// filtering `advisory.*`/`assistant.*`.
+        /// §4.4 item (14), the A3 extension over the 2026-10-15
+        /// postures: with the assistant plane STATIC-ONLY (no backing)
+        /// vs HOSTED-MODEL-BACKED over an erroring double, the
+        /// deterministic surfaces are byte-identical (the picker
+        /// pipeline's pure functions; the engage ladder is pinned by its
+        /// own golden test), and the telemetry streams are
+        /// byte-identical after filtering `assistant.*`.
         #[tokio::test]
-        async fn assistant_a3_extension_plane_absent_vs_erroring() {
+        async fn assistant_a3_extension_static_only_vs_hosted_backed() {
             let dir = tempfile::tempdir().unwrap();
 
             // The deterministic picker pipeline, computed identically in
@@ -8038,45 +8032,35 @@ mod tests {
             };
             assert_eq!(score(6_144, 5_680), score(6_144, 5_680));
 
-            // Plane ABSENT vs erroring: the telemetry streams, filtered
-            // of advisory.*/assistant.*, are byte-identical.
-            let (telemetry_absent, sink_absent) = Telemetry::memory();
+            // STATIC-ONLY vs HOSTED-BACKED-ERRORING: the telemetry
+            // streams, filtered of assistant.*, are byte-identical.
+            let (telemetry_static, sink_static) = Telemetry::memory();
             let picker = cards();
             let ctx = inputs(&hardware, &picker);
-            let absent = assistant::turn(
-                deps(None, "no_key", true, false, &telemetry_absent, &ctx),
+            let static_only = assistant::turn(
+                deps(None, "not_hosting", false, &telemetry_static, &ctx),
                 "question",
             )
             .await;
             let (telemetry_erroring, sink_erroring) = Telemetry::memory();
             let double = Arc::new(CountingTransport::always_erroring());
-            let plane = boot_cloud(dir.path(), double.clone());
+            let plane = boot_hosted_backed(dir.path(), double.clone());
             let erroring = assistant::turn(
-                deps(
-                    plane.as_ref(),
-                    "none",
-                    true,
-                    false,
-                    &telemetry_erroring,
-                    &ctx,
-                ),
+                deps(plane.as_ref(), "none", false, &telemetry_erroring, &ctx),
                 "question",
             )
             .await;
-            assert!(matches!(absent, PanelOutcome::StaticHelp { .. }));
-            assert!(matches!(erroring, PanelOutcome::CloudGap { .. }));
+            assert!(matches!(static_only, PanelOutcome::StaticHelp { .. }));
+            assert!(matches!(erroring, PanelOutcome::ModelGap { .. }));
             let filter = |rows: Vec<String>| -> Vec<String> {
                 rows.into_iter()
-                    .filter(|l| {
-                        !l.contains("\"event\":\"advisory.")
-                            && !l.contains("\"event\":\"assistant.")
-                    })
+                    .filter(|l| !l.contains("\"event\":\"assistant."))
                     .collect()
             };
             assert_eq!(
-                filter(sink_absent.snapshot()),
+                filter(sink_static.snapshot()),
                 filter(sink_erroring.snapshot()),
-                "A3: byte-identical after filtering the planes' own rows"
+                "A3: byte-identical after filtering the plane's own rows"
             );
             // And the erroring plane emitted ONLY assistant.* rows.
             for line in sink_erroring.snapshot() {

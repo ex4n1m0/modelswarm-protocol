@@ -126,12 +126,6 @@ pub struct NodeConfig {
     pub engine_model: Option<PathBuf>,
     /// Compute threads for the engine; `None` = engine default.
     pub engine_threads: Option<u32>,
-    /// TEST SEAM (ADR-033 §9.2 venue matrix): an injected advisory
-    /// transport double for the chat-wall and cadence suites. Production
-    /// passes `None` — the plane then uses the pinned reqwest adapter
-    /// (https-only, no redirects). The advisory plane itself is
-    /// default-off and keyless-inert (`advisory.json`).
-    pub advisory_transport: Option<Arc<dyn advisory::AdvisoryTransport>>,
 }
 
 impl Default for NodeConfig {
@@ -146,7 +140,6 @@ impl Default for NodeConfig {
             engine_gpu_binary: None,
             engine_model: None,
             engine_threads: None,
-            advisory_transport: None,
         }
     }
 }
@@ -400,17 +393,13 @@ impl Node {
             telemetry.info("tracker.configured", &[("base", base.as_str())]);
         }
 
-        // The advisory plane (ADR-033 rev 2, digest leg): timer-driven,
-        // default-off, keyless-inert — `advisory.json` in the data dir
-        // decides. Emits ONLY `advisory.*` telemetry rows (the A3
-        // filtered-stream discipline); never touches the gateway,
-        // serving, or any decision path (the chat-wall suite pins this).
-        let advisory = advisory::wire(
-            &config.data_dir,
-            &telemetry,
-            shutdown.clone(),
-            config.advisory_transport.clone(),
-        );
+        // (The advisory digest plane that used to be wired here is
+        // DELETED by the 2026-10-15 owner directive — the provider-key
+        // era ended. The node hosts no advisory machinery anymore; the
+        // ASSISTANT plane lives in `modelswarm_node::advisory` and is
+        // constructed by the desktop against this node's own gateway
+        // while hosting. The chat-wall suite pins that nothing in this
+        // composition ever calls it.)
 
         // Gateway wiring.
         let executor = Arc::new(
@@ -474,7 +463,6 @@ impl Node {
             runtime: handle_runtime,
             executor: Some(executor),
             shutdown_rx: handle_shutdown_rx,
-            advisory,
             server,
         })
     }
@@ -519,11 +507,6 @@ pub struct NodeHandle {
     /// The backend the engine actually serves on ("cpu" or a GPU variant
     /// name, ADR-024); `None` when no engine was started.
     pub engine_backend: Option<String>,
-    /// The advisory digest cycle, when the plane is armed
-    /// (`advisory.json` enabled + key + https endpoint + model);
-    /// `None` = inert. The handle exposes ONLY the typed accumulator
-    /// feed — the plane has no other integration surface at this leg.
-    pub advisory: Option<advisory::AdvisoryHandle>,
     server: tokio::task::JoinHandle<()>,
 }
 

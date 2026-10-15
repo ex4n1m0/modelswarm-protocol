@@ -137,7 +137,7 @@
           <button type="button" class="menu-item" data-panel="panel-setup" role="menuitem">Tracker, engine &amp; device approval…</button>
           <button type="button" class="menu-item" data-panel="panel-serving" role="menuitem">Swarm pairing &amp; content carriage…</button>
           <button type="button" class="menu-item" data-panel="panel-temp" role="menuitem">Chat temperature…</button>
-          <button type="button" class="menu-item" data-panel="panel-assistant-settings" role="menuitem">Cloud assistant…</button>
+          <button type="button" class="menu-item" data-panel="panel-assistant-settings" role="menuitem">Assistant…</button>
         </div>
       </div>
       <div class="menu" id="menu-help">
@@ -282,26 +282,28 @@
         <p class="note" style="margin:6px 0 0">temperature applies to chat replies only — pairing/verification stays greedy (its determinism contract).</p>
       </section>
 
-      <section id="panel-assistant-settings" data-title="Cloud assistant (Settings)" hidden>
-        <h2>Cloud assistant</h2>
+      <section id="panel-assistant-settings" data-title="Assistant (Settings)" hidden>
+        <h2>Assistant</h2>
         <dl class="kv">
-          <dt>Cloud assistant</dt><dd class="row" style="flex-wrap:nowrap;gap:8px;align-items:center">
-            <button type="button" class="switch" id="assistant-switch" data-on="true" role="switch" aria-checked="true" aria-label="Cloud assistant toggle"><span class="knob"></span></button>
-            <span class="note" id="assistant-note" style="margin:0">the setup assistant's cloud mode — turn it off any time; built-in help keeps working either way.</span>
+          <dt>Assistant</dt><dd class="row" style="flex-wrap:nowrap;gap:8px;align-items:center">
+            <button type="button" class="switch" id="assistant-switch" data-on="true" role="switch" aria-checked="true" aria-label="Assistant toggle"><span class="knob"></span></button>
+            <span class="note" id="assistant-note" style="margin:0">the setup assistant's model-backed mode — it answers with the model this machine hosts; turn it off any time, built-in help keeps working either way.</span>
           </dd>
         </dl>
-        <p class="note" style="margin:6px 0 0">the assistant itself lives in Help → Setup assistant.</p>
+        <p class="note" style="margin:6px 0 0">the assistant itself lives in Help → Setup assistant. Nothing leaves this machine.</p>
       </section>
 
-      <!-- ADR-037 §3.6/§4.5: the assistant panel keeps its OWN section,
-           input, and assistant-* event namespace (chat wall W4) — now
-           opened from the Help menu. Plain text only (§3.7). -->
+      <!-- ADR-037 §3.6/§4.5 (2026-10-15 rewire): the assistant panel keeps
+           its OWN section, input, and assistant-* event namespace (chat
+           wall W4) — now opened from the Help menu. Plain text only (§3.7).
+           The cloud-era disclosure/ack GATE folded away with the cloud;
+           the banner below is the dismissible helper-identity line. -->
       <section id="assistant-section" data-title="Setup assistant" aria-labelledby="assistant-h" hidden>
         <h2 id="assistant-h">Setup assistant</h2>
         <p class="note" id="assistant-mode" style="margin:0 0 4px">built-in help</p>
         <div id="assistant-disclosure" class="banner" hidden style="margin:0 0 6px;padding:8px;background:var(--panel-2)">
           <p id="assistant-disclosure-text" style="margin:0 0 6px"></p>
-          <button class="ghost" id="assistant-ack" type="button">I understand — enable the cloud assistant</button>
+          <button class="ghost" id="assistant-ack" type="button">Got it</button>
         </div>
         <p class="note" id="assistant-facts" style="margin:0 0 4px;font-size:11px"></p>
         <div id="assistant-transcript" style="max-height:180px;overflow-y:auto"></div>
@@ -310,7 +312,7 @@
           <button type="submit" id="assistant-send">ask</button>
         </form>
         <div class="row" style="justify-content:space-between;align-items:center;margin-top:4px">
-          <span class="chip" id="assistant-chip" hidden>Cloud assistant — advice only; this app's rules decide.</span>
+          <span class="chip" id="assistant-chip" hidden>Hosted-model assistant — your machine's model answers; this app's rules decide.</span>
           <button class="ghost" id="assistant-reset" type="button" title="Close the conversation and clear it">reset</button>
         </div>
       </section>
@@ -1069,21 +1071,22 @@
       if (!a) return;
       $("assistant-switch").dataset.on = !!a.enabled;
       $("assistant-switch").setAttribute("aria-checked", !!a.enabled);
-      $("assistant-mode").textContent = a.cloud
-        ? "cloud mode — advice only"
-        : "Built-in help — the cloud assistant is off/unreachable (" + (a.gap || "disabled") + ").";
-      // §3.6: the first-use disclosure gates the FIRST cloud call; the
-      // text renders VERBATIM from the daemon field.
+      $("assistant-mode").textContent = a.hosted
+        ? "model-backed — answers with the model this machine hosts"
+        : "Built-in help — the model-backed assistant is off/unavailable (" + (a.gap || "not_hosting") + ").";
+      // The first-use helper-identity banner (2026-10-15: dismissible,
+      // NEVER a gate — nothing external is called, so no turn blocks on
+      // it). The text renders VERBATIM from the daemon field.
       const disclosure = $("assistant-disclosure");
-      if (a.cloud && !a.acknowledged && a.disclosure) {
+      if (a.hosted && !a.acknowledged && a.identity) {
         disclosure.hidden = false;
-        $("assistant-disclosure-text").textContent = a.disclosure;
+        $("assistant-disclosure-text").textContent = a.identity;
       } else {
         disclosure.hidden = true;
       }
-      // AD-3 display-pairing: cloud replies that name product states
-      // render ADJACENT to the local status facts they discuss — the
-      // facts line stays under every reply.
+      // AD-3 display-pairing: model-backed replies that name product
+      // states render ADJACENT to the local status facts they discuss —
+      // the facts line stays under every reply.
       const fam = s.family
         ? (s.family.state + (s.family.reason ? " (" + s.family.reason + ")" : ""))
         : "unknown";
@@ -1112,26 +1115,19 @@
     function renderAssistantPayload(p) {
       const chip = $("assistant-chip");
       if (p.kind === "reply") {
-        // The untrusted-provenance chip is ALWAYS adjacent to a cloud
-        // reply (§3.6); the daemon carries it verbatim.
+        // The helper-identity chip is ALWAYS adjacent to a model-backed
+        // reply (the RC-5 discipline); the daemon carries it verbatim.
         chip.hidden = false;
-        chip.textContent = p.chip || "Cloud assistant — advice only; this app's rules decide.";
+        chip.textContent = p.chip || "Hosted-model assistant — your machine's model answers; this app's rules decide.";
         assistantAdd("assistant", p.reply,
-          "cloud · turn " + p.turn + " · conversation " + (p.conversation_id || "?").slice(0, 8) +
+          "hosted model · turn " + p.turn + " · conversation " + (p.conversation_id || "?").slice(0, 8) +
           (p.hints_discarded ? " · " + p.hints_discarded + " malformed hint(s) discarded" : "") +
           (p.hints && p.hints.length ? " · hints: " + p.hints.join(" | ") : ""));
       } else if (p.kind === "gap") {
         chip.hidden = false;
         assistantAdd("assistant",
-          "Built-in help — the cloud assistant is off/unreachable (" + p.gap + ").",
-          "cloud turn failed (" + p.gap + ") — the next message retries");
-      } else if (p.kind === "needs_ack") {
-        chip.hidden = true;
-        $("assistant-disclosure").hidden = false;
-        $("assistant-disclosure-text").textContent = p.disclosure;
-        assistantAdd("assistant",
-          "The first cloud call is blocked until you acknowledge the disclosure above.",
-          "needs acknowledgement");
+          "Built-in help — the model-backed assistant is off/unavailable (" + p.gap + ").",
+          "model-backed turn failed (" + p.gap + ") — the next message retries");
       } else if (p.kind === "static") {
         chip.hidden = true;
         assistantAdd("assistant", p.line, "built-in help");

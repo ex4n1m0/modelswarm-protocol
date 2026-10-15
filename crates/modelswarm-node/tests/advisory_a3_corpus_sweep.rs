@@ -1,8 +1,12 @@
 //! The §9.2(7) FULL A3 CORPUS SWEEP (ADR-033 (7) as extended by ADR-037
-//! §4.4 item 14): with the advisory/assistant plane ABSENT vs
-//! ENABLED-WITH-ERRORING-TRANSPORT, every observable decision surface is
-//! byte-identical and the telemetry stream is byte-identical after
-//! filtering the planes' own `advisory.*`/`assistant.*` rows.
+//! §4.4 item 14 and retargeted by the 2026-10-15 owner directive): with
+//! the assistant plane in its TWO postures — HOSTED-MODEL-BACKED (the
+//! plane armed over a double standing in for the machine's hosted
+//! model, turns driven and answering) vs STATIC-ONLY (no backing: the
+//! plane is absent, the surface serves the frozen static floor) — every
+//! observable decision surface is byte-identical and the telemetry
+//! stream is byte-identical after filtering the plane's own
+//! `assistant.*` rows.
 //!
 //! Corpus families executed here (the ADR-033 §9.2(7) letter, at the
 //! composition seam where the plane can exist):
@@ -20,33 +24,32 @@
 //!   postures; the node's `logs/node.jsonl` streams are diffed
 //!   byte-for-byte after filtering plane rows and normalizing ONLY the
 //!   log timestamp, the ephemeral port, and the per-installation identity
-//!   (declared normalizations — everything else must match exactly).
-//! - **(e) the accumulation-layer input distribution** — posture B feeds
-//!   the typed accumulators past `events_threshold` with the five
-//!   feeds_digest event names, so the digest plane actually CYCLES (and
-//!   fails against the erroring double, recording `advisory.cycle.gap`)
-//!   while the corpus runs.
-//! - **the assistant plane** — armed in-process over an erroring double
-//!   in posture B with driven turns (`assistant.turn.gap` rows), and the
+//!   (declared normalizations — everything else must match exactly). In
+//!   the hosted-backed posture the assistant turns run AGAINST A
+//!   TELEMETRY SINK OPENED ON THE SAME DATA DIR, so their `assistant.*`
+//!   rows genuinely interleave into the compared stream — the filter
+//!   removes REAL rows, never a vacuous absence.
+//! - **the assistant plane** — armed in-process over an ECHOING double
+//!   (the hosted-model posture; turns complete and answer), with the
 //!   plane-rows-only confinement pinned on a shared memory sink.
 //!
 //! Corpus families (b) session admission/coordinator suites, (c) the
 //! sim pinned-verdict scenarios, and (d) the bench corpora execute BELOW
 //! the advisory host in the crate graph — the chat-wall layer 1 test
 //! (`advisory_chat_wall.rs`) pins that they cannot even name the plane,
-//! so the absent posture IS their only possible posture; they re-run
-//! per-push in their own suites (the venue matrix rows).
+//! so the static-only posture IS their only possible posture; they
+//! re-run per-push in their own suites (the venue matrix rows).
 //!
 //! ADR-037 item 14's picker corpus (the deterministic `fit_and_score`
 //! shortlist) lives in the desktop crate; the desktop seam's A3 pattern
-//! test (`assistant_a3_extension_plane_absent_vs_erroring`) pins it, and
-//! the chat-wall layer-2 scan pins that `app.rs` (the picker's home)
-//! carries no advisory name at all — structurally incapable of seeing
-//! the plane.
+//! test (`assistant_a3_extension_static_only_vs_hosted_backed`) pins
+//! it, and the chat-wall layer-2 scan pins that `app.rs` (the picker's
+//! home) carries no advisory name at all — structurally incapable of
+//! seeing the plane.
 
 use std::sync::Arc;
 
-use modelswarm_node::advisory::assistant::{AssistantPlane, TurnOutcome};
+use modelswarm_node::advisory::assistant::{AssistantPlane, HostedBacking, TurnOutcome};
 use modelswarm_node::advisory::egress::{ContextField, ContextValue};
 use modelswarm_node::advisory::{AdvisoryTransport, CountingTransport};
 use modelswarm_scheduler::{
@@ -55,9 +58,9 @@ use modelswarm_scheduler::{
 };
 use modelswarm_types::ModelProfileId;
 
-// No env mutation in this binary: key resolution rides advisory.json's
-// `key_file` (no MSP_ADVISORY_KEY_FILE set/remove — the A-4 discipline
-// does not apply; each test binary is its own process anyway).
+// No env mutation in this binary: arming rides advisory.json plus the
+// caller-supplied hosted backing facts (no key, no env var — the
+// 2026-10-15 collapse removed those surfaces).
 
 // ---------------------------------------------------------------------------
 // Corpus (a): the scheduler decision surface — the full candidate matrix
@@ -151,15 +154,13 @@ fn engage_corpus_digest(candidates: &[Candidate]) -> String {
 
 /// Boots a runtime-less node in `dir`, drives the identical gateway turn
 /// set (3 × no-peer 503, 2 × unknown-profile), stops it, and returns the
-/// NORMALIZED + plane-filtered `logs/node.jsonl` stream. When the node
-/// wires an armed advisory plane, the typed accumulators are fed past
-/// threshold first (the five feeds_digest event names — corpus family
-/// (e)) so the digest runner CYCLES against the erroring double during
-/// the workload.
-async fn node_workload(
-    dir: &std::path::Path,
-    advisory_transport: Option<Arc<dyn AdvisoryTransport>>,
-) -> String {
+/// NORMALIZED + plane-filtered `logs/node.jsonl` stream. When
+/// `hosted_backed` is set, the assistant plane is armed in-process over
+/// an echoing double (the hosted-model posture) and THREE turns are
+/// driven DURING the workload against a telemetry sink opened on the
+/// same data dir — their `assistant.*` rows interleave into the compared
+/// file stream, so the plane-row filter removes real rows.
+async fn node_workload(dir: &std::path::Path, hosted_backed: bool) -> String {
     let (tx, rx) = tokio::sync::watch::channel(false);
     // logs/node.jsonl APPENDS across boots in one data dir — compare only
     // THIS boot's lines (the workload window).
@@ -171,30 +172,58 @@ async fn node_workload(
         gateway_port: 0,
         data_dir: dir.to_path_buf(),
         profile_id: Some("msp1:a3workload".to_string()),
-        advisory_transport,
         ..modelswarm_node::NodeConfig::default()
     };
     let handle = modelswarm_node::Node::start(config, rx)
         .await
         .expect("node starts");
-    if let Some(advisory) = &handle.advisory {
-        let acc = advisory.accumulators.clone();
-        for _ in 0..50 {
-            for event in [
-                "serving.session_ended",
-                "serving.clamped",
-                "serving.refused",
-                "verifydrafts.verifier_divergence",
-                "engine.gpu_fallback",
-            ] {
-                acc.lock().unwrap().record_event(event);
-            }
-        }
-        // Let the fast-tick runner cycle (and fail) against the double.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    }
     let addr = handle.local_addr;
     let client = reqwest::Client::new();
+
+    let mut double: Option<Arc<CountingTransport>> = None;
+    let mut memory_sink_rows: Vec<String> = Vec::new();
+    if hosted_backed {
+        std::fs::write(dir.join("advisory.json"), r#"{"assistant.enabled":true}"#).unwrap();
+        let echo = Arc::new(CountingTransport::assistant_echo(
+            "hosted-model advice".into(),
+        ));
+        let backing = HostedBacking {
+            gateway_addr: addr,
+            profile: "msp1:a3workload".to_string(),
+        };
+        let (plane, gap) = AssistantPlane::spawn(
+            dir,
+            Some(&backing),
+            Some(echo.clone() as Arc<dyn AdvisoryTransport>),
+        );
+        assert_eq!(
+            gap.as_str(),
+            "not_hosting",
+            "armed spawn reports no degrade"
+        );
+        let plane = plane.expect("the plane arms over the hosted-model double");
+        double = Some(echo);
+        // The turns run against a FILE telemetry sink on the same data
+        // dir (the desktop's own posture: the app-level telemetry), so
+        // the assistant.* rows interleave with the node's rows in the
+        // compared stream; the confinement check rides a memory sink.
+        let file_telemetry = open_file_telemetry(dir);
+        let (memory_telemetry, sink) = modelswarm_telemetry::Telemetry::memory();
+        for question in ["which model fits?", "why is family off?", "third turn"] {
+            let outcome = plane
+                .run_turn(&memory_telemetry, question, typed_context())
+                .await;
+            let _ = plane
+                .run_turn(&file_telemetry, question, typed_context())
+                .await;
+            assert!(
+                matches!(outcome, TurnOutcome::Reply { .. }),
+                "the hosted-model double answers"
+            );
+        }
+        memory_sink_rows = sink.snapshot();
+    }
+
     for _ in 0..3 {
         let r = client
             .post(format!("http://{addr}/v1/chat/completions"))
@@ -225,13 +254,33 @@ async fn node_workload(
     handle.stopped().await;
     let raw = std::fs::read_to_string(&log_path).unwrap();
     let window: String = raw.lines().skip(prior_lines).collect::<Vec<_>>().join("\n");
+    if hosted_backed {
+        let echo = double.expect("armed posture carries the double");
+        assert_eq!(echo.count(), 6, "three turns x two telemetry sinks called");
+        // Confinement: the plane's memory-sink rows are ALL assistant.*
+        // (counts/labels only; no reply text).
+        for line in &memory_sink_rows {
+            assert!(line.contains("\"event\":\"assistant."), "{line}");
+            assert!(!line.contains("hosted-model advice"), "{line}");
+        }
+    }
     normalize_node_log(&window)
+}
+
+/// Opens a telemetry file sink on the node's data dir — the same
+/// `logs/node.jsonl` the node appends to (the desktop's app-level
+/// posture for the plane's rows).
+fn open_file_telemetry(dir: &std::path::Path) -> modelswarm_telemetry::Telemetry {
+    let _ = std::fs::create_dir_all(dir.join("logs"));
+    let sink = modelswarm_telemetry::FileSink::open(&dir.join("logs").join("node.jsonl"))
+        .expect("telemetry file sink opens");
+    modelswarm_telemetry::Telemetry::with_sink(Box::new(sink))
 }
 
 /// The declared normalizations for cross-run file comparison (everything
 /// else must match byte-for-byte): the log `ts` field, the ephemeral
 /// gateway port, and the per-installation identity string. Plane rows
-/// (`advisory.*` / `assistant.*`) are the A3 carve-out — filtered.
+/// (`assistant.*`) are the A3 carve-out — filtered.
 fn normalize_node_log(raw: &str) -> String {
     let mut kept: Vec<String> = Vec::new();
     for line in raw.lines() {
@@ -264,6 +313,7 @@ fn normalize_node_log(raw: &str) -> String {
         // installation ids (base58-ish runs) -> ID
         let l = replace_field_value(&l, "installation_id");
         let l = replace_field_value(&l, "peer");
+        let l = replace_field_value(&l, "conversation_id");
         kept.push(l);
     }
     kept.join("\n")
@@ -290,13 +340,15 @@ fn typed_context() -> Vec<ContextField> {
     }]
 }
 
-/// ADR-033 §9.2(7) + ADR-037 §4.4 item (14): the FULL corpus, plane
-/// absent vs enabled-with-erroring-transport. Decision outputs
+/// ADR-033 §9.2(7) + ADR-037 §4.4 item (14), post-2026-10-15 postures:
+/// the FULL corpus, STATIC-ONLY (no model backing — the plane is absent)
+/// vs HOSTED-MODEL-BACKED (the plane armed over the hosted-model double,
+/// turns driven and answering during the workload). Decision outputs
 /// byte-identical; the node workload telemetry byte-identical after the
 /// declared normalizations + plane filtering; the plane confined to its
 /// own rows.
 #[tokio::test]
-async fn a3_full_corpus_plane_absent_vs_armed_erroring() {
+async fn a3_full_corpus_static_only_vs_hosted_model_backed() {
     let dir = tempfile::tempdir().unwrap();
     let candidates: Vec<Candidate> = (0..96).map(candidate).collect();
 
@@ -316,90 +368,85 @@ async fn a3_full_corpus_plane_absent_vs_armed_erroring() {
         handle.stopped().await;
     }
 
-    // ---- Posture A: the plane ABSENT (no advisory.json) --------------
-    let digest_absent = engage_corpus_digest(&candidates);
-    let workload_absent = node_workload(dir.path(), None).await;
+    // ---- Posture A: STATIC-ONLY (no backing; the plane is absent) ----
+    let digest_static = engage_corpus_digest(&candidates);
+    let workload_static = node_workload(dir.path(), false).await;
+    // The honest static-floor arming: not_hosting, no plane.
+    let (plane, gap) = AssistantPlane::spawn(dir.path(), None, None);
+    assert!(plane.is_none());
+    assert_eq!(gap.as_str(), "not_hosting");
+    let digest_static_again = engage_corpus_digest(&candidates);
+    assert_eq!(
+        digest_static, digest_static_again,
+        "the pure decision corpus is deterministic"
+    );
 
-    // ---- Posture B: BOTH planes ENABLED over ERRORING transports -----
-    // The digest plane rides the node (config-driven arming, no env var:
-    // advisory.json carries key_file); a fast min_interval + low
-    // threshold make it cycle (and fail) DURING the workload (the feed
-    // happens inside node_workload via the wired accumulators).
-    let key = dir.path().join("a3-key.txt");
-    std::fs::write(&key, "test-key-local-double\n").unwrap();
-    let key_json = key.to_string_lossy().replace('\\', "/");
+    // ---- Posture B: HOSTED-MODEL-BACKED ------------------------------
+    // The plane arms over the echoing double (the hosted-model posture)
+    // and turns run DURING the workload (see node_workload); the corpus
+    // is re-evaluated with the plane armed in-process.
     std::fs::write(
         dir.path().join("advisory.json"),
-        format!(r#"{{"enabled":true,"assistant.enabled":true,"endpoint_url":"https://advisor.invalid/v1","model":"test-model","key_file":"{key_json}","min_interval_ms":30,"events_threshold":5,"request_timeout_ms":500}}"#),
+        r#"{"assistant.enabled":true}"#,
     )
     .unwrap();
-
-    let digest_double = Arc::new(CountingTransport::always_erroring());
-    let digest_as_trait: Arc<dyn AdvisoryTransport> = digest_double.clone();
-
-    // The assistant plane, armed in-process over its own erroring double
-    // (assistant.turn.gap rows land in the memory sink; its presence in
-    // the process during the corpus evaluation is the point).
-    let assistant_double = Arc::new(CountingTransport::always_erroring());
-    let assistant_as_trait: Arc<dyn AdvisoryTransport> = assistant_double.clone();
-    let (plane, gap) = AssistantPlane::spawn(dir.path(), Some(assistant_as_trait));
+    let armed_double = Arc::new(CountingTransport::assistant_echo("advice".into()));
+    let armed_backing = HostedBacking {
+        gateway_addr: "127.0.0.1:1".parse().unwrap(),
+        profile: "msp1:a3workload".to_string(),
+    };
+    let (ambient_plane, gap) = AssistantPlane::spawn(
+        dir.path(),
+        Some(&armed_backing),
+        Some(armed_double.clone() as Arc<dyn AdvisoryTransport>),
+    );
     assert_eq!(
         gap.as_str(),
-        "disabled",
-        "the armed spawn reports no degrade"
+        "not_hosting",
+        "armed spawn reports no degrade"
     );
-    let plane = plane.expect("the assistant plane arms over the double");
-    let (telemetry, sink) = modelswarm_telemetry::Telemetry::memory();
-    for question in ["which model fits?", "why is family off?", "third turn"] {
-        let outcome = plane.run_turn(&telemetry, question, typed_context()).await;
-        assert!(
-            matches!(outcome, TurnOutcome::Gap { .. }),
-            "the erroring double must yield an honest gap"
-        );
+    let _ambient_plane = ambient_plane.expect("the plane arms over the double");
+    let (ambient_telemetry, ambient_sink) = modelswarm_telemetry::Telemetry::memory();
+    for question in ["ambient q1", "ambient q2"] {
+        let outcome = _ambient_plane
+            .run_turn(&ambient_telemetry, question, typed_context())
+            .await;
+        assert!(matches!(outcome, TurnOutcome::Reply { .. }));
     }
-    assert_eq!(assistant_double.count(), 3, "three assistant turns called");
+    assert_eq!(armed_double.count(), 2, "the ambient plane is live");
 
     // The corpus evaluated WHILE the assistant plane is armed in-process
     // (ambient plane activity must not perturb the decisions).
-    let digest_armed = engage_corpus_digest(&candidates);
+    let digest_hosted = engage_corpus_digest(&candidates);
 
-    // The node workload with the digest plane wired over the erroring
-    // double (NodeConfig seam) — the accumulators are fed past threshold
-    // inside, advisory.cycle.gap rows appear in the node's file sink, and
-    // the filtered stream must stay byte-identical.
-    let workload_armed = node_workload(dir.path(), Some(digest_as_trait)).await;
+    // The node workload with the hosted-backed posture (turns driven
+    // inside, assistant.* rows interleaved into the compared stream).
+    let workload_hosted = node_workload(dir.path(), true).await;
 
     // ---- (i) Decision outputs byte-identical -------------------------
     assert_eq!(
-        digest_absent, digest_armed,
-        "A3(i): the full scheduler decision corpus is byte-identical with the plane armed-and-erroring"
+        digest_static, digest_hosted,
+        "A3(i): the full scheduler decision corpus is byte-identical with the plane hosted-model-backed and live"
     );
 
     // ---- (ii) The telemetry stream byte-identical after filtering -----
     assert_eq!(
-        workload_absent, workload_armed,
-        "A3(ii): the node workload telemetry is byte-identical after filtering advisory.*/assistant.* (declared normalizations: ts, ephemeral port, installation ids)"
+        workload_static, workload_hosted,
+        "A3(ii): the node workload telemetry is byte-identical after filtering assistant.* (declared normalizations: ts, ephemeral port, installation/conversation ids)"
     );
 
-    // The armed digest plane must have CYCLED (non-vacuous filtered
-    // equality): at least one advisory.cycle.gap row was filtered away.
-    let raw_armed = std::fs::read_to_string(dir.path().join("logs/node.jsonl")).unwrap();
+    // Non-vacuous filtered equality: the hosted-backed stream REALLY
+    // carried assistant.* rows that the filter removed.
+    let raw_hosted = std::fs::read_to_string(dir.path().join("logs/node.jsonl")).unwrap();
     assert!(
-        raw_armed.contains("\"event\":\"advisory.cycle.gap\""),
-        "the digest plane must have cycled against the erroring double"
+        raw_hosted.contains("\"event\":\"assistant.turn.sent\""),
+        "the hosted-backed posture must have interleaved real assistant rows"
     );
-    assert!(digest_double.count() >= 1, "the digest double was called");
 
-    // Confinement: the assistant plane's memory-sink rows are ALL
-    // assistant.* (counts/labels only; no reply text, no key).
-    for line in sink.snapshot() {
+    // Confinement: the ambient plane's memory-sink rows are ALL
+    // assistant.* (counts/labels only; no reply text).
+    for line in ambient_sink.snapshot() {
         assert!(line.contains("\"event\":\"assistant."), "{line}");
-        assert!(!line.contains("test-key-local-double"), "{line}");
+        assert!(!line.contains("advice"), "{line}");
     }
-    assert!(
-        sink.snapshot()
-            .iter()
-            .any(|l| l.contains("assistant.turn.gap")),
-        "the assistant gap rows were recorded"
-    );
 }

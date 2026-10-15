@@ -3548,6 +3548,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures-util",
  "hex",
+ "libp2p",
  "modelswarm-eligibility",
  "modelswarm-gateway",
  "modelswarm-identity",

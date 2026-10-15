@@ -391,7 +391,10 @@ async fn real_capi_engine_serves_verifydrafts_through_composed_daemon() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let telemetry = Arc::new(Telemetry::memory().0);
     let serving = tokio::spawn(serve_sessions_composed(
-        listener,
+        modelswarm_node::serving::ServingInbox::new(
+            listener,
+            modelswarm_node::serving::RelaySlot::empty(),
+        ),
         Arc::new(ComposedFixedExecutor),
         TEST_PROFILE.to_string(),
         policy,

@@ -221,7 +221,10 @@ async fn one_listener_serves_both_vocabularies() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let serving_telemetry = Arc::clone(&telemetry);
     tokio::spawn(serve_sessions_composed(
-        listener,
+        modelswarm_node::serving::ServingInbox::new(
+            listener,
+            modelswarm_node::serving::RelaySlot::empty(),
+        ),
         Arc::new(FixedExecutor),
         TEST_PROFILE.to_string(),
         policy,
@@ -339,7 +342,10 @@ async fn family_session_refused_without_lease() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let serving_telemetry = Arc::clone(&telemetry);
     let serving = tokio::spawn(serve_sessions_composed(
-        listener,
+        modelswarm_node::serving::ServingInbox::new(
+            listener,
+            modelswarm_node::serving::RelaySlot::empty(),
+        ),
         Arc::new(NeverExecutor),
         TEST_PROFILE.to_string(),
         policy,
@@ -426,7 +432,10 @@ async fn family_session_refused_on_wrong_profile_lease() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let serving_telemetry = Arc::clone(&telemetry);
     let serving = tokio::spawn(serve_sessions_composed(
-        listener,
+        modelswarm_node::serving::ServingInbox::new(
+            listener,
+            modelswarm_node::serving::RelaySlot::empty(),
+        ),
         Arc::new(NeverExecutor),
         TEST_PROFILE.to_string(),
         policy_over(&hub),

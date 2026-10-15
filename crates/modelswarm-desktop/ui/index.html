@@ -547,8 +547,12 @@
       // the text; a failed bind or a disabled toggle names the exact
       // cause here AND in the family line below.
       const listener = s.node.listener_addr;
+      // F2B: the relay circuit address (while a live reservation holds
+      // it) is part of the serving truth — same chip, honest
+      // reachability, no separate switch.
+      const relay = s.node.relay_circuit_addr;
       $("chip-direct").textContent = listener
-        ? "remote serve: on (" + listener + ")"
+        ? "remote serve: on (" + listener + (relay ? " + relay" : "") + ")"
         : pairingAllowed
           ? "remote serve: off (bind failed — see family line)"
           : "remote serve: off (swarm pairing off in Setup)";

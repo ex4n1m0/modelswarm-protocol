@@ -59,7 +59,7 @@ use time::OffsetDateTime;
 use modelswarm_eligibility::EligibilityLease;
 use modelswarm_gateway::InferenceExecutor;
 use modelswarm_telemetry::Telemetry;
-use modelswarm_transport::libp2p_backend::{Libp2pListener, Libp2pSession};
+use modelswarm_transport::libp2p_backend::Libp2pSession;
 use modelswarm_transport::message::WireMessage;
 use modelswarm_transport::TransportError;
 
@@ -435,8 +435,10 @@ async fn demux_first_frame(session: &mut Libp2pSession, idle: Duration) -> First
 // constructs it per accepted family session over the QUIC wire (whose
 // Drop still FINs + drains gracefully).
 
-/// The composed serve loop: ONE listener, BOTH vocabularies, ONE
-/// admission gate, ONE lease discipline. Lifecycle contract identical to
+/// The composed serve loop: ONE serving inbox (the direct listener plus,
+/// since F2B, the relay reservation slot — see
+/// [`crate::serving::ServingInbox`]), BOTH vocabularies, ONE admission
+/// gate, ONE lease discipline. Lifecycle contract identical to
 /// [`crate::serving::serve_sessions`]: stop when `shutdown` flips true OR
 /// its watch sender drops. Per accepted session (in its own task, holding
 /// one `Admission` slot for its whole lifetime regardless of vocabulary):
@@ -456,7 +458,7 @@ async fn demux_first_frame(session: &mut Libp2pSession, idle: Duration) -> First
 ///    engine's real capabilities, then [`serve_verifydrafts_session`] with
 ///    the offer handed pre-read ([`PrefacedWire`]).
 pub async fn serve_sessions_composed(
-    mut listener: Libp2pListener,
+    mut serving: crate::serving::ServingInbox,
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: LeasePolicy,
@@ -487,7 +489,7 @@ pub async fn serve_sessions_composed(
                     continue;
                 }
             },
-            accepted = listener.accept(Duration::from_secs(1)) => match accepted {
+            accepted = serving.recv(Duration::from_secs(1)) => match accepted {
                 Ok(s) => s,
                 Err(_) => continue, // timeout/accept miss: keep serving
             },

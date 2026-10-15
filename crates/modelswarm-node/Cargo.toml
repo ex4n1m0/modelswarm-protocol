@@ -72,6 +72,20 @@ modelswarm-runtime = { path = "../modelswarm-runtime", features = ["mock-runtime
 # observations with the frozen cost model); the production node crate
 # does NOT depend on the scheduler.
 modelswarm-scheduler = { path = "../modelswarm-scheduler" }
+# F2B test double: the relay binary's exact rust-libp2p relay stack,
+# built in-process to prove the node's relayed serving + fallback dial
+# against the real behaviour — dev-only (same double the transport crate
+# uses; the production client shares no code with it).
+libp2p = { version = "0.57", features = [
+    "tokio",
+    "quic",
+    "noise",
+    "yamux",
+    "identify",
+    "ping",
+    "relay",
+    "macros",
+] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 

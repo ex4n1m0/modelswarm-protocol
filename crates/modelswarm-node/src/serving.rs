@@ -10,6 +10,14 @@
 //! ADR-025 ChatML templating applies), and stream
 //! `TokenDelta`/`Usage`/`Completed` frames back.
 //!
+//! F2B (ADR-014, 2026-10-15): serving is no longer listener-only. A
+//! [`RelayReservation`] on a configured relay (owned through the
+//! replaceable [`RelaySlot`]) admits RELAYED circuits — requesters behind
+//! NAT dial `<relay>/p2p-circuit/p2p/<us>` — into the SAME admission- and
+//! lease-gated loop. [`ServingInbox`] fans the direct listener and the
+//! relay slot into one bounded session channel so an accepted session is
+//! never lost to select-cancellation.
+//!
 //! Privacy: peer-supplied frame payloads are never logged or echoed —
 //! diagnostics carry variant names and stable codes only (AGENTS.md
 //! rule 5). Admission control (session cap, per-peer cap, request-id
@@ -30,8 +38,129 @@ use modelswarm_transport::libp2p_backend::{Libp2pListener, Libp2pSession};
 use modelswarm_transport::message::{
     ChatMessage, Completed, StreamError, TokenDelta, Usage, WireMessage,
 };
+use modelswarm_transport::relay_client::RelayReservation;
+use modelswarm_transport::TransportError;
 
 const IO_DEADLINE: Duration = Duration::from_secs(30);
+/// Serving-source poll cadence (the direct listener and the relay slot
+/// both wake at this period when idle).
+const SERVE_POLL: Duration = Duration::from_secs(1);
+
+/// The serving side's relay reservation slot (F2B): a replaceable handle
+/// a supervisor task owns and [`ServingInbox`] polls. Installing a new
+/// reservation drops the previous one — its driver aborts, which the
+/// relay reads as a released lease (honest cleanup, no leak).
+#[derive(Clone)]
+pub struct RelaySlot {
+    inner: Arc<tokio::sync::Mutex<Option<RelayReservation>>>,
+}
+
+impl RelaySlot {
+    /// No reservation held — direct-only serving (the pre-F2B behavior).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Installs `reservation`, replacing (and releasing) any previous one.
+    pub async fn install(&self, reservation: RelayReservation) {
+        *self.inner.lock().await = Some(reservation);
+    }
+
+    /// Whether a reservation is held AND believed live (honest: a
+    /// relay-side drop is only observed on the next renewal or traffic —
+    /// the transport's own liveness signal).
+    pub async fn holds_live(&self) -> bool {
+        self.inner
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(RelayReservation::alive)
+    }
+
+    /// The held reservation's advertised circuit address
+    /// (`<relay>/p2p-circuit/p2p/<own peer id>`), `None` while none is
+    /// held or the held one reads dead.
+    pub async fn circuit_addr(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .await
+            .as_ref()
+            .filter(|reservation| reservation.alive())
+            .map(RelayReservation::circuit_addr)
+    }
+}
+
+/// ONE receiving end for ALL serving sources (F2B): the direct listener
+/// and the relay slot each get a forwarder task; accepted sessions land
+/// in one bounded channel. A session accepted by either source is
+/// buffered and never dropped by select-cancellation (cancelling a raw
+/// `accept` future mid-completion would kill the connection — the same
+/// class of bug as the 2026-10-09 LAN pass-1 shutdown race).
+pub struct ServingInbox {
+    rx: tokio::sync::mpsc::Receiver<Libp2pSession>,
+}
+
+impl ServingInbox {
+    /// Fans `listener` and `relay` into one inbox. Both forwarder tasks
+    /// stop when the inbox (its receiver) is dropped.
+    #[must_use]
+    pub fn new(mut listener: Libp2pListener, relay: RelaySlot) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Libp2pSession>(16);
+        // Direct-listener forwarder: owns the listener end-to-end.
+        let listener_tx = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept(SERVE_POLL).await {
+                    Ok(session) => {
+                        if listener_tx.send(session).await.is_err() {
+                            break; // inbox dropped: stop serving
+                        }
+                    }
+                    Err(TransportError::Closed) => break,
+                    Err(_) => {}
+                }
+            }
+        });
+        // Relay forwarder: polls the (replaceable) reservation slot. A
+        // dead reservation reads `Closed` — sleep and re-poll (the
+        // supervisor replaces it); never spin.
+        let relay_tx = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let session = {
+                    let mut guard = relay.inner.lock().await;
+                    match guard.as_mut() {
+                        Some(reservation) => reservation.accept(SERVE_POLL).await.ok(),
+                        None => None,
+                    }
+                }; // lock released before any channel backpressure
+                match session {
+                    Some(session) => {
+                        if relay_tx.send(session).await.is_err() {
+                            break; // inbox dropped: stop serving
+                        }
+                    }
+                    None => tokio::time::sleep(SERVE_POLL).await,
+                }
+            }
+        });
+        Self { rx }
+    }
+
+    /// Accepts the next session from any source. Same contract as
+    /// [`Libp2pListener::accept`]: deadline expiry is a poll timeout
+    /// (`Err(Timeout)`), a dead inbox is `Err(Closed)`.
+    pub async fn recv(&mut self, deadline: Duration) -> Result<Libp2pSession, TransportError> {
+        match tokio::time::timeout(deadline, self.rx.recv()).await {
+            Ok(Some(session)) => Ok(session),
+            Ok(None) => Err(TransportError::Closed),
+            Err(_) => Err(TransportError::Timeout),
+        }
+    }
+}
 
 /// Serves accepted sessions until `shutdown` flips to true OR its watch
 /// sender is dropped (no owner left to signal stop ⇒ stop serving). Callers
@@ -39,7 +168,53 @@ const IO_DEADLINE: Duration = Duration::from_secs(30);
 /// lifetime. Never panics on a bad session: malformed input becomes a
 /// `StreamError` frame, then the session closes.
 pub async fn serve_sessions(
-    mut listener: Libp2pListener,
+    listener: Libp2pListener,
+    executor: Arc<dyn InferenceExecutor>,
+    profile_id: String,
+    lease_policy: LeasePolicy,
+    telemetry: Arc<Telemetry>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    serve_sessions_relayed(
+        listener,
+        RelaySlot::empty(),
+        executor,
+        profile_id,
+        lease_policy,
+        telemetry,
+        shutdown,
+    )
+    .await
+}
+
+/// F2B (ADR-014): the serving bridge with a relay reservation slot —
+/// sessions from the DIRECT listener and from RELAYED circuits (peers
+/// behind NAT that reserved nothing themselves but dial us through the
+/// relay we reserved on) land in the same admission- and lease-gated
+/// loop. Identical to [`serve_sessions`] when the slot is empty.
+pub async fn serve_sessions_relayed(
+    listener: Libp2pListener,
+    relay: RelaySlot,
+    executor: Arc<dyn InferenceExecutor>,
+    profile_id: String,
+    lease_policy: LeasePolicy,
+    telemetry: Arc<Telemetry>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    serve_inbox(
+        ServingInbox::new(listener, relay),
+        executor,
+        profile_id,
+        lease_policy,
+        telemetry,
+        shutdown,
+    )
+    .await
+}
+
+/// The F0(3)/F2B serving loop over a [`ServingInbox`].
+async fn serve_inbox(
+    mut inbox: ServingInbox,
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: LeasePolicy,
@@ -77,7 +252,7 @@ pub async fn serve_sessions(
                     continue;
                 }
             },
-            accepted = listener.accept(Duration::from_secs(1)) => match accepted {
+            accepted = inbox.recv(Duration::from_secs(1)) => match accepted {
                 Ok(s) => s,
                 Err(_) => continue, // timeout/accept miss: keep serving
             },

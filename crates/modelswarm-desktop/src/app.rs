@@ -64,6 +64,68 @@ mod assistant;
 /// direct-connect honestly for every remote peer (beta boundary).
 const ADDR_NO_LISTENER: &str = "/ip4/0.0.0.0/tcp/0";
 
+/// F2B (ADR-014): a circuit multiaddr — `<relay>/p2p-circuit[/p2p/<dst>]`,
+/// the relayed-reachability shape that rides the tracker's EXISTING
+/// `addresses` field (no schema change). A peer advertising one is
+/// REACHABLE (through the relay), never skipped.
+fn addr_is_circuit(addr: &str) -> bool {
+    addr.contains("/p2p-circuit")
+}
+
+/// The roster/picker DIALABILITY predicate (F2B): a direct QUIC multiaddr
+/// OR a circuit address; `0.0.0.0` placeholders stay undialable. A
+/// relayed peer is reachable, not skipped.
+fn peer_addr_dialable(addr: &str) -> bool {
+    !addr.contains("0.0.0.0") && (addr.ends_with("quic-v1") || addr_is_circuit(addr))
+}
+
+/// A DIRECT QUIC multiaddr only (the pre-F2B predicate). Used where the
+/// consumer is honestly direct-only (the family probe's `dial_quic`, the
+/// shadow planner's frozen `has_direct_quic_addr` fact).
+fn peer_addr_direct(addr: &str) -> bool {
+    addr.ends_with("quic-v1") && !addr.contains("0.0.0.0")
+}
+
+/// The F2B relay endpoint configuration: `<data_dir>/relay.addr`, ONE
+/// relay multiaddr (e.g. `/ip4/10.0.0.2/udp/4001/quic-v1/p2p/<relay peer
+/// id>` — the run line in the Network Engineer's handoff §6). Blank lines
+/// and `#` comments are ignored.
+///
+/// DELIBERATELY default-EMPTY: no relay address is invented or hard-coded
+/// — nothing may silently point at a nonexistent host. Absence = the
+/// pre-F2B behavior (direct-only serving, direct-only dialing). When a
+/// relay address IS present, using it is AUTOMATIC: the serving side
+/// reserves and advertises its circuit address, requesters dial relay
+/// candidates on direct failure — no user-facing switch (owner directive
+/// 2026-10-15, "everything on by design").
+const RELAY_ADDR_FILE: &str = "relay.addr";
+
+fn configured_relay_addr(data_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(data_dir.join(RELAY_ADDR_FILE)).ok()?;
+    raw.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+}
+
+/// Keeps the heartbeat's advertised address list truthful (F2B): the
+/// direct address always first, the circuit address only while a live
+/// reservation holds it. Sends only on CHANGE (the heartbeat re-registers
+/// on change so the roster never claims a dead circuit).
+fn set_advertised_addrs(
+    advertised: &tokio::sync::watch::Sender<Vec<String>>,
+    direct: &str,
+    circuit: Option<String>,
+) {
+    let mut next = vec![direct.to_string()];
+    if let Some(circuit) = circuit {
+        next.push(circuit);
+    }
+    if *advertised.borrow() != next {
+        let _ = advertised.send(next);
+    }
+}
+
 /// The daemon-pinned family session prompt (ADR-032 light-up): whitespace-
 /// separated token ids, read from `<data_dir>/family-prompt-tokens.txt`.
 /// The family wire never carries the session prompt (the recorded G6 gap
@@ -357,6 +419,11 @@ struct RunningNode {
     shutdown: tokio::sync::watch::Sender<bool>,
     heartbeat: tokio::task::JoinHandle<()>,
     enrollment: Arc<tokio::sync::RwLock<EnrollmentView>>,
+    /// F2B: the advertised address list (direct first, relay circuit
+    /// while a live reservation holds) — the relay supervisor writes it,
+    /// the heartbeat registers it, `get_status` reads it for the
+    /// serving chip's relay label.
+    advertised: tokio::sync::watch::Sender<Vec<String>>,
 }
 
 /// The enrollment/roster half of "swarm readiness", shared between the
@@ -718,6 +785,90 @@ async fn bind_serving_listener(
         .replace("/0.0.0.0/", &format!("/{lan_ip}/"));
     log_event(telemetry, "info", "listener.bound", &[("addr", &addr)]);
     ListenerBind::Bound(listener, addr)
+}
+
+/// F2B (ADR-014): one reservation attempt on the configured relay.
+/// Errors carry the exact transport text — the relay's own status
+/// vocabulary (`no_reservation(204)`, …) rides it verbatim. Callers log
+/// through the EXISTING `listener.error` event (phase `relay_reserve`);
+/// no new event names.
+async fn reserve_relay_attempt(
+    data_dir: &Path,
+    telemetry: &Telemetry,
+    relay_addr: &str,
+) -> Result<modelswarm_transport::relay_client::RelayReservation, String> {
+    let identity = load_or_create_identity(data_dir, telemetry).map_err(|e| e.to_string())?;
+    let backend = modelswarm_transport::libp2p_backend::Libp2pTransport::new(&identity)
+        .map_err(|e| format!("transport backend: {e}"))?;
+    backend
+        .reserve_relay(relay_addr, Duration::from_secs(10))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The F2B relay reservation SUPERVISOR (serving side): every 30 s, when
+/// no live reservation is held, retry the configured relay (the relay may
+/// start after the app — the owner's second-desktop deployment); keep the
+/// advertised address list truthful (circuit address only while a live
+/// reservation holds it); the heartbeat re-registers on any list change.
+/// Reservation RENEWAL itself is the transport's own driver (re-reserve
+/// at 3/4 of each lease) — this task only acquires and re-acquires.
+/// Failures log through the EXISTING `listener.error` event (phase
+/// `relay_reserve`), throttled to the first and every 20th retry (10 min,
+/// the roster-failure cadence); success logs `listener.bound` with the
+/// circuit address (a relayed serving path IS a bound serving path).
+async fn relay_reservation_supervisor(
+    data_dir: PathBuf,
+    relay_addr: String,
+    slot: modelswarm_node::serving::RelaySlot,
+    advertised: tokio::sync::watch::Sender<Vec<String>>,
+    direct_addr: String,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    telemetry: std::sync::Arc<Telemetry>,
+) {
+    let mut failures: u32 = 0;
+    loop {
+        if slot.holds_live().await {
+            set_advertised_addrs(&advertised, &direct_addr, slot.circuit_addr().await);
+        } else {
+            set_advertised_addrs(&advertised, &direct_addr, None);
+            match reserve_relay_attempt(&data_dir, &telemetry, &relay_addr).await {
+                Ok(reservation) => {
+                    failures = 0;
+                    let circuit = reservation.circuit_addr();
+                    log_event(&telemetry, "info", "listener.bound", &[("addr", &circuit)]);
+                    slot.install(reservation).await;
+                    set_advertised_addrs(&advertised, &direct_addr, slot.circuit_addr().await);
+                }
+                Err(error) => {
+                    failures += 1;
+                    if failures == 1 || failures % 20 == 0 {
+                        log_event(
+                            &telemetry,
+                            "warn",
+                            "listener.error",
+                            &[
+                                ("phase", "relay_reserve"),
+                                ("error", &error),
+                                ("attempt", &failures.to_string()),
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            changed = shutdown.changed() => match changed {
+                Err(_) => return,
+                Ok(()) => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                }
+            },
+        }
+    }
 }
 
 // ---- The composed daemon's family half (ADR-032 light-up; cfg
@@ -1706,6 +1857,17 @@ async fn get_status(
             "engine_port": engine_port,
             "engine_backend": engine_backend,
             "listener_addr": inner.listener_addr,
+            // F2B: the relay circuit address currently ADVERTISED (only
+            // while a live reservation holds it — the supervisor keeps
+            // this truthful); null when no relay is configured/reserved.
+            "relay_circuit_addr": inner.node.as_ref().and_then(|running| {
+                running
+                    .advertised
+                    .borrow()
+                    .iter()
+                    .find(|addr| addr_is_circuit(addr))
+                    .cloned()
+            }),
             "enrollment": enrollment,
         },
         // The ADR-032 family half, exactly as the daemon decided it (on
@@ -2568,18 +2730,24 @@ async fn set_hosting_inner(
 
     // F0(3) + the ADR-032 light-up: attach the serving bridge to the
     // node's executor. The bridge dies with the node via the shared
-    // shutdown watch; the advertised multiaddr is the listener's real
-    // bound address. With the family tier compiled in (verifydrafts),
-    // ONE listener serves BOTH vocabularies through the composed daemon —
-    // msp-v1 unchanged, family sessions behind the RC-L1 profile-bound
-    // lease gate; when the family half cannot init the daemon degrades
-    // HONESTLY to the plain msp-v1 bridge (a logged reason + the status
-    // field, never a silent family-off). The family tier is ON BY DEFAULT
-    // since 2026-10-13: the "allow swarm pairing" settings toggle (default
-    // on) gates the listener; a bind failure surfaces its exact reason in
-    // the family line.
+    // shutdown watch; the advertised addresses are the listener's real
+    // bound address plus — since F2B (ADR-014) — the relay circuit
+    // address while a configured relay holds a live reservation. With the
+    // family tier compiled in (verifydrafts), ONE listener serves BOTH
+    // vocabularies through the composed daemon — msp-v1 unchanged, family
+    // sessions behind the RC-L1 profile-bound lease gate; when the family
+    // half cannot init the daemon degrades HONESTLY to the plain msp-v1
+    // bridge (a logged reason + the status field, never a silent
+    // family-off). The family tier is ON BY DEFAULT since 2026-10-13: the
+    // "allow swarm pairing" settings toggle (default on) gates the
+    // listener; a bind failure surfaces its exact reason in the family
+    // line.
     let hardware = hardware_of(app, state).await;
-    let mut advertised_addr: Option<String> = None;
+    // F2B: the heartbeat's advertised address list — direct first, the
+    // relay circuit address while a live reservation holds it. The relay
+    // supervisor (below) owns changes; the heartbeat re-registers on
+    // change; `get_status` reads it for the serving chip.
+    let (advertised_tx, advertised_rx) = tokio::sync::watch::channel(Vec::<String>::new());
     let listener_bind =
         bind_serving_listener(&inner.data_dir, &state.telemetry, inner.allow_swarm_pairing).await;
     let listener_bind_reason: Option<(&'static str, String)> = match &listener_bind {
@@ -2594,10 +2762,33 @@ async fn set_hosting_inner(
         if let (Some(executor), Some(profile)) =
             (handle.executor.clone(), handle.profile_id.clone())
         {
-            advertised_addr = Some(addr);
-            inner.listener_addr = advertised_addr.clone();
+            inner.listener_addr = Some(addr.clone());
+            let _ = advertised_tx.send(vec![addr.clone()]);
             let serving_shutdown = handle.shutdown_rx.clone();
             let serving_telemetry = std::sync::Arc::clone(&state.telemetry);
+
+            // F2B (ADR-014) serving side: reserve on the CONFIGURED relay
+            // (`<data_dir>/relay.addr`, default EMPTY — nothing invented)
+            // so peers behind NAT can still dial us. Reservation use is
+            // automatic when configured: no switch, no prompt, and never
+            // a BLOCKING one — the supervisor's FIRST tick (it runs
+            // before its first sleep) performs the initial attempt in
+            // the background, so a configured-but-down relay cannot stall
+            // hosting start. It keeps reacquiring (the relay may start
+            // later) and owns the advertised list's circuit entry; the
+            // heartbeat re-registers when the list changes.
+            let relay_slot = modelswarm_node::serving::RelaySlot::empty();
+            if let Some(relay_addr) = configured_relay_addr(&inner.data_dir) {
+                tokio::spawn(relay_reservation_supervisor(
+                    inner.data_dir.clone(),
+                    relay_addr,
+                    relay_slot.clone(),
+                    advertised_tx.clone(),
+                    addr.clone(),
+                    handle.shutdown_rx.clone(),
+                    std::sync::Arc::clone(&state.telemetry),
+                ));
+            }
 
             #[cfg(feature = "verifydrafts")]
             let (family_serving, family_status, family_engine) = compose_family_serving(
@@ -2627,7 +2818,13 @@ async fn set_hosting_inner(
                 match family_serving {
                     Some(family) => {
                         tokio::spawn(modelswarm_node::verifydrafts::serve_sessions_composed(
-                            listener,
+                            // F2B: the composed daemon serves BOTH
+                            // vocabularies over the direct listener AND
+                            // relayed circuits (one inbox).
+                            modelswarm_node::serving::ServingInbox::new(
+                                listener,
+                                relay_slot.clone(),
+                            ),
                             executor,
                             profile,
                             modelswarm_node::serving::LeasePolicy::production(),
@@ -2639,8 +2836,9 @@ async fn set_hosting_inner(
                     // Honest degradation: the pre-light-up msp-v1 bridge,
                     // with the reason already telemetered and in status.
                     None => {
-                        tokio::spawn(modelswarm_node::serving::serve_sessions(
+                        tokio::spawn(modelswarm_node::serving::serve_sessions_relayed(
                             listener,
+                            relay_slot.clone(),
                             executor,
                             profile,
                             modelswarm_node::serving::LeasePolicy::production(),
@@ -2651,8 +2849,9 @@ async fn set_hosting_inner(
                 }
             }
             #[cfg(not(feature = "verifydrafts"))]
-            tokio::spawn(modelswarm_node::serving::serve_sessions(
+            tokio::spawn(modelswarm_node::serving::serve_sessions_relayed(
                 listener,
+                relay_slot.clone(),
                 executor,
                 profile,
                 modelswarm_node::serving::LeasePolicy::production(),
@@ -2707,6 +2906,8 @@ async fn set_hosting_inner(
         // found live 2026-10-06 when registration first got past the
         // schema gate).
         let peer_id = heartbeat_tracker.identity().peer_id();
+        // F2B: the advertised-list receiver (see the register step below).
+        let mut advertised_rx = advertised_rx;
         let runtime_desc = runtime_wire_desc(&build);
         let mut lease_id: Option<String> = None;
         let mut roster_failures: u32 = 0;
@@ -2831,6 +3032,22 @@ async fn set_hosting_inner(
             }
 
             // ---- roster register/heartbeat (session required) ----
+            // F2B: the advertised address list is supervisor-owned (direct
+            // first, the relay circuit address while a live reservation
+            // holds it). Any change forces a re-register so the roster
+            // never claims a dead circuit.
+            if advertised_rx.has_changed().unwrap_or(false) {
+                let _ = advertised_rx.borrow_and_update();
+                lease_id = None;
+            }
+            let addresses: Vec<String> = {
+                let current = advertised_rx.borrow().clone();
+                if current.is_empty() {
+                    vec![ADDR_NO_LISTENER.to_string()]
+                } else {
+                    current
+                }
+            };
             let result = if heartbeat_tracker.has_session() {
                 match &lease_id {
                     Some(id) => heartbeat_tracker
@@ -2845,9 +3062,7 @@ async fn set_hosting_inner(
                     None => heartbeat_tracker
                         .register(
                             &peer_id,
-                            &[advertised_addr
-                                .clone()
-                                .unwrap_or_else(|| ADDR_NO_LISTENER.to_string())],
+                            &addresses,
                             std::slice::from_ref(&profile_id),
                             1,
                             runtime_desc.clone(),
@@ -2923,6 +3138,7 @@ async fn set_hosting_inner(
         shutdown: shutdown_tx,
         heartbeat,
         enrollment: enrollment_view,
+        advertised: advertised_tx,
     });
     Ok(status)
 }
@@ -3014,11 +3230,26 @@ async fn lookup_peers(
     Ok(peers
         .into_iter()
         .map(|p| {
+            // F2B roster classification: a peer advertising a circuit
+            // address is REACHABLE (through the relay) even without a
+            // direct QUIC address — the roster row says which path
+            // exists, never "unreachable" for a relayed peer.
+            let has_direct = p.addresses.iter().any(|a| peer_addr_direct(a));
+            let has_circuit = p.addresses.iter().any(|a| addr_is_circuit(a));
+            let nat_path = if has_direct && has_circuit {
+                "direct + relay"
+            } else if has_circuit {
+                "relay (circuit)"
+            } else if has_direct {
+                "direct"
+            } else {
+                "no dialable address (beta)"
+            };
             serde_json::json!({
                 "peer_id": p.peer_id,
                 "lease_expires_at": p.lease_expires_at,
                 "capacity_class": p.capacity_class,
-                "nat_path": "no listener (beta) — direct-connect will fail",
+                "nat_path": nat_path,
             })
         })
         .collect())
@@ -3137,12 +3368,14 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
         Err(_) => return Ok(fail("identity_unavailable")),
     };
     let own_peer_id = identity.peer_id();
+    // F2B note: the probe's own dial (`dial_quic`) is DIRECT-only this
+    // pass, so the candidate predicate stays direct — a relay-only peer
+    // is honestly reported as not probeable here while remaining fully
+    // served by the swarm chat path (which dials its circuit address).
     let candidate = peers.into_iter().find(|p| {
         p.peer_id != own_peer_id
             && p.free_slots > 0
-            && p.addresses
-                .iter()
-                .any(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))
+            && p.addresses.iter().any(|a| peer_addr_direct(a))
     });
     let Some(candidate) = candidate else {
         log_event(
@@ -3156,7 +3389,7 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
     let addr = candidate
         .addresses
         .iter()
-        .find(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))
+        .find(|a| peer_addr_direct(a))
         .expect("the candidate predicate guarantees a QUIC addr")
         .clone();
     // The verifier key is PINNED from the roster peer id (ADR-020
@@ -3828,10 +4061,11 @@ async fn gather_shadow_plan(
                 free_slots: u32::from(p.free_slots),
                 advertised_queue_ms: Some(p.queue_ms),
                 capacity_class: p.capacity_class.clone(),
-                has_direct_quic_addr: p
-                    .addresses
-                    .iter()
-                    .any(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0")),
+                // F2B: the frozen fact stays exactly what it names — a
+                // DIRECT quic addr. Relay-only reachability is a separate
+                // fact the cost model does not price yet (recorded
+                // follow-up; ADR-014 relay cost penalty).
+                has_direct_quic_addr: p.addresses.iter().any(|a| peer_addr_direct(a)),
             },
             observed: metrics.observe(&p.peer_id),
         })
@@ -4507,13 +4741,13 @@ async fn try_swarm_chat(
     let shadow_plan =
         gather_shadow_plan(inner, telemetry, &peers, &own_peer_id, log, max_tokens).await;
 
-    // First peer with a real QUIC multiaddr that is not us.
+    // First peer with a DIALABLE advertised address (F2B: a direct QUIC
+    // multiaddr OR a circuit address — a relayed peer is reachable, not
+    // skipped) that is not us.
     let candidate = match peers.into_iter().find(|p| {
         p.peer_id != own_peer_id
             && p.free_slots > 0
-            && p.addresses
-                .iter()
-                .any(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))
+            && p.addresses.iter().any(|a| peer_addr_dialable(a))
     }) {
         Some(c) => c,
         None => {
@@ -4533,15 +4767,11 @@ async fn try_swarm_chat(
             return None;
         }
     };
-    let addr = match candidate
-        .addresses
-        .iter()
-        .find(|a| a.ends_with("quic-v1") && !a.contains("0.0.0.0"))
-    {
+    let addr = match candidate.addresses.iter().find(|a| peer_addr_dialable(a)) {
         Some(a) => a.clone(),
         None => {
             // Unreachable in practice (the candidate predicate above
-            // requires a QUIC addr) but fail visible if it ever fires.
+            // requires a dialable addr) but fail visible if it ever fires.
             let pick = log_shadow_decision(telemetry, &shadow_plan, profile, &candidate.peer_id);
             record_shadow_failure(
                 telemetry,
@@ -4559,9 +4789,28 @@ async fn try_swarm_chat(
     // recorded next to the measured admission-to-first-token).
     let advertised_queue_ms = candidate.queue_ms;
     // The elected ADR-036 path (below) dials its own carrier session to
-    // the same candidate before the pooled executor takes the addr.
+    // the same candidate before the pooled executor takes the addr. Its
+    // dial (`dial_quic`) is DIRECT-only this pass, so a direct address is
+    // preferred when one exists; a circuit addr fails it fast and the
+    // turn falls back to the plain swarm path below — which dials the
+    // circuit honestly (recorded follow-up: family-over-relay).
     #[cfg(feature = "verifydrafts")]
-    let elected_addr = addr.clone();
+    let elected_addr = candidate
+        .addresses
+        .iter()
+        .find(|a| peer_addr_direct(a))
+        .or_else(|| candidate.addresses.iter().find(|a| peer_addr_dialable(a)))
+        .cloned()
+        .unwrap_or_else(|| addr.clone());
+    // F2B: the peer's FULL advertised candidate list (direct + circuit)
+    // rides the pooled executor — direct first, relay fallback, honest
+    // per-attempt reporting (see RemoteExecutor::execute).
+    let candidate_addrs: Vec<String> = candidate
+        .addresses
+        .iter()
+        .filter(|a| peer_addr_dialable(a))
+        .cloned()
+        .collect();
     let peer = modelswarm_node::remote::RemotePeer {
         addr,
         peer_id: candidate.peer_id,
@@ -4687,6 +4936,10 @@ async fn try_swarm_chat(
     // F15: keep the advertised queueMs fresh from THIS roster lookup —
     // the pooled executor outlives any single roster.
     remote.set_advertised_queue_ms(Some(advertised_queue_ms));
+    // F2B: same freshness for the candidate address list (direct +
+    // circuit) — a peer that gained or lost relay reachability since the
+    // last turn is dialed per its CURRENT advertisement.
+    remote.set_candidate_addrs(candidate_addrs);
     use futures_util::StreamExt;
     use modelswarm_gateway::{ExecutorEvent, InferenceExecutor};
 
@@ -4739,9 +4992,16 @@ async fn try_swarm_chat(
                     content,
                     completion_tokens,
                 } => {
+                    // F2B honesty (ADR-014 rule 5): a reply served through
+                    // a relay circuit is labeled relayed, never direct.
+                    let relayed = matches!(
+                        remote.pooled_dial_path(),
+                        Some(modelswarm_transport::libp2p_backend::DialPath::Relayed { .. })
+                    );
                     let label: String = format!(
-                        "swarm — remote peer {}…",
-                        remote_peer_id.chars().take(12).collect::<String>()
+                        "swarm — remote peer {}…{}",
+                        remote_peer_id.chars().take(12).collect::<String>(),
+                        if relayed { " (relayed)" } else { "" }
                     );
                     (content, completion_tokens, label, true)
                 }
@@ -4796,7 +5056,17 @@ async fn try_swarm_chat(
             },
             Err(e) => {
                 // Pre-token dial/protocol failure: honest local fallback.
-                let reason = e.to_string();
+                // F2B: the per-attempt dial report (kind, addr, error —
+                // including the relay's own status vocabulary, surfaced
+                // verbatim by the transport) rides the EXISTING fallback
+                // event's reason text.
+                let mut reason = e.to_string();
+                for attempt in remote.last_dial_attempts() {
+                    reason.push_str(&format!(
+                        "; {} {}: {}",
+                        attempt.kind, attempt.addr, attempt.error
+                    ));
+                }
                 telemetry.warn("chat.swarm.fallback", &[("reason", &reason)]);
                 match local_executor.execute(make_request()).await {
                     Ok(events) => match drain_chat(events, on_delta).await {
@@ -5645,6 +5915,95 @@ mod tests {
         assert_eq!(obj.len(), 2, "no extra keys allowed: {desc}");
         assert_eq!(obj["name"], "llama.cpp");
         assert_eq!(obj["build"], "353c4aab0f0d");
+    }
+
+    /// F2B roster/picker classification: a circuit multiaddr (relayed
+    /// reachability) is DIALABLE — a relayed peer is reachable, never
+    /// skipped — while placeholder `0.0.0.0` addresses stay undialable
+    /// and the direct-only predicate (probe/shadow facts) excludes
+    /// circuit addresses by name.
+    #[test]
+    fn peer_address_classification_direct_circuit_and_placeholders() {
+        let direct = "/ip4/192.168.1.5/udp/4001/quic-v1";
+        let circuit =
+            "/ip4/10.0.0.2/udp/4001/quic-v1/p2p/12D3KooWrelay/p2p-circuit/p2p/12D3KooWpeer";
+        let placeholder = "/ip4/0.0.0.0/udp/4001/quic-v1";
+        let circuit_placeholder = "/ip4/0.0.0.0/udp/4001/quic-v1/p2p/12D3KooWrelay/p2p-circuit";
+
+        assert!(peer_addr_dialable(direct));
+        assert!(peer_addr_dialable(circuit), "a relayed peer is reachable");
+        assert!(!peer_addr_dialable(placeholder));
+        assert!(!peer_addr_dialable(circuit_placeholder));
+        assert!(!peer_addr_dialable(ADDR_NO_LISTENER));
+
+        assert!(peer_addr_direct(direct));
+        assert!(
+            !peer_addr_direct(circuit),
+            "the direct-only fact excludes circuits"
+        );
+        assert!(!peer_addr_direct(placeholder));
+
+        assert!(addr_is_circuit(circuit));
+        assert!(!addr_is_circuit(direct));
+    }
+
+    /// The F2B relay endpoint configuration: default-EMPTY (a missing
+    /// `relay.addr` file = no relay, exactly the pre-F2B behavior —
+    /// nothing invented, nothing pointing at a nonexistent host), blank
+    /// lines and `#` comments skipped, first real line wins.
+    #[test]
+    fn relay_addr_file_is_optional_and_comment_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent file: no relay configured.
+        assert_eq!(configured_relay_addr(dir.path()), None);
+        // Empty / whitespace / comment-only file: still none.
+        std::fs::write(dir.path().join(RELAY_ADDR_FILE), "\n  \n# comment\n").unwrap();
+        assert_eq!(configured_relay_addr(dir.path()), None);
+        // One real line (trailing newline + indentation tolerated).
+        std::fs::write(
+            dir.path().join(RELAY_ADDR_FILE),
+            "# the owner's second desktop\n  /ip4/10.0.0.2/udp/4001/quic-v1/p2p/12D3KooWrelay  \n",
+        )
+        .unwrap();
+        assert_eq!(
+            configured_relay_addr(dir.path()).as_deref(),
+            Some("/ip4/10.0.0.2/udp/4001/quic-v1/p2p/12D3KooWrelay")
+        );
+    }
+
+    /// The advertised-list truth rule (F2B): direct always first, the
+    /// circuit address only while set, and the watch fires ONLY on
+    /// change (the heartbeat re-registers on change — a no-op update
+    /// must not force one).
+    #[test]
+    fn advertised_list_tracks_the_live_circuit_truthfully() {
+        let (tx, mut rx) = tokio::sync::watch::channel(Vec::<String>::new());
+        set_advertised_addrs(&tx, "/ip4/192.168.1.5/udp/4001/quic-v1", None);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(
+            *rx.borrow_and_update(),
+            vec!["/ip4/192.168.1.5/udp/4001/quic-v1".to_string()]
+        );
+        // Same value again: no change signal.
+        set_advertised_addrs(&tx, "/ip4/192.168.1.5/udp/4001/quic-v1", None);
+        assert!(!rx.has_changed().unwrap());
+        // Circuit added: change fires, direct stays FIRST (requesters try
+        // direct before the relay — ADR-014 direct-first).
+        set_advertised_addrs(
+            &tx,
+            "/ip4/192.168.1.5/udp/4001/quic-v1",
+            Some("/ip4/10.0.0.2/udp/4001/quic-v1/p2p/r/p2p-circuit/p2p/us".into()),
+        );
+        assert!(rx.has_changed().unwrap());
+        let list = rx.borrow_and_update().clone();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].ends_with("quic-v1"));
+        assert!(addr_is_circuit(&list[1]));
+        // Circuit lost (relay died): the list shrinks and the change
+        // fires — the roster must not claim a dead circuit.
+        set_advertised_addrs(&tx, "/ip4/192.168.1.5/udp/4001/quic-v1", None);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().len(), 1);
     }
 
     #[test]

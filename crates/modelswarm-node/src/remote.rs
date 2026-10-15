@@ -11,6 +11,17 @@
 //! `ExecutorEvent::Error` — never a fabricated continuation, never a
 //! silent regeneration.
 //!
+//! F2B (ADR-014, 2026-10-15): the dial is DIRECT-FIRST over ALL
+//! advertised candidates with honest relay fallback
+//! ([`Libp2pTransport::dial_with_fallback`]). Circuit candidates
+//! (`<relay>/p2p-circuit[/p2p/<dst>]`) ride the peer record's existing
+//! multiaddr list, so a peer behind NAT stays reachable. Every failed
+//! attempt is reported per-attempt through the EXISTING vocabulary
+//! (`net.failure` / stage=`dial` rows via the attached [`PeerMetrics`],
+//! plus the stderr diagnostics this module always printed); the winning
+//! path is exposed as [`RemoteExecutor::pooled_dial_path`] so callers
+//! label relayed replies as relayed — never as direct.
+//!
 //! Selection (fastest eligible peer, EWMA probing) is deliberately NOT
 //! here: this executor serves ONE peer; the choosing/swarm layer stacks
 //! on top once live measurements exist (F1.5).
@@ -31,7 +42,9 @@ use modelswarm_gateway::{
     NormalizedMessage, NormalizedRequest,
 };
 use modelswarm_identity::InstallationIdentity;
-use modelswarm_transport::libp2p_backend::{Libp2pSession, Libp2pTransport, PeerId};
+use modelswarm_transport::libp2p_backend::{
+    DialAttempt, DialPath, Libp2pSession, Libp2pTransport, PeerId,
+};
 use modelswarm_transport::message::{
     ChatMessage as WireChat, InferenceRequest as WireRequest, Sampling as WireSampling,
     StreamError as WireStreamError, WireMessage,
@@ -40,7 +53,16 @@ use modelswarm_transport::observe::{CompletionObservation, CompletionOutcome, Us
 
 use crate::measure::PeerMetrics;
 
-const DIAL_DEADLINE: Duration = Duration::from_secs(10);
+/// F2B: per-attempt budget for DIRECT candidates — deliberately SHORT:
+/// a blackholed cross-NAT QUIC dial burns the whole per-attempt budget,
+/// and the relay leg must not be starved behind it (Network handoff
+/// 2026-10-15 guidance; `dial_with_fallback` has one budget per call, so
+/// the node splits the phases around it).
+const DIRECT_DIAL_DEADLINE: Duration = Duration::from_secs(5);
+/// F2B: per-attempt budget for RELAY (circuit) candidates — generous:
+/// the circuit handshake is a QUIC connection to the relay plus the
+/// CONNECT exchange (a few WAN RTTs).
+const RELAY_DIAL_DEADLINE: Duration = Duration::from_secs(10);
 const IO_DEADLINE: Duration = Duration::from_secs(30);
 /// F15: ping/pong probes per post-completion RTT batch.
 const RTT_PROBE_SAMPLES: usize = 3;
@@ -50,7 +72,11 @@ const RTT_PROBE_DEADLINE: Duration = Duration::from_secs(2);
 /// One remote serving peer.
 #[derive(Debug, Clone)]
 pub struct RemotePeer {
-    /// Multiaddr, e.g. `/ip4/192.168.1.5/udp/4001/quic-v1`.
+    /// The peer's PRIMARY advertised multiaddr, e.g.
+    /// `/ip4/192.168.1.5/udp/4001/quic-v1`. F2B: this may itself be a
+    /// circuit address (`<relay>/p2p-circuit[/p2p/<dst>]`) when the peer
+    /// advertises no direct reachability — `dial_with_fallback`
+    /// classifies it either way.
     pub addr: String,
     /// The ADR-020 PeerId the QUIC handshake must verify.
     pub peer_id: String,
@@ -74,6 +100,19 @@ pub struct RemoteExecutor {
     /// measured admission-to-first-token. Advertised values are untrusted
     /// inputs, never measurements.
     advertised_queue_ms: StdMutex<Option<u64>>,
+    /// F2B: the peer's additional advertised candidate multiaddrs (direct
+    /// or circuit), refreshed per roster lookup via
+    /// [`RemoteExecutor::set_candidate_addrs`] — the same freshness
+    /// pattern as `set_advertised_queue_ms`. `peer.addr` is always
+    /// candidate #1; these follow in advertised order, deduplicated.
+    candidate_addrs: StdMutex<Vec<String>>,
+    /// F2B: the dial path of the session currently pooled/serving —
+    /// `Some(DialPath::Relayed { .. })` means replies come through the
+    /// relay and must be labeled as such (ADR-014 rule 5).
+    pooled_path: StdMutex<Option<DialPath>>,
+    /// F2B: the per-attempt failures of the most recent dial (the honest
+    /// report callers fold into their existing dial-failure surfaces).
+    last_attempts: StdMutex<Vec<DialAttempt>>,
 }
 
 impl RemoteExecutor {
@@ -84,6 +123,9 @@ impl RemoteExecutor {
             pool: Arc::new(tokio::sync::Mutex::new(None)),
             metrics: None,
             advertised_queue_ms: StdMutex::new(None),
+            candidate_addrs: StdMutex::new(Vec::new()),
+            pooled_path: StdMutex::new(None),
+            last_attempts: StdMutex::new(Vec::new()),
         }
     }
 
@@ -101,6 +143,35 @@ impl RemoteExecutor {
             .advertised_queue_ms
             .lock()
             .expect("advertised queue lock") = queue_ms;
+    }
+
+    /// F2B: refreshes the peer's additional advertised candidate
+    /// multiaddrs from the latest roster (direct AND circuit addresses —
+    /// circuit addrs ride the tracker's existing `addresses` list). The
+    /// primary `peer.addr` stays candidate #1; duplicates of it are
+    /// dropped here. Call per lookup; pooled executors outlive single
+    /// rosters.
+    pub fn set_candidate_addrs(&self, addrs: Vec<String>) {
+        let mut guard = self.candidate_addrs.lock().expect("candidate addr lock");
+        *guard = addrs;
+        if let Some(primary) = guard.iter().position(|a| *a == self.peer.addr) {
+            guard.remove(primary);
+        }
+    }
+
+    /// F2B: the dial path of the session currently pooled/serving —
+    /// callers label the reply's mode with it (a relayed reply must never
+    /// read as direct; ADR-014 rule 5). `None` when no dial has happened
+    /// yet (or the executor is un-pooled test usage).
+    pub fn pooled_dial_path(&self) -> Option<DialPath> {
+        self.pooled_path.lock().expect("dial path lock").clone()
+    }
+
+    /// F2B: the per-attempt failures of the most recent dial, in attempt
+    /// order — transport report data for the caller's existing
+    /// dial-failure diagnostics (kind, addr, error text).
+    pub fn last_dial_attempts(&self) -> Vec<DialAttempt> {
+        self.last_attempts.lock().expect("dial report lock").clone()
     }
 
     fn record_failure(&self, stage: &'static str) {
@@ -236,6 +307,38 @@ fn return_to_pool(session: Libp2pSession, pool: &Arc<tokio::sync::Mutex<Option<L
         if guard.is_none() {
             *guard = Some(session);
         }
+    }
+}
+
+/// Circuit candidates (F2B): a multiaddr carrying `/p2p-circuit` —
+/// `<relay>/p2p-circuit[/p2p/<dst>]`. This split ONLY routes candidates
+/// into their budget phase (short direct / generous relay);
+/// [`Libp2pTransport::dial_with_fallback`] does the authoritative
+/// classification inside each phase.
+fn is_circuit_addr(addr: &str) -> bool {
+    addr.contains("/p2p-circuit")
+}
+
+/// One F2B dial phase: dials `candidates` (all one kind — the caller
+/// split them) through [`Libp2pTransport::dial_with_fallback`] with
+/// `per_attempt` and returns the winner plus the honest per-attempt
+/// report. An EMPTY candidate list is a no-op — no fabricated
+/// "no candidates" attempt row, no dial at all.
+async fn dial_phase(
+    client: &Libp2pTransport,
+    candidates: &[String],
+    expected_peer: &PeerId,
+    per_attempt: Duration,
+) -> (Option<(Libp2pSession, DialPath)>, Vec<DialAttempt>) {
+    if candidates.is_empty() {
+        return (None, Vec::new());
+    }
+    match client
+        .dial_with_fallback(candidates, expected_peer, per_attempt)
+        .await
+    {
+        Ok((session, path)) => (Some((session, path)), Vec::new()),
+        Err((_, attempts)) => (None, attempts),
     }
 }
 
@@ -411,19 +514,87 @@ impl InferenceExecutor for RemoteExecutor {
                     Libp2pTransport::new(&self.identity).map_err(|e| ExecutorError::Fatal {
                         code: format!("transport: {e}"),
                     })?;
-                match client
-                    .dial(self.peer.addr.as_str(), &expected_peer, DIAL_DEADLINE)
-                    .await
+                // F2B (ADR-014): direct-first over ALL advertised
+                // candidates, honest relay fallback. The two phases below
+                // split only the per-attempt BUDGET (short for direct so
+                // a cross-NAT blackhole cannot starve the relay leg,
+                // generous for relay) — ordering and classification stay
+                // `dial_with_fallback`'s own (direct candidates in list
+                // order, then circuit candidates in list order).
+                let mut candidates: Vec<String> = vec![self.peer.addr.clone()];
+                for extra in self
+                    .candidate_addrs
+                    .lock()
+                    .expect("candidate addr lock")
+                    .iter()
                 {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("modelswarm-node: remote dial failed: {e}");
-                        self.record_failure("dial");
-                        return Err(ExecutorError::Retryable {
-                            peer_hint: Some(self.peer.peer_id.clone()),
-                        });
+                    if !candidates.contains(extra) {
+                        candidates.push(extra.clone());
                     }
                 }
+                let direct: Vec<String> = candidates
+                    .iter()
+                    .filter(|addr| !is_circuit_addr(addr))
+                    .cloned()
+                    .collect();
+                let relay: Vec<String> = candidates
+                    .iter()
+                    .filter(|addr| is_circuit_addr(addr))
+                    .cloned()
+                    .collect();
+                let mut attempts: Vec<DialAttempt> = Vec::new();
+                let (winner, direct_attempts) =
+                    dial_phase(&client, &direct, &expected_peer, DIRECT_DIAL_DEADLINE).await;
+                attempts.extend(direct_attempts);
+                let (session, path) = match winner {
+                    Some((session, path)) => (session, path),
+                    None => {
+                        let (winner, relay_attempts) =
+                            dial_phase(&client, &relay, &expected_peer, RELAY_DIAL_DEADLINE).await;
+                        attempts.extend(relay_attempts);
+                        match winner {
+                            Some((session, path)) => (session, path),
+                            None => {
+                                // Every failed attempt is reported
+                                // per-attempt through the EXISTING
+                                // vocabulary (`net.failure` /
+                                // stage=`dial` rows via the attached
+                                // metrics; the stderr diagnostics this
+                                // module always printed) — no new event
+                                // names.
+                                for attempt in &attempts {
+                                    eprintln!(
+                                        "modelswarm-node: remote dial failed ({} {}): {}",
+                                        attempt.kind, attempt.addr, attempt.error
+                                    );
+                                }
+                                for _ in &attempts {
+                                    self.record_failure("dial");
+                                }
+                                *self.last_attempts.lock().expect("dial report lock") = attempts;
+                                return Err(ExecutorError::Retryable {
+                                    peer_hint: Some(self.peer.peer_id.clone()),
+                                });
+                            }
+                        }
+                    }
+                };
+                // Failed attempts before a WIN are still telemetered (a
+                // direct blackhole followed by a relay win must be
+                // visible), and the winning path labels the pooled
+                // session for the reply's mode honesty.
+                for attempt in &attempts {
+                    eprintln!(
+                        "modelswarm-node: remote dial attempt failed ({} {}): {}",
+                        attempt.kind, attempt.addr, attempt.error
+                    );
+                }
+                for _ in &attempts {
+                    self.record_failure("dial");
+                }
+                *self.pooled_path.lock().expect("dial path lock") = Some(path);
+                *self.last_attempts.lock().expect("dial report lock") = attempts;
+                session
             }
         };
         drop(guard);
@@ -1454,6 +1625,358 @@ mod shadow_tests {
         let json = serde_json::to_string(&decision).expect("serializes");
         assert!(json.contains("\"predicted_ms\":null"));
         assert!(!json.contains("infinity") && !json.contains("NaN"));
+    }
+}
+
+#[cfg(test)]
+mod relay_fallback_tests {
+    use super::*;
+    use crate::serving::{serve_sessions_relayed, RelaySlot};
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{ExecutorError, ExecutorStream, NormalizedRequest};
+    use modelswarm_identity::InstallationIdentity;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The relay binary's raised limits (crates/modelswarm-relay
+    /// relay_config): stream-carrying — no duration/byte caps. This is
+    /// the relay DOUBLE the transport crate's F2B suite uses: the exact
+    /// rust-libp2p stack the modelswarm-relay binary hosts, in-process
+    /// on an ephemeral loopback QUIC port.
+    fn raised_relay_config() -> libp2p::relay::Config {
+        libp2p::relay::Config {
+            max_reservations: 4096,
+            max_reservations_per_peer: 8,
+            max_circuits: 4096,
+            max_circuits_per_peer: 128,
+            max_circuit_duration: Duration::from_secs(u32::MAX as u64),
+            max_circuit_bytes: u64::MAX,
+            ..libp2p::relay::Config::default()
+        }
+    }
+
+    /// Spawns the relay double; returns its `/p2p/`-suffixed address and a
+    /// live circuit counter.
+    async fn spawn_relay_double(
+        config: libp2p::relay::Config,
+    ) -> (libp2p::Multiaddr, Arc<AtomicUsize>) {
+        use libp2p::swarm::NetworkBehaviour;
+
+        #[derive(NetworkBehaviour)]
+        struct RelayOnly {
+            relay: libp2p::relay::Behaviour,
+        }
+
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let relay_peer_id = libp2p::PeerId::from(key.public());
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(key)
+            .with_tokio()
+            .with_quic()
+            .with_behaviour(|key| RelayOnly {
+                relay: libp2p::relay::Behaviour::new(key.public().to_peer_id(), config),
+            })
+            .expect("relay double behaviour builds")
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
+            .build();
+        swarm
+            .behaviour_mut()
+            .relay
+            .set_status(Some(libp2p::relay::Status::Enable));
+        swarm
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+
+        let bound = loop {
+            match swarm.select_next_some().await {
+                libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => break address,
+                _ => continue,
+            }
+        };
+        swarm.add_external_address(bound.clone());
+        let addr = bound.with(libp2p::multiaddr::Protocol::P2p(relay_peer_id));
+
+        let circuits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&circuits);
+        tokio::spawn(async move {
+            loop {
+                if let libp2p::swarm::SwarmEvent::Behaviour(RelayOnlyEvent::Relay(
+                    libp2p::relay::Event::CircuitReqAccepted { .. },
+                )) = swarm.select_next_some().await
+                {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        (addr, circuits)
+    }
+
+    /// A BLACKHOLED direct candidate: a UDP socket is bound (so no sibling
+    /// test can take the port) but never answers — the loopback stand-in
+    /// for the owner's cross-NAT failure mode. The returned socket must
+    /// stay alive for the blackhole to hold.
+    fn blackholed_direct_addr() -> (String, std::net::UdpSocket) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (format!("/ip4/127.0.0.1/udp/{port}/quic-v1"), socket)
+    }
+
+    struct TwoTokenExecutor;
+    #[async_trait::async_trait]
+    impl modelswarm_gateway::InferenceExecutor for TwoTokenExecutor {
+        async fn execute(
+            &self,
+            _request: NormalizedRequest,
+        ) -> Result<ExecutorStream, ExecutorError> {
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                ExecutorEvent::TokenDelta {
+                    delta: "a".into(),
+                    index: 0,
+                },
+                ExecutorEvent::TokenDelta {
+                    delta: "b".into(),
+                    index: 1,
+                },
+                ExecutorEvent::Completed {
+                    finish_reason: modelswarm_gateway::FinishReason::Stop,
+                },
+            ])))
+        }
+    }
+
+    fn request(profile: &str, token: &str) -> NormalizedRequest {
+        NormalizedRequest {
+            request_id: format!("req-f2b-{}", modelswarm_identity::new_nonce()),
+            profile_id: profile.into(),
+            capability_token: Some(token.to_string()),
+            messages: vec![modelswarm_gateway::NormalizedMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            sampling: modelswarm_gateway::Sampling {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 40,
+                seed: None,
+            },
+            max_tokens: 8,
+            deadline_ms: 60_000,
+            stream: true,
+        }
+    }
+
+    async fn collect(stream: ExecutorStream) -> String {
+        let mut text = String::new();
+        futures_util::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            if let ExecutorEvent::TokenDelta { delta, .. } = event {
+                text.push_str(&delta);
+            }
+        }
+        text
+    }
+
+    /// F2B requester+serving proof (the owner's live blocker, simulated):
+    /// the peer's PRIMARY advertised direct address is a cross-NAT
+    /// blackhole; its advertised candidate list also carries the circuit
+    /// address it reserved on the relay. The RemoteExecutor's direct phase
+    /// burns its SHORT budget, the relay phase wins, the serving bridge
+    /// (admitting the relayed circuit through the RelaySlot) serves, and
+    /// the honesty surfaces are exact: the pooled path is labeled
+    /// `Relayed`, the failed direct attempt is reported per-attempt
+    /// (`net.failure`/stage=dial counted, kind=direct in the report) even
+    /// though the dial SUCCEEDED via the relay.
+    #[tokio::test]
+    async fn direct_blackhole_falls_back_to_relay_through_the_serving_bridge() {
+        let server_identity = InstallationIdentity::from_bytes(&[111u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[112u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let server_peer = server.peer_id().to_string();
+
+        let (relay_addr, circuits) = spawn_relay_double(raised_relay_config()).await;
+        let reservation = server
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .expect("serving peer reserves on the relay");
+        let circuit = reservation.circuit_addr();
+
+        // The serving bridge: direct listener (unused by this client) PLUS
+        // the relay slot — the composed F2B serving shape.
+        let listener = server.listen("127.0.0.1:0").await.unwrap();
+        let slot = RelaySlot::empty();
+        assert!(
+            slot.circuit_addr().await.is_none(),
+            "empty slot advertises nothing"
+        );
+        slot.install(reservation).await;
+        assert_eq!(
+            slot.circuit_addr().await.as_deref(),
+            Some(circuit.as_str()),
+            "the installed reservation's circuit addr is exposed"
+        );
+        assert!(slot.holds_live().await);
+
+        let profile = crate::serving::lease_helpers::TEST_PROFILE;
+        let client_peer_id = Libp2pTransport::new(&client_identity)
+            .unwrap()
+            .peer_id()
+            .to_string();
+        let (policy, token) =
+            crate::serving::lease_helpers::policy_and_lease(profile, &client_peer_id);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_sessions_relayed(
+            listener,
+            slot,
+            Arc::new(TwoTokenExecutor),
+            profile.into(),
+            policy,
+            Arc::new(modelswarm_telemetry::Telemetry::memory().0),
+            rx,
+        ));
+
+        // The requester: blackhole primary + the peer's advertised circuit
+        // candidate (exactly what the tracker `addresses` list carries).
+        let (direct, _blackhole) = blackholed_direct_addr();
+        let metrics = Arc::new(PeerMetrics::memory(Arc::new(
+            modelswarm_telemetry::Telemetry::memory().0,
+        )));
+        let executor = RemoteExecutor::new(
+            RemotePeer {
+                addr: direct,
+                peer_id: server_peer.clone(),
+            },
+            client_identity,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        executor.set_candidate_addrs(vec![circuit.clone()]);
+
+        let text = collect(
+            executor
+                .execute(request(profile, &token))
+                .await
+                .expect("the direct blackhole must not kill the dial: the relay candidate serves"),
+        )
+        .await;
+        assert_eq!(text, "ab");
+        assert_eq!(
+            circuits.load(Ordering::SeqCst),
+            1,
+            "exactly one relayed circuit served the request"
+        );
+
+        // Honesty surfaces.
+        assert!(
+            matches!(executor.pooled_dial_path(), Some(DialPath::Relayed { .. })),
+            "the winning path must be labeled relayed: {:?}",
+            executor.pooled_dial_path()
+        );
+        let attempts = executor.last_dial_attempts();
+        assert_eq!(attempts.len(), 1, "one failed direct attempt, reported");
+        assert_eq!(attempts[0].kind, "direct");
+        assert_eq!(attempts[0].addr, executor_primary_blackhole(&executor));
+        assert_eq!(
+            metrics.observe(&server_peer).failure_count,
+            1,
+            "the failed direct attempt counts one net.failure/stage=dial row"
+        );
+    }
+
+    /// The executor's primary address (test seam for the report shape).
+    fn executor_primary_blackhole(executor: &RemoteExecutor) -> String {
+        executor.peer.addr.clone()
+    }
+
+    /// F2B: a RELAY-ONLY peer (its sole advertised address is the circuit)
+    /// is dialable — the circuit addr as the PRIMARY candidate works, no
+    /// direct phase runs at all, and no per-attempt failure is recorded.
+    #[tokio::test]
+    async fn relay_only_peer_is_dialable_as_the_primary_candidate() {
+        let server_identity = InstallationIdentity::from_bytes(&[113u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[114u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let server_peer = server.peer_id().to_string();
+
+        let (relay_addr, _circuits) = spawn_relay_double(raised_relay_config()).await;
+        let reservation = server
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .expect("reservation");
+        let circuit = reservation.circuit_addr();
+
+        let listener = server.listen("127.0.0.1:0").await.unwrap();
+        let slot = RelaySlot::empty();
+        slot.install(reservation).await;
+        let profile = crate::serving::lease_helpers::TEST_PROFILE;
+        let client_peer_id = Libp2pTransport::new(&client_identity)
+            .unwrap()
+            .peer_id()
+            .to_string();
+        let (policy, token) =
+            crate::serving::lease_helpers::policy_and_lease(profile, &client_peer_id);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_sessions_relayed(
+            listener,
+            slot,
+            Arc::new(TwoTokenExecutor),
+            profile.into(),
+            policy,
+            Arc::new(modelswarm_telemetry::Telemetry::memory().0),
+            rx,
+        ));
+
+        let metrics = Arc::new(PeerMetrics::memory(Arc::new(
+            modelswarm_telemetry::Telemetry::memory().0,
+        )));
+        let executor = RemoteExecutor::new(
+            RemotePeer {
+                addr: circuit,
+                peer_id: server_peer.clone(),
+            },
+            client_identity,
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        let text = collect(executor.execute(request(profile, &token)).await.expect(
+            "a relay-only peer's circuit address must be dialable as the primary candidate",
+        ))
+        .await;
+        assert_eq!(text, "ab");
+        assert!(matches!(
+            executor.pooled_dial_path(),
+            Some(DialPath::Relayed { .. })
+        ));
+        assert!(
+            executor.last_dial_attempts().is_empty(),
+            "no direct phase ran: no attempts, no failures"
+        );
+        assert_eq!(metrics.observe(&server_peer).failure_count, 0);
+    }
+
+    /// The candidate-refresh seam: the primary address is deduplicated out
+    /// of the additional candidates (one dial per address, advertised
+    /// order otherwise preserved).
+    #[test]
+    fn candidate_addrs_dedup_the_primary() {
+        let executor = RemoteExecutor::new(
+            RemotePeer {
+                addr: "/ip4/10.1.1.5/udp/4001/quic-v1".into(),
+                peer_id: "peer".into(),
+            },
+            InstallationIdentity::from_bytes(&[115u8; 32]),
+        );
+        executor.set_candidate_addrs(vec![
+            "/ip4/10.1.1.5/udp/4001/quic-v1".into(), // duplicate of primary
+            "/ip4/10.2.2.6/udp/4002/quic-v1/p2p/relayx/p2p-circuit".into(),
+        ]);
+        let candidates = executor
+            .candidate_addrs
+            .lock()
+            .expect("candidate addr lock")
+            .clone();
+        assert_eq!(
+            candidates,
+            vec!["/ip4/10.2.2.6/udp/4002/quic-v1/p2p/relayx/p2p-circuit".to_string()]
+        );
     }
 }
 

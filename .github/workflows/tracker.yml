@@ -69,6 +69,15 @@ jobs:
   # the other). Runs the ignored live_tracker harness against a REAL
   # locally-started tracker over a real Postgres — every signed route the
   # desktop uses, including the full challenge→lease→gate chain.
+  # ADR-038 §6.2(7) extension (T/R 2026-10-15): the heartbeat
+  # `relayTicket` field is asserted end-to-end inside the harness step
+  # (TS mint → Rust from_wire → hub-key verify → ADR-020 identity
+  # binding; the additive old-client tolerance is pinned tracker-api-side
+  # by heartbeat_response_relay_ticket_deploy_skew_tolerance), and the
+  # frozen relay-ticket-1.json vector is consumed by the Rust vector
+  # step below — the SAME file apps/tracker's TS suite pins — so the
+  # ticket bytes/canonical-form/signature stay lockstep across both
+  # language stacks in one job.
   wire-compat:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -135,6 +144,9 @@ jobs:
             -d "{\"profileId\":\"$PROFILE_ID\"}" \
             http://127.0.0.1:3010/api/v1/admin/catalog/promote
           echo "PROFILE_ID=$PROFILE_ID" >> "$GITHUB_ENV"
+      - name: Rust relay-ticket vector consumer (ADR-038 §6.2(7) lockstep)
+        working-directory: .
+        run: cargo test -p modelswarm-eligibility --test relay_ticket_vectors
       - name: Run the Rust wire harness against the live tracker
         working-directory: .
         run: |

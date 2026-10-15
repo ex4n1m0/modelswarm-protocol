@@ -100,6 +100,62 @@ async fn signed_flow_enroll_register_heartbeat_lookup() {
         .expect("heartbeat (signed POST)");
     println!("heartbeat ok: lease expires {}", hb.lease_expires_at);
 
+    // 3b) ADR-038 §3.3 + §6.2(7) wire-compat lockstep, heartbeat-field
+    //     half: every successful heartbeat also mints one relay admission
+    //     ticket server-side (the TS route mints from the AUTHENTICATED
+    //     identity + the registered lease row, never client input). Here
+    //     the Rust client parses the SAME bytes with the frozen
+    //     `from_wire`, verifies the Ed25519 signature against the SAME
+    //     pinned hub key the §5 lease check uses, and asserts the ADR-020
+    //     binding pair equals the harness identity exactly as the relay's
+    //     §3.4 checks 7-8 would bind it — the cross-language surface where
+    //     a TS/Rust derivation drift would otherwise ship invisibly. The
+    //     additive deploy-order tolerance (OLD tracker, field absent;
+    //     tracker deploys first) is pinned tracker-api-side by
+    //     `heartbeat_response_relay_ticket_deploy_skew_tolerance`; against
+    //     THIS tracker the field must be present — an empty string here
+    //     means the deployed tracker predates ticket minting or the wire
+    //     name drifted, and either is exactly the bug class this harness
+    //     exists to catch.
+    #[cfg(feature = "libp2p-backend")]
+    {
+        use modelswarm_eligibility::relay_ticket::RelayAdmissionTicket;
+        assert!(
+            !hb.relay_ticket.is_empty(),
+            "heartbeat response must carry relayTicket (ADR-038 §3.3)"
+        );
+        let (ticket, signature) = RelayAdmissionTicket::from_wire(&hb.relay_ticket)
+            .expect("the TS-minted relayTicket parses under the frozen Rust from_wire (canonical bytes, exact field set, 600 s TTL)");
+        let ticket_hub_hex = std::env::var("MSP_HUB_PUBLIC_KEY_HEX").unwrap_or_else(|_| {
+            include_str!("../../../protocol/keys/hub-public.hex")
+                .trim()
+                .to_string()
+        });
+        let ticket_hub_bytes: [u8; 32] = hex::decode(&ticket_hub_hex)
+            .expect("hub key hex parses")
+            .try_into()
+            .expect("32-byte hub key");
+        let ticket_hub =
+            ed25519_dalek::VerifyingKey::from_bytes(&ticket_hub_bytes).expect("hub verifying key");
+        ticket
+            .verify(&signature, &ticket_hub, time::OffsetDateTime::now_utc())
+            .expect(
+                "the TS-minted ticket verifies against the pinned hub key (ADR-038 §3.4 check 5)",
+            );
+        assert_eq!(
+            ticket.peer_id, peer_id,
+            "the ticket binds the registered peer row (ADR-038 §3.4 check 7)"
+        );
+        assert_eq!(
+            ticket.installation_id,
+            identity.installation_id(),
+            "the ticket's installation_id re-derives from the authenticated identity (ADR-038 §3.4 check 8 / ADR-020)"
+        );
+        println!(
+            "heartbeat relayTicket: TS-minted, Rust-verified, identity-bound (ADR-038 §6.2(7))"
+        );
+    }
+
     // 4) Roster lookup — the call that exposed BOTH wire bugs (signed GET
     //    with query string + empty-body digest).
     let peers = tracker

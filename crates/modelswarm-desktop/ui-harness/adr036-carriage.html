@@ -32,15 +32,15 @@
     // against drift in EITHER layer).
     const SERVING_TEXT = "This computer carries other users’ conversations (as token ids it can read) through family verification. On by default — you can turn it off, and requesting peers are refused honestly when you do.";
     const OFF_TEXT = /content_carriage_refused/;
-    const REQUESTER_TEXT = (n) => "Family verification ON: your conversation — in a form the receiving computers can read — goes to every verification peer this turn (" + n + "). It is slower than single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees any of it. Turn it off any time.";
+    const REQUESTER_TEXT = (n) => "Family verification ON: your conversation — in a form the receiving computers can read — goes to every verification peer this turn (" + n + "). It is slower than single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees any of it.";
 
-    const calls = { set_content_carriage: null, set_family_verified_chat: null };
+    const calls = { set_content_carriage: null };
     const BASE = {
       version: "0.0.0-harness", tracker: "https://stub.local", data_dir: "C:/stub",
       engine_available: true, engine_path: "C:/stub/engine/llama-server.exe",
       gpu_engine_available: false, license_accepted: true, profile_id: null, artifact: null,
       pairing_allowed: true, content_carriage_allowed: true,
-      family_verified_chat: { elected: false, cohort: 1, disclosure: null },
+      family_verified_chat: { elected: true, cohort: 1, disclosure: null },
       node: { running: false, hosting: false, gateway_addr: null, installation_id: null,
               engine_port: null, engine_backend: null, listener_addr: null, enrollment: null },
       family: null, chat_turns: 0,
@@ -91,7 +91,6 @@
           served_by: "swarm", family_verified: true,
           family_engage: { engaged: true, reason: "elected", cohort: 1 } };
         case "set_content_carriage": calls.set_content_carriage = args; return {};
-        case "set_family_verified_chat": calls.set_family_verified_chat = args; return {};
         default: return {};
       }
     };
@@ -203,14 +202,8 @@
           pass: !!line && line.textContent.includes("slower than single-peer chat, not faster"), detail: "" });
         rows.push({ label: "elected: the hub-blind fact is stated",
           pass: !!line && line.textContent.includes("never sees any of it"), detail: "" });
-        const elect = doc.getElementById("verified-chat-switch");
-        rows.push({ label: "elected: the toggle renders ON",
-          pass: elect.dataset.on === "true", detail: elect.dataset.on });
-        elect.click();
-        await new Promise((r) => setTimeout(r, 250));
-        rows.push({ label: "elected: the toggle writes set_family_verified_chat(false)",
-          pass: !!calls.set_family_verified_chat && calls.set_family_verified_chat.elected === false,
-          detail: JSON.stringify(calls.set_family_verified_chat) });
+        rows.push({ label: "always-on: the retired election toggle is ABSENT from the UI",
+          pass: !doc.getElementById("verified-chat-switch"), detail: doc.getElementById("verified-chat-switch") ? "still present" : "absent" });
         frame.remove();
       }
 

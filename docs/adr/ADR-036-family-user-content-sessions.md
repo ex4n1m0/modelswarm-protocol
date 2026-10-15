@@ -573,3 +573,37 @@ the honest-reject path), `crates/modelswarm-node/src/verifydrafts/mod.rs`
 `compose_family_serving`, `family_probe`), and
 `crates/modelswarm-session/tests/verifydrafts_vocabulary_disjointness.rs`
 (the rule-(i) collision test this ADR extends).
+
+## Revision note (2026-10-15, owner directive "everything on by design"): the requester election is ALWAYS ON — the toggle is retired
+
+Owner ruling (verbatim): "why do we have a button to turn on Family?
+this should always be on, its the sole porpuse of this project, try
+to reduce the number of switches, everywhere, assume everything is
+on by design."
+
+Changes to §3.3's election semantics:
+
+- The requester-side election toggle (`family_verified_chat`
+  persisted key, `set_family_verified_chat` IPC,
+  `verified-chat-switch` UI) is REMOVED. Election is unconditional:
+  every swarm chat turn attempts the carrier-session verification
+  path first, with the existing honest pre-first-token fallback to
+  the plain swarm path (the `elected_fell_back` label — exercised
+  live by the owner's cross-NAT C-machine test on 2026-10-15).
+- The §3.1 requester disclosure is PERMANENTLY visible (no longer
+  gated on election). The frozen text drops its final sentence
+  ("Turn it off any time.") — there is no toggle to turn off; the
+  remaining text is byte-identical.
+- The serving-side carriage default (ON) and its opt-out toggle are
+  UNCHANGED (they are the other party's consent surface), as are the
+  wire contracts, the pin discipline, and both §3.1 texts' remaining
+  content.
+- The automatic engage ladder (§3.3's no-content mode) is superseded
+  at runtime — the always-elected path runs instead. The ladder code
+  and its stable-label vocabulary remain in place this release
+  (compiled, probe-exercised, `last_engage_reason`-fed for the
+  ADR-037 assistant context); its retirement is a recorded follow-up
+  to be reviewed with the relay adoption batch.
+- Old configs carrying `family_verified_chat` are preserved verbatim
+  (unknown keys are never deleted) and the key is simply never read
+  again.

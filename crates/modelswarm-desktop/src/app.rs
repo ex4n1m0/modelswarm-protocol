@@ -10,7 +10,7 @@
 //! | `set_tracker` | saves the tracker base URL |
 //! | `set_pairing_allowed` | the "allow swarm pairing" toggle (persisted, default on; gates the listener + family tier at hosting start) |
 //! | `set_content_carriage` | the ADR-036 serving-side carriage toggle (persisted, DEFAULT ON; opt-out refuses carrier sessions with the honest `content_carriage_refused` reject) |
-//! | `set_family_verified_chat` | the ADR-036 requester-side election (persisted, DEFAULT OFF; while elected, chat turns open carrier sessions with the always-visible §3.1 disclosure) |
+//! | `set_family_verified_chat` | REMOVED 2026-10-15 (owner directive): the ADR-036 requester-side election is ALWAYS ON — every swarm chat turn opens carrier sessions with the always-visible §3.1 disclosure and the honest pre-first-token fallback |
 //! | `accept_privacy` | records the first-run license acceptance |
 //! | `list_models` | verified-catalog active profiles |
 //! | `census` | live per-profile peer counts (public `/api/v1/stats`) for the picker chips |
@@ -127,12 +127,6 @@ struct Inner {
     /// an opted-out peer refuses pin carriers with the honest
     /// `content_carriage_refused` reject.
     allow_content_carriage: bool,
-    /// ADR-036 §3.3: the REQUESTER-side family-verified-chat election
-    /// (persisted key, DEFAULT OFF — election is the user's choice; only
-    /// the serving side is default-on). While elected, swarm chat turns
-    /// open carrier sessions; the chat surface carries the always-visible
-    /// §3.1 disclosure with the actual cohort count.
-    family_verified_chat: bool,
     /// The cohort size of the most recent ELECTED family-verified turn
     /// (the §3.1 disclosure's N — the ACTUAL count for that turn, bounded
     /// by the preset cohort cap and the budget's `max_endpoints`; 1 in
@@ -275,16 +269,17 @@ const CARRIAGE_DISCLOSURE_OFF: &str = "This computer is set NOT to carry other u
      conversations through family verification — requesting peers are refused honestly \
      (content_carriage_refused).";
 
-/// ADR-036 §3.1 (NORMATIVE UI CONTRACT — verbatim): the REQUESTER-side
-/// disclosure, shown on the chat surface while family-verified chat is
-/// ELECTED. `{N}` is the ACTUAL cohort size for the turn (bounded by the
-/// preset cohort cap and the session budget's `max_endpoints`; 1 in the
-/// shipped configuration).
+/// ADR-036 §3.1 (NORMATIVE UI CONTRACT — verbatim; revised 2026-10-15 per
+/// the owner's always-on directive, which RETIRED the election toggle and
+/// its "turn it off" sentence): the REQUESTER-side disclosure, shown
+/// PERMANENTLY on the chat surface. `{N}` is the ACTUAL cohort size for
+/// the turn (bounded by the preset cohort cap and the session budget's
+/// `max_endpoints`; 1 in the shipped configuration).
 #[cfg(feature = "verifydrafts")]
 const CARRIAGE_DISCLOSURE_REQUESTER: &str = "Family verification ON: your conversation — in a \
      form the receiving computers can read — goes to every verification peer this turn ({N}). It \
      is slower than single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees \
-     any of it. Turn it off any time.";
+     any of it.";
 
 /// Renders the §3.1 requester disclosure with the ACTUAL cohort count.
 #[cfg(feature = "verifydrafts")]
@@ -407,7 +402,6 @@ impl DesktopState {
                 chat_log: Vec::new(),
                 allow_swarm_pairing: config.allow_swarm_pairing,
                 allow_content_carriage: config.allow_content_carriage,
-                family_verified_chat: config.family_verified_chat,
                 #[cfg(feature = "verifydrafts")]
                 last_family_cohort: None,
                 #[cfg(feature = "verifydrafts")]
@@ -492,12 +486,6 @@ struct PersistedConfig {
     /// ADR-036 §3.1/§3.3: the REQUESTER-side election for
     /// family-verified chat — DEFAULT OFF. Election is the USER's choice
     /// (only the serving side is default-on): while elected, chat turns
-    /// open carrier sessions (the conversation, as token ids, goes to
-    /// every verification peer) with the always-visible §3.1 disclosure
-    /// and its honest cost. Flippable at any time — it routes the NEXT
-    /// turn, contradicting no live session.
-    #[serde(default)]
-    family_verified_chat: bool,
     /// ADR-037 §3.6 (disclosure and consent): the first-use disclosure
     /// acknowledgement. DEFAULT FALSE — the first cloud call is BLOCKED
     /// until the user acknowledges the verbatim disclosure in the
@@ -542,7 +530,6 @@ impl Default for PersistedConfig {
             profile_id: None,
             allow_swarm_pairing: default_allow_swarm_pairing(),
             allow_content_carriage: default_allow_content_carriage(),
-            family_verified_chat: false,
             assistant_acknowledged: false,
             assistant_enabled: default_assistant_enabled(),
         }
@@ -1396,11 +1383,12 @@ async fn resolve_profile(
 
 fn persist_config(inner: &Inner) -> Result<(), String> {
     // TR-RC-8 (ADR-033 §9.2 review): READ-MODIFY-WRITE the FULL JSON
-    // object. The daemon owns exactly seven keys (`tracker`, `profile_id`,
+    // object. The daemon owns exactly six keys (`tracker`, `profile_id`,
     // `allow_swarm_pairing`, `allow_content_carriage`,
-    // `family_verified_chat`, `assistant_acknowledged`,
-    // `assistant_enabled`); every other key in config.json — another
-    // subsystem's config surface that later moves in here — is preserved
+    // `assistant_acknowledged`, `assistant_enabled`); every other key in
+    // config.json — another subsystem's config surface that later moves
+    // in here, including the RETIRED `family_verified_chat` election key
+    // (owner directive 2026-10-15: always on, no toggle) — is preserved
     // verbatim. (The previous struct-rewrite serialized only the known
     // fields and SILENTLY DELETED everything else on every rewrite.)
     let path = inner.data_dir.join("config.json");
@@ -1417,10 +1405,6 @@ fn persist_config(inner: &Inner) -> Result<(), String> {
     root.insert(
         "allow_content_carriage".into(),
         serde_json::json!(inner.allow_content_carriage),
-    );
-    root.insert(
-        "family_verified_chat".into(),
-        serde_json::json!(inner.family_verified_chat),
     );
     root.insert(
         "assistant_acknowledged".into(),
@@ -1655,9 +1639,10 @@ async fn get_status(
     let inner = state.inner.lock().await;
     // ADR-036 §3.1: the requester-side election block — computed before
     // the status macro (the `disclosure` is the always-visible §3.1 text
-    // with the ACTUAL cohort count, present only while elected).
+    // with the ACTUAL cohort count). ALWAYS ELECTED since the 2026-10-15
+    // owner directive (the toggle is gone; the disclosure is permanent).
     let family_verified_chat_status = {
-        let elected = inner.family_verified_chat;
+        let elected = true;
         #[cfg(feature = "verifydrafts")]
         {
             let cohort = inner.last_family_cohort.unwrap_or(1);
@@ -1828,28 +1813,10 @@ async fn set_content_carriage(
     persist_config(&inner)
 }
 
-/// ADR-036 §3.1/§3.3: the REQUESTER-side family-verified-chat election
-/// (persisted key `family_verified_chat`, DEFAULT OFF — election is the
-/// user's explicit choice; only the SERVING side is default-on). While
-/// elected, swarm chat turns open carrier sessions and the chat surface
-/// carries the always-visible §3.1 disclosure with the actual cohort
-/// count and the honest cost. Flippable at any time (it routes the next
-/// turn; no live session is contradicted).
-#[tauri::command]
-async fn set_family_verified_chat(
-    state: tauri::State<'_, DesktopState>,
-    elected: bool,
-) -> Result<(), String> {
-    let mut inner = state.inner.lock().await;
-    inner.family_verified_chat = elected;
-    log_event(
-        &state.telemetry,
-        "info",
-        "settings.family_verified_chat",
-        &[("elected", &elected.to_string())],
-    );
-    persist_config(&inner)
-}
+// REMOVED 2026-10-15 (owner directive — "this should always be on"):
+// the requester-side family-verified-chat election toggle and its
+// `set_family_verified_chat` IPC are GONE. Election is unconditional;
+// the ADR-036 revision note records the supersession.
 
 /// Clears the persisted conversation (owner directive 2026-10-13 — the
 /// greedy language-drift escape hatch; tonight's live confirmation: a
@@ -4621,11 +4588,16 @@ async fn try_swarm_chat(
     // family-verified-chat toggle) runs INSTEAD of the ladder, like the
     // probe: user-triggered, honest cost displayed, with its own honest
     // fallback to the plain path below on any failure.
+    // OWNER DIRECTIVE 2026-10-15 ("why do we have a button to turn on
+    // Family? this should always be on — reduce the number of switches,
+    // assume everything is on by design"): the requester-side election
+    // TOGGLE IS GONE. The carrier-session verification is attempted on
+    // EVERY swarm chat turn with its honest pre-first-token fallback;
+    // the §3.1 disclosure is permanently visible. The automatic ladder
+    // below is superseded at runtime (kept compiled; retirement is a
+    // recorded follow-up — see the ADR-036 revision note).
     #[cfg(feature = "verifydrafts")]
-    let elected = {
-        let guard = inner.lock().await;
-        guard.family_verified_chat
-    };
+    let elected = true;
     #[cfg(feature = "verifydrafts")]
     let elected_reply = if elected {
         try_family_verified_chat(
@@ -5602,7 +5574,6 @@ pub fn run() {
             set_tracker,
             set_pairing_allowed,
             set_content_carriage,
-            set_family_verified_chat,
             accept_privacy,
             list_models,
             census,
@@ -6524,7 +6495,6 @@ mod tests {
             chat_log: Vec::new(),
             allow_swarm_pairing: true,
             allow_content_carriage: true,
-            family_verified_chat: false,
             #[cfg(feature = "verifydrafts")]
             last_family_cohort: None,
             #[cfg(feature = "verifydrafts")]
@@ -6604,7 +6574,7 @@ mod tests {
         assert_eq!(saved["profile_id"], serde_json::Value::Null);
         assert_eq!(
             saved.as_object().unwrap().len(),
-            7,
+            6,
             "a fresh file carries exactly the daemon's keys"
         );
         assert_eq!(saved["allow_swarm_pairing"], true, "default-on posture");
@@ -6631,12 +6601,13 @@ mod tests {
     /// the persisted config, and a config that predates ADR-036 (no
     /// keys) reads as the same postures via the serde defaults.
     #[test]
-    fn adr036_postures_default_on_serving_off_requester() {
-        // Fresh install.
+    fn adr036_postures_default_on_serving_always_elected_requester() {
+        // Fresh install: carriage default ON; the requester election key
+        // NO LONGER EXISTS (owner directive 2026-10-15 — always elected,
+        // no toggle, nothing persisted to read).
         let dir = tempfile::tempdir().unwrap();
         let config = read_config(dir.path());
         assert!(config.allow_content_carriage, "carriage default ON");
-        assert!(!config.family_verified_chat, "election default OFF");
         // A pre-ADR-036 config (the three old keys, none of ours).
         std::fs::write(
             dir.path().join("config.json"),
@@ -6645,21 +6616,28 @@ mod tests {
         .unwrap();
         let config = read_config(dir.path());
         assert!(config.allow_content_carriage, "missing key = default ON");
-        assert!(!config.family_verified_chat, "missing key = default OFF");
-        // Round-trip: flipping both persists and re-reads.
+        // Round-trip: carriage flips persist and re-read; a RETIRED
+        // election key in an old config is preserved verbatim (unknown
+        // keys are never deleted) and never resurrected as a setting.
         let mut inner = test_inner(dir.path(), "https://t.example", None);
         inner.allow_content_carriage = false;
-        inner.family_verified_chat = true;
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"tracker":"https://t.example","profile_id":null,"family_verified_chat":true}"#,
+        )
+        .unwrap();
         persist_config(&inner).unwrap();
         let config = read_config(dir.path());
         assert!(!config.allow_content_carriage);
-        assert!(config.family_verified_chat);
-        // And the daemon's five keys are exactly what the writer owns.
+        // And the daemon's keys are exactly what the writer owns.
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join("config.json")).unwrap())
                 .unwrap();
         assert_eq!(saved["allow_content_carriage"], false);
-        assert_eq!(saved["family_verified_chat"], true);
+        assert_eq!(
+            saved["family_verified_chat"], true,
+            "the retired key is preserved verbatim, not rewritten"
+        );
     }
 
     /// The §3.1 disclosures are VERBATIM (normative UI contract — the
@@ -6675,13 +6653,15 @@ mod tests {
              peers are refused honestly when you do."
         );
         assert!(CARRIAGE_DISCLOSURE_OFF.contains("content_carriage_refused"));
-        // The requester text with the ACTUAL cohort count.
+        // The requester text with the ACTUAL cohort count (revised
+        // 2026-10-15: the election toggle is retired, so the "turn it
+        // off" sentence is gone from the frozen text).
         assert_eq!(
             requester_disclosure(1),
             "Family verification ON: your conversation — in a form the receiving computers \
              can read — goes to every verification peer this turn (1). It is slower than \
              single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees \
-             any of it. Turn it off any time."
+             any of it."
         );
         assert!(requester_disclosure(3).contains("this turn (3)."));
         // The honesty discipline: never implies unreadability, encrypted
@@ -6918,8 +6898,8 @@ mod tests {
         assert_eq!(saved["advisory"]["caps"], 3, "unknown keys survive");
         assert_eq!(
             saved.as_object().unwrap().len(),
-            8,
-            "seven daemon keys + the one unknown key"
+            7,
+            "six daemon keys + the one unknown key"
         );
     }
 

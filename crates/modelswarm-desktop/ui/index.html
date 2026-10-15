@@ -157,8 +157,7 @@
             <button type="button" class="ghost" id="clear-chat" title="Clear the conversation (resets the model's rendered history)">clear chat</button>
           </div>
           <div class="row" style="flex-wrap:nowrap;gap:8px;align-items:center;margin-top:6px">
-            <button type="button" class="switch" id="verified-chat-switch" data-on="false" role="switch" aria-checked="false" aria-label="Family-verified chat election toggle"><span class="knob"></span></button>
-            <span class="note" style="margin:0">family-verified chat — peers hosting the same exact model cross-check every reply. Slower by design, not faster.</span>
+            <span class="note" style="margin:0">family-verified chat — always on: peers hosting the same exact model cross-check every reply. Slower by design, not faster.</span>
           </div>
           <p class="note" id="verified-chat-line" hidden style="margin:6px 0 0;font-size:11.5px"></p>
           <form id="chat-form">
@@ -252,7 +251,7 @@
           <li>Prompts/completions are structurally redacted from all node logs.</li>
           <li>The tracker is content-blind: it never sees prompts or completions.</li>
           <li>Secrets (identity seed, engine key, lease tokens) stay in the node process — never in this UI.</li>
-          <li>Serving peers read the prompts they serve; family-verified chat (your choice, off by default) additionally sends the conversation — in a form the verifying peers can read — to every verification peer. Transport is encrypted; there is no confidential-computing claim.</li>
+          <li>Serving peers read the prompts they serve; family-verified chat (always on — the disclosure below states the cost every turn) additionally sends the conversation — in a form the verifying peers can read — to every verification peer. Transport is encrypted; there is no confidential-computing claim.</li>
         </ul>
       </section>
 
@@ -516,21 +515,15 @@
       $("carriage-note").textContent = carriageAllowed
         ? "on by default — this computer carries other users’ conversations (as token ids it can read) through family verification; requesting peers are refused honestly when you turn it off. Applies at the next hosting start."
         : "off — requesting peers are refused honestly (content_carriage_refused); applies at the next hosting start.";
-      // ADR-036 §3.1/§3.3: the requester-side election (default OFF — the
-      // user's explicit choice). While elected, the chat surface carries
-      // the always-visible §3.1 disclosure with the ACTUAL cohort count N
-      // and the honest cost, rendered VERBATIM from the daemon's field.
-      const verified = s.family_verified_chat || { elected: false, cohort: 1 };
-      $("verified-chat-switch").dataset.on = !!verified.elected;
-      $("verified-chat-switch").setAttribute("aria-checked", !!verified.elected);
+      // ADR-036 §3.1 (owner directive 2026-10-15: ALWAYS ELECTED — the
+      // toggle is gone). The chat surface permanently carries the §3.1
+      // disclosure with the ACTUAL cohort count N and the honest cost,
+      // rendered VERBATIM from the daemon's field.
+      const verified = s.family_verified_chat || { elected: true, cohort: 1 };
       const verifiedLine = $("verified-chat-line");
-      if (verified.elected) {
-        verifiedLine.hidden = false;
-        verifiedLine.textContent = verified.disclosure
-          || ("Family verification ON: your conversation — in a form the receiving computers can read — goes to every verification peer this turn (" + (verified.cohort ?? 1) + "). It is slower than single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees any of it. Turn it off any time.");
-      } else {
-        verifiedLine.hidden = true;
-      }
+      verifiedLine.hidden = false;
+      verifiedLine.textContent = verified.disclosure
+        || ("Family verification ON: your conversation — in a form the receiving computers can read — goes to every verification peer this turn (" + (verified.cohort ?? 1) + "). It is slower than single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees any of it.");
       hostingOn = s.node.hosting;
       $("hosting-switch").dataset.on = hostingOn;
       $("hosting-switch").setAttribute("aria-checked", hostingOn);
@@ -643,16 +636,6 @@
     $("carriage-switch").onclick = async () => {
       const next = $("carriage-switch").dataset.on !== "true";
       try { await invoke("set_content_carriage", { allowed: next }); error(""); }
-      catch (e) { error(String(e)); }
-      refresh();
-    };
-    // ADR-036 §3.3: the requester-side election — flippable any time; it
-    // routes the NEXT chat turn (carrier sessions while elected, plain
-    // single-serving otherwise). The §3.1 disclosure appears on the chat
-    // surface the moment the election is on.
-    $("verified-chat-switch").onclick = async () => {
-      const next = $("verified-chat-switch").dataset.on !== "true";
-      try { await invoke("set_family_verified_chat", { elected: next }); error(""); }
       catch (e) { error(String(e)); }
       refresh();
     };

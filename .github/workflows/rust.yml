@@ -225,17 +225,26 @@ jobs:
       # green (CI runs no browser; the rendered 1152x648 harness stays a
       # review-seat pass). String-level drift detection only — honest
       # about what it can and cannot see.
+      # ADR-036 disclosure surfaces exist in the webview (revised
+      # 2026-10-15: the election TOGGLE is retired by the owner's
+      # always-on directive — verified-chat-switch and its
+      # set_family_verified_chat IPC are gone; the disclosure LINE
+      # stays permanently visible).
       - name: ADR-036 disclosure surfaces exist in the webview
         run: |
-          for id in carriage-line carriage-switch verified-chat-line verified-chat-switch; do
+          for id in carriage-line carriage-switch verified-chat-line; do
             if ! grep -q "\"$id\"" crates/modelswarm-desktop/ui/index.html; then
               echo "::error::ADR-036 UI surface '$id' missing from crates/modelswarm-desktop/ui/index.html (the always-visible disclosure contract)"
               exit 1
             fi
           done
-          for ipc in set_content_carriage set_family_verified_chat; do
+          if grep -q "verified-chat-switch\|set_family_verified_chat" crates/modelswarm-desktop/ui/index.html; then
+            echo "::error::retired ADR-036 election surfaces still referenced by the webview (always-on directive)"
+            exit 1
+          fi
+          for ipc in set_content_carriage; do
             if ! grep -q "$ipc" crates/modelswarm-desktop/ui/index.html; then
-              echo "::error::ADR-036 IPC '$ipc' no longer referenced by the webview (the carriage/election toggles must write through)"
+              echo "::error::ADR-036 IPC '$ipc' no longer referenced by the webview (the carriage toggle must write through)"
               exit 1
             fi
           done

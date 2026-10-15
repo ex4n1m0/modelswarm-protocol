@@ -928,7 +928,7 @@ mod tests {
 
     /// Runs checks 2-10 with the corpus's remote/derived context.
     fn check(body: &[u8], verifier: &AdmissionVerifier) -> Verdict {
-        verify_present(body, &base_peer(), "b58-installation-relay-0001", verifier)
+        verify_present(body, &base_peer(), &base_ticket().installation_id, verifier)
     }
 
     // ------------------------------------------------------------------
@@ -952,15 +952,17 @@ mod tests {
         // uvarint(body.len()) + body (the vector's length_prefix_rule).
         let framed = frame(&body);
         assert_eq!(framed.len(), 2 + expected.len());
-        assert_eq!(&framed[..2], &[0x97, 0x03], "uvarint(407) length prefix");
+        assert_eq!(&framed[..2], &[0xae, 0x03], "uvarint(430) length prefix");
         // The body's inner structure matches the vector's notes: field 1
-        // varint PRESENT, field 2 length-delimited with uvarint length 402
-        // carrying the token bytes.
+        // varint PRESENT, field 2 length-delimited with uvarint length 425
+        // carrying the token bytes. (Lengths move with the token: 402/407
+        // before the 2026-10-15 regeneration, 425/430 after — the hex
+        // above is the pin, these are its annotated structure.)
         assert_eq!(&body[..2], &[0x08, 0x00]);
         assert_eq!(
             &body[2..5],
-            &[0x12, 0x92, 0x03],
-            "field-2 tag + uvarint(402)"
+            &[0x12, 0xa9, 0x03],
+            "field-2 tag + uvarint(425)"
         );
         assert_eq!(
             &body[5..],
@@ -1168,7 +1170,7 @@ mod tests {
         let verifier = verifier(fixed_clock(verify_at));
         let base = base_ticket();
         let base_peer_id = base.peer_id.clone();
-        let derived = "b58-installation-relay-0001";
+        let derived = base.installation_id.clone();
         let nonce = base.nonce.clone();
         let issued = at("2026-10-15T12:00:00Z");
 
@@ -1204,8 +1206,8 @@ mod tests {
         // peer_mismatch: a valid ticket naming peer B on A's connection.
         let b_peer = libp2p::identity::Keypair::generate_ed25519();
         let b_peer_id = libp2p::PeerId::from(b_peer.public()).to_string();
-        let for_b = mint(derived, b_peer_id.as_str(), issued, 600, &nonce);
-        let verdict = verify_present(&encode_present(&for_b), &base_peer(), derived, &verifier);
+        let for_b = mint(&derived, b_peer_id.as_str(), issued, 600, &nonce);
+        let verdict = verify_present(&encode_present(&for_b), &base_peer(), &derived, &verifier);
         assert_eq!(
             (verdict.code, verdict.reason),
             (202, Some(Reason::PeerMismatch))
@@ -1220,7 +1222,10 @@ mod tests {
         );
 
         // unknown_field: canonical JSON gains an extra field.
-        let payload = r#"{"expires_at":"2026-10-15T12:10:00.000Z","extra_key":1,"installation_id":"b58-installation-relay-0001","issued_at":"2026-10-15T12:00:00.000Z","nonce":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6","peer_id":"12D3KooWSrKnMZUcSxK8G7wmBbXdU8nFEfWGhLu6H8xjn8LmCSJb"}"#;
+        let payload = format!(
+            r#"{{"expires_at":"{}","extra_key":1,"installation_id":"{}","issued_at":"{}","nonce":"{}","peer_id":"{}"}}"#,
+            base.expires_at, base.installation_id, base.issued_at, base.nonce, base.peer_id
+        );
         use base64::Engine as _;
         let unknown_field = format!(
             "{}.{}",
@@ -1268,7 +1273,7 @@ mod tests {
         );
 
         // wrong_ttl_delta: 601 s, VALIDLY signed — syntax precedes signature.
-        let wrong_ttl = mint(derived, &base_peer_id, issued, 601, &nonce);
+        let wrong_ttl = mint(&derived, &base_peer_id, issued, 601, &nonce);
         let verdict = check(&encode_present(&wrong_ttl), &verifier);
         assert_eq!(
             (verdict.code, verdict.reason),
@@ -1277,7 +1282,7 @@ mod tests {
 
         // nonce_wrong_charset: 31 chars / uppercase.
         let short_nonce = mint(
-            derived,
+            &derived,
             &base_peer_id,
             issued,
             600,
@@ -1289,7 +1294,7 @@ mod tests {
             (400, Some(Reason::Malformed))
         );
         let upper_nonce = mint(
-            derived,
+            &derived,
             &base_peer_id,
             issued,
             600,
@@ -1381,21 +1386,31 @@ mod tests {
         );
     }
 
-    /// Check 8 with the REAL derivation: the vector peer's embedded key
-    /// derives an installation id that is NOT the vector's placeholder —
-    /// so the golden token cannot pass end-to-end against a real PeerId
-    /// (the vectors pin checks 1-6; binding needs re-derived fixtures).
+    /// Check 8 with the REAL derivation, CLOSED (the 2026-10-15 vector
+    /// regeneration, drift ruling (b)): the vector pair is really derived
+    /// — the recorded peer seed's embedded key derives EXACTLY the
+    /// vector's installation_id — so the golden token now passes check 8
+    /// end-to-end against a real PeerId, and checks 7-8 are replayable
+    /// cross-language (peer_identity_seed_hex is carried in the vectors;
+    /// the TS consumer re-derives both ids with the tracker's own
+    /// crypto primitives).
     #[test]
-    fn real_derivation_rejects_the_vector_placeholder_installation() {
-        // The vector peer IS the identity test's seed-[9u8;32] PeerId.
-        let keypair =
-            libp2p::identity::Keypair::ed25519_from_bytes(&mut [9u8; 32]).expect("seed 9 keypair");
+    fn real_derivation_accepts_the_regenerated_vector_pair() {
+        // The vector peer IS the identity recorded as
+        // peer_identity_seed_hex (0x51 × 32) in the vectors.
+        let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut [0x51; 32])
+            .expect("seed 0x51 keypair");
         let peer = libp2p::PeerId::from(keypair.public());
-        assert_eq!(peer, base_peer(), "the vector peer is the seed-9 identity");
+        assert_eq!(
+            peer,
+            base_peer(),
+            "the vector peer is the recorded-seed identity"
+        );
         let derived = derived_installation_id(&peer).expect("ed25519 identity multihash derives");
-        assert_ne!(
-            derived, "b58-installation-relay-0001",
-            "the placeholder is not the real ADR-020 derivation"
+        assert_eq!(
+            derived,
+            base_ticket().installation_id,
+            "the vector installation_id IS the real ADR-020 derivation"
         );
         // Cross-check the derivation against modelswarm-identity directly
         // (protobuf key bytes = [0x08 0x01 0x12 0x20 ‖ 32-byte key]).
@@ -1406,14 +1421,12 @@ mod tests {
             modelswarm_identity::installation_id_for(&protobuf[4..36])
         );
 
-        // Presenting the golden token under the REAL derivation therefore
-        // fails check 8 — honestly, per the frozen order.
+        // Presenting the golden token under the REAL derivation now
+        // passes end-to-end — checks 1-10, the closure the drift ruling
+        // asked for.
         let verifier = verifier(fixed_clock(at("2026-10-15T12:05:00Z")));
         let verdict = verify_present(&encode_present(&base_token()), &peer, &derived, &verifier);
-        assert_eq!(
-            (verdict.code, verdict.reason),
-            (202, Some(Reason::InstallationMismatch))
-        );
+        assert_eq!((verdict.code, verdict.reason), (100, None));
     }
 
     // ------------------------------------------------------------------

@@ -22,8 +22,11 @@ import { fileURLToPath } from "node:url";
 import * as heartbeatRoute from "@/app/api/v1/peers/heartbeat/route";
 import {
   base64UrlEncode,
+  bs58Encode,
   canonicalJson,
+  derivePeerId,
   publicKeyOf,
+  sha256,
   sha256Hex,
   signBase64,
   verifyBase64Url,
@@ -245,6 +248,23 @@ describe("relay-ticket-1 accept vector (ADR-038 §6.2, TS↔Rust parity)", () =>
     expect(Buffer.from(FIXTURE_PUBLIC_KEY).toString("hex")).toBe(
       ACCEPT.signing_public_key_hex,
     );
+  });
+
+  it("cross-language identity-pair replay (the §6.1 drift ruling (b) closure): the recorded peer seed re-derives BOTH ids", () => {
+    // ADR-020 from the seed alone: installation_id = base58(SHA-256(pubkey))
+    // is check 8's re-derivation, and the peer_id is the identity multihash
+    // of the SAME key — so checks 7-8 are replayable in TS, not just Rust
+    // (the vectors carry peer_identity_seed_hex for exactly this).
+    const seed = Uint8Array.from(
+      ((ACCEPT.peer_identity_seed_hex as string).match(/.{2}/g) ?? []).map((h) =>
+        parseInt(h, 16),
+      ),
+    );
+    expect(seed).toHaveLength(32);
+    const pub = publicKeyOf(seed);
+    expect(Buffer.from(pub).toString("hex")).toBe(ACCEPT.peer_public_key_hex);
+    expect(bs58Encode(sha256(pub))).toBe(ACCEPT_FIELDS.installation_id);
+    expect(derivePeerId(pub)).toBe(ACCEPT_FIELDS.peer_id);
   });
 
   it("payload is the byte-exact canonical JSON of the recorded fields", () => {

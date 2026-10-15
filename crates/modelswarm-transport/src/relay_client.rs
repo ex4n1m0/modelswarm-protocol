@@ -1442,8 +1442,9 @@ mod tests {
         let body = encode_admission_present(&token);
         assert_eq!(body, expected, "PRESENT body must match the vector");
         let framed = proto_frame(&body);
-        // uvarint(407) = 0x97 0x03, then the body.
-        assert_eq!(&framed[..2], &[0x97, 0x03]);
+        // uvarint(430) = 0xae 0x03, then the body. (425-byte token since
+        // the 2026-10-15 vector regeneration; was 402/0x97 0x03 before.)
+        assert_eq!(&framed[..2], &[0xae, 0x03]);
         assert_eq!(framed.len(), 2 + expected.len());
     }
 

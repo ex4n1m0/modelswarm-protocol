@@ -5,9 +5,9 @@
   "signing_seed_hex": "3838383838383838383838383838383838383838383838383838383838383838",
   "signing_public_key_hex": "76d81b33ba721df89b8e0b0ef26c34eb72e978951044798cd608a4f6dbf2e6d6",
   "base_ticket": "relay-ticket-1.json",
-  "authenticated_remote_peer_id": "12D3KooWSrKnMZUcSxK8G7wmBbXdU8nFEfWGhLu6H8xjn8LmCSJb",
-  "derived_installation_id": "b58-installation-relay-0001",
-  "binding_note": "PLACEHOLDER PAIR — this fixture's installation_id does NOT re-derive from the peer_id under the real ADR-020 rule (the Security review's binding drift ruling (b), 2026-10-15: split coverage accepted — checks 1-6 pinned here; check 7-8 binding pinned by the implementation's re-derived fixtures + the in-process end-to-end proofs). The next vector revision regenerates accept/expired/forge with a properly-derived pair AND records the peer identity seed so checks 7-8 become replayable cross-language (T/R concurrence adds the seed requirement).",
+  "authenticated_remote_peer_id": "12D3KooWNm5t4HypYRmiC5v9CD2TnPKrJh2J8TcfJ2gPhA7L8TiZ",
+  "derived_installation_id": "65XbepYwFHBHzMqcTG1uqwN2Qo9xay8jtPSdNwcUm1Sq",
+  "binding_note": "REAL DERIVED PAIR (regenerated 2026-10-15, closing drift ruling (b)): installation_id = base58(SHA-256(pubkey)) re-derives from the authenticated PeerId's embedded key using peer_identity_seed_hex below (any ed25519-from-seed + base58 implementation reproduces it), so checks 7-8 are replayable cross-language — the TS consumer re-derives from the same seed with the tracker's own crypto primitives.",
   "rows": [
     {
       "id": "bad_signature",
@@ -82,5 +82,7 @@
       "expected_status": "malformed_message(400)",
       "expected_reason": "malformed"
     }
-  ]
+  ],
+  "peer_identity_seed_hex": "5151515151515151515151515151515151515151515151515151515151515151",
+  "peer_public_key_hex": "c050c5637a44fa8629fff3cccce2300cb362a63d99d95fc54145266f4332445a"
 }

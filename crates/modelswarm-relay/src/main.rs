@@ -245,7 +245,8 @@ fn split_listen(listen: &str) -> Result<(IpAddr, u16), String> {
 /// `--max-circuit-duration-secs` value: a whole number of seconds in
 /// `1..=u32::MAX`. 0 is REFUSED (not reinterpreted): a zero-second cap
 /// would cut every circuit at acceptance, which is not "uncapped" and not
-/// a usable posture — omit the flag for uncapped. Above `u32::MAX` the
+/// a usable posture — omit the flag for the ADR-038 §3.5 frozen default
+/// (1800 s; there has been no uncapped posture since). Above `u32::MAX` the
 /// circuit-relay-v2 wire format's duration field cannot carry the value
 /// and the behaviour PANICS when it announces the limit, so the range is
 /// enforced here, at the flag boundary.
@@ -256,7 +257,7 @@ fn parse_duration_secs(value: &str) -> Result<u64, String> {
     if secs == 0 {
         return Err(
             "--max-circuit-duration-secs must be >= 1 — 0 would cut every circuit instantly \
-             and is NOT \"uncapped\"; omit the flag to stay uncapped"
+             and is NOT \"uncapped\"; omit the flag for the ADR-038 frozen default (1800 s)"
                 .to_string(),
         );
     }
@@ -274,7 +275,8 @@ fn parse_duration_secs(value: &str) -> Result<u64, String> {
 /// because the library's copy loop treats 0 as "no limit" — accepting it
 /// here would let an operator believe a cap is armed while nothing is
 /// enforced (and the announced limit would still say 0). Omit the flag for
-/// uncapped.
+/// the ADR-038 §3.5 frozen default (16 MiB; there has been no uncapped
+/// posture since).
 fn parse_circuit_bytes(value: &str) -> Result<u64, String> {
     let bytes: u64 = value
         .parse()
@@ -282,7 +284,8 @@ fn parse_circuit_bytes(value: &str) -> Result<u64, String> {
     if bytes == 0 {
         return Err(
             "--max-circuit-bytes must be >= 1 — the relay treats 0 as NO limit \
-             internally, so 0 would not cap anything; omit the flag to stay uncapped"
+             internally, so 0 would not cap anything; omit the flag for the ADR-038 \
+             frozen default (16777216 bytes)"
                 .to_string(),
         );
     }
@@ -837,7 +840,10 @@ mod tests {
         );
 
         // 0 is REFUSED for both — it is not "uncapped" (duration) and not
-        // a cap at all (the library reads 0 bytes as no limit).
+        // a cap at all (the library reads 0 bytes as no limit). The escape
+        // each refusal names is the FROZEN default, never an uncapped
+        // posture (N1: omitting the flag has meant 1800 s / 16 MiB since
+        // ADR-038 — nothing may claim otherwise).
         for zero in [
             &flags(&["--max-circuit-duration-secs", "0"]),
             &flags(&["--max-circuit-bytes", "0"]),
@@ -846,6 +852,14 @@ mod tests {
             assert!(
                 err.contains("omit the flag"),
                 "the 0 refusal must name the escape: {err}"
+            );
+            assert!(
+                err.contains("frozen default"),
+                "the escape the refusal names is the frozen default, not uncapped: {err}"
+            );
+            assert!(
+                !err.to_lowercase().contains("stay uncapped"),
+                "no refusal may claim an uncapped escape: {err}"
             );
         }
 
@@ -947,6 +961,128 @@ mod tests {
         );
         assert!(config.reservation_rate_limiters[0].try_next(peer, &addr, now));
         assert!(config.circuit_src_rate_limiters[0].try_next(peer, &addr, now));
+    }
+
+    /// The upstream accept-site consultation, mirrored exactly: EVERY
+    /// limiter in the vector, first-failure-wins (`Iterator::all`
+    /// short-circuits on the first `false` — the pinned libp2p-relay
+    /// 0.22.0 semantics at both grant sites, reservations and circuit
+    /// sources alike).
+    fn accept_site_grants(
+        limiters: &mut [Box<dyn libp2p::relay::RateLimiter>],
+        peer: libp2p::PeerId,
+        addr: &libp2p::Multiaddr,
+        now: std::time::Instant,
+    ) -> bool {
+        limiters
+            .iter_mut()
+            .all(|limiter| limiter.try_next(peer, addr, now))
+    }
+
+    /// How many DISTINCT admitted peers at `addr` pass the whole vector at
+    /// ONE instant before the shared per-IP bucket empties — the config's
+    /// live per-IP allowance. (Distinct PeerIds keep the per-PEER stock
+    /// limiter — one fresh bucket per peer — out of the measurement; only
+    /// the per-IP bucket is shared. Hard-bounded so a pathological
+    /// always-grant limiter fails loudly instead of hanging; the stock
+    /// per-IP budget — 60/min in libp2p-relay 0.22.0 — is far below it.)
+    fn per_ip_allowance(
+        limiters: &mut Vec<Box<dyn libp2p::relay::RateLimiter>>,
+        table: &Arc<admission::AdmissionTable>,
+        addr: &libp2p::Multiaddr,
+        now: std::time::Instant,
+    ) -> usize {
+        let mut granted = 0usize;
+        while granted < 10_000 {
+            let peer = libp2p::PeerId::random();
+            assert!(
+                table.admit(
+                    peer,
+                    OffsetDateTime::now_utc() + time::Duration::seconds(120)
+                ),
+                "the probe table never fills (capacity 4096)"
+            );
+            if !accept_site_grants(limiters, peer, addr, now) {
+                return granted;
+            }
+            granted += 1;
+        }
+        panic!("the per-IP limiter never refused at a single instant — probe is broken");
+    }
+
+    /// F-6, pinning S8 (ADR-038 §6.1): a gate denial leaves the per-IP
+    /// rate-limiter bucket untouched — unadmitted peers never consume the
+    /// per-IP tokens honest peers behind shared NATs depend on. The
+    /// property lives in the ORDER the `relay_config` seam arms (gate
+    /// `insert(0, ..)` FIRST in both vectors) combined with upstream's
+    /// short-circuiting `.all()`: a denial returns false at the gate, so
+    /// the stock per-peer/per-IP token buckets behind it are never even
+    /// CALLED for a denial. Pinned by driving MORE unadmitted denials
+    /// through the exact accept-site call than any per-IP budget from ONE
+    /// shared-NAT IP, then proving the per-IP bucket still holds its FULL
+    /// allowance for admitted peers at that same IP — measured against a
+    /// never-hammered twin config, so the pin survives a library default
+    /// change while still catching a reordered or dropped gate (either
+    /// regression drains the shared bucket and fails the equality).
+    #[test]
+    fn gate_denials_leave_the_per_ip_rate_limit_bucket_untouched() {
+        // The shared-NAT address every peer in this proof dials from
+        // (TEST-NET-3, RFC 5737 — a documentation address, never a host).
+        let nat: libp2p::Multiaddr = "/ip4/203.0.113.7/udp/4001/quic-v1".parse().unwrap();
+        let now = std::time::Instant::now();
+
+        // The hammered config: 200 unadmitted peers — far past the per-IP
+        // budget — each denied through the EXACT accept-site call, at both
+        // grant sites. Every denial must be the GATE's false.
+        let table = admission::AdmissionTable::new(admission::wall_clock());
+        let mut hammered = relay_config(None, None, &table);
+        for _ in 0..200 {
+            let peer = libp2p::PeerId::random();
+            assert!(
+                !accept_site_grants(&mut hammered.reservation_rate_limiters, peer, &nat, now),
+                "the gate denies the unadmitted reservation"
+            );
+            assert!(
+                !accept_site_grants(&mut hammered.circuit_src_rate_limiters, peer, &nat, now),
+                "the gate denies the unadmitted circuit"
+            );
+        }
+
+        // The pristine twin: identical construction, zero denials.
+        let pristine_table = admission::AdmissionTable::new(admission::wall_clock());
+        let mut pristine = relay_config(None, None, &pristine_table);
+
+        let pristine_reservations = per_ip_allowance(
+            &mut pristine.reservation_rate_limiters,
+            &pristine_table,
+            &nat,
+            now,
+        );
+        assert!(
+            pristine_reservations > 0,
+            "the probe must actually reach the per-IP bucket"
+        );
+        let hammered_reservations =
+            per_ip_allowance(&mut hammered.reservation_rate_limiters, &table, &nat, now);
+        assert_eq!(
+            hammered_reservations, pristine_reservations,
+            "200 gate denials from one IP must not consume a single per-IP reservation token"
+        );
+
+        // The circuit-src vector holds the same untouched budget.
+        let pristine_circuits = per_ip_allowance(
+            &mut pristine.circuit_src_rate_limiters,
+            &pristine_table,
+            &nat,
+            now,
+        );
+        assert!(pristine_circuits > 0);
+        let hammered_circuits =
+            per_ip_allowance(&mut hammered.circuit_src_rate_limiters, &table, &nat, now);
+        assert_eq!(
+            hammered_circuits, pristine_circuits,
+            "200 gate denials from one IP must not consume a single per-IP circuit token"
+        );
     }
 
     /// Arming a flag overrides the frozen defaults EXACTLY; the frozen

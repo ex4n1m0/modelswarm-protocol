@@ -245,3 +245,45 @@ bc2a8e5; dmg ea7eec77…c2b4690. CROSS-PATH: page.tsx 0.2.23→0.2.24
 retarget (5 replacements) — Tracker-Engineer-owned, flagged for review;
 typecheck clean, build green. Owner rulings in force: unsigned by
 decision; key rotation deferred until he says so.
+
+## v0.2.25 staging rehearsal (2026-10-15, the relay release)
+
+Artifacts from desktop-installer run 38736456892 — AUTO-TRIGGERED on the bump
+commit 330b96c (no manual dispatch; artifacts carry 0.2.25 in filenames,
+verified). Hash chain: CI per-job SHA256SUMS verified (4/4 OK over the
+downloaded files); staged copies byte-identical under canonical dashed names.
+0.2.24 binaries removed (all-OS-together rule). Two-push window as on every
+train: the bump commit's `guards` job was red on the SHA256SUMS version match
+(expected; goes green at this staging commit — the 0.2.24 train's documented
+pattern), while `check`, `check-nonwindows-capi`, `windows-package-dry-run`,
+and the installer matrix were all green.
+
+Staged hashes:
+
+- ModelSwarm-Setup-0.2.25-windows-x64.exe
+  sha256 2100b35d759090c683d69e30ba9ec01756f6ad0f305553e0c1c7d609b77afe23
+- ModelSwarm-0.2.25-linux-amd64.deb
+  sha256 5a78edbb96a1ecbea388bb8fc89f09bb88fea297c09de712abe589b581add3fe
+- ModelSwarm-0.2.25-linux-amd64.AppImage
+  sha256 6a9dcc9d88006fa81a45ca945fa2b59a728e623c9d3c44433854822962dd4f16
+- ModelSwarm-0.2.25-macos-arm64.dmg
+  sha256 97832672163a7a433f61cb8d9283d413f5cc89d986f8c28cedcb34e26330ae16
+
+Signing: v2 CLI `--app-version 0.2.25`, owner-local key file path only,
+passwordless, non-interactive; all four .sig trusted comments decoded and
+checked to carry `file:<canonical name>` + `version:0.2.25`. Manifest
+signature = the .sig text VERBATIM (the 0.2.23 standing rule — first-try
+verify this train). Rehearsal verdict — tests/updater-manifest-verify:
+ALL THREE PLATFORM SIGNATURES VERIFY against the embedded key
+(38FC98CB4B064F37) over the staged bytes, signed version == 0.2.25, sha256
+match, URL shape OK. Manifest notes state the relay posture honestly
+(default-empty relay.addr, direct-first, slower relayed turns, tracker-minted
+tickets). CROSS-PATH: page.tsx 0.2.24→0.2.25 retarget (5 replacements) —
+Tracker-Engineer-owned, flagged for review; typecheck clean, next build
+green. NOTE: an in-flight uncommitted visual redesign of page.tsx from a
+parallel session was parked (byte-identical backup at owner-local temp,
+restored to the working tree after this deploy with links already bumped) —
+it is NOT part of this staging and ships only after its own rendered-
+geometry verification per the standing rule. Owner rulings in force:
+unsigned by decision; updater key rotation deferred (the DeepSeek advisory
+key, separately, is removed by this release — different key, different fate).

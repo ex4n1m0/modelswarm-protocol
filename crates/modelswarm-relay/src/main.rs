@@ -579,4 +579,242 @@ mod tests {
             "reservation + circuit + bidirectional ping through the relay did not complete in time"
         );
     }
+
+    // ------------------------------------------------------------------
+    // F2B: honest enforcement proofs — caps and refusal paths against a
+    // real relay swarm (standard libp2p relay clients).
+    // ------------------------------------------------------------------
+
+    /// A standard relay-client swarm (relay client + ping), as in
+    /// `standard_clients_reserve_and_circuit_through_the_relay`.
+    fn std_client_swarm() -> (libp2p::Swarm<StdClientBehaviour>, libp2p::identity::Keypair) {
+        use libp2p::{noise, yamux};
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let swarm = libp2p::SwarmBuilder::with_existing_identity(key.clone())
+            .with_tokio()
+            .with_quic()
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .unwrap()
+            .with_behaviour(|_key, relay_client| StdClientBehaviour {
+                relay_client,
+                ping: ping::Behaviour::new(
+                    ping::Config::new().with_interval(Duration::from_secs(30)),
+                ),
+            })
+            .unwrap()
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        (swarm, key)
+    }
+
+    #[derive(NetworkBehaviour)]
+    struct StdClientBehaviour {
+        relay_client: relay::client::Behaviour,
+        ping: ping::Behaviour,
+    }
+
+    /// Starts an in-process relay (the binary's exact behaviour stack) with
+    /// the GIVEN config, on an ephemeral loopback QUIC port. Returns its
+    /// `/p2p/`-suffixed address and a report channel carrying one honest
+    /// line per relay lifecycle event (the binary's diagnostics
+    /// vocabulary).
+    async fn start_relay(
+        config: relay::Config,
+    ) -> (
+        libp2p::Multiaddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        use libp2p::swarm::SwarmEvent;
+        let relay_key = libp2p::identity::Keypair::generate_ed25519();
+        let relay_peer_id = libp2p::PeerId::from(relay_key.public());
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(relay_key)
+            .with_tokio()
+            .with_quic()
+            .with_behaviour(|key| Behaviour {
+                relay: relay::Behaviour::new(key.public().to_peer_id(), config),
+                identify: identify::Behaviour::new(identify::Config::new(
+                    "/msp-relay-test/1".to_string(),
+                    key.public(),
+                )),
+                ping: ping::Behaviour::new(
+                    ping::Config::new().with_interval(Duration::from_secs(30)),
+                ),
+            })
+            .unwrap()
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        // Fresh relays are HOP-disabled until identify reports an external
+        // address; force it on like the binary does.
+        swarm
+            .behaviour_mut()
+            .relay
+            .set_status(Some(relay::Status::Enable));
+        swarm
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let bound = loop {
+            match swarm.select_next_some().await {
+                SwarmEvent::NewListenAddr { address, .. } => break address,
+                _ => continue,
+            }
+        };
+        // Clients reject reservations whose response carries no relay
+        // addresses; advertise the bound addr like the binary does.
+        swarm.add_external_address(bound.clone());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(event) = swarm.next().await {
+                let line = match event {
+                    SwarmEvent::Behaviour(BehaviourEvent::Relay(
+                        relay::Event::ReservationReqAccepted {
+                            src_peer_id,
+                            renewed,
+                        },
+                    )) => Some(format!(
+                        "reservation {} by {src_peer_id}",
+                        if renewed { "renewed" } else { "accepted" }
+                    )),
+                    SwarmEvent::Behaviour(BehaviourEvent::Relay(
+                        relay::Event::ReservationReqDenied {
+                            src_peer_id,
+                            status,
+                        },
+                    )) => Some(format!("reservation denied for {src_peer_id}: {status:?}")),
+                    SwarmEvent::Behaviour(BehaviourEvent::Relay(
+                        relay::Event::CircuitReqAccepted {
+                            src_peer_id,
+                            dst_peer_id,
+                        },
+                    )) => Some(format!("circuit {src_peer_id} -> {dst_peer_id}")),
+                    SwarmEvent::Behaviour(BehaviourEvent::Relay(
+                        relay::Event::CircuitReqDenied {
+                            src_peer_id,
+                            dst_peer_id,
+                            status,
+                        },
+                    )) => Some(format!(
+                        "circuit denied {src_peer_id} -> {dst_peer_id}: {status:?}"
+                    )),
+                    _ => None,
+                };
+                if let Some(line) = line {
+                    let _ = tx.send(line);
+                }
+            }
+        });
+        (
+            bound.with(libp2p::multiaddr::Protocol::P2p(relay_peer_id)),
+            rx,
+        )
+    }
+
+    /// The configured `max_reservations` cap is ENFORCED: with a cap of 1,
+    /// the first peer's reservation is accepted and the second DISTINCT
+    /// peer's is denied with the honest `ResourceLimitExceeded` status on
+    /// the wire (this is the machinery our uncapped production config
+    /// deliberately sizes at 4096 instead of disabling).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_cap_is_enforced_with_resource_limit_exceeded() {
+        let config = relay::Config {
+            max_reservations: 1,
+            ..relay_config()
+        };
+        let (relay_addr, mut reports) = start_relay(config).await;
+
+        // First peer reserves: accepted.
+        let (mut first, _) = std_client_swarm();
+        first
+            .listen_on(
+                relay_addr
+                    .clone()
+                    .with(libp2p::multiaddr::Protocol::P2pCircuit),
+            )
+            .unwrap();
+        tokio::spawn(async move {
+            loop {
+                first.select_next_some().await;
+            }
+        });
+
+        // Second peer reserves: denied by the cap.
+        let (mut second, _) = std_client_swarm();
+        second
+            .listen_on(
+                relay_addr
+                    .clone()
+                    .with(libp2p::multiaddr::Protocol::P2pCircuit),
+            )
+            .unwrap();
+        tokio::spawn(async move {
+            loop {
+                second.select_next_some().await;
+            }
+        });
+
+        let mut saw_accepted = false;
+        let mut saw_denied = false;
+        let overall = tokio::time::timeout(Duration::from_secs(30), async {
+            while !(saw_accepted && saw_denied) {
+                let line = reports
+                    .recv()
+                    .await
+                    .expect("relay driver exited before both events");
+                if line.starts_with("reservation accepted") {
+                    saw_accepted = true;
+                }
+                if line.starts_with("reservation denied") && line.contains("ResourceLimitExceeded")
+                {
+                    saw_denied = true;
+                }
+            }
+        })
+        .await;
+        assert!(
+            overall.is_ok(),
+            "cap of 1 must accept the first reservation and deny the second with ResourceLimitExceeded"
+        );
+    }
+
+    /// A circuit to a destination with NO reservation is refused with the
+    /// honest `NoReservation` status (the peer never reserved, or its lease
+    /// expired) — never a silent hang or a partial circuit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn circuit_to_unreserved_destination_is_denied_no_reservation() {
+        let (relay_addr, mut reports) = start_relay(relay_config()).await;
+
+        let (mut dialer, _) = std_client_swarm();
+        let stranger = libp2p::PeerId::random();
+        let dial_addr = relay_addr
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2pCircuit)
+            .with(libp2p::multiaddr::Protocol::P2p(stranger));
+        dialer.dial(dial_addr).unwrap();
+        tokio::spawn(async move {
+            loop {
+                dialer.select_next_some().await;
+            }
+        });
+
+        let mut saw_denied = false;
+        let overall = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let line = reports
+                    .recv()
+                    .await
+                    .expect("relay driver exited before the denial");
+                if line.starts_with("circuit denied") && line.contains("NoReservation") {
+                    saw_denied = true;
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            overall.is_ok() && saw_denied,
+            "the relay must deny the circuit"
+        );
+        // The client-side error surface belongs to the client; this test
+        // pins the RELAY's honest refusal vocabulary.
+    }
 }

@@ -1742,4 +1742,116 @@ mod tests {
         assert_eq!(limits.bytes, Some(u64::MAX));
         assert!(!reservation.terms().addrs.is_empty());
     }
+
+    /// F2B honest deadline behavior: a relay configured with a SHORT
+    /// circuit duration CUTS the circuit at the announced limit — proof
+    /// the enforcement machinery works, which is exactly why our production
+    /// relay config leaves it uncapped (a token stream must never be cut
+    /// by the relay itself; ADR-007 forbids retry after the first token).
+    #[tokio::test]
+    async fn announced_circuit_duration_limit_cuts_the_stream() {
+        let server_identity = InstallationIdentity::from_bytes(&[69u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[70u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let client = Libp2pTransport::new(&client_identity).unwrap();
+
+        let config = libp2p::relay::Config {
+            max_circuit_duration: Duration::from_secs(1),
+            ..raised_relay_config()
+        };
+        let (relay_addr, _circuits) = spawn_relay_double(config).await;
+        let mut reservation = server
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        let circuit = reservation.circuit_addr();
+
+        let expected = server.peer_id();
+        let candidates = vec![circuit];
+        let (dialing, acceptor) = tokio::join!(
+            client.dial_with_fallback(&candidates, &expected, Duration::from_secs(5)),
+            reservation.accept(Duration::from_secs(10)),
+        );
+        let (mut session_client, _path) = dialing.unwrap();
+        let mut session_server = acceptor.unwrap();
+
+        // Before the deadline the circuit carries frames normally.
+        let msg = WireMessage::Control(Control::pong("before-cut"));
+        session_client
+            .send(&msg, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            session_server.recv(Duration::from_secs(5)).await.unwrap(),
+            msg
+        );
+
+        // Past the 1s duration limit the relay cuts the circuit: whatever
+        // the local write does, the far end can no longer receive.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        let after = WireMessage::Control(Control::pong("after-cut"));
+        let _ = session_client.send(&after, Duration::from_secs(2)).await;
+        let outcome = session_server.recv(Duration::from_secs(3)).await;
+        assert!(
+            outcome.is_err(),
+            "a duration-limited circuit must be cut at the announced limit"
+        );
+    }
+
+    /// F2B honest limit behavior: a relay configured with a small
+    /// `max_circuit_bytes` cuts the circuit once that many bytes have been
+    /// relayed — the byte-cap machinery our production config leaves
+    /// uncapped for the same ADR-007 reason.
+    #[tokio::test]
+    async fn announced_circuit_byte_limit_cuts_the_stream() {
+        let server_identity = InstallationIdentity::from_bytes(&[71u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[72u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let client = Libp2pTransport::new(&client_identity).unwrap();
+
+        let config = libp2p::relay::Config {
+            max_circuit_bytes: 1024,
+            ..raised_relay_config()
+        };
+        let (relay_addr, _circuits) = spawn_relay_double(config).await;
+        let mut reservation = server
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        let circuit = reservation.circuit_addr();
+
+        let expected = server.peer_id();
+        let candidates = vec![circuit];
+        let (dialing, acceptor) = tokio::join!(
+            client.dial_with_fallback(&candidates, &expected, Duration::from_secs(5)),
+            reservation.accept(Duration::from_secs(10)),
+        );
+        let (mut session_client, _path) = dialing.unwrap();
+        let mut session_server = acceptor.unwrap();
+
+        // Six ~330-byte frames far exceed the 1024-byte cap: some prefix
+        // gets through, then the circuit is cut mid-stream.
+        let frame = WireMessage::Control(Control::pong(&"x".repeat(320)));
+        for _ in 0..6 {
+            if session_client
+                .send(&frame, Duration::from_secs(2))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        let mut received = 0usize;
+        let cut = loop {
+            match session_server.recv(Duration::from_secs(3)).await {
+                Ok(_) => received += 1,
+                Err(_) => break true,
+            }
+        };
+        assert!(cut, "the byte-capped circuit must end in an error");
+        assert!(
+            (1..6).contains(&received),
+            "some frames pass the 1024-byte cap, not all: got {received}"
+        );
+    }
 }

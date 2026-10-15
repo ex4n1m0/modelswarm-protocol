@@ -165,3 +165,43 @@ tracker outage (the transport surfaces
 After that, Security (§6.1 adversary matrix + threat-model D12 row) and
 T/R (§6.2 sign-off + wire-compat extension), then the owner-gated §6.3
 real-network verification entry against the redeployed relay.
+
+---
+
+## Addendum 2026-10-15 (post-review cleanups N1 + F-6, commit ef847ae)
+
+Two routed items from the ADR-038 reviews, applied to
+`crates/modelswarm-relay/src/main.rs` only; no behavior change except
+corrected refusal strings — every enforced posture identical to ca28601.
+
+**N1 (T/R review — stale "uncapped" wording).** Four flag-surface spots
+still claimed omitting a cap flag leaves the relay uncapped (false since
+the §3.5 frozen defaults: absent flag = 1800 s / 16 MiB). Swept to name
+the ADR-038 frozen default: the `parse_duration_secs` /
+`parse_circuit_bytes` doc comments and both 0-refusal error strings
+("omit the flag for the ADR-038 frozen default (1800 s /
+16777216 bytes)"). The 0-refusal test now pins the wording (the named
+escape must be the frozen default; no refusal may claim an uncapped
+escape), so the sweep cannot silently regress. `--help` was already
+honest; every remaining "uncapped" in the crate is historical framing
+("replaces the former uncapped posture"), verified by sweep. No test
+name lied; none renamed.
+
+**F-6 (Security review, low — the S8 pin).** New
+`gate_denials_leave_the_per_ip_rate_limit_bucket_untouched`: 200
+unadmitted peers from ONE shared-NAT IP (TEST-NET-3) denied through the
+exact upstream accept-site call (`limiters.iter_mut().all(try_next)` —
+the pinned libp2p-relay 0.22.0 semantics at both grant sites), then each
+vector's live per-IP allowance measured for admitted peers at that same
+IP must EQUAL a never-hammered twin config's (full allowance, no
+hardcoded library budgets). Mutation-checked before commit: moving the
+gate to the END of the vectors fails the test exactly on the S8
+assertion — a reordered or dropped gate cannot regress silently.
+
+Commands and outcomes (all green): `cargo fmt --check` (workspace);
+`cargo clippy -p modelswarm-relay --all-targets -- -D warnings`;
+`cargo test -p modelswarm-relay` 3x consecutive — 29 passed / 0 failed /
+0 ignored each run (was 28; +1 is the F-6 pin), the pin green in all
+three. Committed ef847ae on main and pushed (remote confirmed at
+ef847ae). No new assumptions; no new unresolved risks — the open items
+in section 5 above stand unchanged.

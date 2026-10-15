@@ -45,6 +45,8 @@ pub mod handshake;
 pub mod libp2p_backend;
 pub mod message;
 pub mod observe;
+#[cfg(feature = "libp2p-backend")]
+pub mod relay_client;
 pub mod transport;
 
 /// Re-exported so callers can name the key type that

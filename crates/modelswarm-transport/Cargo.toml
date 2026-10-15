@@ -36,5 +36,21 @@ libp2p = { version = "0.57", optional = true, features = [
     "macros",
 ] }
 
+[dev-dependencies]
+# F2B test double: the relay binary's exact rust-libp2p relay stack, built
+# in-process to prove wire interop of the hand-rolled circuit-relay v2
+# client (src/relay_client.rs) against the real behaviour — dev-only; the
+# production client shares no code with it.
+libp2p = { version = "0.57", features = [
+    "tokio",
+    "quic",
+    "noise",
+    "yamux",
+    "identify",
+    "ping",
+    "relay",
+    "macros",
+] }
+
 [lints]
 workspace = true

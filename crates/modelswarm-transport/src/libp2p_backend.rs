@@ -109,6 +109,11 @@ enum Role {
         connection: quic::Connection,
         stream: Option<quic::Stream>,
     },
+    /// An already-open stream that needs no lazy materialization: the
+    /// payload stream of a relayed circuit (F2B — either side; see
+    /// [`crate::relay_client`]). `partial` is pre-seeded with any payload
+    /// bytes that coalesced with the circuit handshake.
+    Ready { stream: quic::Stream },
 }
 
 impl Libp2pSession {
@@ -140,12 +145,31 @@ impl Libp2pSession {
         }
     }
 
+    /// A session over an ALREADY-OPEN circuit payload stream (F2B): the
+    /// far-end `peer_id` is relay-vouched (see [`crate::relay_client`]'s
+    /// trust statement) and `preloaded` seeds the partial frame buffer with
+    /// payload bytes that coalesced with the circuit handshake.
+    pub(crate) fn new_relayed(
+        stream: quic::Stream,
+        peer_id: libp2p::PeerId,
+        preloaded: Vec<u8>,
+    ) -> Self {
+        Self {
+            role: Role::Ready { stream },
+            peer_id,
+            stashed_typed: VecDeque::new(),
+            stashed_raw: VecDeque::new(),
+            partial: preloaded,
+        }
+    }
+
     async fn stream_pin(
         &mut self,
         deadline: Duration,
     ) -> Result<std::pin::Pin<&mut quic::Stream>, TransportError> {
         match &mut self.role {
             Role::Client { stream } => Ok(std::pin::Pin::new(stream)),
+            Role::Ready { stream } => Ok(std::pin::Pin::new(stream)),
             Role::Server { connection, stream } => {
                 if stream.is_none() {
                     let mut conn = std::pin::Pin::new(connection);
@@ -670,6 +694,253 @@ impl Libp2pTransport {
         .map_err(|e| io_err("libp2p stream open", e))?;
         Ok(Libp2pSession::new_client(stream, peer_id))
     }
+
+    // -----------------------------------------------------------------------
+    // F2B (ADR-014): relay candidates — direct first, honest fallback
+    // -----------------------------------------------------------------------
+
+    /// Reserves on the relay at `relay_addr` (a multiaddr ending
+    /// `/p2p/<relay-peer-id>`; the relay leg is dialed with the same
+    /// PeerId-verification discipline as a direct dial). The returned
+    /// [`crate::relay_client::RelayReservation`] receives relayed circuits via
+    /// `accept` and exposes the relay's honest terms (expiry, announced
+    /// circuit limits, the circuit address to advertise in the peer
+    /// record's existing multiaddr list — no schema change needed).
+    ///
+    /// Reservations auto-renew at 3/4 of each lease; dropping the handle
+    /// closes the connection, which the relay reads as a released lease.
+    pub async fn reserve_relay(
+        &self,
+        relay_addr: &str,
+        deadline: Duration,
+    ) -> Result<crate::relay_client::RelayReservation, TransportError> {
+        let relay: Multiaddr = relay_addr
+            .parse()
+            .map_err(|e| TransportError::Io(invalid_data("invalid relay multiaddr", e)))?;
+        crate::relay_client::reserve(
+            &self.keypair,
+            &relay,
+            tokio::time::Instant::now() + deadline,
+        )
+        .await
+    }
+
+    /// Dials `expected_peer` DIRECT-FIRST over the candidate multiaddrs,
+    /// falling back to relay candidates (`…/p2p/<relay>/p2p-circuit[/p2p/<dst>]`)
+    /// exactly per ADR-014 rule 7: a direct failure is never silent — every
+    /// attempt is labeled in the returned report, and the winning path is
+    /// named in [`DialPath`] so callers can enforce rule 5 (relay-only peers
+    /// are never counted direct-capable) and price relayed paths.
+    ///
+    /// Attempt order: direct candidates in list order, then relay
+    /// candidates in list order. Each attempt is bounded by
+    /// `per_attempt_deadline` (a blackholed cross-NAT direct dial should
+    /// get a SHORT budget so the relay leg is not starved — the caller
+    /// decides; no hidden total budget). A circuit candidate whose trailing
+    /// `/p2p/<dst>` names a peer other than `expected_peer` is SKIPPED with
+    /// an impostor label, never dialed.
+    ///
+    /// The relayed session's far-end PeerId is relay-vouched (see
+    /// [`relay_client`]'s trust statement) — `remote_peer_id()` returns the
+    /// circuit's destination peer, not the relay.
+    ///
+    /// Failure returns the LAST transport error plus the full honest
+    /// per-attempt report (data for the caller's existing dial-failure
+    /// telemetry — no new event vocabulary is defined here).
+    pub async fn dial_with_fallback(
+        &self,
+        candidates: &[String],
+        expected_peer: &libp2p::PeerId,
+        per_attempt_deadline: Duration,
+    ) -> Result<(Libp2pSession, DialPath), (TransportError, Vec<DialAttempt>)> {
+        let mut attempts: Vec<DialAttempt> = Vec::new();
+        let mut last_error: Option<TransportError> = None;
+        let mut record = |addr: &str, kind: &'static str, error: &TransportError| {
+            attempts.push(DialAttempt {
+                addr: addr.to_string(),
+                kind,
+                error: error.to_string(),
+            });
+        };
+
+        if candidates.is_empty() {
+            return Err((
+                TransportError::Io(invalid_data("dial candidates", "no candidate addresses")),
+                attempts,
+            ));
+        }
+
+        // Classify every candidate; unparseable ones become labeled attempts.
+        let mut classified: Vec<(&str, Candidate)> = Vec::new();
+        for addr in candidates {
+            match classify_candidate(addr) {
+                Ok(candidate) => classified.push((addr.as_str(), candidate)),
+                Err(e) => {
+                    record(addr, "unparsed", &e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // Direct first (ADR-014 rule: direct-first, relay only on failure).
+        for (addr, candidate) in &classified {
+            let Candidate::Direct(_) = candidate else {
+                continue;
+            };
+            match self.dial(addr, expected_peer, per_attempt_deadline).await {
+                Ok(session) => {
+                    return Ok((
+                        session,
+                        DialPath::Direct {
+                            addr: (*addr).to_string(),
+                        },
+                    ))
+                }
+                Err(e) => {
+                    record(addr, "direct", &e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // Then relay candidates, in list order.
+        for (addr, candidate) in &classified {
+            let Candidate::Circuit { relay, dst } = candidate else {
+                continue;
+            };
+            if let Some(named) = dst {
+                if named != expected_peer {
+                    let e = relay_err(
+                        "circuit relay address",
+                        format!(
+                            "circuit address names destination {named}, not the expected \
+                             {expected_peer} — skipped (possible impostor address)"
+                        ),
+                    );
+                    record(addr, "relay", &e);
+                    last_error = Some(e);
+                    continue;
+                }
+            }
+            let deadline = tokio::time::Instant::now() + per_attempt_deadline;
+            match crate::relay_client::dial_circuit(&self.keypair, relay, expected_peer, deadline)
+                .await
+            {
+                Ok(circuit) => {
+                    let session = Libp2pSession::new_relayed(
+                        circuit.stream,
+                        *expected_peer,
+                        circuit.preloaded,
+                    );
+                    return Ok((
+                        session,
+                        DialPath::Relayed {
+                            relay_addr: relay.to_string(),
+                        },
+                    ));
+                }
+                Err(e) => {
+                    record(addr, "relay", &e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err((
+            last_error.unwrap_or_else(|| {
+                TransportError::Io(invalid_data("dial candidates", "every candidate failed"))
+            }),
+            attempts,
+        ))
+    }
+}
+
+/// How one F2B dial candidate address is interpreted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Candidate {
+    /// A plain dialable multiaddr (`/…/quic-v1`).
+    Direct(Multiaddr),
+    /// A circuit address: the relay's own multiaddr (ending
+    /// `/p2p/<relay-peer-id>`) plus the optionally-named destination peer.
+    Circuit {
+        relay: Multiaddr,
+        dst: Option<libp2p::PeerId>,
+    },
+}
+
+/// Classifies one candidate multiaddr from a peer record's `addresses`
+/// list. Circuit addresses ride the SAME existing field —
+/// `<relay>/p2p-circuit[/p2p/<dst>]` parses as a multiaddr, so advertising
+/// relay reachability needs no tracker schema change (ADR-001/028 surface
+/// unchanged).
+fn classify_candidate(addr: &str) -> Result<Candidate, TransportError> {
+    let multiaddr: Multiaddr = addr
+        .parse()
+        .map_err(|e| TransportError::Io(invalid_data("invalid candidate multiaddr", e)))?;
+    let mut protocols: Vec<libp2p::multiaddr::Protocol> = multiaddr.iter().collect();
+
+    // Trailing /p2p/<dst> after a circuit suffix names the destination.
+    let mut dst = None;
+    if let Some(libp2p::multiaddr::Protocol::P2p(named)) = protocols.last().cloned() {
+        if protocols.len() >= 2
+            && protocols[protocols.len() - 2] == libp2p::multiaddr::Protocol::P2pCircuit
+        {
+            dst = Some(named);
+            protocols.truncate(protocols.len() - 1);
+        }
+    }
+
+    if protocols.last() == Some(&libp2p::multiaddr::Protocol::P2pCircuit) {
+        // The protocol BEFORE the /p2p-circuit suffix must be the relay's
+        // /p2p/<relay-peer-id>; it STAYS in the rebuilt relay multiaddr
+        // (the relay leg is dialed with dial-side PeerId verification).
+        match protocols.get(protocols.len() - 2) {
+            Some(libp2p::multiaddr::Protocol::P2p(_)) => {
+                let mut relay = Multiaddr::empty();
+                for protocol in &protocols[..protocols.len() - 1] {
+                    relay.push(protocol.clone());
+                }
+                Ok(Candidate::Circuit { relay, dst })
+            }
+            _ => Err(TransportError::Io(invalid_data(
+                "invalid circuit multiaddr",
+                "a /p2p-circuit address must follow a /p2p/<relay-peer-id>",
+            ))),
+        }
+    } else {
+        Ok(Candidate::Direct(multiaddr))
+    }
+}
+
+/// The winning path of a [`Libp2pTransport::dial_with_fallback`] dial —
+/// the honest label ADR-014 rule 5 requires (relayed paths must be visible
+/// as relayed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialPath {
+    /// A direct QUIC dial (PeerId verified by the TLS handshake).
+    Direct { addr: String },
+    /// A circuit-relay v2 dial through the named relay (PeerId
+    /// relay-vouched; carry ADR-014's relay cost penalty).
+    Relayed { relay_addr: String },
+}
+
+/// One failed attempt of a [`Libp2pTransport::dial_with_fallback`] —
+/// transport DATA for honest per-attempt diagnostics, deliberately not a
+/// telemetry event: the caller reports failures through whatever frozen
+/// vocabulary it already uses (the node's `net.failure`/`stage` surface,
+/// unchanged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialAttempt {
+    /// The candidate address as given.
+    pub addr: String,
+    /// `"direct"`, `"relay"`, or `"unparsed"` — the attempt kind.
+    pub kind: &'static str,
+    /// The attempt's failure (`TransportError` Display).
+    pub error: String,
+}
+
+fn relay_err(context: &'static str, detail: String) -> TransportError {
+    TransportError::Io(invalid_data(context, detail))
 }
 
 /// Libp2p listener yielding framed sessions (loopback by default;
@@ -1147,5 +1418,328 @@ mod tests {
             msg,
             "pings were transparent; the app frame arrives intact"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // F2B: relay candidates — the relay double is the relay binary's exact
+    // rust-libp2p stack built in-process; the client under test is OUR
+    // hand-rolled circuit-relay v2 implementation.
+    // -------------------------------------------------------------------
+
+    /// The relay binary's raised limits (crates/modelswarm-relay
+    /// relay_config): stream-carrying — no duration/byte caps.
+    fn raised_relay_config() -> libp2p::relay::Config {
+        libp2p::relay::Config {
+            max_reservations: 4096,
+            max_reservations_per_peer: 8,
+            max_circuits: 4096,
+            max_circuits_per_peer: 128,
+            max_circuit_duration: Duration::from_secs(u32::MAX as u64),
+            max_circuit_bytes: u64::MAX,
+            ..libp2p::relay::Config::default()
+        }
+    }
+
+    /// Spawns the local relay double (dev-dependency rust-libp2p relay —
+    /// the exact behaviour the modelswarm-relay binary hosts) on an
+    /// ephemeral loopback QUIC port. Returns its `/p2p/`-suffixed address
+    /// and a live circuit counter for never-touched assertions.
+    async fn spawn_relay_double(
+        config: libp2p::relay::Config,
+    ) -> (Multiaddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use libp2p::swarm::NetworkBehaviour;
+
+        #[derive(NetworkBehaviour)]
+        struct RelayOnly {
+            relay: libp2p::relay::Behaviour,
+        }
+
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let relay_peer_id = libp2p::PeerId::from(key.public());
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(key)
+            .with_tokio()
+            .with_quic()
+            .with_behaviour(|key| RelayOnly {
+                relay: libp2p::relay::Behaviour::new(key.public().to_peer_id(), config),
+            })
+            .expect("relay double behaviour builds")
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
+            .build();
+        // Like the binary: a dedicated relay advertises HOP immediately.
+        swarm
+            .behaviour_mut()
+            .relay
+            .set_status(Some(libp2p::relay::Status::Enable));
+        swarm
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+
+        let bound = loop {
+            match swarm.select_next_some().await {
+                libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => break address,
+                _ => continue,
+            }
+        };
+        // Clients reject reservations without relay addresses — advertise
+        // the bound addr like the binary does.
+        swarm.add_external_address(bound.clone());
+        let addr = bound.with(libp2p::multiaddr::Protocol::P2p(relay_peer_id));
+
+        let circuits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&circuits);
+        tokio::spawn(async move {
+            loop {
+                if let libp2p::swarm::SwarmEvent::Behaviour(RelayOnlyEvent::Relay(
+                    libp2p::relay::Event::CircuitReqAccepted { .. },
+                )) = swarm.select_next_some().await
+                {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        (addr, circuits)
+    }
+
+    /// A loopback port that is (almost certainly) closed: bind an
+    /// ephemeral UDP socket, take its port, drop it. Direct QUIC dials to
+    /// it fail fast (refused) or hit the per-attempt budget (timeout) —
+    /// either way the honest direct-attempt failure the fallback must
+    /// survive.
+    fn dead_direct_addr() -> String {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+        format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+    }
+
+    /// F2B core proof: the direct candidate FAILS (closed port — the
+    /// loopback stand-in for the owner's cross-NAT blackhole), the relay
+    /// candidate succeeds, the winning path is labeled Relayed, and typed
+    /// frames stream BOTH ways over the circuit. The frame the client
+    /// sends immediately after dialing must arrive intact on the server —
+    /// payload bytes coalescing with the circuit handshake are preserved.
+    #[tokio::test]
+    async fn direct_failure_falls_back_to_relay_and_streams_both_ways() {
+        let server_identity = InstallationIdentity::from_bytes(&[61u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[62u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let client = Libp2pTransport::new(&client_identity).unwrap();
+
+        let (relay_addr, circuits) = spawn_relay_double(raised_relay_config()).await;
+        let mut reservation = server
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .expect("reservation on the relay double");
+        assert!(reservation.alive());
+        assert!(
+            reservation.terms().expire
+                > std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+        );
+        let circuit = reservation.circuit_addr();
+
+        let expected = server.peer_id();
+        let candidates = vec![dead_direct_addr(), circuit];
+        let (dialing, acceptor) = tokio::join!(
+            client.dial_with_fallback(&candidates, &expected, Duration::from_secs(2),),
+            reservation.accept(Duration::from_secs(10)),
+        );
+        let (session_client, path) = dialing.expect("relay fallback dials");
+        assert!(
+            matches!(path, DialPath::Relayed { .. }),
+            "the direct candidate failed; the winning path must be labeled relayed: {path:?}"
+        );
+        let mut session_client = session_client;
+        let mut session_server = acceptor.expect("the server accepts the relayed circuit");
+        // Relay-vouched far-end binding: each side names the other.
+        assert_eq!(session_client.remote_peer_id(), &expected);
+        assert_eq!(
+            session_server.remote_peer_id(),
+            &client.peer_id(),
+            "the relay-vouched source peer id must be the dialer"
+        );
+
+        // Client -> server immediately after dial (coalescing hazard).
+        let msg = WireMessage::Control(Control::pong("f2b-relay"));
+        session_client
+            .send(&msg, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            session_server.recv(Duration::from_secs(5)).await.unwrap(),
+            msg
+        );
+        // Server -> client over the same circuit.
+        session_server
+            .send(&msg, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            session_client.recv(Duration::from_secs(5)).await.unwrap(),
+            msg
+        );
+        // Exactly one circuit was made — the failed direct attempt never
+        // reached the relay.
+        assert_eq!(
+            circuits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one relayed circuit, no more"
+        );
+    }
+
+    /// ADR-014 direct-first: when the direct candidate works, the relay is
+    /// never contacted (zero circuits on the relay double).
+    #[tokio::test]
+    async fn direct_success_never_touches_the_relay() {
+        let server_identity = InstallationIdentity::from_bytes(&[63u8; 32]);
+        let client_identity = InstallationIdentity::from_bytes(&[64u8; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let client = Libp2pTransport::new(&client_identity).unwrap();
+        let mut listener = server.listen("127.0.0.1:0").await.unwrap();
+
+        let (relay_addr, circuits) = spawn_relay_double(raised_relay_config()).await;
+        let reservation = server
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        let circuit = reservation.circuit_addr();
+
+        let bound = listener.bound_addr().to_string();
+        let expected = server.peer_id();
+        let dialing = tokio::spawn(async move {
+            client
+                .dial_with_fallback(&[bound, circuit], &expected, Duration::from_secs(5))
+                .await
+        });
+        let mut session_server = listener.accept(Duration::from_secs(10)).await.unwrap();
+        let (mut session_client, path) = dialing.await.unwrap().expect("direct dial wins");
+        assert!(
+            matches!(path, DialPath::Direct { .. }),
+            "the direct candidate must win when it works: {path:?}"
+        );
+
+        let msg = WireMessage::Control(Control::pong("direct-first"));
+        session_client
+            .send(&msg, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            session_server.recv(Duration::from_secs(5)).await.unwrap(),
+            msg
+        );
+        assert_eq!(
+            circuits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a winning direct dial must never open a relay circuit"
+        );
+    }
+
+    /// Honest relay refusal: a circuit to a peer with NO reservation is
+    /// denied by the relay and the error carries the relay's own status
+    /// vocabulary (no_reservation).
+    #[tokio::test]
+    async fn relay_dial_to_unreserved_peer_is_refused_with_status_label() {
+        let client_identity = InstallationIdentity::from_bytes(&[65u8; 32]);
+        let client = Libp2pTransport::new(&client_identity).unwrap();
+        let (relay_addr, _circuits) = spawn_relay_double(raised_relay_config()).await;
+
+        let stranger = libp2p::PeerId::random();
+        let circuit = format!("{relay_addr}/p2p-circuit");
+        let (error, attempts) = client
+            .dial_with_fallback(&[circuit], &stranger, Duration::from_secs(5))
+            .await
+            .err()
+            .expect("the relay must refuse a circuit to an unreserved peer");
+        assert!(
+            error.to_string().contains("no_reservation"),
+            "the refusal must carry the relay's status label: {error}"
+        );
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].kind, "relay");
+        assert!(attempts[0].error.contains("no_reservation(204)"));
+    }
+
+    /// A circuit address whose trailing /p2p/<dst> names a DIFFERENT peer
+    /// than the expected one is skipped with an impostor label — never
+    /// dialed (dial-side PeerId verification discipline).
+    #[tokio::test]
+    async fn circuit_address_for_another_destination_is_skipped() {
+        let client_identity = InstallationIdentity::from_bytes(&[66u8; 32]);
+        let client = Libp2pTransport::new(&client_identity).unwrap();
+        let (relay_addr, circuits) = spawn_relay_double(raised_relay_config()).await;
+
+        let someone_else = libp2p::PeerId::random();
+        let expected = libp2p::PeerId::random();
+        let circuit = format!("{relay_addr}/p2p-circuit/p2p/{someone_else}");
+        let (_error, attempts) = client
+            .dial_with_fallback(&[circuit], &expected, Duration::from_secs(5))
+            .await
+            .err()
+            .expect("a mismatched circuit address must not dial");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].kind, "relay");
+        assert!(
+            attempts[0].error.contains("skipped"),
+            "the attempt report must label the skip: {:?}",
+            attempts[0]
+        );
+        assert_eq!(
+            circuits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a skipped impostor address must never open a circuit"
+        );
+    }
+
+    /// The circuit address shape round-trips through classification: the
+    /// reservation's advertised address parses back to the same relay and
+    /// names this node as the destination — the exact multiaddr peers put
+    /// in the tracker's existing `addresses` list (no schema change).
+    #[test]
+    fn circuit_addr_classification_round_trip() {
+        let identity = InstallationIdentity::from_bytes(&[67u8; 32]);
+        let transport = Libp2pTransport::new(&identity).unwrap();
+        let relay_addr: Multiaddr = "/ip4/192.168.1.9/udp/4001/quic-v1"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(libp2p::multiaddr::Protocol::P2p(libp2p::PeerId::random()));
+        let circuit = format!("{relay_addr}/p2p-circuit/p2p/{}", transport.peer_id());
+        match classify_candidate(&circuit).unwrap() {
+            Candidate::Circuit { ref relay, dst } => {
+                assert_eq!(relay, &relay_addr);
+                assert_eq!(dst.as_ref(), Some(&transport.peer_id()));
+            }
+            other => panic!("a /p2p-circuit address must classify as a circuit: {other:?}"),
+        }
+        // Bare circuit suffix (no named destination) is also valid.
+        match classify_candidate(&format!("{relay_addr}/p2p-circuit")).unwrap() {
+            Candidate::Circuit { dst: None, .. } => {}
+            other => panic!("bare circuit suffix must classify with no dst: {other:?}"),
+        }
+        // Plain addresses stay direct.
+        assert!(matches!(
+            classify_candidate("/ip4/127.0.0.1/udp/4001/quic-v1").unwrap(),
+            Candidate::Direct(_)
+        ));
+        // A circuit address without a relay peer-id suffix is refused.
+        assert!(classify_candidate("/ip4/127.0.0.1/udp/4001/quic-v1/p2p-circuit").is_err());
+    }
+
+    /// The relay's announced limits are surfaced honestly from the
+    /// reservation (the double runs the binary's uncapped config).
+    #[tokio::test]
+    async fn reservation_surfaces_the_relay_terms() {
+        let identity = InstallationIdentity::from_bytes(&[68u8; 32]);
+        let transport = Libp2pTransport::new(&identity).unwrap();
+        let (relay_addr, _circuits) = spawn_relay_double(raised_relay_config()).await;
+        let reservation = transport
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        let limits = reservation.announced_limits();
+        assert_eq!(limits.duration_secs, Some(u32::MAX as u64));
+        assert_eq!(limits.bytes, Some(u64::MAX));
+        assert!(!reservation.terms().addrs.is_empty());
     }
 }

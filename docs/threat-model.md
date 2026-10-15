@@ -2,10 +2,11 @@
 
 Status: Phase 0 draft, owned by the Architect with QA/Security review.
 Scope: MSP v0.1 prototype (Windows nodes + Vercel tracker hub).
-Updated 2026-10-14 (ADR-036 §6 Security-seat rows: the §3 adversary-B
-restatement under default-on carriage, the §4.2 carrier-exposure and
-open-exchange rows, the §4.3 KV-residency row, the §5.2 extension, and
-the §6 ADR-036 abuse-test index).
+Updated 2026-10-15 (ADR-038 §6.1 Security-seat rows: the §4.6 relay
+admission surface with the S1-S9 mitigation table and five residual
+rows — gate D12 closes conditionally; the §5.4 relayed-path restatement;
+the §6 ADR-038 abuse-test index. Previous: 2026-10-14 ADR-036 §6
+Security-seat rows).
 
 ## 1. System under analysis
 
@@ -17,6 +18,8 @@ See `docs/architecture.md`. Surfaces an adversary can touch:
 4. Local node files (SQLite, cached GGUF, logs) and Windows credential store.
 5. The user's local OpenAI-compatible gateway on 127.0.0.1:11435.
 6. Supply chain: GGUF artifacts, llama.cpp builds, npm/cargo dependencies.
+7. The operator-hosted circuit relay (F2B deployment; `--public` QUIC
+   listener, open-by-default with ADR-038 ticket admission — §4.6).
 
 ## 2. Assets
 
@@ -163,6 +166,85 @@ Residual risks, accepted for v0.2.x (invite-only tester population):
    private key never enters the repo, CI, or logs; rotation is a manual client
    ship recorded in the release checklist.
 
+### 4.6 Circuit relay + admission tickets (added 2026-10-15; ADR-038;
+review: `docs/reviews/review-adr038-admission-security-2026-10-15.md`)
+
+Surface: the operator-hosted circuit relay (`crates/modelswarm-relay`),
+loopback by default, `--public` on explicit operator opt-in. Posture per
+ADR-038: open-by-default admission by tracker-signed `RelayAdmissionTicket`
+(content-blind, 600 s TTL, minted on every successful heartbeat), enforced
+FAIL-CLOSED at the two libp2p-relay accept sites (one gate limiter FIRST in
+both rate-limiter vectors), under finite frozen caps (600 s reservation,
+1800 s / 16 MiB per circuit). **Gate D12** (`docs/reviews/
+architecture-gate-2026-10-09.md`) closes CONDITIONALLY: this §6.1 review
+approves the landed code; D12 is closed only when T/R's §6.2 sign-off exists
+AND the owner-gated §6.3 real-network verification entry
+(`docs/verification/relay-admission-<date>.md`) exists against the REDEPLOYED
+gated relay — until then the deployed F2B relay must not run `--public` on
+the old ungated binary.
+
+The §6.1 adversary matrix, adjudicated against the landed code (evidence in
+the review file):
+
+| Attack | Mitigation (as landed, 2026-10-15) |
+|---|---|
+| S1 ticketless flood, incl. clients that skip the pre-flight | Gate predicate on the reservation AND circuit accept paths (upstream `.all()` short-circuits on the gate's `false` ⇒ `resource_limit_exceeded(201)` before any token bucket or reservation lookup); proven in-process with a real libp2p client that never presents; renewals re-hit the gate every ≤ 450 s |
+| S2 forged signature | Ed25519 over the canonical signature-omitted JSON against the pinned hub key (`protocol/keys/hub-public.hex`, `--tracker-key` override); fail-closed boot — no resolvable key refuses startup (exit 2) in EVERY mode |
+| S3 farmed/stolen ticket | Check 7 peer binding: only the named PeerId's Noise-authenticated key can present it (a stolen ticket is useless to a third party); check 8: `installation_id` must re-derive from the authenticated PeerId's embedded key (ADR-020); farming = enrolled sybils, bounded by enrollment (`DEVICE_APPROVAL_CAP` 250 / admin approval) + per-peer caps (8 reservations, 128 circuits, 30 creations/2 min, 16 MiB/30 min per circuit) |
+| S4 tracker-key compromise | Same root-of-trust exposure as catalog + leases (§4.1 residual — not a new class); NEW instant relay-side lever: restart with `--tracker-key` kills every outstanding ticket at once (residual 1 below) |
+| S5 admission-table exhaustion | 4096 entries keyed by PeerId, memory-only, full expired-sweep on every admit (a full sweep precedes every `table_full` refusal); filling it requires 4096 DISTINCT live validly-ticketed PeerIds — enrollment-bounded, and one installation's tickets can never occupy more than one slot |
+| S6 clock-skew games | ±120 s skew window at verify (check 6) + admission deadline `expires_at + 120 s` (T4); one shared clock feeds verify, admit, and the gate; pinned by the expiry vector and the virtual-clock re-close proof |
+| S7 pre-flight injection | Strict frozen protobuf (unknown/duplicate/wrongly-typed/wire-type-3+ fields refused), exactly one frame each way, announced length validated ∈ [1, 4096] BEFORE body allocation, 15 s deadline per exchange, mss-bounded negotiation; the admission table keys on the Noise-authenticated presenting PeerId, never ticket input |
+| S8 shared-NAT rate-limiter token theft | The gate limiter is FIRST in both limiter vectors (index-0 insert, test-pinned); upstream short-circuit means unadmitted peers never call `try_next` on the per-peer/per-IP token buckets honest peers behind shared NATs depend on |
+| S9 restart/state | Admission state is memory-only and never persisted; a restart empties the table and every peer re-presents one cheap frame; reservations/circuits die with the relay's connections (no state to forge or replay across restarts) |
+
+Residual risks (accepted for the open-relay posture, recorded 2026-10-15 —
+deterrence-grade, in the AGENTS.md sense):
+
+1. **Tracker-key compromise = unlimited relay admission until rotation.**
+   The hub Ed25519 key can mint tickets for any PeerId the holder controls;
+   each ticket is capped at TTL + skew, but issuance is unbounded while the
+   compromise lasts. Recovery: rotate the key at the tracker, restart every
+   relay with `--tracker-key <new>` (INSTANT global ticket invalidation —
+   the one lever the ADR adds); full rotation additionally ships new node
+   releases because deployed nodes pin the OLD public key for
+   catalog/lease verification (the §4.1/§4.5 key-lifecycle lead time —
+   rotation lead time is one full client adoption cycle). Stated runbook
+   order: generate new key → tracker redeploy (re-signs catalog + leases +
+   tickets) → relay `--tracker-key` restarts → node release train.
+2. **Ticket farming via enrolled installs — bounded, not prevented.** A
+   determined operator of many enrolled installations (sybil ring) earns one
+   admitted PeerId per install; damage per install is bounded by the §3.5
+   caps (worst sustained burn ≈ 32 Mbps per admitted rogue — the operator's
+   pipe, not the protocol, is the global bound). Enrollment controls
+   (`DEVICE_APPROVAL_CAP`, admin approval, enrollment rate limits) are the
+   actual bound; the relay adds no per-identity economics in v1.
+3. **The relay operator sees flow metadata and relays PLAINTEXT frames.**
+   Who reserves, who circuits to whom, timing, and sizes are visible to the
+   operator (admission/relay log discipline: counts, PeerIds, reasons only
+   — no ticket bytes, no payload), and QUIC terminates at the relay, so a
+   hostile relay fork can READ relayed frames (our relay is content-blind
+   by construction; a fork need not be). The standing mitigation is the
+   msp-v1 §6.1 end-to-end handshake over relayed circuits — the queued
+   session-layer decision (F2B §7.2); until it lands, relayed paths are
+   relay-vouched and labeled as such, and prompts/completions still never
+   reach the tracker.
+4. **Expiry-only revocation tail ≤ 12 min.** No relay-side revocation
+   channel exists (T8: the relay never contacts the tracker); an
+   installation revoked at the tracker keeps its LAST ticket valid until
+   `expires_at + 120 s`, during which the per-peer caps bound the damage.
+   Key rotation (residual 1) is the only instant lever.
+5. **Tracker outage > TTL degrades NEW relayed circuits honestly.** No
+   fresh tickets ⇒ new relay legs earn a verbatim
+   `permission_denied(202)/expired` (or the gate's `201` when the client
+   has nothing to present); established circuits live out their caps,
+   direct paths are unaffected — the §8 "tracker outage → streams
+   continue" discipline holds for established streams with this labeled
+   degradation for new relayed ones. (Related: an ADMITTED rogue behind a
+   shared NAT still shares that NAT's per-IP token bucket with honest
+   peers — inherent to per-IP accounting; the per-peer bucket bounds the
+   rogue itself.)
+
 ## 5. Explicit non-guarantees (v0.1)
 
 1. **No remote attestation.** A patched binary can claim to host while not
@@ -175,7 +257,9 @@ Residual risks, accepted for v0.2.x (invite-only tester population):
    their always-visible lines; the swarm is invite-only in v0.1.
 3. **No Sybil resistance** beyond invite-only accounts + per-account limits.
 4. **No universal NAT traversal.** Direct failure is possible and must be
-   reported honestly; relay/DCUtR is a later milestone.
+   reported honestly; relayed paths exist (F2B) and are admission-gated
+   (ADR-038, §4.6) but carry the relay-vouched trust and metadata/plaintext
+   residuals stated there; DCUtR/hole-punching remains a later milestone.
 5. **No protection of the local machine from its own user** — a user who
    controls the OS controls the node.
 6. **No update-rollback fence** — a compromised update origin can withhold
@@ -215,3 +299,27 @@ prompt-redaction gate in every phase whose code first touches prompt text
   `crates/modelswarm-session/tests/verifydrafts_vectors.rs`; the
   desktop-level redaction and disclosure pins live in
   `crates/modelswarm-desktop/src/app.rs` tests under `tauri-shell`).
+- ADR-038 admission abuse (added 2026-10-15): the §6.2 suites are the
+  abuse tests for §4.6's S1-S9 rows — the in-process fail-closed proofs
+  (ticketless reservation AND circuit refusal, admit-on-ticket, virtual-
+  clock re-close), the twelve-row forge corpus re-derived against the
+  frozen status+reason pairs with the first-failure order pinned
+  (syntax ≺ signature ≺ peer binding ≺ installation ≺ capacity), the
+  frame-vector malformed corpus (strict protobuf), size-before-allocation
+  refusal at the frame reader, boot-discipline refusals, the frozen-cap
+  cut proofs, the transport presentation suite (pre-flight before
+  reserve/connect, 202 ⇒ no hop stream with the verbatim label, `na`
+  third-party interop, renewal re-presentation window), the node cache
+  suite (deploy skew, malformed-drop, replace-never-accumulate, no
+  freshness policy), and the TS↔Rust ticket byte-parity gate
+  (`crates/modelswarm-relay/src/main.rs` + `src/admission.rs` tests,
+  `crates/modelswarm-transport/src/relay_client.rs` +
+  `libp2p_backend.rs` tests, `crates/modelswarm-node/src/relay_ticket_cache.rs`
+  tests, `apps/tracker/tests/relay-ticket.test.ts`). Known drift, ruled
+  acceptable 2026-10-15 (binding; see the §6.1 review): the golden accept
+  vector's `installation_id` placeholder cannot pass check 8's real
+  ADR-020 derivation — the vectors pin checks 1-6, binding is pinned by
+  re-derived fixtures; regeneration with a real (peer_id,
+  installation_id) pair is REQUIRED in the next Protocol vector revision
+  (`relay-ticket-forge-1.json`'s `derived_installation_id` field
+  especially — it currently records the placeholder as if real).

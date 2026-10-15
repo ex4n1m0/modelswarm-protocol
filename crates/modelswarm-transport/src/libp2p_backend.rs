@@ -481,6 +481,13 @@ enum DriverEvent {
 /// The libp2p (QUIC) backend, feature-gated `libp2p-backend` (F11).
 pub struct Libp2pTransport {
     keypair: Keypair,
+    /// The node's relay-ticket cache seam (ADR-038 §3.2) — interior
+    /// mutability so the heartbeat-driven cache can be attached after
+    /// construction (the Windows Product wiring, row 8). Defaults to the
+    /// EMPTY cache ([`crate::relay_client::no_ticket_source`]): relays
+    /// without an admission surface dial exactly as before, and an MSP
+    /// relay's gate refusal surfaces verbatim at the hop exchange.
+    relay_tickets: std::sync::Mutex<crate::relay_client::TicketSource>,
 }
 
 impl std::fmt::Debug for Libp2pTransport {
@@ -540,7 +547,26 @@ impl Libp2pTransport {
     pub fn new(identity: &InstallationIdentity) -> Result<Self, TransportError> {
         Ok(Self {
             keypair: keypair_from(identity)?,
+            relay_tickets: std::sync::Mutex::new(crate::relay_client::no_ticket_source()),
         })
+    }
+
+    /// Attaches the node's relay-ticket cache (ADR-038 §3.2/§6.4 row 8):
+    /// `source` returns the freshest tracker-issued serialized ticket, or
+    /// `None` while the cache is empty. Every subsequent relay leg
+    /// (reservation and circuit dial) offers `/msp/relay-ticket/1` first
+    /// and presents the cached ticket when the relay echoes; relays
+    /// answering `na` are dialed directly (third-party interop). The
+    /// ticket string is opaque to this crate.
+    pub fn set_relay_ticket_source(&self, source: crate::relay_client::TicketSource) {
+        *self.relay_tickets.lock().expect("relay ticket source lock") = source;
+    }
+
+    fn relay_tickets(&self) -> crate::relay_client::TicketSource {
+        self.relay_tickets
+            .lock()
+            .expect("relay ticket source lock")
+            .clone()
     }
 
     /// The local libp2p PeerId (the ADR-020 multihash derivation).
@@ -721,6 +747,7 @@ impl Libp2pTransport {
             &self.keypair,
             &relay,
             tokio::time::Instant::now() + deadline,
+            self.relay_tickets(),
         )
         .await
     }
@@ -823,8 +850,15 @@ impl Libp2pTransport {
                 }
             }
             let deadline = tokio::time::Instant::now() + per_attempt_deadline;
-            match crate::relay_client::dial_circuit(&self.keypair, relay, expected_peer, deadline)
-                .await
+            let tickets = self.relay_tickets();
+            match crate::relay_client::dial_circuit(
+                &self.keypair,
+                relay,
+                expected_peer,
+                deadline,
+                tickets,
+            )
+            .await
             {
                 Ok(circuit) => {
                     let session = Libp2pSession::new_relayed(
@@ -991,6 +1025,7 @@ impl std::fmt::Debug for Libp2pListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// F12/F11: the libp2p keypair derived from the installation seed yields
     /// EXACTLY the ADR-020 peer_id derivation.
@@ -1426,16 +1461,20 @@ mod tests {
     // hand-rolled circuit-relay v2 implementation.
     // -------------------------------------------------------------------
 
-    /// The relay binary's raised limits (crates/modelswarm-relay
-    /// relay_config): stream-carrying — no duration/byte caps.
+    /// The relay binary's frozen ADR-038 policy (crates/modelswarm-relay
+    /// `relay_config`): finite caps at 1800 s / 16 MiB, reservation
+    /// duration 600 s (≤ the ticket TTL). The double mirrors the binary's
+    /// config so the client's recorded limits are the ones production
+    /// announces.
     fn raised_relay_config() -> libp2p::relay::Config {
         libp2p::relay::Config {
             max_reservations: 4096,
             max_reservations_per_peer: 8,
+            reservation_duration: Duration::from_secs(600),
             max_circuits: 4096,
             max_circuits_per_peer: 128,
-            max_circuit_duration: Duration::from_secs(u32::MAX as u64),
-            max_circuit_bytes: u64::MAX,
+            max_circuit_duration: Duration::from_secs(1800),
+            max_circuit_bytes: 16 * 1024 * 1024,
             ..libp2p::relay::Config::default()
         }
     }
@@ -1729,7 +1768,8 @@ mod tests {
     }
 
     /// The relay's announced limits are surfaced honestly from the
-    /// reservation (the double runs the binary's uncapped config).
+    /// reservation (the double runs the binary's ADR-038 frozen config),
+    /// and the 600 s lease drives the 450 s renewal cadence (§6.2 test 3).
     #[tokio::test]
     async fn reservation_surfaces_the_relay_terms() {
         let identity = InstallationIdentity::from_bytes(&[68u8; 32]);
@@ -1740,9 +1780,29 @@ mod tests {
             .await
             .unwrap();
         let limits = reservation.announced_limits();
-        assert_eq!(limits.duration_secs, Some(u32::MAX as u64));
-        assert_eq!(limits.bytes, Some(u64::MAX));
+        assert_eq!(
+            limits.duration_secs,
+            Some(1800),
+            "the frozen 30-minute circuit cap rides every reservation (T5)"
+        );
+        assert_eq!(
+            limits.bytes,
+            Some(16 * 1024 * 1024),
+            "the frozen 16 MiB cap rides every reservation (T5)"
+        );
         assert!(!reservation.terms().addrs.is_empty());
+        // The frozen 600 s reservation duration: announced expiry ~ now+600
+        // and the client renews at 3/4 (450 s) — re-hitting the gate well
+        // inside the ticket TTL.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let lifetime = reservation.terms().expire.saturating_sub(now);
+        assert!(
+            (590..=600).contains(&lifetime),
+            "announced reservation lifetime must be the frozen 600 s, got {lifetime}"
+        );
     }
 
     /// F2B honest deadline behavior: a relay configured with a SHORT
@@ -1855,5 +1915,582 @@ mod tests {
             (1..6).contains(&received),
             "some frames pass the 1024-byte cap, not all: got {received}"
         );
+    }
+    // Snippet appended to libp2p_backend.rs's test module (ADR-038 §6.2 test 5).
+
+    // -------------------------------------------------------------------
+    // ADR-038 §6.2 test 5: the admission pre-flight presentation paths —
+    // ok → hop proceeds; 202 → NO hop stream, verbatim label; na → hop
+    // proceeds (third-party interop); the renewal re-presentation rule.
+    // The admission double is a raw-QUIC relay double speaking mss + the
+    // frozen /msp/relay-ticket/1 frames + a hand-crafted hop RESERVE
+    // response; full-stack proofs against the REAL relay behaviour live in
+    // crates/modelswarm-relay's tests.
+    // -------------------------------------------------------------------
+
+    /// The recorded fixture signing key (the vectors' 0x38 seed).
+    fn fixture_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x38u8; 32])
+    }
+
+    /// The ADR-020 installation id of a libp2p keypair (protobuf key bytes
+    /// = [0x08 0x01 0x12 0x20 ‖ 32-byte key]).
+    fn installation_of(keypair: &Keypair) -> String {
+        let protobuf = keypair.public().encode_protobuf();
+        assert_eq!(protobuf.len(), 36);
+        modelswarm_identity::installation_id_for(&protobuf[4..36])
+    }
+
+    fn rfc3339(t: time::OffsetDateTime) -> String {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339")
+    }
+
+    /// A fixture ticket for `peer` (fixture-key signed, real derivations).
+    fn mint_ticket(keypair: &Keypair, now: time::OffsetDateTime, ttl_skew: i64) -> String {
+        use modelswarm_eligibility::relay_ticket::{sign_ticket, RelayAdmissionTicket};
+        let installation = installation_of(keypair);
+        let peer = libp2p::PeerId::from(keypair.public());
+        let ticket = RelayAdmissionTicket {
+            installation_id: installation,
+            peer_id: peer.to_string(),
+            issued_at: rfc3339(now - time::Duration::seconds(600 - ttl_skew)),
+            expires_at: rfc3339(now + time::Duration::seconds(ttl_skew)),
+            nonce: "0123456789abcdef0123456789abcdef".to_string(),
+        };
+        sign_ticket(&ticket, &fixture_signing_key())
+    }
+
+    /// A static ticket source holding one string.
+    fn static_ticket_source(ticket: String) -> crate::relay_client::TicketSource {
+        Arc::new(move || Some(ticket.clone()))
+    }
+
+    // -- minimal mss + framing over quic::Stream (test-double side) ------
+
+    struct DoubleIo {
+        stream: quic::Stream,
+        buf: Vec<u8>,
+        pos: usize,
+    }
+
+    impl DoubleIo {
+        fn new(stream: quic::Stream) -> Self {
+            Self {
+                stream,
+                buf: Vec::new(),
+                pos: 0,
+            }
+        }
+
+        async fn fill(&mut self, deadline: tokio::time::Instant) -> Result<(), String> {
+            use futures::AsyncReadExt as _;
+            let mut chunk = [0u8; 2048];
+            let n = tokio::time::timeout_at(deadline, self.stream.read(&mut chunk))
+                .await
+                .map_err(|e| format!("read timeout: {e:?}"))?
+                .map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                return Err("closed".to_string());
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+            Ok(())
+        }
+
+        async fn read_frame(
+            &mut self,
+            max: usize,
+            deadline: tokio::time::Instant,
+        ) -> Result<Vec<u8>, String> {
+            loop {
+                let mut value: u64 = 0;
+                let mut shift = 0;
+                let mut len: Option<usize> = None;
+                for index in 0..10 {
+                    let Some(byte) = self.buf.get(self.pos + index).copied() else {
+                        break;
+                    };
+                    value |= u64::from(byte & 0x7f).checked_shl(shift).unwrap_or(0);
+                    if byte & 0x80 == 0 {
+                        self.pos += index + 1;
+                        len = Some(value as usize);
+                        break;
+                    }
+                    shift += 7;
+                }
+                if let Some(len) = len {
+                    if len == 0 || len > max {
+                        return Err(format!("announced length {len} outside 1..={max}"));
+                    }
+                    while self.buf.len() - self.pos < len {
+                        self.buf.drain(..self.pos);
+                        self.pos = 0;
+                        self.fill(deadline).await?;
+                    }
+                    let frame = self.buf[self.pos..self.pos + len].to_vec();
+                    self.pos += len;
+                    return Ok(frame);
+                }
+                self.fill(deadline).await?;
+            }
+        }
+
+        async fn write_all(
+            &mut self,
+            bytes: &[u8],
+            deadline: tokio::time::Instant,
+        ) -> Result<(), String> {
+            use futures::AsyncWriteExt as _;
+            tokio::time::timeout_at(deadline, self.stream.write_all(bytes))
+                .await
+                .map_err(|e| format!("write timeout: {e:?}"))?
+                .map_err(|e| format!("write: {e}"))?;
+            tokio::time::timeout_at(deadline, self.stream.flush())
+                .await
+                .map_err(|e| format!("flush timeout: {e:?}"))?
+                .map_err(|e| format!("flush: {e}"))?;
+            Ok(())
+        }
+    }
+
+    fn put_uv(buf: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            buf.push(byte);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uv(&mut out, payload.len() as u64);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// What the double saw (shared with its stream handlers).
+    #[derive(Default)]
+    struct AdmissionDoubleState {
+        order: std::sync::Mutex<Vec<&'static str>>,
+        presents: std::sync::atomic::AtomicUsize,
+        tickets: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AdmissionDoubleState {
+        fn note(&self, what: &'static str) {
+            self.order.lock().unwrap().push(what);
+        }
+        fn order(&self) -> Vec<&'static str> {
+            self.order.lock().unwrap().clone()
+        }
+        fn presents(&self) -> usize {
+            self.presents.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Spawns the raw-QUIC admission double. `verify` makes the admission
+    /// side honest (fixture-key signature + expiry; 202 on failure);
+    /// otherwise every PRESENT gets `ok(100)`. Hop RESERVE requests are
+    /// answered with a hand-crafted ok(100) Status carrying
+    /// `lease_lifetime_secs` and the frozen circuit limits (1800 s /
+    /// 16 MiB) — everything the client records.
+    async fn spawn_admission_double(
+        verify: bool,
+        lease_lifetime_secs: u64,
+    ) -> (Multiaddr, Arc<AdmissionDoubleState>) {
+        use libp2p::core::transport::ListenerId;
+        let key = Keypair::generate_ed25519();
+        let peer_id = libp2p::PeerId::from(key.public());
+        let state: Arc<AdmissionDoubleState> = Arc::new(AdmissionDoubleState::default());
+        let state_for_listener = Arc::clone(&state);
+        let mut transport = quic::tokio::Transport::new(quic::Config::new(&key));
+        transport
+            .listen_on(
+                ListenerId::next(),
+                "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+            )
+            .unwrap();
+        let mut events = futures::stream::poll_fn(move |cx| {
+            use std::task::Poll;
+            match std::pin::Pin::new(&mut transport).poll(cx) {
+                Poll::Ready(event) => Poll::Ready(Some(event)),
+                Poll::Pending => Poll::Pending,
+            }
+        });
+        let bound: Multiaddr = loop {
+            use futures::StreamExt as _;
+            match tokio::time::timeout(Duration::from_secs(10), events.next()).await {
+                Ok(Some(TransportEvent::NewAddress { listen_addr, .. })) => break listen_addr,
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("admission double listener ended"),
+                Err(_) => panic!("admission double bind timeout"),
+            }
+        };
+        let bound_for_limit = bound.clone();
+        let addr = bound.with(libp2p::multiaddr::Protocol::P2p(peer_id));
+        tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                let TransportEvent::Incoming { upgrade, .. } = event else {
+                    continue;
+                };
+                let Ok(Ok((_peer, mut connection))) =
+                    tokio::time::timeout(Duration::from_secs(10), upgrade).await
+                else {
+                    continue;
+                };
+                let state = Arc::clone(&state_for_listener);
+                let bound = bound_for_limit.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let stream = {
+                            use libp2p::core::muxing::StreamMuxer as _;
+                            let inbound = std::future::poll_fn(|cx| {
+                                std::pin::Pin::new(&mut connection).poll_inbound(cx)
+                            });
+                            match tokio::time::timeout(Duration::from_secs(60), inbound).await {
+                                Ok(Ok(stream)) => stream,
+                                _ => return,
+                            }
+                        };
+                        let state = Arc::clone(&state);
+                        let bound = bound.clone();
+                        tokio::spawn(handle_double_stream(
+                            stream,
+                            state,
+                            bound,
+                            verify,
+                            lease_lifetime_secs,
+                        ));
+                    }
+                });
+            }
+        });
+        (addr, state)
+    }
+
+    /// One inbound stream of the admission double: mss-listen, then either
+    /// the admission exchange or the hop RESERVE exchange.
+    async fn handle_double_stream(
+        stream: quic::Stream,
+        state: Arc<AdmissionDoubleState>,
+        bound: Multiaddr,
+        verify: bool,
+        lease_lifetime_secs: u64,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut io = DoubleIo::new(stream);
+        let res = async {
+            // mss listen: header, then the proposal.
+            let header = io.read_frame(16 * 1024, deadline).await?;
+            if header != b"/multistream/1.0.0\n" {
+                return Err("missing mss header".to_string());
+            }
+            io.write_all(&framed(b"/multistream/1.0.0\n"), deadline)
+                .await?;
+            let proposal = io.read_frame(16 * 1024, deadline).await?;
+            let admission = format!("{}\n", crate::relay_client::ADMISSION_PROTOCOL);
+            let hop = format!("{}\n", crate::relay_client::HOP_PROTOCOL);
+            if proposal == admission.as_bytes() {
+                io.write_all(&framed(proposal.as_slice()), deadline).await?;
+                state.note("admission");
+                // ONE PRESENT frame in, ONE STATUS frame out.
+                let body = io.read_frame(4096, deadline).await?;
+                let ticket = double_extract_ticket(&body)?;
+                state
+                    .tickets
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&ticket).to_string());
+                state
+                    .presents
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let code = if verify {
+                    match modelswarm_eligibility::relay_ticket::verify_wire(
+                        &String::from_utf8_lossy(&ticket),
+                        &fixture_signing_key().verifying_key(),
+                        time::OffsetDateTime::now_utc(),
+                    ) {
+                        Ok(()) => 100,
+                        Err(_) => 202,
+                    }
+                } else {
+                    100
+                };
+                let mut status = Vec::new();
+                put_uv(&mut status, 1 << 3);
+                put_uv(&mut status, 1);
+                put_uv(&mut status, 3 << 3);
+                put_uv(&mut status, code as u64);
+                io.write_all(&framed(&status), deadline).await?;
+                Ok(())
+            } else if proposal == hop.as_bytes() {
+                io.write_all(&framed(proposal.as_slice()), deadline).await?;
+                state.note("hop");
+                // ONE hop frame in (RESERVE), ONE Status ok out with
+                // reservation terms + the frozen circuit limits.
+                let _reserve = io.read_frame(4096, deadline).await?;
+                let expire = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + lease_lifetime_secs;
+                let mut reservation = Vec::new();
+                put_uv(&mut reservation, 1 << 3);
+                put_uv(&mut reservation, expire);
+                put_uv(&mut reservation, (2 << 3) | 2);
+                put_uv(&mut reservation, bound.to_vec().len() as u64);
+                reservation.extend_from_slice(&bound.to_vec());
+                let mut limit = Vec::new();
+                put_uv(&mut limit, 1 << 3);
+                put_uv(&mut limit, 1800);
+                put_uv(&mut limit, 2 << 3);
+                put_uv(&mut limit, 16 * 1024 * 1024);
+                let mut status = Vec::new();
+                put_uv(&mut status, 1 << 3);
+                put_uv(&mut status, 2);
+                put_uv(&mut status, (3 << 3) | 2);
+                put_uv(&mut status, reservation.len() as u64);
+                status.extend_from_slice(&reservation);
+                put_uv(&mut status, (4 << 3) | 2);
+                put_uv(&mut status, limit.len() as u64);
+                status.extend_from_slice(&limit);
+                put_uv(&mut status, 5 << 3);
+                put_uv(&mut status, 100);
+                io.write_all(&framed(&status), deadline).await?;
+                Ok(())
+            } else {
+                io.write_all(&framed(b"na\n"), deadline).await?;
+                Err("unexpected protocol".to_string())
+            }
+        }
+        .await;
+        let _ = res;
+    }
+
+    /// Extracts the field-2 ticket bytes from a PRESENT body (test double:
+    /// lenient — the strict decoder is pinned by relay_client's unit
+    /// tests against the frozen corpus).
+    fn double_extract_ticket(body: &[u8]) -> Result<Vec<u8>, String> {
+        if body.len() < 4 || body[0] != 0x08 || body[1] != 0x00 {
+            return Err("not a PRESENT body".to_string());
+        }
+        if body[2] != 0x12 {
+            return Err("missing field 2".to_string());
+        }
+        // uvarint length
+        let mut value: u64 = 0;
+        let mut shift = 0;
+        let mut index = 3;
+        loop {
+            let Some(byte) = body.get(index).copied() else {
+                return Err("truncated length".to_string());
+            };
+            value |= u64::from(byte & 0x7f) << shift;
+            index += 1;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        let end = index + value as usize;
+        if end > body.len() {
+            return Err("ticket length overrun".to_string());
+        }
+        Ok(body[index..end].to_vec())
+    }
+
+    /// ok(100) → the hop exchange proceeds: the reservation lands, the
+    /// admission protocol was negotiated BEFORE the hop protocol, exactly
+    /// ONE PRESENT frame was sent, and the recorded terms carry the
+    /// crafted lease + the frozen circuit limits.
+    #[tokio::test]
+    async fn pre_flight_ok_then_hop_proceeds() {
+        let identity = InstallationIdentity::from_bytes(&[71u8; 32]);
+        let transport = Libp2pTransport::new(&identity).unwrap();
+        let keypair = keypair_from(&identity).unwrap();
+        let (relay_addr, state) = spawn_admission_double(true, 600).await;
+        transport.set_relay_ticket_source(static_ticket_source(mint_ticket(
+            &keypair,
+            time::OffsetDateTime::now_utc(),
+            600,
+        )));
+
+        let reservation = transport
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .expect("admitted pre-flight then reserve proceeds");
+        assert_eq!(state.order(), vec!["admission", "hop"]);
+        assert_eq!(state.presents(), 1, "exactly ONE PRESENT frame");
+        assert_eq!(state.tickets.lock().unwrap().len(), 1);
+        // The hop Status was accepted: finite terms recorded (T5).
+        assert_eq!(reservation.announced_limits().duration_secs, Some(1800));
+        assert_eq!(reservation.announced_limits().bytes, Some(16 * 1024 * 1024));
+        assert!(!reservation.terms().addrs.is_empty());
+        assert!(reservation.alive());
+    }
+
+    /// A non-ok admission status (202) means NO hop stream on the
+    /// connection — the reserve AND the circuit dial fail with the
+    /// relay's verbatim label, and the double sees only the admission
+    /// protocol.
+    #[tokio::test]
+    async fn pre_flight_refused_means_no_hop_stream_and_verbatim_label() {
+        let identity = InstallationIdentity::from_bytes(&[72u8; 32]);
+        let transport = Libp2pTransport::new(&identity).unwrap();
+        let keypair = keypair_from(&identity).unwrap();
+        // verify=true and a ticket signed by the WRONG key → 202.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]);
+        let peer = libp2p::PeerId::from(keypair.public());
+        let installation = installation_of(&keypair);
+        let now = time::OffsetDateTime::now_utc();
+        let ticket = modelswarm_eligibility::relay_ticket::sign_ticket(
+            &modelswarm_eligibility::relay_ticket::RelayAdmissionTicket {
+                installation_id: installation,
+                peer_id: peer.to_string(),
+                issued_at: rfc3339(now - time::Duration::seconds(60)),
+                expires_at: rfc3339(now + time::Duration::seconds(540)),
+                nonce: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+            &other,
+        );
+        let (relay_addr, state) = spawn_admission_double(true, 600).await;
+        transport.set_relay_ticket_source(static_ticket_source(ticket));
+
+        let error = transport
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .err()
+            .expect("the refused admission must fail the reserve");
+        assert!(
+            error.to_string().contains("relay refused admission"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("permission_denied(202)"),
+            "the label is the relay's verbatim status: {error}"
+        );
+        assert_eq!(state.presents(), 1, "the PRESENT was answered, not ignored");
+
+        // No hop stream follows on the connection (a grace window proves
+        // the negative).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            state.order(),
+            vec!["admission"],
+            "no hop stream may be opened after a refused admission"
+        );
+
+        // The circuit dialer path fails the same way, BEFORE any hop work.
+        let circuit = format!("{relay_addr}/p2p-circuit");
+        let (_error, attempts) = transport
+            .dial_with_fallback(&[circuit], &peer, Duration::from_secs(5))
+            .await
+            .err()
+            .expect("the refused admission must fail the dial");
+        assert_eq!(attempts[0].kind, "relay");
+        assert!(attempts[0].error.contains("permission_denied(202)"));
+        assert_eq!(
+            state.order(),
+            vec!["admission", "admission"],
+            "the dial presented, was refused, and opened no hop stream"
+        );
+    }
+
+    /// `na` from a relay without the admission protocol → the hop exchange
+    /// proceeds directly (third-party relay interop preserved), with a
+    /// ticket cached AND with the empty cache.
+    #[tokio::test]
+    async fn na_relay_dials_directly_with_and_without_a_ticket() {
+        // With a ticket: the offer is answered na, the hop proceeds.
+        let identity = InstallationIdentity::from_bytes(&[73u8; 32]);
+        let transport = Libp2pTransport::new(&identity).unwrap();
+        let keypair = keypair_from(&identity).unwrap();
+        let (relay_addr, _circuits) = spawn_relay_double(raised_relay_config()).await;
+        transport.set_relay_ticket_source(static_ticket_source(mint_ticket(
+            &keypair,
+            time::OffsetDateTime::now_utc(),
+            600,
+        )));
+        let reservation = transport
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .expect("an na relay (no admission surface) admits the hop directly");
+        assert!(reservation.alive());
+
+        // Without a ticket (the empty cache): identical behavior — the
+        // pre-wiring default.
+        let identity2 = InstallationIdentity::from_bytes(&[74u8; 32]);
+        let transport2 = Libp2pTransport::new(&identity2).unwrap();
+        let (relay_addr2, _circuits2) = spawn_relay_double(raised_relay_config()).await;
+        let reservation2 = transport2
+            .reserve_relay(&relay_addr2.to_string(), Duration::from_secs(10))
+            .await
+            .expect("the empty cache dials third-party relays unchanged");
+        assert!(reservation2.alive());
+    }
+
+    /// The renewal re-presentation rule end-to-end: with a 2 s lease
+    /// (renewals every ~1 s), a FRESH ticket is presented exactly once,
+    /// while a NEAR-EXPIRY ticket (within the 120 s window) is
+    /// re-presented on every renewal.
+    #[tokio::test]
+    async fn renewal_re_presents_only_when_the_ticket_is_near_expiry() {
+        let identity = InstallationIdentity::from_bytes(&[75u8; 32]);
+        let transport = Libp2pTransport::new(&identity).unwrap();
+        let keypair = keypair_from(&identity).unwrap();
+        let (relay_addr, state) = spawn_admission_double(true, 2).await;
+        transport.set_relay_ticket_source(static_ticket_source(mint_ticket(
+            &keypair,
+            time::OffsetDateTime::now_utc(),
+            600,
+        )));
+
+        let reservation = transport
+            .reserve_relay(&relay_addr.to_string(), Duration::from_secs(10))
+            .await
+            .expect("admitted reserve");
+        // Let ~3 renewal cycles pass (lease 2 s → renewal at 1 s, clamped
+        // by the 1 s floor).
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert!(
+            state.presents() == 1,
+            "a fresh ticket must NOT be re-presented at renewals: {} presents",
+            state.presents()
+        );
+        assert!(
+            state.order().iter().filter(|p| **p == "hop").count() >= 3,
+            "renewals must have happened: {:?}",
+            state.order()
+        );
+        drop(reservation);
+
+        // Near-expiry ticket: issued 590 s ago, expires in 10 s — every
+        // renewal re-presents (the rule: within 120 s of expires_at).
+        let identity2 = InstallationIdentity::from_bytes(&[76u8; 32]);
+        let transport2 = Libp2pTransport::new(&identity2).unwrap();
+        let keypair2 = keypair_from(&identity2).unwrap();
+        let (relay_addr2, state2) = spawn_admission_double(true, 2).await;
+        transport2.set_relay_ticket_source(static_ticket_source(mint_ticket(
+            &keypair2,
+            time::OffsetDateTime::now_utc(),
+            10,
+        )));
+        let reservation2 = transport2
+            .reserve_relay(&relay_addr2.to_string(), Duration::from_secs(10))
+            .await
+            .expect("admitted reserve (near-expiry ticket still valid)");
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert!(
+            state2.presents() >= 3,
+            "a near-expiry ticket must be re-presented at every renewal: {} presents",
+            state2.presents()
+        );
+        drop(reservation2);
     }
 }

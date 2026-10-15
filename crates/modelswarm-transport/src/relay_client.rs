@@ -18,6 +18,23 @@
 //!   the announced length is validated BEFORE any body allocation (the
 //!   same size-before-allocation discipline as the JSON frame codec).
 //!
+//! ADR-038 §3.2 — the admission pre-flight: after dialing a relay leg
+//! (PeerId-verified, unchanged) and BEFORE the first hop exchange on that
+//! connection (RESERVE or CONNECT), the client offers
+//! [`ADMISSION_PROTOCOL`]. On echo it sends ONE PRESENT frame with the
+//! freshest cached ticket and requires `ok(100)` before opening the hop
+//! stream; any other status fails the leg with the relay's verbatim label
+//! and NO hop stream is opened. On `na` — a relay without the admission
+//! protocol, e.g. a third-party relay — the hop exchange proceeds directly
+//! (that relay has no gate; the documented relay-vouched posture). The
+//! ticket arrives as an OPAQUE string from the node's cache
+//! ([`TicketSource`] — the Windows-Product seam); an empty/absent ticket
+//! skips the offer entirely (nothing to present): third-party relays dial
+//! unchanged, and an MSP relay's gate then refuses the hop exchange with
+//! the upstream `resource_limit_exceeded(201)` label, surfaced verbatim —
+//! never reinterpreted (§3.6 item 5: new relayed circuits during a tracker
+//! outage fail honestly).
+//!
 //! Honest security posture: a DIRECT dial's PeerId is verified by the QUIC
 //! TLS handshake (ADR-020). A RELAYED session's far-end PeerId is
 //! **relay-vouched**: the QUIC crypto terminates at the relay, and the relay
@@ -46,11 +63,14 @@ use std::future::Future as _;
 
 use crate::error::{invalid_data, TransportError};
 use crate::libp2p_backend::Libp2pSession;
+use modelswarm_eligibility::relay_ticket::{RelayAdmissionTicket, RELAY_TICKET_SKEW_GRACE_SECS};
 
 /// The circuit-relay v2 hop protocol (frozen upstream name).
 pub const HOP_PROTOCOL: &str = "/libp2p/circuit/relay/0.2.0/hop";
 /// The circuit-relay v2 stop protocol (frozen upstream name).
 pub const STOP_PROTOCOL: &str = "/libp2p/circuit/relay/0.2.0/stop";
+/// The MSP relay-admission pre-flight protocol (ADR-038 §3.2, frozen).
+pub const ADMISSION_PROTOCOL: &str = "/msp/relay-ticket/1";
 /// Maximum protobuf message size (libp2p-relay's `MAX_MESSAGE_SIZE`).
 const MAX_PROTO_MESSAGE: usize = 4096;
 /// multistream-select's frame bound (2-byte uvarint length prefix).
@@ -312,6 +332,194 @@ async fn mss_listen(
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ADR-038 §3.2: the admission pre-flight (client half)
+// ---------------------------------------------------------------------------
+
+/// The node's relay-ticket cache seam (ADR-038 §6.4 row 8 — the Windows
+/// Product wiring lands separately): returns the FRESHEST cached serialized
+/// ticket string, or `None` while the cache is empty (fresh boot, tracker
+/// outage). The ticket is opaque here — the transport never mints, signs,
+/// or validates it; it only parses its own cache's copy's expiry
+/// (syntax-only) for the renewal re-presentation rule.
+pub type TicketSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// The empty cache (the pre-wiring default): every relay leg skips the
+/// pre-flight offer — third-party relays dial exactly as before, and an
+/// MSP relay's gate refuses the hop exchange with the upstream
+/// `resource_limit_exceeded(201)` label, surfaced verbatim.
+pub fn no_ticket_source() -> TicketSource {
+    Arc::new(|| None)
+}
+
+/// The admission-deadline (unix seconds) of a CACHED ticket string —
+/// `expires_at + 120 s`. Syntax-only parse of OUR OWN cache's copy (the
+/// tracker signed it; no signature work happens here), reusing the frozen
+/// strict `from_wire` (exact field set + 600 s TTL).
+fn ticket_deadline_unix(wire: &str) -> Option<i64> {
+    let (ticket, _signature) = RelayAdmissionTicket::from_wire(wire).ok()?;
+    ticket
+        .admission_deadline()
+        .ok()
+        .map(|deadline| deadline.unix_timestamp())
+}
+
+/// The renewal re-presentation rule (ADR-038 §3.2, frozen): re-present iff
+/// the last-presented ticket's `expires_at` has passed or is within 120 s
+/// (`expires_at` = deadline − the 120 s grace). `None` (never presented,
+/// e.g. the ticket arrived after the leg dialed) also re-presents.
+fn should_re_present(last_deadline_unix: Option<i64>) -> bool {
+    match last_deadline_unix {
+        None => true,
+        Some(deadline) => {
+            let expires_at = deadline - RELAY_TICKET_SKEW_GRACE_SECS;
+            (unix_now() as i64) + RELAY_TICKET_SKEW_GRACE_SECS >= expires_at
+        }
+    }
+}
+
+/// `AdmissionMessage.type` values (frozen §3.2 protobuf).
+const ADMISSION_TYPE_PRESENT: u64 = 0;
+/// `AdmissionStatus.type` values (frozen §3.2 protobuf).
+const ADMISSION_TYPE_STATUS: u64 = 1;
+
+/// Encodes the ONE request frame (field 1 varint PRESENT, field 2 the
+/// ticket bytes) — byte-pinned against `relay-admission-frame-1.json`.
+fn encode_admission_present(ticket: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + ticket.len());
+    put_field_varint(&mut out, 1, ADMISSION_TYPE_PRESENT);
+    put_field_bytes(&mut out, 2, ticket.as_bytes());
+    out
+}
+
+/// Strict decode of the ONE response frame: exactly one field-1 varint ==
+/// STATUS, exactly one field-3 varint code, nothing else (unknown type
+/// values, unknown or wrongly-typed fields, duplicates, truncations, and
+/// length overruns are transport errors — the same verdicts the frozen
+/// malformed corpus pins).
+fn decode_admission_status(body: &[u8]) -> Result<i32, TransportError> {
+    let bad = |what: &str| relay_err("relay admission protobuf", what.to_string());
+    let fields = parse_fields(body)?;
+    let mut kind = false;
+    let mut code: Option<u64> = None;
+    for (field, value) in fields {
+        match (field, value) {
+            (1, FieldValue::Varint(value)) => {
+                if kind || value != ADMISSION_TYPE_STATUS {
+                    return Err(bad("unexpected admission type"));
+                }
+                kind = true;
+            }
+            (3, FieldValue::Varint(value)) => {
+                if code.is_some() {
+                    return Err(bad("duplicate admission code"));
+                }
+                code = Some(value);
+            }
+            _ => return Err(bad("unknown or wrongly-typed admission field")),
+        }
+    }
+    if !kind {
+        return Err(bad("admission status without type"));
+    }
+    let code = code.ok_or_else(|| bad("admission status without code"))?;
+    if code > i32::MAX as u64 {
+        return Err(bad("admission code out of range"));
+    }
+    Ok(code as i32)
+}
+
+/// A multistream-select offer's outcome for an OPTIONAL protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MssOutcome {
+    /// The responder echoed the protocol.
+    Agreed,
+    /// The responder answered `na` (does not speak the protocol) — the
+    /// standard optional-protocol behavior.
+    NotSupported,
+}
+
+/// The optional-protocol variant of [`mss_dial`]: propose `protocol`;
+/// distinguish the echo from an `na` answer instead of failing on it.
+async fn mss_offer(
+    io: &mut HandshakeBuf,
+    protocol: &str,
+    deadline: Instant,
+) -> Result<MssOutcome, TransportError> {
+    let proposal = protocol_with_newline(protocol);
+    let mut out = mss_frame(MSS_HEADER);
+    out.extend_from_slice(&mss_frame(proposal.as_bytes()));
+    io.write_all(&out, deadline).await?;
+    let header = io.read_frame(MAX_MSS_FRAME, deadline).await?;
+    if header != MSS_HEADER {
+        return Err(relay_err(
+            "multistream-select",
+            format!(
+                "unexpected header echo {:?}",
+                String::from_utf8_lossy(&header)
+            ),
+        ));
+    }
+    let echo = io.read_frame(MAX_MSS_FRAME, deadline).await?;
+    if echo == proposal.as_bytes() {
+        Ok(MssOutcome::Agreed)
+    } else if echo == MSS_NA {
+        Ok(MssOutcome::NotSupported)
+    } else {
+        Err(relay_err(
+            "multistream-select",
+            format!(
+                "unexpected multistream reply for {protocol}: {:?}",
+                String::from_utf8_lossy(&echo)
+            ),
+        ))
+    }
+}
+
+/// Runs the ADR-038 §3.2 pre-flight on a dialed relay leg, BEFORE any hop
+/// exchange on the connection:
+///
+/// - No cached ticket ⇒ `Ok(None)`: the offer is skipped entirely (there is
+///   nothing to present) and the caller proceeds to the hop exchange —
+///   third-party relays are unchanged, and an MSP relay's gate then refuses
+///   the hop with the upstream 201 label (surfaced verbatim by the caller).
+/// - Offer answered `na` ⇒ `Ok(None)`: the relay has no admission surface;
+///   proceed directly (third-party interop preserved).
+/// - Echo ⇒ ONE PRESENT frame with the freshest ticket; `ok(100)` ⇒
+///   `Ok(Some(deadline_unix))` (the renewal rule's bookkeeping); any other
+///   status ⇒ `Err` carrying the relay's verbatim status label — the caller
+///   must NOT open the hop stream on this connection.
+async fn admission_pre_flight(
+    connection: &mut quic::Connection,
+    tickets: &TicketSource,
+    deadline: Instant,
+) -> Result<Option<i64>, TransportError> {
+    let ticket = match tickets() {
+        Some(ticket) => ticket,
+        None => return Ok(None),
+    };
+    let stream = open_outbound_stream(connection, deadline).await?;
+    let mut io = HandshakeBuf::new(stream);
+    match mss_offer(&mut io, ADMISSION_PROTOCOL, deadline).await? {
+        MssOutcome::NotSupported => return Ok(None),
+        MssOutcome::Agreed => {}
+    }
+    io.write_all(&proto_frame(&encode_admission_present(&ticket)), deadline)
+        .await?;
+    // Mirror the reserve discipline: FIN the request half before awaiting
+    // the response.
+    io.finish_write(deadline).await?;
+    let frame = io.read_frame(MAX_PROTO_MESSAGE, deadline).await?;
+    let code = decode_admission_status(&frame)?;
+    if code != STATUS_OK {
+        return Err(relay_err(
+            "relay admission",
+            format!("relay refused admission: {}", status_name(code)),
+        ));
+    }
+    Ok(Some(ticket_deadline_unix(&ticket).unwrap_or(0)))
 }
 
 // ---------------------------------------------------------------------------
@@ -707,17 +915,21 @@ pub(crate) struct CircuitStream {
     pub preloaded: Vec<u8>,
 }
 
-/// Opens one circuit: dial the relay leg (PeerId-verified), negotiate hop,
-/// CONNECT to `dst`. `Ok` means the relay accepted for exactly `dst` — the
-/// far-end binding is relay-vouched (see the module docs for the honest
-/// trust statement).
+/// Opens one circuit: dial the relay leg (PeerId-verified), run the
+/// admission pre-flight (ADR-038 §3.2 — a refusal fails here with the
+/// relay's verbatim label and NO hop stream), negotiate hop, CONNECT to
+/// `dst`. `Ok` means the relay accepted for exactly `dst` — the far-end
+/// binding is relay-vouched (see the module docs for the honest trust
+/// statement).
 pub(crate) async fn dial_circuit(
     keypair: &Keypair,
     relay_addr: &Multiaddr,
     dst: &PeerId,
     deadline: Instant,
+    tickets: TicketSource,
 ) -> Result<CircuitStream, TransportError> {
     let mut connection = dial_relay_leg(keypair, relay_addr, deadline).await?;
+    admission_pre_flight(&mut connection, &tickets, deadline).await?;
     let stream = open_outbound_stream(&mut connection, deadline).await?;
     let mut io = HandshakeBuf::new(stream);
     mss_dial(&mut io, HOP_PROTOCOL, deadline).await?;
@@ -887,14 +1099,19 @@ impl Drop for RelayReservation {
 
 /// Reserves on the relay at `relay_addr` and spawns the driver task that
 /// (a) answers inbound stop-stream handshakes into sessions on `inbound_tx`
-/// and (b) renews at 3/4 of each lease. Returns the caller-facing handle.
+/// and (b) renews at 3/4 of each lease — re-presenting the admission
+/// ticket first iff the last-presented one has expired or is within 120 s
+/// (ADR-038 §3.2). `tickets` is the node's cache seam. Returns the
+/// caller-facing handle.
 pub(crate) async fn reserve(
     keypair: &Keypair,
     relay_addr: &Multiaddr,
     deadline: Instant,
+    tickets: TicketSource,
 ) -> Result<RelayReservation, TransportError> {
     let mut connection = dial_relay_leg(keypair, relay_addr, deadline).await?;
     let at = Instant::now() + RESERVE_DEADLINE;
+    let admission_deadline = admission_pre_flight(&mut connection, &tickets, deadline).await?;
     let (terms, limits) = reserve_on_connection(&mut connection, at).await?;
 
     let state = Arc::new(StdMutex::new(ReservationState {
@@ -907,6 +1124,8 @@ pub(crate) async fn reserve(
         connection,
         Arc::clone(&state),
         inbound_tx,
+        tickets,
+        admission_deadline,
     ));
     Ok(RelayReservation {
         relay_addr: relay_addr.to_string(),
@@ -965,10 +1184,13 @@ enum DriverStep {
 }
 
 /// Owns the reservation connection: polls inbound stop streams into
-/// sessions, and renews the lease at 3/4 of its lifetime. Any leg failure
-/// marks the reservation dead (`alive() == false`) and ends the task (the
-/// task is aborted on handle drop, which drops the connection — the relay
-/// reads that as a released lease).
+/// sessions, and renews the lease at 3/4 of its lifetime — re-presenting
+/// the admission ticket first iff the last-presented one has expired or is
+/// within 120 s (ADR-038 §3.2's renewal rule; a MSP relay's gate would
+/// otherwise deny the renewal RESERVE with 201 once the admission lapsed).
+/// Any leg failure marks the reservation dead (`alive() == false`) and
+/// ends the task (the task is aborted on handle drop, which drops the
+/// connection — the relay reads that as a released lease).
 ///
 /// Structure note: the connection and the renewal timer are polled from
 /// ONE `poll_fn` (two futures borrowing the connection mutably cannot
@@ -977,6 +1199,8 @@ async fn reservation_driver(
     mut connection: quic::Connection,
     state: Arc<StdMutex<ReservationState>>,
     inbound: tokio::sync::mpsc::Sender<Libp2pSession>,
+    tickets: TicketSource,
+    mut admission_deadline: Option<i64>,
 ) {
     let interval = {
         let guard = state.lock().expect("reservation state lock");
@@ -1010,6 +1234,21 @@ async fn reservation_driver(
             }
             DriverStep::Renew => {
                 let at = Instant::now() + RESERVE_DEADLINE;
+                // ADR-038 §3.2 renewal rule: re-present iff the
+                // last-presented ticket's expires_at has passed or is
+                // within 120 s (presentations are idempotent at the relay).
+                if should_re_present(admission_deadline) {
+                    // A failed re-presentation (refused ticket) kills the
+                    // reservation honestly — same as a failed renewal.
+                    admission_deadline =
+                        match admission_pre_flight(&mut connection, &tickets, at).await {
+                            Ok(deadline) => deadline,
+                            Err(_) => {
+                                state.lock().expect("reservation state lock").alive = false;
+                                break;
+                            }
+                        };
+                }
                 match reserve_on_connection(&mut connection, at).await {
                     Ok((terms, limits)) => {
                         let expire = terms.expire;
@@ -1162,5 +1401,140 @@ mod tests {
         assert!(peer_id_suffix(&with).is_ok());
         let without: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
         assert!(peer_id_suffix(&without).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-038 §6.2 test 5: the admission codec byte-pinned against
+    // relay-admission-frame-1.json, including the malformed corpus.
+    // ------------------------------------------------------------------
+
+    fn vector(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/../../protocol/vectors/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        serde_json::from_str(&raw).expect("vector json parses")
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("hex byte"))
+            .collect()
+    }
+
+    /// The PRESENT encode reproduces the vector's frame byte for byte (the
+    /// relay-ticket-1 token as the ticket bytes), and the wire form is the
+    /// uvarint-length-prefixed body.
+    #[test]
+    fn admission_present_encode_is_byte_pinned_to_the_frame_vector() {
+        let doc = vector("relay-admission-frame-1.json");
+        let expected = unhex(
+            doc["present_frame_hex"]
+                .as_str()
+                .expect("present_frame_hex"),
+        );
+        let token = vector("relay-ticket-1.json")["token"]
+            .as_str()
+            .expect("token")
+            .to_string();
+        let body = encode_admission_present(&token);
+        assert_eq!(body, expected, "PRESENT body must match the vector");
+        let framed = proto_frame(&body);
+        // uvarint(407) = 0x97 0x03, then the body.
+        assert_eq!(&framed[..2], &[0x97, 0x03]);
+        assert_eq!(framed.len(), 2 + expected.len());
+    }
+
+    /// The four STATUS frames decode to their codes with verbatim labels;
+    /// the second implementation reproduces the vector's verdicts.
+    #[test]
+    fn admission_status_frames_decode_to_the_vector_codes() {
+        let doc = vector("relay-admission-frame-1.json");
+        let statuses = &doc["status_frames_hex"];
+        for (key, code) in [
+            ("ok_100", 100),
+            ("resource_limit_exceeded_201", 201),
+            ("permission_denied_202", 202),
+            ("malformed_message_400", 400),
+        ] {
+            let bytes = unhex(statuses[key].as_str().expect("status frame"));
+            assert_eq!(decode_admission_status(&bytes).unwrap(), code, "{key}");
+        }
+        // The refusal labels surface verbatim (one vocabulary, T6).
+        assert_eq!(status_name(202), "permission_denied(202)");
+        assert_eq!(status_name(400), "malformed_message(400)");
+    }
+
+    /// The malformed corpus is refused by the strict STATUS decoder — the
+    /// same verdicts the relay-side decoder produces.
+    #[test]
+    fn admission_malformed_corpus_is_refused() {
+        let doc = vector("relay-admission-frame-1.json");
+        for row in doc["malformed_corpus"].as_array().expect("corpus rows") {
+            let id = row["id"].as_str().expect("id");
+            let bytes = unhex(row["hex"].as_str().expect("hex"));
+            assert!(
+                decode_admission_status(&bytes).is_err(),
+                "{id} must be refused"
+            );
+        }
+        // Additional strictness: duplicate fields.
+        let mut dup = Vec::new();
+        put_field_varint(&mut dup, 1, 1);
+        put_field_varint(&mut dup, 3, 100);
+        put_field_varint(&mut dup, 3, 100);
+        assert!(decode_admission_status(&dup).is_err());
+    }
+
+    /// The renewal re-presentation rule (§3.2): re-present iff the
+    /// last-presented ticket's expires_at has passed or is within 120 s;
+    /// never-presented also re-presents.
+    #[test]
+    fn renewal_re_presentation_rule_matches_the_frozen_window() {
+        // Never presented: re-present.
+        assert!(should_re_present(None));
+
+        // Deadline = expires_at + 120 (grace). expires_at = deadline - 120.
+        let now = unix_now() as i64;
+        // A fresh ticket (expires in 600 s): no re-present until the 120 s
+        // window opens.
+        let fresh_deadline = now + 600 + 120;
+        assert!(!should_re_present(Some(fresh_deadline)));
+        // Inside the last 120 s of the ticket's life: re-present.
+        let near_expiry = now + 100 + 120;
+        assert!(should_re_present(Some(near_expiry)));
+        // Exactly at the window boundary (expires_at - now == 120): the
+        // rule reads "within 120 s" inclusively.
+        let boundary = now + 120 + 120;
+        assert!(should_re_present(Some(boundary)));
+        // Past expiry (still inside the relay's own grace): re-present.
+        let past = now - 10 + 120;
+        assert!(should_re_present(Some(past)));
+    }
+
+    /// The cached ticket's deadline parses (syntax-only) to
+    /// `expires_at + 120 s` — the relay-ticket-1 vector pins 12:12:00Z.
+    #[test]
+    fn cached_ticket_deadline_parses_from_the_vector_token() {
+        let token = vector("relay-ticket-1.json")["token"]
+            .as_str()
+            .expect("token")
+            .to_string();
+        let deadline = ticket_deadline_unix(&token).expect("vector token parses");
+        // 2026-10-15T12:12:00Z in unix seconds.
+        assert_eq!(deadline, 1_792_066_320);
+        // A non-ticket string does not parse — the seam treats it as
+        // absent (no deadline bookkeeping, next renewal re-presents).
+        assert!(ticket_deadline_unix("not-a-ticket").is_none());
+    }
+
+    /// The empty cache source is the honest default: `None`, so relay legs
+    /// skip the offer (third-party interop unchanged; MSP relays refuse at
+    /// the hop with the upstream label).
+    #[test]
+    fn no_ticket_source_is_empty() {
+        assert!((no_ticket_source())().is_none());
     }
 }

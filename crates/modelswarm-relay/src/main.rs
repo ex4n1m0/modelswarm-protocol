@@ -1,82 +1,129 @@
-//! MSP circuit-relay v2 host (ADR-014, Phase F2).
+//! MSP circuit-relay v2 host (ADR-014, Phase F2; ADR-038 admission).
 //!
 //! A standard rust-libp2p relay with the limits the phase-f research
-//! mandates: reservations ≥1024 and, BY DEFAULT, **no per-circuit
-//! duration/byte caps** — the stock defaults (2 min / 128 KiB) reset a
-//! token stream mid-flight, which ADR-007 forbids (no retry after the
-//! first output token). The library's anti-abuse creation rates are
-//! deliberately kept.
+//! mandates, plus the ADR-038 admission gate (the D12 close):
 //!
-//! Admission bounds (2026-10-15, gate D12 runtime half): an operator may
-//! arm per-circuit caps at runtime with `--max-circuit-duration-secs` /
-//! `--max-circuit-bytes`; when a flag is absent the posture is EXACTLY the
-//! phase-f uncapped one (the live deployment changes nothing until the
-//! operator opts in). The startup `--limit-summary` line prints the
-//! effective posture honestly. A cap is a real cut: the relay terminates
-//! the circuit at the limit, and a cut mid-token-stream is unrecoverable
-//! for the requester — which is precisely why uncapped is the default.
-//! The PROTOCOL half of D12 (admission tickets, ADR-038) is not here; this
-//! binary moves bytes and refuses nothing on identity grounds.
+//! - **Admission by tracker-signed ticket** ([`admission`]): the
+//!   `/msp/relay-ticket/1` pre-flight verifies a `RelayAdmissionTicket`
+//!   against the pinned hub key, and ONE gate limiter prepended to BOTH
+//!   rate-limiter vectors refuses every reservation and circuit from a
+//!   peer without live admission (`resource_limit_exceeded(201)`) —
+//!   fail-closed at the accept path itself, independent of the pre-flight.
+//!   No valid ticket ⇒ no resources, ever.
+//! - **Finite, ADR-frozen circuit caps** (§3.5): `reservation_duration`
+//!   600 s (≤ ticket TTL), `max_circuit_duration` 1800 s,
+//!   `max_circuit_bytes` 16 MiB. These replace the F2A/F2B uncapped
+//!   posture per ADR-038; the operator flags override them. A cap cut
+//!   mid-token-stream is unrecoverable (ADR-007: no retry after the first
+//!   output token) — the frozen numbers sit two orders above every
+//!   legitimate maximum, and the relay announces them with every
+//!   reservation so clients price relayed paths honestly.
+//! - The library's anti-abuse creation rates are kept (per-peer/per-IP),
+//!   with the gate FIRST so unadmitted peers never consume the per-IP
+//!   tokens honest peers behind shared NATs depend on.
 //!
-//! The relay is content-blind by construction: it forwards opaque
-//! substreams and never parses MSP frames, prompts, or completions.
-//! Access control is NOT here — serving peers enforce the ADR-026 lease
-//! gate; this host only moves bytes.
+//! The relay is content-blind by construction: admission is a PRE-STREAM
+//! check of a signed blob, and relayed substreams are forwarded as opaque
+//! bytes — never parsed (prompts and completions cannot appear here).
+//! Admission state is memory-only; the relay NEVER contacts the tracker
+//! (T8). The ticket asserts installation liveness ONLY — serving
+//! eligibility stays the ADR-026 lease gate at the peers.
 //!
 //! Node-side support (reserve + dial through `/p2p-circuit` addresses over
 //! the raw-QUIC session layer) is the F2b transport work
 //! (`modelswarm-transport`); this binary is interoperable with any standard
-//! libp2p client today.
+//! libp2p client today (which the gate will refuse unless admitted).
 //!
 //! Bind discipline (F2B, 2026-10-15): the default bind is LOOPBACK
 //! (`127.0.0.1:4001`) — the same ADR-018 posture the transport crate's
 //! `ListenOptions::allow_off_loopback` enforces. Binding any non-loopback
 //! address requires the explicit `--public` operator opt-in at the command
-//! line; a silently-open relay is never the default. The refusal is tested
-//! (`non_loopback_bind_requires_the_explicit_public_opt_in`).
+//! line; a silently-open relay is never the default. Since ADR-038 a
+//! `--public` bind ADDITIONALLY requires a parseable tracker key (embedded
+//! default or `--tracker-key`) — refusal is honest and early (exit 2). The
+//! gate itself is unconditional: every mode answers the admission protocol
+//! and runs the gate limiters; no ungated mode exists.
+
+mod admission;
 
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use ed25519_dalek::VerifyingKey;
 use futures::StreamExt;
 use libp2p::relay;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{identify, ping};
 
-/// Stream-carrying limits (the whole point of running our own relay).
-/// `max_circuit_duration_secs` / `max_circuit_bytes` are the OPERATOR caps
-/// (`--max-circuit-duration-secs` / `--max-circuit-bytes`); `None` keeps
-/// the phase-f uncapped posture EXACTLY as it was before the flags existed
-/// (identical `Config` fields, bit for bit — the absent-flag regression
-/// test pins this).
+/// The pinned hub Ed25519 public key (protocol/keys/hub-public.hex) — the
+/// same root the node build embeds for catalog/lease verification; one key
+/// now guards tickets too (ADR-038 §3.4). Overridable for rotation testing
+/// by `--tracker-key <PATH>`.
+const HUB_PUBLIC_KEY_HEX: &str = include_str!("../../../protocol/keys/hub-public.hex");
+
+/// ADR-038 §3.5 frozen policy: reservation lifetime (≤ ticket TTL —
+/// admission can never outlive its ticket beyond the skew grace; renewals
+/// re-hit the gate every ≤ 450 s).
+pub const FROZEN_RESERVATION_DURATION_SECS: u64 = 600;
+
+/// ADR-038 §3.5 frozen policy: per-circuit lifetime cap.
+pub const FROZEN_MAX_CIRCUIT_DURATION_SECS: u64 = 1800;
+
+/// ADR-038 §3.5 frozen policy: per-circuit relayed-byte cap (16 MiB).
+pub const FROZEN_MAX_CIRCUIT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Stream-carrying limits + the admission gate (the whole point of running
+/// our own relay). The circuit caps default to the ADR-038 §3.5 FROZEN
+/// numbers (which REPLACE the pre-ADR-038 uncapped posture); the operator
+/// flags override them. `table` is the shared admission state both the
+/// pre-flight and the gate limiters close over.
 fn relay_config(
     max_circuit_duration_secs: Option<u64>,
     max_circuit_bytes: Option<u64>,
+    table: &Arc<admission::AdmissionTable>,
 ) -> relay::Config {
-    // Reservation/circuit CREATION rates keep the library's anti-abuse
-    // defaults via struct-update (30 per 2 min per peer) — circuits are per
-    // pooled session, not per request, so this does not bound throughput.
-    relay::Config {
+    let mut config = relay::Config {
         max_reservations: 4096,
         max_reservations_per_peer: 8,
+        // ≤ ticket TTL (ADR-038 §3.5): admission never outlives its ticket
+        // beyond the skew grace; renewals re-hit the gate.
+        reservation_duration: Duration::from_secs(FROZEN_RESERVATION_DURATION_SECS),
         max_circuits: 4096,
         max_circuits_per_peer: 128,
-        // Default: a token stream must never be cut by the relay itself.
-        // The wire format's duration field is u32 seconds — u64::MAX PANICS
-        // the behaviour when it announces the limit (~136 years is the real
-        // max), so "uncapped" is u32::MAX seconds, not Duration::MAX.
+        // ADR-038 §3.5 frozen defaults (replacing the F2A/F2B uncapped
+        // posture): two orders of magnitude above every legitimate maximum;
+        // announced with every reservation (T5).
         max_circuit_duration: Duration::from_secs(
-            max_circuit_duration_secs.unwrap_or(u32::MAX as u64),
+            max_circuit_duration_secs.unwrap_or(FROZEN_MAX_CIRCUIT_DURATION_SECS),
         ),
-        max_circuit_bytes: max_circuit_bytes.unwrap_or(u64::MAX),
+        max_circuit_bytes: max_circuit_bytes.unwrap_or(FROZEN_MAX_CIRCUIT_BYTES),
+        // Reservation/circuit CREATION rates keep the library's anti-abuse
+        // defaults via struct-update (30 per 2 min per peer) — circuits are
+        // per pooled session, not per request, so this does not bound
+        // throughput.
         ..relay::Config::default()
-    }
+    };
+    // THE GATE (ADR-038 §3.4): one closure limiter prepended FIRST to BOTH
+    // limiter vectors — the pinned libp2p-relay 0.22.0 seam consults every
+    // limiter at both resource-grant sites (reservations incl. renewals;
+    // circuit sources) and denies ResourceLimitExceeded on the first false,
+    // so no valid admission ⇒ no resources, pre-flight or not (T1). FIRST
+    // also means unadmitted peers never consume the per-IP tokens honest
+    // peers behind shared NATs depend on (`.all()` short-circuits).
+    let [gate_reservations, gate_circuits] = admission::gate_limiters(table);
+    config
+        .reservation_rate_limiters
+        .insert(0, gate_reservations);
+    config.circuit_src_rate_limiters.insert(0, gate_circuits);
+    config
 }
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     relay: relay::Behaviour,
+    admission: admission::Behaviour,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
 }
@@ -96,7 +143,9 @@ fn load_or_create_key(path: &PathBuf) -> Result<libp2p::identity::Keypair, Strin
 
 fn print_usage() {
     println!("usage: modelswarm-relay [--listen 127.0.0.1:4001] [--key msp-relay.key] [--public]");
-    println!("        [--max-circuit-duration-secs N] [--max-circuit-bytes N]");
+    println!(
+        "        [--tracker-key <PATH>] [--max-circuit-duration-secs N] [--max-circuit-bytes N]"
+    );
     println!("  --listen  UDP/QUIC bind address (default 127.0.0.1:4001 — LOOPBACK).");
     println!("            A non-loopback IP additionally requires --public.");
     println!("  --key     persisted ed25519 key file (default msp-relay.key in cwd)");
@@ -104,27 +153,43 @@ fn print_usage() {
     println!("            /p2p/<relay>/p2p-circuit address — valid across restarts.");
     println!("  --public  EXPLICIT operator opt-in for a non-loopback bind (the");
     println!("            ADR-018 allow_off_loopback discipline: the relay never");
-    println!("            silently binds a public interface).");
+    println!("            silently binds a public interface). Since ADR-038 a");
+    println!("            --public bind ALSO requires a parseable tracker key");
+    println!("            (embedded default or --tracker-key) — the relay refuses");
+    println!("            to start (exit 2) otherwise: no ungated public mode.");
+    println!("  --tracker-key <PATH>  overrides the embedded pinned hub Ed25519");
+    println!("            key (protocol/keys/hub-public.hex) with a file of 64");
+    println!("            lowercase hex chars — the key relay admission tickets");
+    println!("            verify against. Rotation/testing surface, not protocol.");
     println!("  --max-circuit-duration-secs N   per-circuit lifetime cap in seconds.");
-    println!("            DEFAULT: UNCAPPED — omitting the flag keeps today's");
-    println!("            behavior EXACTLY (the live deployment is unchanged until");
-    println!("            the operator arms a cap). HONEST WARNING: a cap is a real");
-    println!("            CUT — the relay terminates the circuit at the limit, and a");
-    println!("            cut mid-token-stream is unrecoverable for the requester");
-    println!("            (ADR-007: no retry after the first output token). Size caps");
-    println!("            generously or leave them off. Range 1..=4294967295");
-    println!("            (u32::MAX — the circuit-relay-v2 wire format's duration");
-    println!("            field); 0 is rejected, not read as \"uncapped\".");
+    println!("            DEFAULT (ADR-038, 2026-10-15): 1800 — the frozen finite");
+    println!("            cap that REPLACES the former UNCAPPED posture (the");
+    println!("            absent flag now means the ADR default, not uncapped).");
+    println!("            HONEST WARNING: a cap is a real CUT — the relay terminates");
+    println!("            the circuit at the limit, and a cut mid-token-stream is");
+    println!("            unrecoverable for the requester (ADR-007: no retry after");
+    println!("            the first output token). The frozen numbers sit two");
+    println!("            orders above legitimate traffic; if a legitimate workload");
+    println!("            ever measures against them they move by ADR amendment,");
+    println!("            never by config tweak. Range 1..=4294967295 (u32::MAX —");
+    println!("            the circuit-relay-v2 wire format's duration field); 0 is");
+    println!("            rejected, not read as \"uncapped\".");
     println!("  --max-circuit-bytes N            per-circuit relayed-byte cap.");
-    println!("            DEFAULT: UNCAPPED; same CUT warning as above (size for the");
-    println!("            FULL response a peer may stream, plus framing). Range");
-    println!("            1..=2^64-1; 0 is rejected — the library treats 0 as \"no");
-    println!("            limit\" internally, so accepting it here would silently");
-    println!("            mean the opposite of what it says.");
+    println!("            DEFAULT (ADR-038): 16777216 (16 MiB) — same frozen-default");
+    println!("            change and CUT warning as above. Range 1..=2^64-1; 0 is");
+    println!("            rejected — the library treats 0 as \"no limit\"");
+    println!("            internally, so accepting it here would silently mean the");
+    println!("            opposite of what it says.");
+    println!("  Admission (ADR-038): reservations and circuits are granted only to");
+    println!("  peers presenting a valid tracker-signed relay admission ticket");
+    println!("  (/msp/relay-ticket/1 pre-flight); the gate is fail-closed at the");
+    println!("  accept sites. The admission table is memory-only (4096 PeerIds,");
+    println!("  deadline-evicted). reservation_duration is frozen at 600 s (<= the");
+    println!("  ticket TTL).");
     println!("  At startup the relay prints a --limit-summary line with the");
     println!("  EFFECTIVE posture (reservations, circuits, per-peer counts,");
-    println!("  duration/byte caps or UNCAPPED) — the ops surface for the live");
-    println!("  deployment's logs.");
+    println!("  duration/byte caps) — the ops surface for the live deployment's");
+    println!("  logs.");
 }
 
 /// Resolve the advertised LAN IP the way the node does — the UDP-connect
@@ -136,13 +201,15 @@ fn lan_ip() -> Option<std::net::IpAddr> {
 }
 
 /// Parsed command line. `public` is the explicit non-loopback opt-in; the
-/// cap fields are `Option` — `None` is the ADR-free default meaning
-/// EXACTLY today's uncapped posture (never a silent reinterpretation).
+/// cap fields are `Option` — `None` means the ADR-038 §3.5 FROZEN defaults
+/// (1800 s / 16 MiB), which supersede the pre-ADR-038 uncapped posture;
+/// `tracker_key` overrides the embedded pinned hub key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Args {
     listen: String,
     key_path: PathBuf,
     public: bool,
+    tracker_key: Option<PathBuf>,
     max_circuit_duration_secs: Option<u64>,
     max_circuit_bytes: Option<u64>,
 }
@@ -153,6 +220,7 @@ impl Default for Args {
             listen: "127.0.0.1:4001".to_string(),
             key_path: PathBuf::from("msp-relay.key"),
             public: false,
+            tracker_key: None,
             max_circuit_duration_secs: None,
             max_circuit_bytes: None,
         }
@@ -241,6 +309,12 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Args, String> {
                 );
             }
             "--public" => parsed.public = true,
+            "--tracker-key" => {
+                parsed.tracker_key = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--tracker-key needs a value".to_string())?,
+                ));
+            }
             "--max-circuit-duration-secs" => {
                 let value = args
                     .next()
@@ -273,47 +347,77 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Args, String> {
     Ok(parsed)
 }
 
+/// Resolves the tracker verification key: `--tracker-key <PATH>` (64
+/// lowercase hex, trimmed) or the embedded pinned default
+/// ([`HUB_PUBLIC_KEY_HEX`]). The ADR-038 §3.4 boot discipline — a `--public`
+/// bind REQUIRES a parseable key — refuses startup on `Err` (exit 2); and
+/// because no ungated mode exists, an unresolvable key refuses startup in
+/// EVERY mode.
+fn resolve_tracker_key(args: &Args) -> Result<VerifyingKey, String> {
+    let hex_source: String = match &args.tracker_key {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("--tracker-key {}: {e}", path.display()))?;
+            raw.trim().to_string()
+        }
+        None => HUB_PUBLIC_KEY_HEX.trim().to_string(),
+    };
+    if hex_source.len() != 64
+        || !hex_source
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "tracker key must be 64 lowercase hex chars, got {} char(s){}",
+            hex_source.len(),
+            if args.tracker_key.is_none() {
+                " (the embedded protocol/keys/hub-public.hex is corrupt)"
+            } else {
+                ""
+            }
+        ));
+    }
+    let bytes = hex::decode(&hex_source).map_err(|e| format!("tracker key hex: {e}"))?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "tracker key must decode to 32 bytes".to_string())?;
+    VerifyingKey::from_bytes(&bytes).map_err(|e| format!("tracker key parse: {e}"))
+}
+
 /// The startup `--limit-summary` ops line: the EFFECTIVE posture the relay
-/// is about to run with, as greppable key=value tokens. Duration is
-/// reported UNCAPPED at the wire maximum (>= u32::MAX seconds — the value
-/// the flag-less config itself uses for "no signaling-grade cap"), bytes
-/// UNCAPPED at `u64::MAX`; any operator-armed cap prints as its number.
+/// is about to run with, as greppable key=value tokens. The ADR-038 frozen
+/// caps (1800 s / 16 MiB) are finite by default; operator overrides print
+/// as their numbers.
 fn limit_summary(config: &relay::Config) -> String {
-    let duration = if config.max_circuit_duration >= Duration::from_secs(u32::MAX as u64) {
-        "UNCAPPED".to_string()
-    } else {
-        format!("{}s", config.max_circuit_duration.as_secs())
-    };
-    let bytes = if config.max_circuit_bytes == u64::MAX {
-        "UNCAPPED".to_string()
-    } else {
-        config.max_circuit_bytes.to_string()
-    };
     format!(
         "--limit-summary reservations={} reservations_per_peer={} circuits={} \
-         circuits_per_peer={} max_circuit_duration={} max_circuit_bytes={}",
+         circuits_per_peer={} max_circuit_duration={}s max_circuit_bytes={} \
+         reservation_duration={}s admission=ADR-038-ticket",
         config.max_reservations,
         config.max_reservations_per_peer,
         config.max_circuits,
         config.max_circuits_per_peer,
-        duration,
-        bytes
+        config.max_circuit_duration.as_secs(),
+        config.max_circuit_bytes,
+        config.reservation_duration.as_secs(),
     )
 }
 
-/// The honest warning printed at startup when an operator has armed a cap:
-/// the relay WILL cut circuits at the limit, and a cut mid-token-stream is
-/// unrecoverable for the requester (ADR-007). `None` when uncapped — the
-/// default posture needs no warning.
+/// The honest warning printed at startup when an operator has armed a cap
+/// OVERRIDE: the frozen ADR-038 defaults are already cuts (that is their
+/// point); an override moves the cut, which is an operator decision the
+/// log must show. ADR-007 interplay: a cut mid-token-stream is
+/// unrecoverable for the requester.
 fn caps_warning(args: &Args) -> Option<String> {
     if args.max_circuit_duration_secs.is_none() && args.max_circuit_bytes.is_none() {
         return None;
     }
     Some(
-        "--limit-summary WARNING: operator caps are ARMED — the relay CUTS circuits at \
+        "--limit-summary WARNING: operator cap overrides are ARMED (ADR-038 frozen \
+         defaults are 1800s / 16777216 bytes) — the relay CUTS circuits at \
          max_circuit_duration/max_circuit_bytes, and a cut mid-token-stream is \
          unrecoverable for the requester (ADR-007: no retry after the first output \
-         token). Size caps for the full streamed response or leave them off."
+         token). Caps move by ADR amendment with measurements, never by tweak."
             .to_string(),
     )
 }
@@ -336,12 +440,41 @@ async fn main() {
     });
     let peer_id = libp2p::PeerId::from(keypair.public());
 
-    let config = relay_config(parsed.max_circuit_duration_secs, parsed.max_circuit_bytes);
+    // ADR-038 §3.4 boot discipline: fail-closed at startup. A --public bind
+    // REQUIRES a parseable tracker key; and because the gate is
+    // unconditional (no ungated mode exists), an unresolvable key refuses
+    // startup in every mode.
+    let tracker_key = resolve_tracker_key(&parsed).unwrap_or_else(|e| {
+        eprintln!(
+            "modelswarm-relay: refusing to start{}: {e}",
+            if parsed.public {
+                " (--public requires a valid tracker key: embedded default or --tracker-key)"
+            } else {
+                " (no ungated mode exists; fix the tracker key)"
+            }
+        );
+        std::process::exit(2);
+    });
+    let table = admission::AdmissionTable::new(admission::wall_clock());
+    let verifier = Arc::new(admission::AdmissionVerifier {
+        key: tracker_key,
+        table: Arc::clone(&table),
+    });
+
+    let config = relay_config(
+        parsed.max_circuit_duration_secs,
+        parsed.max_circuit_bytes,
+        &table,
+    );
     println!("modelswarm-relay: peer id {peer_id}");
     println!("modelswarm-relay: {}", limit_summary(&config));
     if let Some(warning) = caps_warning(&parsed) {
         println!("modelswarm-relay: {warning}");
     }
+    println!(
+        "modelswarm-relay: admission gate ARMED — /msp/relay-ticket/1 pre-flight + \
+         fail-closed reservation/circuit limiters; admission state is memory-only"
+    );
     println!("modelswarm-relay: content-blind — frames are forwarded, never parsed");
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -349,6 +482,7 @@ async fn main() {
         .with_quic()
         .with_behaviour(|key| Behaviour {
             relay: relay::Behaviour::new(key.public().to_peer_id(), config),
+            admission: admission::Behaviour::new(verifier),
             identify: identify::Behaviour::new(identify::Config::new(
                 "/msp-relay/1".to_string(),
                 key.public(),
@@ -412,6 +546,11 @@ async fn main() {
     loop {
         tokio::select! {
             event = swarm.select_next_some() => match event {
+                SwarmEvent::Behaviour(BehaviourEvent::Admission(event)) => {
+                    // The frozen ADR-038 §3.4 vocabulary, exactly — peer id,
+                    // code, reason, deadline; never any ticket bytes.
+                    println!("modelswarm-relay: {}", event.log_line());
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Relay(
                     relay::Event::ReservationReqAccepted { src_peer_id, renewed },
                 )) => println!(
@@ -447,6 +586,17 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::core::muxing::StreamMuxer as _;
+    use libp2p::core::transport::{DialOpts, PortUse};
+    use libp2p::core::Transport as _;
+    use libp2p::quic;
+    use modelswarm_eligibility::relay_ticket::sign_ticket;
+    use modelswarm_eligibility::relay_ticket::RelayAdmissionTicket;
+    use time::OffsetDateTime;
+
+    // ------------------------------------------------------------------
+    // Bind-discipline / flag parsing (ADR-018 + ADR-038 command surface)
+    // ------------------------------------------------------------------
 
     /// F2B bind discipline: the default is LOOPBACK, a non-loopback bind is
     /// refused without the explicit `--public` opt-in, and the opt-in lifts
@@ -469,10 +619,6 @@ mod tests {
                 "refusal must name the opt-in: {err}"
             );
         }
-        // Same with the flag split form.
-        let err = parse_args(["--listen".to_string(), "0.0.0.0:4001".to_string()].into_iter())
-            .unwrap_err();
-        assert!(err.contains("--public"));
 
         // With --public the non-loopback bind parses.
         let public = parse_args(
@@ -493,7 +639,8 @@ mod tests {
         assert!(!loopback.public);
     }
 
-    /// Malformed listen values and unknown flags are honest parse failures.
+    /// Malformed listen values, unknown flags, and valueless flags are
+    /// honest parse failures.
     #[test]
     fn parse_args_rejects_malformed_input() {
         for bad in [
@@ -511,20 +658,142 @@ mod tests {
         assert!(parse_args(["--nope".to_string()].into_iter()).is_err());
         assert!(parse_args(["--listen".to_string()].into_iter()).is_err());
         assert!(parse_args(["--key".to_string()].into_iter()).is_err());
+        assert!(parse_args(["--tracker-key".to_string()].into_iter()).is_err());
     }
 
-    /// Admission-bounds flag parsing (gate D12 runtime half): absent flags
-    /// are UNCAPPED (None — exactly today's posture), valid values land in
-    /// `Args`, and every dishonest value is refused with a reason that
-    /// names the fix (0 is not "uncapped"; the duration field is u32
-    /// seconds on the wire).
+    /// The `--tracker-key` flag: absent means the embedded pinned key; a
+    /// value lands in `Args`; a valueless flag fails.
     #[test]
-    fn cap_flags_parse_validate_and_default_to_absent() {
+    fn tracker_key_flag_parses() {
+        let absent = parse_args(std::iter::empty()).unwrap();
+        assert_eq!(absent.tracker_key, None);
+
+        let with_path =
+            parse_args(["--tracker-key".to_string(), "fixture-hub.hex".to_string()].into_iter())
+                .unwrap();
+        assert_eq!(
+            with_path.tracker_key,
+            Some(PathBuf::from("fixture-hub.hex"))
+        );
+
+        // Combines with the other flags.
+        let combined = parse_args(
+            [
+                "--listen".to_string(),
+                "0.0.0.0:4001".to_string(),
+                "--public".to_string(),
+                "--tracker-key".to_string(),
+                "/keys/hub.hex".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(combined.tracker_key, Some(PathBuf::from("/keys/hub.hex")));
+    }
+
+    /// Boot discipline (ADR-038 §3.4, §6.2 test 4): a `--public` bind
+    /// without a resolvable tracker key refuses startup (the exit-2 path —
+    /// `resolve_tracker_key`'s Err is what main turns into exit 2); the
+    /// embedded default key resolves; a valid `--tracker-key` file
+    /// overrides it; garbage (wrong length, uppercase, non-hex, missing
+    /// file) is refused honestly. The loopback default is unchanged.
+    #[test]
+    fn public_boot_requires_a_resolvable_tracker_key() {
+        // The embedded default resolves (both modes).
+        let args = parse_args(std::iter::empty()).unwrap();
+        assert!(resolve_tracker_key(&args).is_ok(), "embedded key parses");
+        let public = parse_args(
+            [
+                "--listen".to_string(),
+                "0.0.0.0:4001".to_string(),
+                "--public".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert!(
+            resolve_tracker_key(&public).is_ok(),
+            "--public boots with the embedded key"
+        );
+
+        // A --tracker-key file overrides the embedded key.
+        let fixture = std::env::temp_dir().join("msp-relay-test-hub-key.hex");
+        std::fs::write(
+            &fixture,
+            "76d81b33ba721df89b8e0b0ef26c34eb72e978951044798cd608a4f6dbf2e6d6\n",
+        )
+        .unwrap();
+        let with_file = parse_args(
+            [
+                "--listen".to_string(),
+                "0.0.0.0:4001".to_string(),
+                "--public".to_string(),
+                "--tracker-key".to_string(),
+                fixture.to_string_lossy().to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let key = resolve_tracker_key(&with_file).expect("fixture key file resolves");
+        let expected: [u8; 32] =
+            hex::decode("76d81b33ba721df89b8e0b0ef26c34eb72e978951044798cd608a4f6dbf2e6d6")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert_eq!(key.as_bytes(), &expected);
+        let _ = std::fs::remove_file(&fixture);
+
+        // Missing file: honest refusal naming the path.
+        let missing = parse_args(
+            [
+                "--tracker-key".to_string(),
+                "C:/definitely/not/here.hex".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let err = resolve_tracker_key(&missing).unwrap_err();
+        assert!(err.contains("--tracker-key"), "{err}");
+
+        // Garbage contents: refused naming the required shape.
+        for garbage in [
+            "",
+            "abcd",
+            "ABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCD",
+            "zz",
+        ] {
+            let garbage_path = std::env::temp_dir().join("msp-relay-test-hub-garbage.hex");
+            std::fs::write(&garbage_path, garbage).unwrap();
+            let bad = parse_args(
+                [
+                    "--listen".to_string(),
+                    "0.0.0.0:4001".to_string(),
+                    "--public".to_string(),
+                    "--tracker-key".to_string(),
+                    garbage_path.to_string_lossy().to_string(),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+            let err = resolve_tracker_key(&bad).unwrap_err();
+            assert!(
+                err.contains("64 lowercase hex"),
+                "the refusal must name the shape: {err}"
+            );
+            let _ = std::fs::remove_file(&garbage_path);
+        }
+    }
+
+    /// Admission-bounds flag parsing: absent flags mean the ADR-038 frozen
+    /// defaults (1800 s / 16 MiB), valid values land in `Args`, and every
+    /// dishonest value is refused with a reason that names the fix.
+    #[test]
+    fn cap_flags_parse_validate_and_default_to_the_frozen_policy() {
         fn flags(v: &[&str]) -> Vec<String> {
             v.iter().map(|s| s.to_string()).collect::<Vec<_>>()
         }
 
-        // ABSENT: both caps are None — the live deployment's default.
+        // ABSENT: both caps are None — meaning the FROZEN defaults.
         let absent = parse_args(std::iter::empty()).unwrap();
         assert_eq!(absent.max_circuit_duration_secs, None);
         assert_eq!(absent.max_circuit_bytes, None);
@@ -576,7 +845,7 @@ mod tests {
             let err = parse_args(zero.iter().cloned()).unwrap_err();
             assert!(
                 err.contains("omit the flag"),
-                "the 0 refusal must name the uncapped escape: {err}"
+                "the 0 refusal must name the escape: {err}"
             );
         }
 
@@ -604,39 +873,86 @@ mod tests {
         );
     }
 
-    /// The absent-flag regression: parsed-from-empty-argv args produce the
-    /// config of TODAY'S uncapped relay, field for field — the live
-    /// deployment restarts bit-identical until an operator arms a cap.
+    /// The ADR-038 frozen policy table (§3.5) is the absent-flag config,
+    /// field for field: reservation_duration 600 s (≤ ticket TTL), circuit
+    /// caps 1800 s / 16 MiB, the raised counts unchanged, and the gate
+    /// limiter prepended to BOTH limiter vectors. This REPLACES the
+    /// pre-ADR-038 uncapped posture — an honest, ADR-recorded change.
     #[test]
-    fn absent_cap_flags_keep_todays_uncapped_config() {
+    fn absent_flags_mean_the_frozen_adr038_policy() {
         let args = parse_args(std::iter::empty()).unwrap();
-        let config = relay_config(args.max_circuit_duration_secs, args.max_circuit_bytes);
+        let table = admission::AdmissionTable::new(admission::wall_clock());
+        let config = relay_config(
+            args.max_circuit_duration_secs,
+            args.max_circuit_bytes,
+            &table,
+        );
         assert_eq!(config.max_reservations, 4096);
         assert_eq!(config.max_reservations_per_peer, 8);
         assert_eq!(config.max_circuits, 4096);
         assert_eq!(config.max_circuits_per_peer, 128);
-        assert_eq!(config.max_circuit_bytes, u64::MAX);
         assert_eq!(
-            config.max_circuit_duration,
-            Duration::from_secs(u32::MAX as u64),
-            "uncapped stays at the wire-format maximum, exactly as before the flags"
+            config.reservation_duration,
+            Duration::from_secs(600),
+            "reservation_duration is frozen at the ticket TTL (§3.5)"
         );
-        // And the pre-flag literal config equals the flag-derived one.
         assert_eq!(
             config.max_circuit_duration,
-            relay_config(None, None).max_circuit_duration
+            Duration::from_secs(1800),
+            "the frozen 30-minute circuit cap (§3.5)"
         );
         assert_eq!(
             config.max_circuit_bytes,
-            relay_config(None, None).max_circuit_bytes
+            16 * 1024 * 1024,
+            "the frozen 16 MiB circuit cap (§3.5)"
+        );
+        // The gate limiter is FIRST in both vectors (fail-closed; §3.4):
+        // exactly one MORE limiter than the library default, in front.
+        assert_eq!(
+            config.reservation_rate_limiters.len(),
+            relay::Config::default().reservation_rate_limiters.len() + 1
+        );
+        assert_eq!(
+            config.circuit_src_rate_limiters.len(),
+            relay::Config::default().circuit_src_rate_limiters.len() + 1
         );
     }
 
-    /// Arming a flag reaches the relay behaviour's config EXACTLY: the cap
-    /// values the operator typed are the values the relay will enforce,
-    /// and the raised reservation/circuit counts are untouched by them.
+    /// The gate limiters actually GATE: with an empty admission table every
+    /// peer is refused by the FIRST limiter in both vectors (probed through
+    /// the config objects the relay would run).
     #[test]
-    fn armed_cap_flags_reach_the_relay_config_exactly() {
+    fn gate_limiters_refuse_unadmitted_peers() {
+        let table = admission::AdmissionTable::new(admission::wall_clock());
+        let mut config = relay_config(None, None, &table);
+        let peer = libp2p::PeerId::random();
+        let addr: libp2p::Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
+        let now = std::time::Instant::now();
+        // The gate is FIRST in both vectors and refuses the unadmitted
+        // peer; the stock token buckets behind it individually would say
+        // yes (tokens free) — the ORDER is the fail-closed property
+        // (upstream `.all()` short-circuits on the gate's false).
+        assert!(
+            !config.reservation_rate_limiters[0].try_next(peer, &addr, now),
+            "the gate is the FIRST reservation limiter"
+        );
+        assert!(
+            !config.circuit_src_rate_limiters[0].try_next(peer, &addr, now),
+            "the gate is the FIRST circuit-src limiter"
+        );
+        // Admit the peer: the gate passes; the whole vector passes.
+        table.admit(
+            peer,
+            OffsetDateTime::now_utc() + time::Duration::seconds(120),
+        );
+        assert!(config.reservation_rate_limiters[0].try_next(peer, &addr, now));
+        assert!(config.circuit_src_rate_limiters[0].try_next(peer, &addr, now));
+    }
+
+    /// Arming a flag overrides the frozen defaults EXACTLY; the frozen
+    /// reservation duration and raised counts are untouched by them.
+    #[test]
+    fn armed_cap_flags_override_the_frozen_defaults_exactly() {
         let args = parse_args(
             [
                 "--max-circuit-duration-secs".to_string(),
@@ -647,33 +963,47 @@ mod tests {
             .into_iter(),
         )
         .unwrap();
-        let config = relay_config(args.max_circuit_duration_secs, args.max_circuit_bytes);
+        let table = admission::AdmissionTable::new(admission::wall_clock());
+        let config = relay_config(
+            args.max_circuit_duration_secs,
+            args.max_circuit_bytes,
+            &table,
+        );
         assert_eq!(config.max_circuit_duration, Duration::from_secs(7200));
         assert_eq!(config.max_circuit_bytes, 5_368_709_120);
+        assert_eq!(config.reservation_duration, Duration::from_secs(600));
         assert_eq!(config.max_reservations, 4096);
         assert_eq!(config.max_circuits, 4096);
         assert_eq!(config.max_circuits_per_peer, 128);
         assert_eq!(config.max_reservations_per_peer, 8);
-        // One flag alone leaves the other uncapped.
+        // One flag alone leaves the other at its frozen default.
         let only_duration =
             parse_args(["--max-circuit-duration-secs".to_string(), "60".to_string()].into_iter())
                 .unwrap();
+        let table = admission::AdmissionTable::new(admission::wall_clock());
         let config = relay_config(
             only_duration.max_circuit_duration_secs,
             only_duration.max_circuit_bytes,
+            &table,
         );
         assert_eq!(config.max_circuit_duration, Duration::from_secs(60));
-        assert_eq!(config.max_circuit_bytes, u64::MAX);
+        assert_eq!(config.max_circuit_bytes, 16 * 1024 * 1024);
     }
 
     /// The `--limit-summary` ops line reports the EFFECTIVE posture
-    /// honestly: full UNCAPPED vocabulary for absent flags, the armed
-    /// numbers when set, and the ADR-007 warning only when a cap exists.
+    /// honestly: the frozen finite numbers by default, the operator's
+    /// numbers when overridden, and the ADR-007 warning only when an
+    /// override is armed.
     #[test]
     fn limit_summary_reports_the_effective_posture() {
-        // Uncapped (the live deployment's restart posture).
+        // Frozen defaults (the live deployment's restart posture).
         let args = parse_args(std::iter::empty()).unwrap();
-        let config = relay_config(args.max_circuit_duration_secs, args.max_circuit_bytes);
+        let table = admission::AdmissionTable::new(admission::wall_clock());
+        let config = relay_config(
+            args.max_circuit_duration_secs,
+            args.max_circuit_bytes,
+            &table,
+        );
         let summary = limit_summary(&config);
         assert!(summary.starts_with("--limit-summary"), "{summary}");
         for token in [
@@ -681,17 +1011,20 @@ mod tests {
             "reservations_per_peer=8",
             "circuits=4096",
             "circuits_per_peer=128",
-            "max_circuit_duration=UNCAPPED",
-            "max_circuit_bytes=UNCAPPED",
+            "max_circuit_duration=1800s",
+            "max_circuit_bytes=16777216",
+            "reservation_duration=600s",
+            "admission=ADR-038-ticket",
         ] {
             assert!(summary.contains(token), "{summary} must contain {token}");
         }
         assert!(
             caps_warning(&args).is_none(),
-            "no warning in the default uncapped posture"
+            "the frozen default posture carries no override warning"
         );
 
-        // Armed: the numbers appear, UNCAPPED disappears for the armed cap.
+        // Armed: the operator numbers appear, warning fires naming the
+        // frozen defaults it moved.
         let args = parse_args(
             [
                 "--max-circuit-duration-secs".to_string(),
@@ -702,262 +1035,172 @@ mod tests {
             .into_iter(),
         )
         .unwrap();
-        let config = relay_config(args.max_circuit_duration_secs, args.max_circuit_bytes);
+        let table = admission::AdmissionTable::new(admission::wall_clock());
+        let config = relay_config(
+            args.max_circuit_duration_secs,
+            args.max_circuit_bytes,
+            &table,
+        );
         let summary = limit_summary(&config);
         assert!(summary.contains("max_circuit_duration=120s"), "{summary}");
         assert!(summary.contains("max_circuit_bytes=2048"), "{summary}");
-        assert!(!summary.contains("UNCAPPED"), "{summary}");
-        let warning = caps_warning(&args).expect("an armed cap must warn");
+        let warning = caps_warning(&args).expect("an armed override must warn");
         assert!(warning.contains("CUT"), "{warning}");
         assert!(warning.contains("ADR-007"), "{warning}");
+        assert!(
+            warning.contains("1800s"),
+            "{warning} names the frozen default"
+        );
 
-        // One cap armed: the other still reports UNCAPPED, warning present.
+        // One cap overridden: the other stays frozen, warning still fires.
         let args = parse_args(["--max-circuit-bytes".to_string(), "4096".to_string()].into_iter())
             .unwrap();
-        let config = relay_config(args.max_circuit_duration_secs, args.max_circuit_bytes);
+        let table = admission::AdmissionTable::new(admission::wall_clock());
+        let config = relay_config(
+            args.max_circuit_duration_secs,
+            args.max_circuit_bytes,
+            &table,
+        );
         let summary = limit_summary(&config);
         assert!(summary.contains("max_circuit_bytes=4096"), "{summary}");
-        assert!(
-            summary.contains("max_circuit_duration=UNCAPPED"),
-            "{summary}"
-        );
+        assert!(summary.contains("max_circuit_duration=1800s"), "{summary}");
         assert!(caps_warning(&args).is_some());
     }
 
-    /// The stream-carrying contract from the phase-f research: a stock relay
-    /// resets token streams at 2 min / 128 KiB; ours must never.
+    /// The stream-carrying contract, post-ADR-038: caps are FINITE but two
+    /// orders above every legitimate maximum (64 max-size frames per
+    /// direction; ≥ 15 maximum-length request deadlines per circuit).
     #[test]
     fn limits_carry_streams_and_scale_reservations() {
-        let config = relay_config(None, None);
+        let table = admission::AdmissionTable::new(admission::wall_clock());
+        let config = relay_config(None, None, &table);
         assert!(
             config.max_reservations >= 1024,
             "reservations must be >= 1024"
         );
         assert!(config.max_circuits >= 1024, "circuits must be >= 1024");
-        assert_eq!(config.max_circuit_bytes, u64::MAX, "no byte cap");
+        assert!(config.max_circuit_bytes >= 16 * 1024 * 1024, "16 MiB cap");
         assert!(
-            config.max_circuit_duration >= Duration::from_secs(24 * 60 * 60),
-            "no signaling-grade duration cap"
+            config.max_circuit_duration >= Duration::from_secs(15 * 120),
+            "the duration cap covers >= 15 maximum-length request deadlines"
         );
-        assert_eq!(
-            config.max_circuit_duration,
-            Duration::from_secs(u32::MAX as u64),
+        assert!(
+            config.max_circuit_duration <= Duration::from_secs(u32::MAX as u64),
             "must stay within the wire format's u32-second field"
         );
     }
 
-    /// End-to-end acceptance proof for the relay binary's behaviour stack:
-    /// a standard libp2p client reserves through our raised-limit relay,
-    /// a second client establishes a circuit to it, and ping frames flow
-    /// BOTH ways through the relayed connection. This is the interop level
-    /// the F2b node-side client must reach.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn standard_clients_reserve_and_circuit_through_the_relay() {
-        let _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Debug)
-            .parse_env("RUST_LOG")
-            .try_init();
-        use libp2p::swarm::SwarmEvent;
-        use libp2p::{noise, yamux};
+    // ------------------------------------------------------------------
+    // In-process gated-relay infrastructure (fixture key + virtual clock)
+    // ------------------------------------------------------------------
 
-        #[derive(NetworkBehaviour)]
-        struct ClientBehaviour {
-            relay_client: relay::client::Behaviour,
-            ping: ping::Behaviour,
-        }
-
-        fn client_swarm() -> (libp2p::Swarm<ClientBehaviour>, libp2p::identity::Keypair) {
-            let key = libp2p::identity::Keypair::generate_ed25519();
-            let swarm = libp2p::SwarmBuilder::with_existing_identity(key.clone())
-                .with_tokio()
-                .with_quic()
-                .with_relay_client(noise::Config::new, yamux::Config::default)
-                .unwrap()
-                .with_behaviour(|_key, relay_client| ClientBehaviour {
-                    relay_client,
-                    ping: ping::Behaviour::new(
-                        ping::Config::new().with_interval(Duration::from_secs(1)),
-                    ),
-                })
-                .unwrap()
-                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
-                .build();
-            (swarm, key)
-        }
-
-        // --- relay (the binary's exact behaviour stack + limits) ---
-        let relay_key = libp2p::identity::Keypair::generate_ed25519();
-        let relay_peer_id = libp2p::PeerId::from(relay_key.public());
-        let mut relay_swarm = libp2p::SwarmBuilder::with_existing_identity(relay_key)
-            .with_tokio()
-            .with_quic()
-            .with_behaviour(|key| Behaviour {
-                relay: relay::Behaviour::new(key.public().to_peer_id(), relay_config(None, None)),
-                identify: identify::Behaviour::new(identify::Config::new(
-                    "/msp-relay-test/1".to_string(),
-                    key.public(),
-                )),
-                ping: ping::Behaviour::new(
-                    ping::Config::new().with_interval(Duration::from_secs(30)),
-                ),
-            })
-            .unwrap()
-            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build();
-        // Fresh relays are HOP-disabled until identify reports an external
-        // address; force it on like the binary does.
-        relay_swarm
-            .behaviour_mut()
-            .relay
-            .set_status(Some(relay::Status::Enable));
-        relay_swarm
-            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
-            .unwrap();
-        let relay_addr = loop {
-            match relay_swarm.select_next_some().await {
-                SwarmEvent::NewListenAddr { address, .. } => break address,
-                _ => continue,
-            }
-        };
-        // Clients reject a reservation whose response carries no relay
-        // addresses (NoAddressesInReservation) — advertise the bound addr
-        // like the binary advertises its LAN addr.
-        relay_swarm.add_external_address(relay_addr.clone());
-        let relay_addr = relay_addr.with(libp2p::multiaddr::Protocol::P2p(relay_peer_id));
-
-        let (report_tx, mut report_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let relay_tx = report_tx.clone();
-        tokio::spawn(async move {
-            let mut swarm = relay_swarm;
-            let tx = relay_tx;
-            while let Some(event) = swarm.next().await {
-                if let SwarmEvent::Behaviour(BehaviourEvent::Relay(
-                    relay::Event::CircuitReqAccepted {
-                        src_peer_id,
-                        dst_peer_id,
-                    },
-                )) = event
-                {
-                    let _ = tx.send(format!("relay circuit {src_peer_id} -> {dst_peer_id}"));
-                }
-            }
-        });
-
-        // --- server client (B): reserve, then receive the circuit ---
-        let (server_swarm, server_key) = client_swarm();
-        let server_peer_id = libp2p::PeerId::from(server_key.public());
-        let circuit_listen = relay_addr
-            .clone()
-            .with(libp2p::multiaddr::Protocol::P2pCircuit);
-        let mut server_swarm = server_swarm;
-        server_swarm.listen_on(circuit_listen).unwrap();
-        let server_tx = report_tx.clone();
-        tokio::spawn(async move {
-            let mut swarm = server_swarm;
-            while let Some(event) = swarm.next().await {
-                match event {
-                    SwarmEvent::Behaviour(ClientBehaviourEvent::RelayClient(
-                        relay::client::Event::ReservationReqAccepted { .. },
-                    )) => {
-                        let _ = server_tx.send("server reserved".to_string());
-                    }
-                    SwarmEvent::Behaviour(ClientBehaviourEvent::Ping(ping::Event {
-                        result: Ok(_),
-                        ..
-                    })) => {
-                        let _ = server_tx.send("server ping ok".to_string());
-                    }
-                    SwarmEvent::ConnectionEstablished { endpoint, .. } if endpoint.is_relayed() => {
-                        let _ = server_tx.send("server circuit in".to_string());
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        // --- dialer client (A): circuit to the server, then ping it. The
-        // reservation is one localhost round trip; a short grace period
-        // before the single dial avoids a denied first attempt (a channel-
-        // driven dial re-enters select! with a consumed receiver — hot
-        // loop hazard not worth the coordination for a test). ---
-        let (dialer_swarm, _) = client_swarm();
-        let dial_addr = relay_addr
-            .with(libp2p::multiaddr::Protocol::P2pCircuit)
-            .with(libp2p::multiaddr::Protocol::P2p(server_peer_id));
-        let dialer_tx = report_tx.clone();
-        tokio::spawn(async move {
-            let mut swarm = dialer_swarm;
-            let dial_at = tokio::time::Instant::now() + Duration::from_secs(2);
-            let mut dialed = false;
-            loop {
-                tokio::select! {
-                    event = swarm.select_next_some() => match event {
-                        SwarmEvent::Behaviour(ClientBehaviourEvent::Ping(ping::Event {
-                            result: Ok(_),
-                            ..
-                        })) => {
-                            let _ = dialer_tx.send("dialer ping ok".to_string());
-                        }
-                        SwarmEvent::ConnectionEstablished {
-                            endpoint, ..
-                        } if endpoint.is_relayed() => {
-                            let _ = dialer_tx.send("dialer circuit out".to_string());
-                        }
-                        _ => {}
-                    },
-                    _ = tokio::time::sleep_until(dial_at), if !dialed => {
-                        dialed = true;
-                        match swarm.dial(dial_addr.clone()) {
-                            Ok(()) => { let _ = dialer_tx.send("dialer dialed".to_string()); }
-                            Err(e) => { let _ = dialer_tx.send(format!("dialer dial error {e:?}")); }
-                        }
-                    }
-                }
-            }
-        });
-
-        // --- collect the proof: circuit + both-way pings (the reservation
-        // line is informational; the dial is timer-driven) ---
-        let overall = tokio::time::timeout(Duration::from_secs(60), async {
-            let mut server_pinged = false;
-            let mut dialer_pinged = false;
-            let mut relay_circuit = false;
-            while !server_pinged || !dialer_pinged || !relay_circuit {
-                let line = report_rx
-                    .recv()
-                    .await
-                    .expect("all swarm drivers exited before the proof completed");
-                match line.as_str() {
-                    "server ping ok" => server_pinged = true,
-                    "dialer ping ok" => dialer_pinged = true,
-                    l if l.starts_with("relay circuit") => relay_circuit = true,
-                    _ => {}
-                }
-            }
-        })
-        .await;
-        assert!(
-            overall.is_ok(),
-            "reservation + circuit + bidirectional ping through the relay did not complete in time"
-        );
+    /// The recorded fixture signing key (the vectors' 0x38 seed — never the
+    /// production hub key; §6.2 fixture discipline).
+    fn fixture_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x38u8; 32])
     }
 
-    // ------------------------------------------------------------------
-    // F2B: honest enforcement proofs — caps and refusal paths against a
-    // real relay swarm (standard libp2p relay clients).
-    // ------------------------------------------------------------------
+    fn rfc3339(t: OffsetDateTime) -> String {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339")
+    }
 
-    /// A standard relay-client swarm (relay client + ping), as in
-    /// `standard_clients_reserve_and_circuit_through_the_relay`.
+    fn parse_rfc3339(s: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    /// A fixture ticket minted for `keypair`'s PeerId (real ADR-020
+    /// derivations — the in-process proofs exercise checks 7-8 against
+    /// real keys), valid from `now` under the frozen 600 s TTL.
+    fn mint_ticket_for(keypair: &libp2p::identity::Keypair, now: OffsetDateTime) -> String {
+        let peer = libp2p::PeerId::from(keypair.public());
+        let installation = admission::derived_installation_id(&peer).expect("ed25519 peer derives");
+        let ticket = RelayAdmissionTicket {
+            installation_id: installation,
+            peer_id: peer.to_string(),
+            issued_at: rfc3339(now - time::Duration::seconds(60)),
+            expires_at: rfc3339(now + time::Duration::seconds(540)),
+            nonce: "0123456789abcdef0123456789abcdef".to_string(),
+        };
+        sign_ticket(&ticket, &fixture_signing_key())
+    }
+
+    /// The raw-QUIC pre-flight presenter (the F2B-era client discipline:
+    /// dial the relay leg, offer `/msp/relay-ticket/1` over
+    /// multistream-select 1.0.0, send ONE PRESENT frame, read ONE STATUS
+    /// frame). Test-only mirror of `modelswarm-transport`'s client half.
+    async fn present_ticket(
+        keypair: &libp2p::identity::Keypair,
+        relay_addr: &libp2p::Multiaddr,
+        ticket: &str,
+    ) -> Result<i32, String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut transport = quic::tokio::Transport::new(quic::Config::new(keypair));
+        let dial = transport
+            .dial(
+                relay_addr.clone(),
+                DialOpts {
+                    role: libp2p::core::Endpoint::Dialer,
+                    port_use: PortUse::New,
+                },
+            )
+            .map_err(|e| format!("dial: {e}"))?;
+        let (_peer_id, mut connection) = tokio::time::timeout_at(deadline, dial)
+            .await
+            .map_err(|e| format!("dial: {e:?}"))?
+            .map_err(|e| format!("dial: {e}"))?;
+        let stream = {
+            let opened =
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut connection).poll_outbound(cx));
+            tokio::time::timeout_at(deadline, opened)
+                .await
+                .map_err(|e| format!("stream open: {e:?}"))?
+                .map_err(|e| format!("stream open: {e}"))?
+        };
+
+        let mut io = admission::ExchangeBuf::new(stream);
+        // mss offer: header + protocol, then read both echoes.
+        let protocol = format!("{}\n", admission::ADMISSION_PROTOCOL);
+        let mss_frame = |payload: &[u8]| -> Vec<u8> {
+            let mut frame = Vec::new();
+            admission::put_uvarint(&mut frame, payload.len() as u64);
+            frame.extend_from_slice(payload);
+            frame
+        };
+        let mut offer = Vec::new();
+        offer.extend_from_slice(&mss_frame(b"/multistream/1.0.0\n"));
+        offer.extend_from_slice(&mss_frame(protocol.as_bytes()));
+        io.write_frame(&offer, deadline)
+            .await
+            .map_err(|e| format!("mss offer write: {e:?}"))?;
+        let _header = io
+            .read_frame(deadline)
+            .await
+            .map_err(|e| format!("mss header: {e:?}"))?;
+        let echo = io
+            .read_frame(deadline)
+            .await
+            .map_err(|e| format!("mss echo: {e:?}"))?;
+        if echo != protocol.as_bytes() {
+            return Err(format!("mss refused: {}", String::from_utf8_lossy(&echo)));
+        }
+        // ONE PRESENT frame, ONE STATUS frame (§3.2).
+        let body = admission::encode_present(ticket);
+        io.write_frame(&admission::frame(&body), deadline)
+            .await
+            .map_err(|e| format!("present write: {e:?}"))?;
+        let status_body = io
+            .read_frame(deadline)
+            .await
+            .map_err(|e| format!("status read: {e:?}"))?;
+        admission::decode_status(&status_body).map_err(|e| format!("status decode: {e:?}"))
+    }
+
+    /// A standard relay-client swarm (relay client + ping).
     fn std_client_swarm() -> (libp2p::Swarm<StdClientBehaviour>, libp2p::identity::Keypair) {
         std_client_swarm_with_ping(Duration::from_secs(30))
     }
 
-    /// [`std_client_swarm`] with a configurable ping interval — the
-    /// flag-cap cut proofs need fast pings so a byte cap is crossed
-    /// DETERMINISTICALLY (ping traffic never stops, so the relay's
-    /// forwarded-byte counter grows without bound and any finite cap is
-    /// eventually reached).
     fn std_client_swarm_with_ping(
         interval: Duration,
     ) -> (libp2p::Swarm<StdClientBehaviour>, libp2p::identity::Keypair) {
@@ -978,19 +1221,56 @@ mod tests {
         (swarm, key)
     }
 
+    /// A standard relay-client swarm with a FIXED keypair (same key ⇒ same
+    /// PeerId ⇒ one admission covers the presenter connection AND the
+    /// swarm's — the table is keyed by PeerId, §3.4 check 10).
+    fn std_client_swarm_with_key(
+        keypair: libp2p::identity::Keypair,
+    ) -> libp2p::Swarm<StdClientBehaviour> {
+        use libp2p::{noise, yamux};
+        libp2p::SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_quic()
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .unwrap()
+            .with_behaviour(|_key, relay_client| StdClientBehaviour {
+                relay_client,
+                ping: ping::Behaviour::new(
+                    ping::Config::new().with_interval(Duration::from_secs(1)),
+                ),
+            })
+            .unwrap()
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build()
+    }
+
     #[derive(NetworkBehaviour)]
     struct StdClientBehaviour {
-        relay_client: relay::client::Behaviour,
+        relay_client: libp2p::relay::client::Behaviour,
         ping: ping::Behaviour,
     }
 
-    /// Starts an in-process relay (the binary's exact behaviour stack) with
-    /// the GIVEN config, on an ephemeral loopback QUIC port. Returns its
+    /// A settable clock shared with the relay's admission verifier.
+    fn settable_clock(
+        now: OffsetDateTime,
+    ) -> (admission::Clock, Arc<std::sync::Mutex<OffsetDateTime>>) {
+        let shared = Arc::new(std::sync::Mutex::new(now));
+        let clock: admission::Clock = {
+            let shared = Arc::clone(&shared);
+            Arc::new(move || *shared.lock().unwrap())
+        };
+        (clock, shared)
+    }
+
+    /// Starts an in-process relay (the binary's exact behaviour stack —
+    /// relay + admission + identify + ping) with the GIVEN config and
+    /// admission verifier, on an ephemeral loopback QUIC port. Returns its
     /// `/p2p/`-suffixed address and a report channel carrying one honest
-    /// line per relay lifecycle event (the binary's diagnostics
-    /// vocabulary).
-    async fn start_relay(
+    /// line per relay/admission lifecycle event (the binary's diagnostics
+    /// vocabulary, admission lines included).
+    async fn start_gated_relay(
         config: relay::Config,
+        verifier: Arc<admission::AdmissionVerifier>,
     ) -> (
         libp2p::Multiaddr,
         tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -1003,6 +1283,7 @@ mod tests {
             .with_quic()
             .with_behaviour(|key| Behaviour {
                 relay: relay::Behaviour::new(key.public().to_peer_id(), config),
+                admission: admission::Behaviour::new(verifier),
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/msp-relay-test/1".to_string(),
                     key.public(),
@@ -1037,6 +1318,9 @@ mod tests {
         tokio::spawn(async move {
             while let Some(event) = swarm.next().await {
                 let line = match event {
+                    SwarmEvent::Behaviour(BehaviourEvent::Admission(event)) => {
+                        Some(event.log_line())
+                    }
                     SwarmEvent::Behaviour(BehaviourEvent::Relay(
                         relay::Event::ReservationReqAccepted {
                             src_peer_id,
@@ -1080,128 +1364,320 @@ mod tests {
         )
     }
 
-    /// The configured `max_reservations` cap is ENFORCED: with a cap of 1,
-    /// the first peer's reservation is accepted and the second DISTINCT
-    /// peer's is denied with the honest `ResourceLimitExceeded` status on
-    /// the wire (this is the machinery our uncapped production config
-    /// deliberately sizes at 4096 instead of disabling).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reservation_cap_is_enforced_with_resource_limit_exceeded() {
-        let config = relay::Config {
-            max_reservations: 1,
-            ..relay_config(None, None)
-        };
-        let (relay_addr, mut reports) = start_relay(config).await;
-
-        // First peer reserves: accepted.
-        let (mut first, _) = std_client_swarm();
-        first
-            .listen_on(
-                relay_addr
-                    .clone()
-                    .with(libp2p::multiaddr::Protocol::P2pCircuit),
-            )
-            .unwrap();
-        tokio::spawn(async move {
-            loop {
-                first.select_next_some().await;
-            }
+    /// A gated relay under the wall clock: ONE verifier (fixture key) feeds
+    /// BOTH the pre-flight and the gate limiters — the config is built from
+    /// the verifier's own table so the two can never diverge (the exact
+    /// wiring main() runs).
+    async fn wall_clock_gated_relay(
+        max_circuit_duration_secs: Option<u64>,
+        max_circuit_bytes: Option<u64>,
+    ) -> (
+        libp2p::Multiaddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let verifier = Arc::new(admission::AdmissionVerifier {
+            key: fixture_signing_key().verifying_key(),
+            table: admission::AdmissionTable::new(admission::wall_clock()),
         });
-
-        // Second peer reserves: denied by the cap.
-        let (mut second, _) = std_client_swarm();
-        second
-            .listen_on(
-                relay_addr
-                    .clone()
-                    .with(libp2p::multiaddr::Protocol::P2pCircuit),
-            )
-            .unwrap();
-        tokio::spawn(async move {
-            loop {
-                second.select_next_some().await;
-            }
-        });
-
-        let mut saw_accepted = false;
-        let mut saw_denied = false;
-        let overall = tokio::time::timeout(Duration::from_secs(30), async {
-            while !(saw_accepted && saw_denied) {
-                let line = reports
-                    .recv()
-                    .await
-                    .expect("relay driver exited before both events");
-                if line.starts_with("reservation accepted") {
-                    saw_accepted = true;
-                }
-                if line.starts_with("reservation denied") && line.contains("ResourceLimitExceeded")
-                {
-                    saw_denied = true;
-                }
-            }
-        })
-        .await;
-        assert!(
-            overall.is_ok(),
-            "cap of 1 must accept the first reservation and deny the second with ResourceLimitExceeded"
+        let config = relay_config(
+            max_circuit_duration_secs,
+            max_circuit_bytes,
+            &verifier.table,
         );
+        start_gated_relay(config, verifier).await
     }
 
-    /// A circuit to a destination with NO reservation is refused with the
-    /// honest `NoReservation` status (the peer never reserved, or its lease
-    /// expired) — never a silent hang or a partial circuit.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn circuit_to_unreserved_destination_is_denied_no_reservation() {
-        let (relay_addr, mut reports) = start_relay(relay_config(None, None)).await;
+    /// Admits a client (mint + present + assert ok(100)). `now` is the
+    /// RELAY's admission clock reading (wall now for wall-clock relays, the
+    /// virtual t0 for the expiry proof).
+    async fn admit_client(
+        keypair: &libp2p::identity::Keypair,
+        relay_addr: &libp2p::Multiaddr,
+        now: OffsetDateTime,
+    ) {
+        let ticket = mint_ticket_for(keypair, now);
+        let code = present_ticket(keypair, relay_addr, &ticket)
+            .await
+            .expect("pre-flight exchange completes");
+        assert_eq!(code, 100, "fixture-key ticket admits the real peer");
+    }
 
-        let (mut dialer, _) = std_client_swarm();
-        let stranger = libp2p::PeerId::random();
+    /// Drives one std client's swarm forever.
+    fn drive(swarm: libp2p::Swarm<StdClientBehaviour>) {
+        tokio::spawn(async move {
+            let mut swarm = swarm;
+            loop {
+                swarm.select_next_some().await;
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // §6.2 test 1: the fail-closed proofs against the REAL relay stack
+    // ------------------------------------------------------------------
+
+    /// T1, the D12 close: a standard libp2p client that NEVER runs the
+    /// pre-flight is refused — reservation AND circuit denied
+    /// `ResourceLimitExceeded`; presenting a fixture-key ticket then admits
+    /// the same peer (reserve → circuit → bidirectional ping, the F2B proof
+    /// extended); admission expiry on the virtual clock (past
+    /// `expires_at + 120 s`) re-closes BOTH gates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate_fails_closed_admits_on_ticket_and_recloses_on_expiry() {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .parse_env("RUST_LOG")
+            .try_init();
+        use libp2p::multiaddr::Protocol;
+        use libp2p::swarm::SwarmEvent;
+
+        // A virtual clock so expiry needs no sleeping.
+        let t0 = parse_rfc3339("2026-10-15T12:00:00Z");
+        let (clock, now) = settable_clock(t0);
+        let verifier = Arc::new(admission::AdmissionVerifier {
+            key: fixture_signing_key().verifying_key(),
+            table: admission::AdmissionTable::new(clock),
+        });
+        let table = Arc::clone(&verifier.table);
+        let config = relay_config(None, None, &table);
+        let (relay_addr, mut reports) = start_gated_relay(config, verifier).await;
+
+        // --- Phase 1: ticketless refusal (reservation AND circuit). ---
+        let server_key = libp2p::identity::Keypair::generate_ed25519();
+        let server_peer = libp2p::PeerId::from(server_key.public());
+        let mut server = std_client_swarm_with_key(server_key.clone());
+        server
+            .listen_on(relay_addr.clone().with(Protocol::P2pCircuit))
+            .unwrap();
+        // One merged proof stream: relay lifecycle lines + ping results.
+        let (proof_tx, mut proof_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let relay_fwd = proof_tx.clone();
+        tokio::spawn(async move {
+            while let Some(line) = reports.recv().await {
+                let _ = relay_fwd.send(line);
+            }
+        });
+        let server_tx = proof_tx.clone();
+        tokio::spawn(async move {
+            let mut swarm = server;
+            loop {
+                match swarm.select_next_some().await {
+                    SwarmEvent::Behaviour(StdClientBehaviourEvent::Ping(ping::Event {
+                        result: Ok(_),
+                        ..
+                    })) => {
+                        let _ = server_tx.send("server ping ok".to_string());
+                    }
+                    SwarmEvent::ConnectionEstablished { endpoint, .. } if endpoint.is_relayed() => {
+                        let _ = server_tx.send("server circuit in".to_string());
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // The circuit dialer (also ticketless in phase 1).
+        let dialer_key = libp2p::identity::Keypair::generate_ed25519();
+        let dialer = std_client_swarm_with_key(dialer_key.clone());
         let dial_addr = relay_addr
             .clone()
-            .with(libp2p::multiaddr::Protocol::P2pCircuit)
-            .with(libp2p::multiaddr::Protocol::P2p(stranger));
-        dialer.dial(dial_addr).unwrap();
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(server_peer));
+        let dialer_tx = proof_tx.clone();
+        let phase1_dial_addr = dial_addr.clone();
         tokio::spawn(async move {
+            let mut swarm = dialer;
+            let dial_at = tokio::time::Instant::now() + Duration::from_secs(1);
+            let mut dialed = false;
             loop {
-                dialer.select_next_some().await;
+                tokio::select! {
+                    event = swarm.select_next_some() => {
+                        if let SwarmEvent::Behaviour(StdClientBehaviourEvent::Ping(
+                            ping::Event { result: Ok(_), .. },
+                        )) = event
+                        {
+                            let _ = dialer_tx.send("dialer ping ok".to_string());
+                        }
+                    }
+                    _ = tokio::time::sleep_until(dial_at), if !dialed => {
+                        dialed = true;
+                        let _ = swarm.dial(phase1_dial_addr.clone());
+                    }
+                }
             }
         });
 
-        let mut saw_denied = false;
-        let overall = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let line = reports
+        // Phase 1 proof: BOTH gates refuse with ResourceLimitExceeded —
+        // the reservation denial from the server's listen, the circuit
+        // denial from the dialer's dial. The circuit denial ALSO pins that
+        // the gate limiter runs before the NoReservation lookup.
+        let mut reservation_denied = false;
+        let mut circuit_denied = false;
+        let phase1 = tokio::time::timeout(Duration::from_secs(30), async {
+            while !(reservation_denied && circuit_denied) {
+                let line = proof_rx
                     .recv()
                     .await
-                    .expect("relay driver exited before the denial");
-                if line.starts_with("circuit denied") && line.contains("NoReservation") {
-                    saw_denied = true;
-                    break;
+                    .expect("relay driver exited before phase 1 completed");
+                if line.starts_with("reservation denied") && line.contains("ResourceLimitExceeded")
+                {
+                    reservation_denied = true;
+                }
+                if line.starts_with("circuit denied") && line.contains("ResourceLimitExceeded") {
+                    circuit_denied = true;
                 }
             }
         })
         .await;
         assert!(
-            overall.is_ok() && saw_denied,
-            "the relay must deny the circuit"
+            phase1.is_ok(),
+            "ticketless clients must be refused at BOTH grant sites with ResourceLimitExceeded"
         );
-        // The client-side error surface belongs to the client; this test
-        // pins the RELAY's honest refusal vocabulary.
+        assert!(reservation_denied && circuit_denied);
+
+        // --- Phase 2: present fixture tickets; the SAME peers (same keys,
+        // = same PeerIds) are admitted. libp2p's relay client CLOSES its
+        // listener after a denied reservation (no retry), so the admitted
+        // phase runs on FRESH swarms with the SAME keys — the admission is
+        // keyed to the PeerId, not the connection (§3.4 check 10).
+        admit_client(&server_key, &relay_addr, t0).await;
+        admit_client(&dialer_key, &relay_addr, t0).await;
+
+        let admitted_server = std_client_swarm_with_key(server_key.clone());
+        let admitted_relay_addr = relay_addr.clone();
+        let server_tx = proof_tx.clone();
+        tokio::spawn(async move {
+            let mut swarm = admitted_server;
+            swarm
+                .listen_on(admitted_relay_addr.with(Protocol::P2pCircuit))
+                .unwrap();
+            loop {
+                match swarm.select_next_some().await {
+                    SwarmEvent::Behaviour(StdClientBehaviourEvent::Ping(ping::Event {
+                        result: Ok(_),
+                        ..
+                    })) => {
+                        let _ = server_tx.send("server ping ok".to_string());
+                    }
+                    SwarmEvent::ConnectionEstablished { endpoint, .. } if endpoint.is_relayed() => {
+                        let _ = server_tx.send("server circuit in".to_string());
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let redial = std_client_swarm_with_key(dialer_key.clone());
+        let redial_tx = proof_tx.clone();
+        let redial_addr = dial_addr.clone();
+        tokio::spawn(async move {
+            let mut swarm = redial;
+            let dial_at = tokio::time::Instant::now() + Duration::from_secs(2);
+            let mut dialed = false;
+            loop {
+                tokio::select! {
+                    event = swarm.select_next_some() => {
+                        if let SwarmEvent::Behaviour(StdClientBehaviourEvent::Ping(
+                            ping::Event { result: Ok(_), .. },
+                        )) = event
+                        {
+                            let _ = redial_tx.send("dialer ping ok".to_string());
+                        }
+                    }
+                    _ = tokio::time::sleep_until(dial_at), if !dialed => {
+                        dialed = true;
+                        let _ = swarm.dial(redial_addr.clone());
+                    }
+                }
+            }
+        });
+
+        // Phase 2 proof: reservation accepted + circuit + BOTH-way pings.
+        let mut reserved = false;
+        let mut circuit = false;
+        let mut server_pinged = false;
+        let mut dialer_pinged = false;
+        let phase2 = tokio::time::timeout(Duration::from_secs(60), async {
+            while !(reserved && circuit && server_pinged && dialer_pinged) {
+                let line = proof_rx
+                    .recv()
+                    .await
+                    .expect("drivers exited before phase 2 completed");
+                match line.as_str() {
+                    l if l.starts_with("reservation accepted") => reserved = true,
+                    l if l.starts_with("circuit ") && l.contains(" -> ") => circuit = true,
+                    "server ping ok" => server_pinged = true,
+                    "dialer ping ok" => dialer_pinged = true,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            phase2.is_ok(),
+            "admitted peers must reserve, circuit, and ping both ways through the relay"
+        );
+
+        // --- Phase 3: virtual clock past expires_at + 120 s re-closes BOTH gates. ---
+        // Ticket issued at t0-60, expires t0+540, deadline t0+660.
+        *now.lock().unwrap() = t0 + time::Duration::seconds(700);
+        assert!(!table.is_live(&server_peer), "server admission expired");
+
+        // Fresh connections from the SAME PeerIds (same keys) are refused.
+        let mut expired_server = std_client_swarm_with_key(server_key.clone());
+        expired_server
+            .listen_on(relay_addr.clone().with(Protocol::P2pCircuit))
+            .unwrap();
+        drive(expired_server);
+        let expired_dialer = std_client_swarm_with_key(dialer_key.clone());
+        let expired_dial_addr = dial_addr.clone();
+        tokio::spawn(async move {
+            let mut swarm = expired_dialer;
+            let dial_at = tokio::time::Instant::now() + Duration::from_secs(1);
+            let mut dialed = false;
+            loop {
+                tokio::select! {
+                    _ = swarm.select_next_some() => {}
+                    _ = tokio::time::sleep_until(dial_at), if !dialed => {
+                        dialed = true;
+                        let _ = swarm.dial(expired_dial_addr.clone());
+                    }
+                }
+            }
+        });
+
+        let mut reservation_denied_again = false;
+        let mut circuit_denied_again = false;
+        let phase3 = tokio::time::timeout(Duration::from_secs(30), async {
+            while !(reservation_denied_again && circuit_denied_again) {
+                let line = proof_rx
+                    .recv()
+                    .await
+                    .expect("drivers exited before phase 3 completed");
+                if line.starts_with("reservation denied") && line.contains("ResourceLimitExceeded")
+                {
+                    reservation_denied_again = true;
+                }
+                if line.starts_with("circuit denied") && line.contains("ResourceLimitExceeded") {
+                    circuit_denied_again = true;
+                }
+            }
+        })
+        .await;
+        assert!(
+            phase3.is_ok(),
+            "past expires_at + 120 s both gates must re-close (ResourceLimitExceeded)"
+        );
     }
 
     // ------------------------------------------------------------------
-    // Gate D12 runtime half: the FLAG PATH end to end — caps armed from a
-    // PARSED COMMAND LINE are the caps a real relay enforces against
-    // standard libp2p clients.
+    // Flag-path cap proofs (the machinery the frozen numbers ride), now
+    // behind the admission gate.
     // ------------------------------------------------------------------
 
-    /// Drives the dialer side of a cap-cut proof: waits `grace` for the
-    /// server's reservation to settle (the timer-driven dial pattern from
-    /// `standard_clients_reserve_and_circuit_through_the_relay`), dials
-    /// through the relay, then reports the RELAYED connection's lifecycle.
-    /// Pings are attributed by `ConnectionId` so only pings that crossed
-    /// THE CIRCUIT count — the ping behaviour also pings the dialer's
-    /// plain transport connection to the relay itself.
+    /// Drives the dialer side of a cap-cut proof (the F2B shape): waits
+    /// `grace` for the server's reservation to settle, dials through the
+    /// relay, then reports the RELAYED connection's lifecycle.
     async fn drive_circuit_dialer(
         mut swarm: libp2p::Swarm<StdClientBehaviour>,
         dial_addr: libp2p::Multiaddr,
@@ -1244,14 +1720,7 @@ mod tests {
         }
     }
 
-    /// Collects the cap-cut proof from the merged report stream (relay
-    /// lifecycle lines + dialer lines): the circuit must be SEEN by the
-    /// relay, ESTABLISH on the dialer, carry at least one ping THROUGH the
-    /// circuit, then CLOSE between `min_lifetime` and `max_lifetime` after
-    /// establishment — it demonstrably worked, and the relay (not a
-    /// handshake failure) ended it at the operator's cap. An uncapped
-    /// circuit would live to the 60s idle timeout, outside every window
-    /// used here.
+    /// Collects the cap-cut proof from the merged report stream.
     async fn await_relayed_circuit_cut(
         reports: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
         min_lifetime: Duration,
@@ -1303,28 +1772,33 @@ mod tests {
     }
 
     /// `--max-circuit-duration-secs 2` from a command line arms a cap a
-    /// REAL relay enforces: the relayed circuit establishes, carries pings
-    /// both ways, and is CUT at the ~2s deadline (closed 1-10s after
-    /// establishment). This is the flag-path version of the transport
-    /// crate's `announced_circuit_duration_limit_cuts_the_stream` — and
-    /// the exact behavior the default posture exists to avoid.
+    /// REAL gated relay enforces: the relayed circuit establishes, carries
+    /// pings both ways, and is CUT at the ~2s deadline.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flag_armed_duration_cap_cuts_the_circuit() {
         // THE FLAG PATH: the enforced cap comes from parsed argv.
         let args =
             parse_args(["--max-circuit-duration-secs".to_string(), "2".to_string()].into_iter())
                 .unwrap();
-        let config = relay_config(args.max_circuit_duration_secs, args.max_circuit_bytes);
+        let table = admission::AdmissionTable::new(admission::wall_clock());
+        let config = relay_config(
+            args.max_circuit_duration_secs,
+            args.max_circuit_bytes,
+            &table,
+        );
         assert_eq!(
             config.max_circuit_duration,
             Duration::from_secs(2),
             "the parsed flag value must be the enforced value"
         );
-        let (relay_addr, mut relay_reports) = start_relay(config).await;
+        drop(config);
+        let (relay_addr, mut relay_reports) = wall_clock_gated_relay(Some(2), None).await;
 
-        // Server reserves and listens on its circuit address.
-        let (mut server, server_key) = std_client_swarm();
+        // Server reserves and listens on its circuit address (admitted).
+        let (server, server_key) = std_client_swarm();
         let server_peer = libp2p::PeerId::from(server_key.public());
+        admit_client(&server_key, &relay_addr, OffsetDateTime::now_utc()).await;
+        let mut server = server;
         server
             .listen_on(
                 relay_addr
@@ -1332,15 +1806,12 @@ mod tests {
                     .with(libp2p::multiaddr::Protocol::P2pCircuit),
             )
             .unwrap();
-        tokio::spawn(async move {
-            loop {
-                server.select_next_some().await;
-            }
-        });
+        drive(server);
 
         // Dialer: fast pings so the circuit demonstrably carries frames
         // before the deadline.
-        let (dialer, _) = std_client_swarm_with_ping(Duration::from_millis(200));
+        let (dialer, dialer_key) = std_client_swarm_with_ping(Duration::from_millis(200));
+        admit_client(&dialer_key, &relay_addr, OffsetDateTime::now_utc()).await;
         let dial_addr = relay_addr
             .with(libp2p::multiaddr::Protocol::P2pCircuit)
             .with(libp2p::multiaddr::Protocol::P2p(server_peer));
@@ -1369,26 +1840,29 @@ mod tests {
     }
 
     /// `--max-circuit-bytes 4096` from a command line arms a byte cap a
-    /// REAL relay enforces: the circuit establishes, carries pings (a
-    /// prefix of the stream), and is CUT once the forwarded-byte counter
-    /// crosses the cap. Deterministic because the ping traffic never
-    /// stops, so the counter grows without bound past any finite cap —
-    /// the flag-path version of the transport crate's
-    /// `announced_circuit_byte_limit_cuts_the_stream`.
+    /// REAL gated relay enforces: the circuit establishes, carries pings,
+    /// and is CUT once the forwarded-byte counter crosses the cap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flag_armed_byte_cap_cuts_the_circuit() {
-        // THE FLAG PATH: the enforced cap comes from parsed argv.
         let args = parse_args(["--max-circuit-bytes".to_string(), "4096".to_string()].into_iter())
             .unwrap();
-        let config = relay_config(args.max_circuit_duration_secs, args.max_circuit_bytes);
+        let table = admission::AdmissionTable::new(admission::wall_clock());
+        let config = relay_config(
+            args.max_circuit_duration_secs,
+            args.max_circuit_bytes,
+            &table,
+        );
         assert_eq!(
             config.max_circuit_bytes, 4096,
             "the parsed flag value must be the enforced value"
         );
-        let (relay_addr, mut relay_reports) = start_relay(config).await;
+        drop(config);
+        let (relay_addr, mut relay_reports) = wall_clock_gated_relay(None, Some(4096)).await;
 
-        let (mut server, server_key) = std_client_swarm();
+        let (server, server_key) = std_client_swarm();
         let server_peer = libp2p::PeerId::from(server_key.public());
+        admit_client(&server_key, &relay_addr, OffsetDateTime::now_utc()).await;
+        let mut server = server;
         server
             .listen_on(
                 relay_addr
@@ -1396,13 +1870,10 @@ mod tests {
                     .with(libp2p::multiaddr::Protocol::P2pCircuit),
             )
             .unwrap();
-        tokio::spawn(async move {
-            loop {
-                server.select_next_some().await;
-            }
-        });
+        drive(server);
 
-        let (dialer, _) = std_client_swarm_with_ping(Duration::from_millis(150));
+        let (dialer, dialer_key) = std_client_swarm_with_ping(Duration::from_millis(150));
+        admit_client(&dialer_key, &relay_addr, OffsetDateTime::now_utc()).await;
         let dial_addr = relay_addr
             .with(libp2p::multiaddr::Protocol::P2pCircuit)
             .with(libp2p::multiaddr::Protocol::P2p(server_peer));
@@ -1420,9 +1891,6 @@ mod tests {
             tx,
         ));
 
-        // The cut lands once handshake + identify + pings cross 4096
-        // forwarded bytes — comfortably after the first ping, well before
-        // the 45s proof deadline.
         let proof =
             await_relayed_circuit_cut(&mut rx, Duration::from_millis(500), Duration::from_secs(20))
                 .await;
@@ -1430,6 +1898,44 @@ mod tests {
             proof.is_ok(),
             "a 4096-byte flag-armed cap must cut the live circuit: {:?}",
             proof.unwrap_err()
+        );
+    }
+
+    /// A circuit to a destination with NO reservation is refused with
+    /// `NoReservation` — from an ADMITTED source (the honest
+    /// unreserved-destination vocabulary, distinct from the gate's
+    /// ResourceLimitExceeded).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_circuit_to_unreserved_destination_is_denied_no_reservation() {
+        let (relay_addr, mut reports) = wall_clock_gated_relay(None, None).await;
+
+        let (mut dialer, dialer_key) = std_client_swarm();
+        admit_client(&dialer_key, &relay_addr, OffsetDateTime::now_utc()).await;
+        let stranger = libp2p::PeerId::random();
+        let dial_addr = relay_addr
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2pCircuit)
+            .with(libp2p::multiaddr::Protocol::P2p(stranger));
+        dialer.dial(dial_addr).unwrap();
+        drive(dialer);
+
+        let mut saw_denied = false;
+        let overall = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let line = reports
+                    .recv()
+                    .await
+                    .expect("relay driver exited before the denial");
+                if line.starts_with("circuit denied") && line.contains("NoReservation") {
+                    saw_denied = true;
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            overall.is_ok() && saw_denied,
+            "the relay must deny the circuit with NoReservation"
         );
     }
 }

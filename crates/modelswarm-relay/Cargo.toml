@@ -20,6 +20,14 @@ libp2p = { version = "0.57", features = [
 ] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 futures = "0.3"
+# ADR-038 §6.4 row 6: the ticket type + frozen verification semantics
+# (from_wire/verify/check_peer_binding/check_installation/admission_deadline).
+modelswarm-eligibility = { path = "../modelswarm-eligibility" }
+# ADR-020 derivation reuse for check 8 (base58(SHA-256(pubkey))).
+modelswarm-identity = { path = "../modelswarm-identity" }
+ed25519-dalek = "2"
+hex = "0.4"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [lints]
 workspace = true
@@ -27,3 +35,5 @@ workspace = true
 [dev-dependencies]
 env_logger = "0.11"
 log = "0.4"
+serde_json = "1"
+base64 = "0.22"

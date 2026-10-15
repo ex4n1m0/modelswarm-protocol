@@ -3577,10 +3577,17 @@ dependencies = [
 name = "modelswarm-relay"
 version = "0.2.24"
 dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek 2.2.0",
  "env_logger",
  "futures",
+ "hex",
  "libp2p",
  "log",
+ "modelswarm-eligibility",
+ "modelswarm-identity",
+ "serde_json",
+ "time",
  "tokio",
 ]
 
@@ -3702,9 +3709,11 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures",
  "libp2p",
+ "modelswarm-eligibility",
  "modelswarm-identity",
  "serde",
  "serde_json",
+ "time",
  "tokio",
 ]
 

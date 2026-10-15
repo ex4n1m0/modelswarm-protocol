@@ -7,6 +7,7 @@
   "base_ticket": "relay-ticket-1.json",
   "authenticated_remote_peer_id": "12D3KooWSrKnMZUcSxK8G7wmBbXdU8nFEfWGhLu6H8xjn8LmCSJb",
   "derived_installation_id": "b58-installation-relay-0001",
+  "binding_note": "PLACEHOLDER PAIR — this fixture's installation_id does NOT re-derive from the peer_id under the real ADR-020 rule (the Security review's binding drift ruling (b), 2026-10-15: split coverage accepted — checks 1-6 pinned here; check 7-8 binding pinned by the implementation's re-derived fixtures + the in-process end-to-end proofs). The next vector revision regenerates accept/expired/forge with a properly-derived pair AND records the peer identity seed so checks 7-8 become replayable cross-language (T/R concurrence adds the seed requirement).",
   "rows": [
     {
       "id": "bad_signature",

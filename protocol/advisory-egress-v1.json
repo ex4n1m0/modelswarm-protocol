@@ -433,7 +433,6 @@
       "runtime.selected": "excluded",
       "runtime.unavailable": "excluded",
       "settings.content_carriage": "excluded",
-      "settings.family_verified_chat": "excluded",
       "settings.pairing": "excluded",
       "tracker.mock_mode": "excluded",
       "updater.before_exit": "excluded",

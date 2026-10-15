@@ -1458,14 +1458,6 @@
       "fields": []
     },
     {
-      "event": "settings.family_verified_chat",
-      "classification": "excluded",
-      "sources": [
-        "crates/modelswarm-desktop/src/app.rs:1845"
-      ],
-      "fields": []
-    },
-    {
       "event": "settings.pairing",
       "classification": "excluded",
       "sources": [

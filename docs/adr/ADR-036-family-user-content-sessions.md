@@ -607,3 +607,9 @@ Changes to §3.3's election semantics:
 - Old configs carrying `family_verified_chat` are preserved verbatim
   (unknown keys are never deleted) and the key is simply never read
   again.
+- The retired event leaves the advisory egress surfaces in the same
+  change: `settings.family_verified_chat` is removed from
+  `protocol/advisory-egress-v1.json` and the frozen fixture inventory
+  (the R-1 two-sided tie requires artifact == source == inventory; a
+  stale row with no emit site fails the guards job — the tie caught
+  exactly this on run 38673888323).

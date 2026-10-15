@@ -99,12 +99,12 @@ standing deployment note).
 
 ## 5. Unresolved risks / open items
 
-1. **PENDING CROSS-TIE (the important one)**: the inline test fixture must be
-   reconciled with `protocol/vectors/relay-ticket-1.json` when the Protocol
-   seat lands it (assert-against or replace). Until then the byte-parity
-   anchor lives only in the TS suite and my handoff — the Rust
-   `modelswarm-eligibility::relay_ticket` consumer does not exist yet, so
-   TS↔Rust ticket parity is unpinned.
+1. **PENDING CROSS-TIE (the important one)**: ~~resolved by the §6 addendum —
+   the vectors landed at `af1dc01` and the TS suite now consumes them
+   directly~~. (Original text: the inline test fixture must be reconciled
+   with `protocol/vectors/relay-ticket-1.json` when the Protocol seat lands
+   it; the Rust consumer did not exist yet, so TS↔Rust ticket parity was
+   unpinned.)
 2. `HeartbeatResponse.relay_ticket` is `String` — if the Windows Product seat
    prefers `Option<String>` for the node cache, that is a one-line serde
    change on their side of the wiring (no wire change; both forms tolerate
@@ -117,7 +117,59 @@ standing deployment note).
    lib.rs test; the node's ticket cache lands with the Windows Product seat).
 5. The observed (non-reproducing) workspace test flake in §2.
 
-## 6. Suggested next task for the Integrator
+## 6. Follow-up addendum (2026-10-15, later) — the pending cross-tie is CLOSED
+
+The Protocol seat landed the vectors at `af1dc01`
+(`protocol/vectors/relay-ticket-1.json`, `relay-ticket-2-expired.json`,
+`relay-ticket-forge-1.json`, `relay-admission-frame-1.json`, plus
+`crates/modelswarm-eligibility/src/relay_ticket.rs` + its vector-consumer
+tests). The recorded follow-up is done: `apps/tracker/tests/relay-ticket.test.ts`
+now consumes the FROZEN vector files directly (the same
+`crypto-vectors.test.ts` vectorsDir discipline) — the inline fixture is
+deleted. The suite grew 11 → 26 tests:
+
+- **relay-ticket-1 (accept)**: fixture seed derives the recorded public key;
+  payload is byte-exact against `canonical_json` AND `canonicalJson(fields)`
+  AND `canonical_json_sha256`; signature verifies against the fixture key
+  (flip + wrong-key fail); frozen shape (exact field set, exactly 600 s delta,
+  32-hex nonce, ≤ 1024 B); admission-deadline arithmetic
+  (`expires_at + 120 s == expected_admission_deadline`) and liveness at
+  `verify_at`; the tracker issuer reproduces the vector's deterministic fields
+  (nonce excepted) under the vector's own seed; and the full wire form
+  reconstructs byte-exactly from `canonicalJson` + the base64url Ed25519
+  primitives — **TS↔Rust ticket byte-parity is now pinned against the same
+  files the eligibility crate consumes** (risk §5.1 resolved).
+- **relay-ticket-2-expired**: same token, signature STILL verifies; the TS
+  skew-rule computation agrees it is expired at its `verify_at` (expiry, not
+  signature, is the failure).
+- **relay-ticket-forge-1 (tracker-side mirror)**: the corpus's 12 rows carry
+  the frozen status/reason vocabulary; the syntax/signature rows are
+  re-derived in code exactly as the Rust forge test derives them (bad
+  signature flip; wrong-key re-sign; unknown field; missing nonce;
+  non-canonical key order; 601 s delta validly signed — signature ok, delta
+  wrong; uppercase/31-char nonce; plain-date timestamp; single segment;
+  > 1024 B wire). The two relay-context rows (peer_mismatch /
+  installation_mismatch) are mirrored only as "the mutated tickets are
+  internally valid" plus the signature-precedes-binding order note — the
+  binding checks belong to the relay, and the tracker deliberately does not
+  reimplement them. `relay-admission-frame-1.json` is the transport seat's
+  frame vector and is intentionally NOT consumed here.
+- The issuance/route/failure-path tests are unchanged (rig-keyed, not
+  fixture-keyed). The strict `from_wire` parser remains the Rust consumer's;
+  the test-local `ticketFormError` mirror is test-only, so no new production
+  surface was invented in the tracker.
+
+Commands/outcomes for the follow-up: `npx vitest run
+tests/relay-ticket.test.ts` 26/26; `npm run test` 162 passed / 2 skipped / 0
+failed; `npm run typecheck` clean; `npm run build` compiled successfully;
+`cargo test -p modelswarm-tracker-api` + `cargo fmt --check` green (crate
+untouched this round; sanity after pulling `af1dc01`).
+
+Remaining §6.4 rows after this: Network 6–7 (relay admission gate +
+pre-flight), Windows Product 8 (node ticket cache), Test and Release 10
+(wire-compat job — should consume the same vector files), Security §6.1.
+
+## 7. Suggested next task for the Integrator
 
 Route to Protocol Architect: land `crates/modelswarm-eligibility/src/relay_ticket.rs`
 + `protocol/vectors/relay-ticket-*.json`, then have me re-point the inline TS

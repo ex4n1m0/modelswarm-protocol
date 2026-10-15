@@ -3,9 +3,17 @@ import { guardPeerRequest } from "@/lib/guard";
 import { leaseBindingError } from "@/lib/leases";
 import { HeartbeatSchema } from "@/lib/schemas";
 import { LEASE_TTL_MS } from "@/lib/constants";
+import { issueRelayAdmissionTicket } from "@/lib/relay-ticket";
 
 // POST /api/v1/peers/heartbeat (msp-v1 §3.3): extends the lease (row-aging
 // TTL), records an observation, and drains revocation notices (delete-on-read).
+// Every SUCCESSFUL heartbeat also mints one RelayAdmissionTicket (ADR-038
+// §3.3): issuance to heartbeat-current installations rides this existing
+// surface — no new auth machinery, no new route, no new rate limit. The
+// ticket is server-side-minted from the AUTHENTICATED installation and the
+// tracker-side lease row (peerId registered at /peers/register); neither id
+// is ever taken from the request body. Failure paths (401/410 below) return
+// BEFORE minting — no ticket for unauthenticated or stale-lease callers.
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,6 +44,19 @@ export async function POST(req: Request) {
     observedAt: now,
   });
 
+  // Same hub key surface as catalog envelopes and eligibility leases
+  // (ADR-038 §3.4 key distribution; deliberately NOT a second key).
+  const relayTicket = issueRelayAdmissionTicket(
+    installationId,
+    lease.peerId,
+    now,
+    ctx.keys.secretKey,
+  );
+
   const notices = await ctx.store.drainNotices(body.leaseId);
-  return jsonOk({ leaseExpiresAt: new Date(expiresAt).toISOString(), notices });
+  return jsonOk({
+    leaseExpiresAt: new Date(expiresAt).toISOString(),
+    relayTicket: relayTicket.token,
+    notices,
+  });
 }

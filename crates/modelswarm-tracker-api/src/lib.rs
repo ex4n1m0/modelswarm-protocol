@@ -169,6 +169,14 @@ pub struct Notice {
 pub struct HeartbeatResponse {
     #[serde(rename = "leaseExpiresAt")]
     pub lease_expires_at: String,
+    /// ADR-038 §3.3: the relay admission ticket minted on every successful
+    /// heartbeat — `base64url(canonical ticket JSON) "." base64url(ed25519
+    /// signature)`, opaque to this client (verification lives in
+    /// `modelswarm-eligibility` / the relay). Additive deploy-order field:
+    /// `#[serde(default)]` keeps an OLD tracker deploy (no field yet)
+    /// parseable by a NEW client — empty string means "no ticket issued".
+    #[serde(default, rename = "relayTicket")]
+    pub relay_ticket: String,
     #[serde(default)]
     pub notices: Vec<Notice>,
 }
@@ -673,6 +681,34 @@ mod tests {
                 canary_digest: None,
             }
         );
+    }
+
+    // ADR-038 §6.2(7) wire-compat lockstep: the `relayTicket` field is
+    // additive with tracker-first deploy order, so an OLD tracker response
+    // (field absent) MUST keep parsing for a NEW client (serde default
+    // tolerance), and a NEW response MUST carry the wire name `relayTicket`.
+    #[test]
+    fn heartbeat_response_relay_ticket_deploy_skew_tolerance() {
+        // Old tracker deploy: field absent -> parses, empty string.
+        let old = serde_json::json!({
+            "leaseExpiresAt": "2026-10-15T12:00:00.000Z",
+            "notices": [],
+        });
+        let parsed: HeartbeatResponse = serde_json::from_value(old).expect("old deploy parses");
+        assert_eq!(parsed.relay_ticket, "");
+        assert_eq!(parsed.lease_expires_at, "2026-10-15T12:00:00.000Z");
+
+        // New tracker deploy: opaque string round-trips under the wire name.
+        let token = "eyJleHBpcmVzX2F0IjoiMjAyNi0xMC0xNVQxMjoxMDowMC4wMDBaIn0.Slb9XGYOFMx1Q";
+        let new = serde_json::json!({
+            "leaseExpiresAt": "2026-10-15T12:00:00.000Z",
+            "relayTicket": token,
+            "notices": [],
+        });
+        let parsed: HeartbeatResponse = serde_json::from_value(new).expect("new deploy parses");
+        assert_eq!(parsed.relay_ticket, token);
+        let reserialized = serde_json::to_value(&parsed).expect("reserialize");
+        assert_eq!(reserialized["relayTicket"], token);
     }
 
     #[test]

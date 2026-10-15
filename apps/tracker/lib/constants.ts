@@ -7,6 +7,13 @@ export const LEASE_TTL_MS = 75_000;
 /** Capability/eligibility-lease grace over the issuing lease (msp-v1 §5). */
 export const TOKEN_GRACE_MS = 60_000;
 
+/** Relay admission ticket TTL (ADR-038 §3.1 frozen constant):
+ *  `expires_at − issued_at` is EXACTLY 600 s. Tickets ride the 15–30 s
+ *  heartbeat cadence, survive brief tracker outages for new relayed
+ *  circuits, and bound every compromise window to TTL + the ±120 s skew
+ *  grace. Serialized ticket length stays ≤ 1024 bytes. */
+export const RELAY_TICKET_TTL_MS = 600_000;
+
 /** Hosting-challenge completion deadline. */
 export const CHALLENGE_TTL_MS = 120_000;
 

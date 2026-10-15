@@ -113,7 +113,7 @@ installation**; referencing another installation's lease is `401 unauthorized`.
 |---|---|---|
 | `POST /peers/challenge/start` | `{leaseId, profileId}` | `{challengeId, challengePrompt, deadlineAt}`; one open challenge per lease+profile. `challengePrompt` is **nonce-bound** (D16, gate 2026-10-09 / ADR-028 §7): `"ModelSwarm readiness challenge <challengeId>"`, plus `"; greedy-canary sha256:<64hex>"` when the profile has a pinned possession digest (hash-only, content-blind; construction byte-pinned by `protocol/vectors/challenge-prompt-1.json`) |
 | `POST /peers/register` | `{peerId, addresses:[multiaddr], profiles:[profileId…], maxSlots, runtime:{name,build}}` | `{leaseId, leaseExpiresAt}` |
-| `POST /peers/heartbeat` | `{leaseId, activeProfiles:[profileId…], freeSlots, queueMs, draining:bool}` | `{leaseExpiresAt, notices:[Notice]}` (below) |
+| `POST /peers/heartbeat` | `{leaseId, activeProfiles:[profileId…], freeSlots, queueMs, draining:bool}` | `{leaseExpiresAt, relayTicket, notices:[Notice]}` (below; `relayTicket` is the §5a admission ticket string, issued on every successful heartbeat — ADR-038) |
 | `POST /peers/drain` | `{leaseId}` | `{draining:true}` |
 | `POST /peers/challenge/complete` | `{leaseId, profileId, challengeId, timings:{firstTokenMs, totalMs}}` | `{passed, challengeId, capacityClass}`; token issuance moved to `/peers/lease` (ADR-012) |
 | `POST /peers/lease` | `{leaseId, profileId}` | `{token, lease}` — the hub-signed EligibilityLease (§5; ADR-012) |
@@ -256,6 +256,32 @@ Semantics (frozen):
 - Peer- and profile-bound: `peerId` MUST equal the authenticated libp2p
   PeerId of the requester; `profileId` MUST equal the request's target.
 
+### 5a. Relay admission ticket (ADR-038)
+
+A tracker-signed, content-blind admission grant for MSP circuit relays. The
+signed fields (snake_case, exactly as serialized inside the token):
+
+```json
+{
+  "installation_id": "b58…",
+  "peer_id": "12D3Koo…",
+  "issued_at": "2026-10-15T12:00:00.000Z",
+  "expires_at": "2026-10-15T12:10:00.000Z",
+  "nonce": "…"
+}
+```
+
+`signature` is base64 Ed25519 over the canonical JSON (§2.2) with `signature`
+omitted; serialized `base64url(canonical JSON) "." base64url(signature)`; TTL
+exactly 600 s; issued on every successful `POST /peers/heartbeat` to the
+authenticated installation (§3.3), verified by relays against the same pinned
+hub key as §4, bound to the Noise-authenticated libp2p PeerId, multi-use
+within its lifetime, expiry-only revocation. The ticket grants relay capacity
+access only — never serving eligibility (§5/ADR-026 govern that). Transport:
+the `/msp/relay-ticket/1` pre-flight protocol (ADR-038 is its schema of
+record). Golden vectors: `protocol/vectors/relay-ticket-*.json`,
+`relay-admission-frame-1.json`.
+
 ## 6. P2P stream protocol (libp2p, protocol id `/msp/infer/1`)
 
 Transport: QUIC + Noise; streams are request-scoped. Message schema of record:
@@ -385,3 +411,4 @@ undocumented amendments.
 (content-blind counters and installer downloads). They are NOT protocol
 endpoints, carry no peer state, and may change with the website without an
 ADR (ADR-028 §1).
+| 2026-10-15 | ADR-038 (relay admission tickets) | §3.3 heartbeat response gains `relayTicket`; §5a added (relay admission ticket, 600 s TTL, `/msp/relay-ticket/1`); §6 untouched |

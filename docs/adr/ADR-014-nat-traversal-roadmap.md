@@ -40,3 +40,13 @@ table stakes for a credible P2P product, not a differentiator.
   (ADR-001).
 - WebRTC data channels as primary transport: duplicates the libp2p stack;
   revisit only if browser peers ever become a goal.
+
+## Revision note (2026-10-15, ADR-038): the relay admission surface
+
+Phase F's "separately hosted public relay" gains admission control and frozen
+per-circuit caps: relays admit only peers presenting a tracker-signed relay
+admission ticket (msp-v1 §5a) via the `/msp/relay-ticket/1` pre-flight and
+enforce admission at the reservation/circuit accept sites; per-circuit caps
+become finite ADR-frozen policy (30 min / 16 MiB). Decision 2's hosting
+posture is unchanged; decision 5's relayed-path labeling is unchanged. DCUtR
+remains separate.

@@ -12,9 +12,18 @@
 //! gate; this host only moves bytes.
 //!
 //! Node-side support (reserve + dial through `/p2p-circuit` addresses over
-//! the raw-QUIC session layer) is the separate F2b transport work; this
-//! binary is interoperable with any standard libp2p client today.
+//! the raw-QUIC session layer) is the F2b transport work
+//! (`modelswarm-transport`); this binary is interoperable with any standard
+//! libp2p client today.
+//!
+//! Bind discipline (F2B, 2026-10-15): the default bind is LOOPBACK
+//! (`127.0.0.1:4001`) — the same ADR-018 posture the transport crate's
+//! `ListenOptions::allow_off_loopback` enforces. Binding any non-loopback
+//! address requires the explicit `--public` operator opt-in at the command
+//! line; a silently-open relay is never the default. The refusal is tested
+//! (`non_loopback_bind_requires_the_explicit_public_opt_in`).
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -63,11 +72,15 @@ fn load_or_create_key(path: &PathBuf) -> Result<libp2p::identity::Keypair, Strin
 }
 
 fn print_usage() {
-    println!("usage: modelswarm-relay [--listen 0.0.0.0:4001] [--key msp-relay.key]");
-    println!("  --listen  UDP/QUIC bind address (default 0.0.0.0:4001)");
+    println!("usage: modelswarm-relay [--listen 127.0.0.1:4001] [--key msp-relay.key] [--public]");
+    println!("  --listen  UDP/QUIC bind address (default 127.0.0.1:4001 — LOOPBACK).");
+    println!("            A non-loopback IP additionally requires --public.");
     println!("  --key     persisted ed25519 key file (default msp-relay.key in cwd)");
     println!("            a STABLE key keeps the relay PeerId — and every");
     println!("            /p2p/<relay>/p2p-circuit address — valid across restarts.");
+    println!("  --public  EXPLICIT operator opt-in for a non-loopback bind (the");
+    println!("            ADR-018 allow_off_loopback discipline: the relay never");
+    println!("            silently binds a public interface).");
 }
 
 /// Resolve the advertised LAN IP the way the node does — the UDP-connect
@@ -78,46 +91,92 @@ fn lan_ip() -> Option<std::net::IpAddr> {
     Some(socket.local_addr().ok()?.ip())
 }
 
-#[tokio::main]
-async fn main() {
-    let mut listen = "0.0.0.0:4001".to_string();
-    let mut key_path = PathBuf::from("msp-relay.key");
-    let mut args = std::env::args().skip(1);
+/// Parsed command line. `public` is the explicit non-loopback opt-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Args {
+    listen: String,
+    key_path: PathBuf,
+    public: bool,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:4001".to_string(),
+            key_path: PathBuf::from("msp-relay.key"),
+            public: false,
+        }
+    }
+}
+
+/// Splits a validated `ip:port` listen value. Returned separately so the
+/// bind-time validation and the tests share one parser.
+fn split_listen(listen: &str) -> Result<(IpAddr, u16), String> {
+    let (ip, port) = listen
+        .rsplit_once(':')
+        .ok_or_else(|| format!("--listen must be ip:port, got {listen}"))?;
+    let ip: IpAddr = ip
+        .parse()
+        .map_err(|_| format!("--listen ip must parse, got {ip}"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("--listen port must be numeric, got {port}"))?;
+    Ok((ip, port))
+}
+
+/// Parses argv into [`Args`], enforcing the ADR-018 bind discipline:
+/// a non-loopback `--listen` without `--public` is REFUSED here, before
+/// any socket exists. `Err` strings are honest one-line diagnostics.
+fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Args, String> {
+    let mut parsed = Args::default();
+    let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => {
-                listen = args.next().unwrap_or_else(|| {
-                    eprintln!("--listen needs a value");
-                    std::process::exit(2);
-                })
+                parsed.listen = args
+                    .next()
+                    .ok_or_else(|| "--listen needs a value".to_string())?;
             }
             "--key" => {
-                key_path = PathBuf::from(args.next().unwrap_or_else(|| {
-                    eprintln!("--key needs a value");
-                    std::process::exit(2);
-                }))
+                parsed.key_path = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--key needs a value".to_string())?,
+                );
             }
+            "--public" => parsed.public = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
             }
             other => {
-                eprintln!("unknown argument: {other}");
                 print_usage();
-                std::process::exit(2);
+                return Err(format!("unknown argument: {other}"));
             }
         }
     }
-    let (bind_ip, bind_port) = listen.rsplit_once(':').unwrap_or_else(|| {
-        eprintln!("--listen must be ip:port, got {listen}");
-        std::process::exit(2);
-    });
-    let bind_port: u16 = bind_port.parse().unwrap_or_else(|_| {
-        eprintln!("--listen port must be numeric, got {bind_port}");
-        std::process::exit(2);
-    });
+    let (ip, _port) = split_listen(&parsed.listen)?;
+    if !ip.is_loopback() && !parsed.public {
+        return Err(format!(
+            "refusing non-loopback bind {ip}: pass --public to explicitly open the relay \
+             beyond loopback (ADR-018 allow_off_loopback discipline)"
+        ));
+    }
+    Ok(parsed)
+}
 
-    let keypair = load_or_create_key(&key_path).unwrap_or_else(|e| {
+#[tokio::main]
+async fn main() {
+    let parsed = parse_args(std::env::args().skip(1)).unwrap_or_else(|e| {
+        eprintln!("modelswarm-relay: {e}");
+        std::process::exit(2);
+    });
+    let (bind_ip, bind_port) = split_listen(&parsed.listen).unwrap_or_else(|e| {
+        eprintln!("modelswarm-relay: {e}");
+        std::process::exit(2);
+    });
+    let bind_port = bind_port.to_string();
+
+    let keypair = load_or_create_key(&parsed.key_path).unwrap_or_else(|e| {
         eprintln!("modelswarm-relay: identity: {e}");
         std::process::exit(1);
     });
@@ -160,25 +219,41 @@ async fn main() {
         .relay
         .set_status(Some(relay::Status::Enable));
 
-    let multiaddr: libp2p::Multiaddr = format!("/ip4/{bind_ip}/udp/{bind_port}/quic-v1")
+    let bind_family = if bind_ip.is_ipv4() { "ip4" } else { "ip6" };
+    let multiaddr: libp2p::Multiaddr = format!("/{bind_family}/{bind_ip}/udp/{bind_port}/quic-v1")
         .parse()
         .unwrap_or_else(|e| {
             eprintln!("modelswarm-relay: bad listen multiaddr: {e}");
             std::process::exit(2);
         });
     swarm.listen_on(multiaddr).unwrap_or_else(|e| {
-        eprintln!("modelswarm-relay: listen {listen} failed: {e}");
+        eprintln!("modelswarm-relay: listen {} failed: {e}", parsed.listen);
         std::process::exit(1);
     });
 
-    let advertised_ip = lan_ip()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| bind_ip.to_string());
-    if let Ok(addr) = format!("/ip4/{advertised_ip}/udp/{bind_port}/quic-v1").parse() {
+    // Honest advertising: a loopback bind advertises exactly the loopback
+    // address (the lan_ip() trick would advertise an interface the relay
+    // never bound); only a --public bind advertises the LAN address.
+    let advertised_ip = if bind_ip.is_loopback() {
+        bind_ip
+    } else {
+        lan_ip().unwrap_or(bind_ip)
+    };
+    let family = if advertised_ip.is_ipv4() {
+        "ip4"
+    } else {
+        "ip6"
+    };
+    if let Ok(addr) = format!("/{family}/{advertised_ip}/udp/{bind_port}/quic-v1").parse() {
         swarm.add_external_address(addr);
     }
+    let posture = if bind_ip.is_loopback() {
+        "loopback-only"
+    } else {
+        "PUBLIC (--public)"
+    };
     println!(
-        "modelswarm-relay: listening on /ip4/{advertised_ip}/udp/{bind_port}/quic-v1 (relay {peer_id}"
+        "modelswarm-relay: listening on /{family}/{advertised_ip}/udp/{bind_port}/quic-v1 ({posture}, relay {peer_id}"
     );
     println!("modelswarm-relay: ready — Ctrl-C stops the relay");
 
@@ -221,6 +296,71 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F2B bind discipline: the default is LOOPBACK, a non-loopback bind is
+    /// refused without the explicit `--public` opt-in, and the opt-in lifts
+    /// exactly that refusal (ADR-018 allow_off_loopback discipline — never a
+    /// silently-open relay).
+    #[test]
+    fn non_loopback_bind_requires_the_explicit_public_opt_in() {
+        // Defaults: loopback, not public.
+        let defaults = parse_args(std::iter::empty()).unwrap();
+        assert_eq!(defaults, Args::default());
+        assert_eq!(defaults.listen, "127.0.0.1:4001");
+        assert!(!defaults.public);
+
+        // Non-loopback without --public: refused, with the opt-in named.
+        for listen in ["0.0.0.0:4001", "192.168.1.10:4001", "10.0.0.5:9000"] {
+            let err =
+                parse_args(["--listen".to_string(), listen.to_string()].into_iter()).unwrap_err();
+            assert!(
+                err.contains("--public") && err.contains("refusing non-loopback bind"),
+                "refusal must name the opt-in: {err}"
+            );
+        }
+        // Same with the flag split form.
+        let err = parse_args(["--listen".to_string(), "0.0.0.0:4001".to_string()].into_iter())
+            .unwrap_err();
+        assert!(err.contains("--public"));
+
+        // With --public the non-loopback bind parses.
+        let public = parse_args(
+            [
+                "--listen".to_string(),
+                "0.0.0.0:4001".to_string(),
+                "--public".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert!(public.public);
+        assert_eq!(public.listen, "0.0.0.0:4001");
+
+        // Loopback never needs the opt-in.
+        let loopback =
+            parse_args(["--listen".to_string(), "127.0.0.1:0".to_string()].into_iter()).unwrap();
+        assert!(!loopback.public);
+    }
+
+    /// Malformed listen values and unknown flags are honest parse failures.
+    #[test]
+    fn parse_args_rejects_malformed_input() {
+        for bad in [
+            "noip",
+            "1.2.3.4",
+            "1.2.3.4:notaport",
+            "1.2.3.4:99999",
+            "1.2.3.4:-1",
+        ] {
+            assert!(
+                parse_args(["--listen".to_string(), bad.to_string()].into_iter()).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse_args(["--nope".to_string()].into_iter()).is_err());
+        assert!(parse_args(["--listen".to_string()].into_iter()).is_err());
+        assert!(parse_args(["--key".to_string()].into_iter()).is_err());
+    }
 
     /// The stream-carrying contract from the phase-f research: a stock relay
     /// resets token streams at 2 min / 128 KiB; ours must never.

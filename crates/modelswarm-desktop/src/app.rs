@@ -5293,27 +5293,59 @@ async fn try_swarm_chat(
 }
 
 /// Neutral language pin for chat completions — see `chat_request_log`.
-/// Constrains the reply language only: no persona, no topics, no
-/// formatting. (Owner directive 2026-10-15, the Chinese-lock evening:
-/// one Chinese assistant turn flips every later reply Chinese at ANY
-/// temperature, reproduced against the shipped model+engine.)
-const CHAT_LANGUAGE_PIN: &str = "Reply in the same language as the user's latest message.";
+/// The effective language pin, APPENDED to the user's latest message on
+/// the REQUEST copy only. Placement is measured, not aesthetic: against
+/// the shipped model+engine (2026-10-15 matrix, poisoned-history
+/// reproduction), a front system instruction does NOT break the lock —
+/// only this trailing named-language form does ("(Respond in the
+/// language of this message: English.)" → English; every system-block
+/// variant and the language-neutral wording → still Chinese). The named
+/// language is filled by `english_message` — the one case the heuristic
+/// confidently recognizes, and the lock's victim case.
+const CHAT_LANGUAGE_PIN_SUFFIX: &str = "\n(Respond in the language of this message: English.)";
 
-/// Builds the outgoing chat request copy: the visible log (already
-/// capped at 20 turns by `send_chat`) plus the language pin as a leading
-/// system turn. The pin never enters the persisted `chat_log` — every
-/// request is rebuilt from the clean log, so the transcript stays
-/// exactly what the user wrote and saw. The `{role, content}` wire
-/// shape carries the system turn through both the swarm path (the
-/// remote peer's executor renders it verbatim in ChatML) and the local
-/// loopback gateway.
+/// True when the message is confidently English: ASCII-dominant AND
+/// containing a common English function word. CJK questions need no pin
+/// (the model naturally matches the user's language there — measured);
+/// other Latin languages (French, German, …) fail the word list on
+/// purpose rather than get mis-pinned to English.
+fn english_message(message: &str) -> bool {
+    let mut ascii = 0usize;
+    let mut total = 0usize;
+    for c in message.chars() {
+        if c.is_alphanumeric() {
+            total += 1;
+            if c.is_ascii() {
+                ascii += 1;
+            }
+        }
+    }
+    if total == 0 || ascii * 10 < total * 9 {
+        return false;
+    }
+    let lower = message.to_lowercase();
+    [
+        "the ", "what", "how", "why", "is ", "are ", "you", "please", "can ", "tell",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
+}
+
+/// Builds the outgoing chat request copy: the visible log (already capped
+/// at 20 turns by `send_chat`) with, for confidently-English messages,
+/// the language pin APPENDED to the last user turn. The pin never enters
+/// the persisted `chat_log` — every request is rebuilt from the clean
+/// log, so the transcript stays exactly what the user wrote and saw. The
+/// `{role, content}` wire shape carries the appended form through both
+/// the swarm path (the remote peer renders the wire messages verbatim in
+/// ChatML) and the local loopback gateway.
 fn chat_request_log(log: &[ChatTurn]) -> Vec<ChatTurn> {
-    let mut out = Vec::with_capacity(log.len() + 1);
-    out.push(ChatTurn {
-        role: "system".into(),
-        content: CHAT_LANGUAGE_PIN.into(),
-    });
-    out.extend(log.iter().cloned());
+    let mut out = log.to_vec();
+    if let Some(last) = out.last_mut() {
+        if last.role == "user" && english_message(&last.content) {
+            last.content.push_str(CHAT_LANGUAGE_PIN_SUFFIX);
+        }
+    }
     out
 }
 
@@ -5371,13 +5403,16 @@ async fn send_chat(
     // Language pin (owner directive 2026-10-15, the Chinese-lock evening):
     // one Chinese assistant turn in the rendered history flips every later
     // reply to Chinese at ANY temperature (reproduced against the shipped
-    // model+engine; a fresh conversation answers English). A neutral
-    // system instruction rides the REQUEST copy only — never the persisted
-    // chat_log — so the swarm path (remote peer renders the wire messages)
-    // and the local path both carry it while the visible transcript stays
-    // exactly what the user wrote and saw. Chat completions only: the
-    // pairing draft path and family verification keep their pinned greedy
-    // contracts; the instruction constrains language, nothing else.
+    // model+engine; a fresh conversation answers English). For
+    // confidently-English messages, the named-language instruction is
+    // APPENDED to the user's latest turn on the REQUEST copy only — never
+    // the persisted chat_log — on both the swarm and local paths, while
+    // the visible transcript stays exactly what the user wrote and saw.
+    // (The v0.2.26 front-system variant was measured INSUFFICIENT live —
+    // only the trailing named form breaks the lock; see
+    // CHAT_LANGUAGE_PIN_SUFFIX.) Chat completions only: the pairing draft
+    // path and family verification keep their pinned greedy contracts;
+    // the instruction constrains language, nothing else.
     let request_log = chat_request_log(&log);
 
     // F1(3): SWARM FIRST — if another peer is verifiably hosting this
@@ -7590,11 +7625,14 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_log_prepends_language_pin_without_touching_the_log() {
+    fn chat_request_log_appends_language_pin_without_touching_the_log() {
         // The rendered-history Chinese lock (owner directive 2026-10-15,
-        // reproduced against the shipped model+engine): the outgoing
-        // request must carry the pin as the FIRST turn so ChatML renders
-        // it as the system block, on both the swarm and local paths.
+        // reproduced against the shipped model+engine; the v0.2.26
+        // front-system form measured INSUFFICIENT live — only the
+        // trailing NAMED-language append breaks the lock): for a
+        // confidently-English latest user turn, the request copy carries
+        // the pin appended to that turn, on both the swarm and local
+        // paths.
         let turn = |role: &str, content: &str| ChatTurn {
             role: role.into(),
             content: content.into(),
@@ -7605,24 +7643,61 @@ mod tests {
             turn("user", "what is ModelSwarm?"),
         ];
         let request = chat_request_log(&log);
-        assert_eq!(request.len(), log.len() + 1);
-        assert_eq!(request[0].role, "system");
-        assert_eq!(request[0].content, CHAT_LANGUAGE_PIN);
-        // The rest of the request is the visible log, order intact — the
-        // remote peer and the local executor see exactly the transcript
-        // plus the pin.
-        for (req, vis) in request[1..].iter().zip(log.iter()) {
+        assert_eq!(request.len(), log.len(), "no turns are added or removed");
+        // Order intact; every earlier turn byte-identical.
+        for (req, vis) in request.iter().zip(log.iter()).take(2) {
             assert_eq!(req.role, vis.role);
             assert_eq!(req.content, vis.content);
         }
+        // The last user turn alone gains the named-language suffix.
+        assert_eq!(request[2].role, "user");
+        assert_eq!(
+            request[2].content,
+            format!("what is ModelSwarm?{CHAT_LANGUAGE_PIN_SUFFIX}")
+        );
         // The input log is untouched — the pin must never reach the
         // persisted chat_log (the transcript stays what the user wrote
         // and saw; requests are rebuilt per send).
-        assert_eq!(log.len(), 3);
-        assert_ne!(log[0].role, "system");
+        assert_eq!(log[2].content, "what is ModelSwarm?");
         // The pin constrains language only — no persona, no topics.
-        assert!(CHAT_LANGUAGE_PIN.to_lowercase().contains("language"));
-        assert!(!CHAT_LANGUAGE_PIN.to_lowercase().contains("you are"));
+        assert!(CHAT_LANGUAGE_PIN_SUFFIX.contains("language"));
+        assert!(!CHAT_LANGUAGE_PIN_SUFFIX.contains("You are"));
+    }
+
+    #[test]
+    fn language_pin_fires_only_for_confident_english() {
+        // CJK questions need no pin — the model naturally matches the
+        // user's language there (measured); pinning would be noise.
+        let cjk = vec![ChatTurn {
+            role: "user".into(),
+            content: "什么是ModelSwarm？".into(),
+        }];
+        assert_eq!(chat_request_log(&cjk)[0].content, "什么是ModelSwarm？");
+        // Other Latin languages fail the English word list on purpose —
+        // mis-pinning French to English would be a regression.
+        let french = vec![ChatTurn {
+            role: "user".into(),
+            content: "Qu'est-ce que c'est ModelSwarm ? Pouvez-vous expliquer".into(),
+        }];
+        assert_eq!(
+            chat_request_log(&french)[0].content,
+            "Qu'est-ce que c'est ModelSwarm ? Pouvez-vous expliquer"
+        );
+        // The heuristic: ASCII-dominant AND a common English word.
+        assert!(english_message("what is ModelSwarm?"));
+        assert!(english_message("Hello, can you help me please"));
+        assert!(!english_message("what 什么是"));
+        assert!(!english_message(""));
+        assert!(!english_message("1234 ?!"));
+        // A trailing assistant turn (not user) is never pinned.
+        let asst_last = vec![ChatTurn {
+            role: "assistant".into(),
+            content: "Sure, here is the answer you asked for".into(),
+        }];
+        assert_eq!(
+            chat_request_log(&asst_last)[0].content,
+            "Sure, here is the answer you asked for"
+        );
     }
 
     // ---- Chat wall (ADR-037 §3.1 W1–W6 / §4.4 item 10): the DESKTOP leg --

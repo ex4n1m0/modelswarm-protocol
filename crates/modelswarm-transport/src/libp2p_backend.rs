@@ -1500,16 +1500,17 @@ mod tests {
         (addr, circuits)
     }
 
-    /// A loopback port that is (almost certainly) closed: bind an
-    /// ephemeral UDP socket, take its port, drop it. Direct QUIC dials to
-    /// it fail fast (refused) or hit the per-attempt budget (timeout) —
-    /// either way the honest direct-attempt failure the fallback must
-    /// survive.
-    fn dead_direct_addr() -> String {
+    /// A BLACKHOLED direct candidate: a UDP socket is bound (so no sibling
+    /// test can take the port) but never answers — QUIC handshake probes
+    /// get no response and the dial burns its per-attempt budget. That is
+    /// exactly the owner's cross-NAT failure mode this fallback exists
+    /// for, and unlike a freed port it cannot race under parallel test
+    /// load. The returned socket must stay alive for the blackhole to
+    /// hold.
+    fn blackholed_direct_addr() -> (String, std::net::UdpSocket) {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = socket.local_addr().unwrap().port();
-        drop(socket);
-        format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+        (format!("/ip4/127.0.0.1/udp/{port}/quic-v1"), socket)
     }
 
     /// F2B core proof: the direct candidate FAILS (closed port — the
@@ -1541,7 +1542,8 @@ mod tests {
         let circuit = reservation.circuit_addr();
 
         let expected = server.peer_id();
-        let candidates = vec![dead_direct_addr(), circuit];
+        let (direct, _blackhole) = blackholed_direct_addr();
+        let candidates = vec![direct, circuit];
         let (dialing, acceptor) = tokio::join!(
             client.dial_with_fallback(&candidates, &expected, Duration::from_secs(2),),
             reservation.accept(Duration::from_secs(10)),

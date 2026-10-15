@@ -307,3 +307,18 @@ version == 0.2.26, sha256 match, first-try. page.tsx retarget: 5 functional
 replacements (the redesign grew two historical comment mentions — left
 as-is with an appended changelog line); typecheck clean, build green.
 Unsigned by owner ruling.
+
+## v0.2.27 staging rehearsal (2026-10-16, small hours — the language pin
+## that holds)
+
+Artifacts from desktop-installer run 38774518372, AUTO-TRIGGERED on the
+bump. The bump's rust run: check ✓ + check-nonwindows-capi ✓ (guards red =
+the standing two-push window, closed here). All three artifacts fetched via
+the API-zip route (gh run download stalls on this network; ONE api-zip
+arrived with a JSON-error head — accepted only after PK-magic + exact-size
++ testzip checks; re-downloaded clean). Per-artifact SHA256SUMS verified.
+0.2.26 binaries removed. Staged: win exe 522f60bd…c1a7; deb
+c1a8caea…f800; AppImage 46782116…c82f; dmg bd51318e…8866. Signed
+--app-version 0.2.27 (4/4); manifest sig = .sig VERBATIM; rehearsal ALL
+VERIFY first-try. page.tsx 0.2.26→0.2.27 (5 functional replacements);
+typecheck clean, build green. Unsigned by owner ruling.

@@ -2247,16 +2247,16 @@ mod tests {
     }
 }
 
-/// ADR-030 B3 (requester half) — the full receipt round-trip over a real
-/// loopback QUIC session: the server's Completed carries the phase-1
-/// receipt, the executor's stream tail counter-signs it with the
-/// requester's identity, sends the best-effort `receipt_ack`, and stashes
-/// the final object for the accounting POST. The serving loop must
-/// SURVIVE the ack frame (a pooled follow-up request still completes —
-/// the pre-B3 loop would have ended the session with `bad_frame`), and
-/// the serving side's telemetry must show the ack landed.
 #[cfg(test)]
 mod b3_receipt_roundtrip {
+    // ADR-030 B3 (requester half) — the full receipt round-trip over a real
+    // loopback QUIC session: the server's Completed carries the phase-1
+    // receipt, the executor's stream tail counter-signs it with the
+    // requester's identity, sends the best-effort `receipt_ack`, and stashes
+    // the final object for the accounting POST. The serving loop must
+    // SURVIVE the ack frame (a pooled follow-up request still completes —
+    // the pre-B3 loop would have ended the session with `bad_frame`), and
+    // the serving side's telemetry must show the ack landed.
     use super::*;
     use crate::serving::{lease_helpers, serve_sessions};
     use futures_util::stream;

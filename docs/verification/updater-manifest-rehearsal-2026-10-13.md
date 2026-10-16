@@ -322,3 +322,17 @@ c1a8caea…f800; AppImage 46782116…c82f; dmg bd51318e…8866. Signed
 --app-version 0.2.27 (4/4); manifest sig = .sig VERBATIM; rehearsal ALL
 VERIFY first-try. page.tsx 0.2.26→0.2.27 (5 functional replacements);
 typecheck clean, build green. Unsigned by owner ruling.
+
+## v0.2.28 staging rehearsal (2026-10-16 — the auto-relay release, ADR-039)
+
+Artifacts from desktop-installer run 38869014882, AUTO-TRIGGERED on the bump.
+Deploy order honored: TRACKER FIRST (deployed with the new MSP_RELAY_ADDR
+env var BEFORE the client site deploy — the additive order pinned by test).
+All artifacts via the API-zip route with PK-magic + exact-API-size
+acceptance (one operator lesson: assert sizes read from the API THIS run —
+stale numbers from the previous release false-flag good downloads).
+Per-artifact SHA256SUMS verified 4/4. 0.2.27 binaries removed. Staged: win
+a9aff652…5af0; deb fbceba7c…7f3d; AppImage 42962d8a…2094; dmg
+ff35d491…57c1. Signed --app-version 0.2.28 (4/4); manifest sig = .sig
+VERBATIM; rehearsal ALL VERIFY first-try. page.tsx 0.2.27→0.2.28 (5
+functional); typecheck clean, build green. Unsigned by owner ruling.

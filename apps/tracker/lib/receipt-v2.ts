@@ -5,7 +5,8 @@
 // cannot drift (the relay-ticket discipline); byte-parity is pinned
 // against protocol/vectors/receipt-v2-1.json in tests.
 
-import { canonicalJson, sha256Hex, verifyBase64Url } from "@/lib/crypto";
+import { base64UrlEncode, canonicalJson, sha256Hex, verifyBase64Url } from "@/lib/crypto";
+import * as ed from "@noble/ed25519";
 
 /** The ADR-030 §1 object on the wire (both signatures present at rest). */
 export interface ReceiptV2 {
@@ -140,4 +141,20 @@ export function validateForAccounting(
     endpoint_seconds: share.endpoint_seconds,
     verified_tokens: share.verified_tokens,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Signing helpers (test/tool surface; the tracker's runtime role is
+// VERIFICATION — production receipts are signed by the peers, Rust side).
+
+/** Phase 1: the serving/coordinating peer signs the both-absent form. */
+export function signReceiptServer(receipt: ReceiptV2, secretKey: Uint8Array): string | null {
+  const preimage = phase1Canonical(receipt);
+  return preimage === null ? null : base64UrlEncode(ed.sign(Buffer.from(preimage, "utf8"), secretKey));
+}
+
+/** Phase 2: the requesting peer counter-signs the server-present form. */
+export function signReceiptRequester(receipt: ReceiptV2, secretKey: Uint8Array): string | null {
+  const preimage = phase2Canonical(receipt);
+  return preimage === null ? null : base64UrlEncode(ed.sign(Buffer.from(preimage, "utf8"), secretKey));
 }

@@ -47,3 +47,8 @@ export const OBSERVATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** device_codes / capability_tokens: rows linger this long past expiry
  *  (debugging grace) before write-time pruning. */
 export const EXPIRED_ROW_GRACE_MS = 24 * 60 * 60 * 1000;
+
+/** ADR-030 §5: granted-accounting time-decay half-life — 7 days, the
+ * frozen INITIAL value (tunable, measurement-informed later; the decay
+ * SHAPE is what is frozen). */
+export const GRANTED_HALF_LIFE_SECS = 7 * 24 * 60 * 60;

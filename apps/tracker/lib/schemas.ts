@@ -119,6 +119,34 @@ export const JobResultSchema = z
   .object({
     receiptDigest: z.string().regex(/^[0-9a-f]{64}$/, "sha256 hex digest"),
     outcome: z.enum(["stop", "length", "cancelled", "error"]),
+    // ADR-030 Phase B1 (additive, optional): the full counter-signed
+    // ReceiptV2. When present, intake validates it (digest preimage +
+    // both signatures against ENROLLED keys) and grants accounting —
+    // absent = exactly the v1 digest-row behavior.
+    receipt: z
+      .object({
+        request_id: z.string(),
+        profile_id: z.string(),
+        preset: z.string(),
+        mode_id: z.string(),
+        cohort_digest: z.string(),
+        peers: z.array(z.object({
+          peer_id: z.string(),
+          installation_id: z.string(),
+          role: z.string(),
+        })),
+        started_at: z.string(),
+        ended_at: z.string(),
+        outcome: z.string(),
+        accepted_tokens: z.number().int().nonnegative(),
+        verified_tokens: z.number().int().nonnegative(),
+        endpoint_seconds: z.number().int().nonnegative(),
+        usage_digest: z.string(),
+        budgets: z.record(z.string(), z.unknown()),
+        server_signature: z.string(),
+        requester_signature: z.string(),
+      })
+      .optional(),
   })
   .strict();
 

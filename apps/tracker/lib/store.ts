@@ -162,6 +162,16 @@ export interface RendezvousItem {
   receivedAt: number;
 }
 
+export interface GrantedAccountingRow {
+  receiptDigest: string;
+  peerId: string;
+  installationId: string;
+  profileId: string;
+  endpointSeconds: number;
+  verifiedTokens: number;
+  grantedAt: number;
+}
+
 export interface ReceiptRecord {
   receiptDigest: string;
   outcome: string;
@@ -315,6 +325,22 @@ export interface TrackerStore {
 
   // -- receipts -----------------------------------------------------------------
   recordReceipt(rec: ReceiptRecord): Promise<void>;
+  /** ADR-030 §3: granted verified-work accounting rows — appended ONLY by
+   * intake-validated ReceiptV2 processing; (receipt_digest, peer_id) is
+   * the replay-proof key (re-posts are no-ops). */
+  recordGrantedAccounting(rows: GrantedAccountingRow[]): Promise<void>;
+  /** Decayed granted counters for one peer (ADR-030 §5 half-life form):
+   * each row contributes value * 0.5^(age/halfLife). Plus raw totals. */
+  grantedCounters(
+    peerId: string,
+    halfLifeSecs: number,
+  ): Promise<{
+    endpointSecondsDecayed: number;
+    verifiedTokensDecayed: number;
+    endpointSecondsRaw: number;
+    verifiedTokensRaw: number;
+    rows: number;
+  }>;
   getReceipt(receiptDigest: string): Promise<ReceiptRecord | null>;
 
   // -- rate-limit counters (persisted observability; the live limiter is the
@@ -832,6 +858,42 @@ export class MemoryStore implements TrackerStore {
 
   async getReceipt(receiptDigest: string): Promise<ReceiptRecord | null> {
     return this.receipts.get(receiptDigest) ?? null;
+  }
+
+  private granted = new Map<string, GrantedAccountingRow>();
+
+  async recordGrantedAccounting(rows: GrantedAccountingRow[]): Promise<void> {
+    for (const row of rows) {
+      this.granted.set(`${row.receiptDigest}:${row.peerId}`, { ...row });
+    }
+  }
+
+  async grantedCounters(
+    peerId: string,
+    halfLifeSecs: number,
+  ): Promise<{
+    endpointSecondsDecayed: number;
+    verifiedTokensDecayed: number;
+    endpointSecondsRaw: number;
+    verifiedTokensRaw: number;
+    rows: number;
+  }> {
+    let endpointSecondsDecayed = 0;
+    let verifiedTokensDecayed = 0;
+    let endpointSecondsRaw = 0;
+    let verifiedTokensRaw = 0;
+    let rows = 0;
+    for (const row of this.granted.values()) {
+      if (row.peerId !== peerId) continue;
+      rows += 1;
+      const ageSecs = Math.max(0, (this.now() - row.grantedAt) / 1000);
+      const weight = Math.pow(0.5, ageSecs / halfLifeSecs);
+      endpointSecondsDecayed += row.endpointSeconds * weight;
+      verifiedTokensDecayed += row.verifiedTokens * weight;
+      endpointSecondsRaw += row.endpointSeconds;
+      verifiedTokensRaw += row.verifiedTokens;
+    }
+    return { endpointSecondsDecayed, verifiedTokensDecayed, endpointSecondsRaw, verifiedTokensRaw, rows };
   }
 
   async bumpRateCounter(bucketKey: string, windowStart: number): Promise<number> {
@@ -1710,6 +1772,57 @@ export class PgStore implements TrackerStore {
       outcome: row.outcome,
       installationId: row.installation_id,
       receivedAt: row.received_at.getTime(),
+    };
+  }
+
+  async recordGrantedAccounting(rows: GrantedAccountingRow[]): Promise<void> {
+    if (rows.length === 0) return;
+    const values: unknown[] = [];
+    const tuples = rows.map((r, i) => {
+      const b = i * 7;
+      values.push(
+        r.receiptDigest, r.peerId, r.installationId, r.profileId,
+        r.endpointSeconds, r.verifiedTokens, PgStore.iso(r.grantedAt),
+      );
+      return `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7})`;
+    });
+    await this.query(
+      `INSERT INTO granted_accounting
+         (receipt_digest, peer_id, installation_id, profile_id,
+          endpoint_seconds, verified_tokens, granted_at)
+       VALUES ${tuples.join(", ")}
+       ON CONFLICT (receipt_digest, peer_id) DO NOTHING`,
+      values,
+    );
+  }
+
+  async grantedCounters(
+    peerId: string,
+    halfLifeSecs: number,
+  ): Promise<{
+    endpointSecondsDecayed: number;
+    verifiedTokensDecayed: number;
+    endpointSecondsRaw: number;
+    verifiedTokensRaw: number;
+    rows: number;
+  }> {
+    const res = (await this.query(
+      `SELECT
+         COALESCE(SUM(endpoint_seconds * pow(0.5, extract(epoch FROM (now() - granted_at)) / $2)), 0) AS decayed_s,
+         COALESCE(SUM(verified_tokens * pow(0.5, extract(epoch FROM (now() - granted_at)) / $2)), 0) AS decayed_t,
+         COALESCE(SUM(endpoint_seconds), 0) AS raw_s,
+         COALESCE(SUM(verified_tokens), 0) AS raw_t,
+         COUNT(*)::int AS rows
+       FROM granted_accounting WHERE peer_id = $1`,
+      [peerId, halfLifeSecs],
+    )) as Array<Record<string, number | null>>;
+    const r = res[0] ?? {};
+    return {
+      endpointSecondsDecayed: Number(r.decayed_s ?? 0),
+      verifiedTokensDecayed: Number(r.decayed_t ?? 0),
+      endpointSecondsRaw: Number(r.raw_s ?? 0),
+      verifiedTokensRaw: Number(r.raw_t ?? 0),
+      rows: Number(r.rows ?? 0),
     };
   }
 

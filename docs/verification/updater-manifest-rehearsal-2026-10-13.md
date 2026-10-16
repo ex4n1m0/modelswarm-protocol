@@ -336,3 +336,15 @@ a9aff652…5af0; deb fbceba7c…7f3d; AppImage 42962d8a…2094; dmg
 ff35d491…57c1. Signed --app-version 0.2.28 (4/4); manifest sig = .sig
 VERBATIM; rehearsal ALL VERIFY first-try. page.tsx 0.2.27→0.2.28 (5
 functional); typecheck clean, build green. Unsigned by owner ruling.
+
+## v0.2.29 staging rehearsal (2026-10-16 night — the UX release)
+
+Artifacts from desktop-installer run 38919371070 (the combo-fix commit
+626d823 — its check job GREEN across all three feature combos after the
+two fix commits; the bump's own check caught the B2 test-combo misses the
+local default pass missed — LESSON: run ALL CI clippy combos locally
+before a bump). 0.2.28 binaries removed. Staged: win e2a48b99…e4c1; deb
+29aeea9e…ed49; AppImage 8b71f9dc…5e3c; dmg 97f1efcd…ba14. Signed
+--app-version 0.2.29 (4/4); manifest sig = .sig VERBATIM; rehearsal ALL
+VERIFY first-try. page.tsx 0.2.28→0.2.29 (5 functional); typecheck clean,
+build green. Unsigned by owner ruling.

@@ -2,32 +2,24 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>MSP resource monitor — stub harness (Help menu panel)</title>
+  <title>MSP resource monitor — stub harness (meters on main)</title>
   <style>
     body { font: 13px/1.5 system-ui, sans-serif; color: #e8edf7; background: #10141c; margin: 1.5rem; }
     h1 { font-size: 16px; } h2 { font-size: 13px; color: #9aa7bf; text-transform: uppercase; }
     .pass { color: #43c78f; } .fail { color: #e06565; }
     td, th { text-align: left; padding: 3px 10px 3px 0; border-bottom: 1px solid #2c3850; }
-    code { color: #a855f7; }
+    code { white-space: pre-wrap; font-size: 11.5px; }
+    .strong-pass { color: #43c78f; font-weight: 700; } .strong-fail { color: #e06565; font-weight: 700; }
   </style>
 </head>
 <body>
-  <h1>Resource monitor stub harness</h1>
-  <p>Loads the REAL <code>../ui/index.html</code> into a same-origin 1152×648 iframe with a stubbed
-  <code>window.__TAURI__</code> bridge, then checks the Resources panel (owner request 2026-10-12;
-  Help → Resource monitor since the 2026-10-15 nav-menu reorg — opened behaviorally via the menu
-  button + menu item clicks): the three labeled meters render daemon-provided values verbatim,
-  every <code>null</code> field reads "n/a" (never a guess), the collapsed/expanded affordance
-  works, and the RENDERED GEOMETRY of both the main page (no panel open) and the open panel is
-  measured at the app's default window size — the owner's standing rule. The sampling/scoping
-  logic itself is pinned by the Rust unit tests in <code>src/app.rs</code>; this harness pins the
-  render + geometry contract.</p>
-  <p><strong>Run:</strong> serve the crate root over http — e.g.
-  <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> —
-  then open <code>http://127.0.0.1:4817/ui-harness/monitor.html</code>.
-  Opening from <code>file://</code> cannot work (the harness fetches the UI same-origin).</p>
-  <h2>Results</h2>
+  <h1>Resource monitor — meters on main</h1>
+  <h2>owner directives 2026-10-16: always-visible horizontal bars on the main page, no hide button; unmissable STARTING feedback on HOST</h2>
+  <p>Drives the REAL ui/index.html in an off-screen 1152×648 iframe with a
+     stubbed Tauri (the daemon's 1 Hz <code>resource_sample</code> drives the
+     meters; null = honest n/a, never a guessed number).</p>
   <div id="results">running…</div>
+
   <script>
     // The full-geometry sample the daemon would return on a healthy Windows
     // tick (field names = modelswarm_resource::ResourceSample verbatim).
@@ -45,20 +37,30 @@
       gpu_utilization_percent: null, gpu_vram_used_bytes: null,
     };
     window.__sample = SAMPLE_LIVE;
+    window.__hosting = false;
+    window.__hostingDelayMs = 0;
 
-    const STATUS = {
+    const STATUS = () => ({
       version: "0.0.0-harness", tracker: "https://stub.local", data_dir: "C:/stub",
       engine_available: true, engine_path: "C:/stub/engine/llama-server.exe",
       gpu_engine_available: false, license_accepted: true, profile_id: null, artifact: null,
-      node: { running: false, hosting: false, gateway_addr: null, installation_id: null,
+      node: { running: window.__hosting, hosting: window.__hosting,
+              gateway_addr: window.__hosting ? "127.0.0.1:1" : null, installation_id: null,
               engine_port: null, engine_backend: null, listener_addr: null, enrollment: null },
       family: null, chat_turns: 0,
-    };
+    });
     window.__stubInvoke = async (cmd) => {
       switch (cmd) {
-        case "get_status": return STATUS;
+        case "get_status": return STATUS();
         case "analyze_hardware": return { ram_mb: 32000, cpu_cores: 12, gpu: { name: "RTX 3080", vram_mb: 9216 } };
         case "resource_sample": return window.__sample;
+        case "set_hosting": {
+          // The simulated engine-boot window: the STARTING feedback must be
+          // visible for the whole delay, then the state flips truthfully.
+          await new Promise((r) => setTimeout(r, window.__hostingDelayMs));
+          window.__hosting = true;
+          return { hosting: true };
+        }
         case "list_models": return [];
         case "census": return { peers_online: 0, counts: {} };
         default: return {};
@@ -66,25 +68,12 @@
     };
     const STUB = '<scr' + 'ipt>window.__TAURI__ = { core: { invoke: (cmd, args) => parent.__stubInvoke(cmd, args) }, event: { listen: async () => {} } };</scr' + 'ipt>';
 
-    // The 2026-10-15 nav-menu reorg moved the monitor behind Help →
-    // Resource monitor. Open it the way a user does.
-    function openPanel(doc, id) {
-      const item = doc.querySelector(`.menu-item[data-panel="${id}"]`);
-      if (!item) return false;
-      item.closest(".menu").querySelector(".menu-btn").click();
-      item.click();
-      const panel = doc.getElementById(id);
-      return !doc.getElementById("sheet").hidden && panel && !panel.hidden;
-    }
-
-    // Loads the UI, waits for the first resource tick (the panel's initial
-    // refreshResources call), opens the monitor panel (unless measuring the
-    // bare main page), optionally expands the meters, and measures.
-    async function scenario(ui, { sample, expand, open }) {
+    // Loads the UI off-screen at the app's default 1152×648 and waits for
+    // the first resource tick (the meters' initial refreshResources call).
+    async function scenario(ui, { sample }) {
       window.__sample = sample;
       const frame = document.createElement("iframe");
       frame.setAttribute("aria-hidden", "true");
-      // The app's default window: 1152×648, parked off-screen.
       frame.style.cssText = "width:1152px;height:648px;border:0;position:absolute;left:-12000px;top:0;";
       document.body.appendChild(frame);
       frame.srcdoc = ui.replace("<head>", "<head>" + STUB);
@@ -93,53 +82,37 @@
       while (Date.now() - t0 < 5000) {
         await new Promise((r) => setTimeout(r, 100));
         doc = frame.contentDocument;
-        // The panel's first tick has rendered when the summary stops saying
-        // "sampling…" (the stub resolves in a microtask).
-        if (doc && !doc.getElementById("res-summary").textContent.includes("sampling")) break;
+        if (doc && doc.querySelector(".meters-row")) break;
       }
-      let panelOpened = true;
-      if (open !== false) panelOpened = openPanel(doc, "panel-resources");
-      if (expand) {
-        doc.getElementById("res-toggle").click();
-        await new Promise((r) => setTimeout(r, 50));
-      }
-      const section = doc.getElementById("panel-resources");
       const main = doc.querySelector("main");
-      const sheet = doc.getElementById("sheet");
-      const sheetBody = sheet.querySelector(".sheet-body");
+      const metersRow = doc.querySelector(".meters-row");
       const meter = (id) => {
         const row = doc.getElementById(id).closest(".meter");
         const fill = row.querySelector(".bar > div");
         return { text: doc.getElementById(id).textContent, width: fill.style.width,
-                 label: row.querySelector(".mlabel").textContent };
+                 label: row.querySelector(".mlabel").textContent,
+                 visible: row.offsetParent !== null && row.getBoundingClientRect().height > 0 };
       };
-      const out = {
-        panelOpened,
-        summary: doc.getElementById("res-summary").textContent,
-        expanded: !doc.getElementById("res-details").hidden,
-        ariaExpanded: doc.getElementById("res-toggle").getAttribute("aria-expanded"),
-        toggleText: doc.getElementById("res-toggle").textContent,
+      return {
+        doc, frame,
+        metersRow: {
+          visible: metersRow.offsetParent !== null,
+          h: Math.round(metersRow.getBoundingClientRect().height),
+          inMain: !!metersRow.closest("main"),
+        },
         cpu: meter("val-cpu"), ram: meter("val-ram"), gpu: meter("val-gpu"),
-        // Rendered geometry at the default 1152×648 window: the bare main
-        // page must not clip, and the open panel must fit the sheet.
+        noToggleButton: doc.getElementById("res-toggle") === null,
+        noPanel: doc.getElementById("panel-resources") === null,
+        noMenuItem: doc.querySelector('.menu-item[data-panel="panel-resources"]') === null,
         geometry: {
           viewportH: 648,
           mainClientH: main.clientHeight, mainScrollH: main.scrollHeight,
           mainClips: main.scrollHeight > main.clientHeight + 1,
-          sectionBottom: Math.round(section.getBoundingClientRect().bottom),
-          sectionH: Math.round(section.getBoundingClientRect().height),
-          sheetFits: open === false || (sheet.getBoundingClientRect().bottom <= 618 + 1
-            && sheet.getBoundingClientRect().right <= 1152 + 1),
-          metersHidden: doc.getElementById("res-details").hidden,
         },
-        sheetBody: { clientH: sheetBody.clientHeight, scrollH: sheetBody.scrollHeight },
       };
-      frame.remove();
-      return out;
     }
 
-    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-    function render(rows) {
+    const render = (rows) => {
       const table = document.createElement("table");
       for (const { label, pass, detail } of rows) {
         const tr = document.createElement("tr");
@@ -148,61 +121,65 @@
       }
       const all = rows.every((r) => r.pass);
       const summary = document.createElement("p");
-      summary.innerHTML = `<strong class="${all ? "pass" : "fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
+      summary.innerHTML = `<strong class="${all ? "strong-pass" : "strong-fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
       document.getElementById("results").replaceChildren(summary, table);
       window.__harnessResults = { all, rows };
       document.title = all ? "ALL PASS" : "FAILURES";
-    }
+    };
 
     (async () => {
       const ui = await (await fetch("../ui/index.html")).text();
       const rows = [];
-      // ---- Baseline: the BARE main page at 1152×648 (geometry ref) -----
-      const baseline = await scenario(ui, { sample: SAMPLE_LIVE, open: false });
-      rows.push({ label: "main page (reorg): hosting strip + chat fit 1152×648 with NO clipping (nothing squished behind overflow:hidden)",
-        pass: !baseline.geometry.mainClips && baseline.geometry.mainScrollH === baseline.geometry.mainClientH,
-        detail: `scrollH=${baseline.geometry.mainScrollH} clientH=${baseline.geometry.mainClientH}` });
-      rows.push({ label: "main page: transcript keeps its >= 80px floor under the strip",
-        pass: true, detail: "measured in the pairing-chat harness (chat section owns that bound)" });
-      // ---- Scenario 1: live sample, COLLAPSED (the shipped default) -------
-      const collapsed = await scenario(ui, { sample: SAMPLE_LIVE, expand: false });
-      rows.push({ label: "menu: Help → Resource monitor panel opens behaviorally before asserting",
-        pass: collapsed.panelOpened, detail: collapsed.panelOpened ? "sheet visible" : "not opened" });
-      rows.push({ label: "collapsed default: meters hidden, summary carries CPU/RAM/GPU",
-        pass: collapsed.geometry.metersHidden && !collapsed.expanded
-          && collapsed.summary.includes("CPU 13%") && collapsed.summary.includes("RAM 51%")
-          && collapsed.summary.includes("GPU 3.3%"),
-        detail: collapsed.summary });
-      // The owner's standing rule, measured: the collapsed panel is ONE
-      // summary row inside the sheet — compact, and the sheet fits the
-      // 1152×648 viewport with room to spare (no forced body scroll).
-      rows.push({ label: "collapsed panel costs one summary row (section ≤ 140px; sheet fits the 648px window)",
-        pass: collapsed.geometry.sectionH <= 140 && collapsed.geometry.sheetFits,
-        detail: `sectionH=${collapsed.geometry.sectionH} bottom=${collapsed.geometry.sectionBottom}` });
-      // ---- Scenario 2: live sample, EXPANDED ------------------------------
-      const expanded = await scenario(ui, { sample: SAMPLE_LIVE, expand: true });
-      rows.push({ label: "expanded: aria-expanded=true, toggle reads 'hide', three labeled meters",
-        pass: expanded.expanded && expanded.ariaExpanded === "true" && expanded.toggleText === "hide"
-          && expanded.cpu.label === "CPU" && expanded.ram.label === "RAM" && expanded.gpu.label === "GPU",
-        detail: `${expanded.ariaExpanded} ${expanded.toggleText} ${expanded.cpu.label}/${expanded.ram.label}/${expanded.gpu.label}` });
-      rows.push({ label: "expanded: values render verbatim — CPU 13% (12.5 rounds under the ≥10 rule), RAM 51% + ours 10 MB, GPU 3.3% + 6.6 GB VRAM",
-        pass: expanded.cpu.text === "13%" && expanded.ram.text === "51% · ours 10 MB"
-          && expanded.gpu.text === "3.3% · 6.6 GB VRAM",
-        detail: `${expanded.cpu.text} | ${expanded.ram.text} | ${expanded.gpu.text}` });
-      rows.push({ label: "expanded: bar widths follow the percentages (12.5% / 51.3% / 3.25%)",
-        pass: expanded.cpu.width === "12.5%" && expanded.ram.width === "51.3%" && expanded.gpu.width === "3.25%",
-        detail: `${expanded.cpu.width} ${expanded.ram.width} ${expanded.gpu.width}` });
-      rows.push({ label: "expanded: meters visible and measured (rendered geometry, not assumed); sheet scrolls instead of clipping",
-        pass: !expanded.geometry.metersHidden && expanded.geometry.sectionH > 90 && expanded.geometry.sheetFits,
-        detail: `sectionH=${expanded.geometry.sectionH} sheetFits=${expanded.geometry.sheetFits} bodyScroll=${expanded.sheetBody.scrollH}/${expanded.sheetBody.clientH}` });
-      // ---- Scenario 3: every field null → per-field n/a, bars at 0% -------
-      const none = await scenario(ui, { sample: SAMPLE_NONE, expand: true });
+
+      // ---- Owner directive: meters ON MAIN, always visible, no hiding ----
+      const live = await scenario(ui, { sample: SAMPLE_LIVE });
+      // let the first tick land on the freshly-loaded meters
+      await new Promise((r) => setTimeout(r, 250));
+      rows.push({ label: "meters live ON THE MAIN PAGE (in <main>, visible, real height)",
+        pass: live.metersRow.inMain && live.metersRow.visible && live.metersRow.h >= 20,
+        detail: `inMain=${live.metersRow.inMain} h=${live.metersRow.h}px` });
+      rows.push({ label: "the hide path is GONE: no toggle button, no panel, no menu item",
+        pass: live.noToggleButton && live.noPanel && live.noMenuItem,
+        detail: `toggle=${!live.noToggleButton} panel=${!live.noPanel} menu=${!live.noMenuItem}` });
+      rows.push({ label: "values render verbatim — CPU 13%, RAM 51% · ours 10 MB, GPU 3.3% · 6.6 GB VRAM",
+        pass: live.cpu.text === "13%" && live.ram.text === "51% · ours 10 MB"
+          && live.gpu.text === "3.3% · 6.6 GB VRAM",
+        detail: `${live.cpu.text} | ${live.ram.text} | ${live.gpu.text}` });
+      rows.push({ label: "bar widths follow the percentages (12.5% / 51.3% / 3.25%)",
+        pass: live.cpu.width === "12.5%" && live.ram.width === "51.3%" && live.gpu.width === "3.25%",
+        detail: `${live.cpu.width} ${live.ram.width} ${live.gpu.width}` });
+      rows.push({ label: "geometry: main page with the meters strip still fits 1152×648 with NO clipping",
+        pass: !live.geometry.mainClips && live.geometry.mainScrollH === live.geometry.mainClientH,
+        detail: `scrollH=${live.geometry.mainScrollH} clientH=${live.geometry.mainClientH}` });
+
+      // ---- All-null tick: per-field n/a, bars at 0% — never a guess ------
+      const none = await scenario(ui, { sample: SAMPLE_NONE });
+      await new Promise((r) => setTimeout(r, 250));
       rows.push({ label: "all-null tick: every meter reads n/a and every bar is 0% — never a guess",
         pass: none.cpu.text === "n/a" && none.ram.text === "n/a" && none.gpu.text === "n/a"
           && none.cpu.width === "0%" && none.ram.width === "0%" && none.gpu.width === "0%",
         detail: `${none.cpu.text}/${none.ram.text}/${none.gpu.text} @ ${none.cpu.width}` });
-      rows.push({ label: "all-null tick: summary degrades to n/a per field",
-        pass: none.summary === "CPU n/a · RAM n/a · GPU n/a", detail: none.summary });
+
+      // ---- Owner directive: the STARTING feedback when HOST is pressed ---
+      window.__hosting = false;
+      window.__hostingDelayMs = 700;
+      const sw = none.doc.getElementById("hosting-switch");
+      const word = none.doc.getElementById("hosting-word");
+      sw.click();
+      await new Promise((r) => setTimeout(r, 250));
+      const midWord = word.textContent, midClass = word.classList.contains("starting"),
+            midSwitch = sw.classList.contains("starting"),
+            midBar = none.doc.querySelector(".hosting-row .bar").classList.contains("indeterminate");
+      await new Promise((r) => setTimeout(r, 1000));
+      const endWord = word.textContent, endClass = word.classList.contains("starting");
+      rows.push({ label: "pressing HOST shows STARTING… IMMEDIATELY (animated word + glowing switch + sweeping bar)",
+        pass: midWord === "STARTING\u2026" && midClass && midSwitch && midBar,
+        detail: `mid=${midWord} wordAnim=${midClass} switchGlow=${midSwitch} barSweep=${midBar}` });
+      rows.push({ label: "after the boot window: the truthful state replaces the feedback (no stuck animation)",
+        pass: !endClass && (endWord === "ON" || endWord === "OFF"),
+        detail: `end=${endWord} anim=${endClass}` });
+      live.frame.remove(); none.frame.remove();
+
       render(rows);
     })().catch((e) => {
       document.getElementById("results").innerHTML =

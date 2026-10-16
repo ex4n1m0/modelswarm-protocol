@@ -82,7 +82,7 @@ describe("heartbeat mints a relay admission ticket (ADR-038 §3.3)", () => {
     rig.advance(5_000);
     const res = await heartbeat(rig, who, leaseId, { profiles: [profileA] });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { relayTicket: string; leaseExpiresAt: string };
+    const body = (await res.json()) as { relayTicket: string; leaseExpiresAt: string; relayAddr?: string };
     expect(typeof body.relayTicket).toBe("string");
     expect(body.relayTicket.length).toBeGreaterThan(0);
 
@@ -130,6 +130,39 @@ describe("heartbeat mints a relay admission ticket (ADR-038 §3.3)", () => {
     const t1 = splitRelayAdmissionTicket(((await (await heartbeat(rig, who, leaseId)).json()) as { relayTicket: string }).relayTicket)!;
     const t2 = splitRelayAdmissionTicket(((await (await heartbeat(rig, who, leaseId)).json()) as { relayTicket: string }).relayTicket)!;
     expect(t1.signature).not.toBe(t2.signature);
+  });
+});
+
+describe("relayAddr distribution (ADR-039, deploy-order additive)", () => {
+  let who: Enrollment;
+  let leaseId: string;
+
+  beforeEach(async () => {
+    ({ leaseId } = await register(rig, who = await enroll(rig), [profileA]));
+  });
+
+  it("unset MSP_RELAY_ADDR -> relayAddr is the empty string (feature off, today's bytes)", async () => {
+    delete process.env.MSP_RELAY_ADDR;
+    rig.advance(5_000);
+    const res = await heartbeat(rig, who, leaseId, { profiles: [profileA] });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { relayAddr: string };
+    expect(body.relayAddr).toBe("");
+  });
+
+  it("set MSP_RELAY_ADDR -> verbatim trimmed multiaddr on every heartbeat", async () => {
+    const addr = "/ip4/152.69.218.106/udp/4001/quic-v1/p2p/12D3KooWKwGxyw6tgndYTxjRRcNrQck3W2f3yuG483vxXaVqbCtZ";
+    process.env.MSP_RELAY_ADDR = `  ${addr}  `;
+    try {
+      rig.advance(5_000);
+      const a = (await (await heartbeat(rig, who, leaseId, { profiles: [profileA] })).json()) as { relayAddr: string };
+      expect(a.relayAddr).toBe(addr);
+      rig.advance(5_000);
+      const b = (await (await heartbeat(rig, who, leaseId, { profiles: [profileA] })).json()) as { relayAddr: string };
+      expect(b.relayAddr).toBe(addr);
+    } finally {
+      delete process.env.MSP_RELAY_ADDR;
+    }
   });
 });
 

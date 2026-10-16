@@ -593,6 +593,12 @@ pub(crate) async fn serve_one_seeded(
             stream: true,
         };
 
+        // ADR-039 (telemetry gap fix): remember the last Usage counts of
+        // THIS request so `Completed` can log a counts-only
+        // `serving.completed` — a cleanly-served swarm turn previously
+        // left NO trace on the serving peer (only errored sessions
+        // logged; the F2B record note). Counts only, never content.
+        let mut last_usage: Option<(u32, u32, u32, u32)> = None;
         let mut events = match executor.execute(normalized).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -615,16 +621,41 @@ pub(crate) async fn serve_one_seeded(
                     completion_tokens,
                     prefill_ms,
                     decode_ms,
-                } => WireMessage::Usage(Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                    prefill_ms: prefill_ms as u32,
-                    decode_ms: decode_ms as u32,
-                }),
-                ExecutorEvent::Completed { finish_reason } => WireMessage::Completed(Completed {
-                    request_id: request.request_id.clone(),
-                    finish_reason: format!("{finish_reason:?}").to_lowercase(),
-                }),
+                } => {
+                    last_usage = Some((
+                        prompt_tokens,
+                        completion_tokens,
+                        prefill_ms as u32,
+                        decode_ms as u32,
+                    ));
+                    WireMessage::Usage(Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        prefill_ms: prefill_ms as u32,
+                        decode_ms: decode_ms as u32,
+                    })
+                }
+                ExecutorEvent::Completed { finish_reason } => {
+                    // The clean-completion trace (ADR-039): counts only —
+                    // peer id and token/timing counters, never content.
+                    let (completion_tokens, prefill_ms, decode_ms) = match last_usage {
+                        Some((_, ct, pf, dc)) => (ct.to_string(), pf.to_string(), dc.to_string()),
+                        None => ("0".to_string(), "0".to_string(), "0".to_string()),
+                    };
+                    telemetry.info(
+                        "serving.completed",
+                        &[
+                            ("peer", peer_id.as_str()),
+                            ("completion_tokens", completion_tokens.as_str()),
+                            ("prefill_ms", prefill_ms.as_str()),
+                            ("decode_ms", decode_ms.as_str()),
+                        ],
+                    );
+                    WireMessage::Completed(Completed {
+                        request_id: request.request_id.clone(),
+                        finish_reason: format!("{finish_reason:?}").to_lowercase(),
+                    })
+                }
                 ExecutorEvent::Error {
                     code, retryable, ..
                 } => {

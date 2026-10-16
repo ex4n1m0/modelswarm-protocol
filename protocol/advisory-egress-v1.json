@@ -370,7 +370,8 @@
       "verifydrafts.unexpected_frame": "excluded",
       "verifydrafts.wire_failure": "excluded",
       "assistant.turn.sent": "plane_own",
-      "assistant.turn.gap": "plane_own"
+      "assistant.turn.gap": "plane_own",
+      "serving.completed": "excluded"
     }
   }
 }

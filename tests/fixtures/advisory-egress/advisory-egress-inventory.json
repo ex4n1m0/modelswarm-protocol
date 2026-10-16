@@ -1276,6 +1276,35 @@
       ]
     },
     {
+      "event": "serving.completed",
+      "classification": "excluded",
+      "sources": [
+        "crates/modelswarm-node/src/serving.rs:645"
+      ],
+      "fields": [
+        {
+          "field": "peer",
+          "type": "string_expr",
+          "adversarial_value": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        },
+        {
+          "field": "completion_tokens",
+          "type": "string_expr",
+          "adversarial_value": "NaN"
+        },
+        {
+          "field": "prefill_ms",
+          "type": "string_expr",
+          "adversarial_value": "-1"
+        },
+        {
+          "field": "decode_ms",
+          "type": "string_expr",
+          "adversarial_value": "-1"
+        }
+      ]
+    },
+    {
       "event": "serving.refused",
       "classification": "excluded",
       "sources": [

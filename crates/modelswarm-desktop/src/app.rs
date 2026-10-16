@@ -102,6 +102,26 @@ fn peer_addr_direct(addr: &str) -> bool {
 /// 2026-10-15, "everything on by design").
 const RELAY_ADDR_FILE: &str = "relay.addr";
 
+/// ADR-039 precedence, pure and testable: the local file value wins over
+/// the tracker value; none -> null. Returns the address plus its source
+/// label for the Diagnostics disclosure.
+fn effective_relay(
+    file_value: Option<&str>,
+    tracker_value: Option<&str>,
+) -> Option<serde_json::Value> {
+    match (file_value, tracker_value) {
+        (Some(file), _) => Some(serde_json::json!({
+            "addr": file,
+            "source": "file",
+        })),
+        (None, Some(tracker)) => Some(serde_json::json!({
+            "addr": tracker,
+            "source": "tracker",
+        })),
+        (None, None) => None,
+    }
+}
+
 fn configured_relay_addr(data_dir: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(data_dir.join(RELAY_ADDR_FILE)).ok()?;
     raw.lines()
@@ -180,6 +200,12 @@ struct Inner {
     /// (the owner's everything-on-by-design directive; the ticket rides
     /// the heartbeat invisibly). `None` while not hosting.
     relay_tickets: Option<std::sync::Arc<modelswarm_node::relay_ticket_cache::RelayTicketCache>>,
+    /// ADR-039: the tracker-supplied community relay address (latest
+    /// heartbeat value), as a watch receiver so `get_status` can read it
+    /// synchronously while the heartbeat task sends updates. `None`
+    /// while not hosting. The local `relay.addr` file still WINS over
+    /// this value (the tester/operator override).
+    relay_config: Option<tokio::sync::watch::Receiver<Option<String>>>,
     /// F15 shadow measurements (per-peer RTT EWMA, completion
     /// distributions): lazily opened store-backed recorder shared by the
     /// swarm executors. Shadow data only — nothing selects peers yet.
@@ -496,6 +522,7 @@ impl DesktopState {
                 swarm_lease: None,
                 swarm_executor: None,
                 relay_tickets: None,
+                relay_config: None,
                 peer_metrics: None,
                 listener_addr: None,
                 family: None,
@@ -837,6 +864,57 @@ async fn reserve_relay_attempt(
 /// start after the app — the owner's second-desktop deployment); keep the
 /// advertised address list truthful (circuit address only while a live
 /// reservation holds it); the heartbeat re-registers on any list change.
+/// ADR-039: resolves the effective relay address for one hosting
+/// session — the local `relay.addr` file WINS (checked first, the F2B
+/// behavior); otherwise waits for the tracker's first non-empty
+/// heartbeat-supplied value — then runs the (unchanged) reservation
+/// supervisor exactly once. Waiting is shutdown-aware: hosting off or app
+/// exit cancels cleanly; a tracker that never supplies an address simply
+/// never starts a supervisor (today's no-relay behavior, no log spam).
+#[allow(clippy::too_many_arguments)]
+async fn relay_config_supervisor(
+    data_dir: std::path::PathBuf,
+    mut tracker_relay: tokio::sync::watch::Receiver<Option<String>>,
+    slot: modelswarm_node::serving::RelaySlot,
+    advertised: tokio::sync::watch::Sender<Vec<String>>,
+    direct_addr: String,
+    tickets: std::sync::Arc<modelswarm_node::relay_ticket_cache::RelayTicketCache>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    telemetry: std::sync::Arc<Telemetry>,
+) {
+    let relay_addr = match configured_relay_addr(&data_dir) {
+        Some(file_addr) => file_addr,
+        None => loop {
+            tokio::select! {
+                changed = tracker_relay.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if let Some(addr) = tracker_relay.borrow().clone() {
+                        break addr;
+                    }
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+        },
+    };
+    relay_reservation_supervisor(
+        data_dir,
+        relay_addr,
+        slot,
+        advertised,
+        direct_addr,
+        tickets,
+        shutdown,
+        telemetry,
+    )
+    .await;
+}
+
 /// Reservation RENEWAL itself is the transport's own driver (re-reserve
 /// at 3/4 of each lease) — this task only acquires and re-acquires.
 /// ADR-038 §6.4 row 8: every attempt presents the heartbeat-supplied
@@ -1899,6 +1977,18 @@ async fn get_status(
                     .find(|addr| addr_is_circuit(addr))
                     .cloned()
             }),
+            // ADR-039 disclosure (Diagnostics → Hosting detail): the
+            // effective relay address and where it came from — the local
+            // relay.addr file (tester/operator override) or the tracker
+            // (community relay). null when neither is configured.
+            "relay_config": effective_relay(
+                configured_relay_addr(&inner.data_dir).as_deref(),
+                inner
+                    .relay_config
+                    .as_ref()
+                    .and_then(|rx| rx.borrow().clone())
+                    .as_deref(),
+            ),
             "enrollment": enrollment,
         },
         // The ADR-032 family half, exactly as the daemon decided it (on
@@ -2700,6 +2790,7 @@ async fn set_hosting_inner(
         // retire the pooled swarm executor so the next turn rebuilds it
         // ticket-less instead of presenting the dead cache forever.
         inner.relay_tickets = None;
+        inner.relay_config = None;
         inner.swarm_executor = None;
         // 2026-10-15: hosting off = no model backing — the assistant
         // returns to the static floor with the honest label (its
@@ -2804,6 +2895,10 @@ async fn set_hosting_inner(
     let relay_tickets =
         std::sync::Arc::new(modelswarm_node::relay_ticket_cache::RelayTicketCache::new());
     inner.relay_tickets = Some(std::sync::Arc::clone(&relay_tickets));
+    // ADR-039: the tracker-supplied relay address channel (heartbeat task
+    // sends; the lazy supervisor and the status surface read).
+    let (relay_config_tx, relay_config_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    inner.relay_config = Some(relay_config_rx.clone());
     // The pooled swarm executor (if any) predates this cache — retire it
     // so the next swarm turn rebuilds with the ticket attached (mirrored
     // by the hosting-off reset above).
@@ -2843,18 +2938,22 @@ async fn set_hosting_inner(
             // later) and owns the advertised list's circuit entry; the
             // heartbeat re-registers when the list changes.
             let relay_slot = modelswarm_node::serving::RelaySlot::empty();
-            if let Some(relay_addr) = configured_relay_addr(&inner.data_dir) {
-                tokio::spawn(relay_reservation_supervisor(
-                    inner.data_dir.clone(),
-                    relay_addr,
-                    relay_slot.clone(),
-                    advertised_tx.clone(),
-                    addr.clone(),
-                    std::sync::Arc::clone(&relay_tickets),
-                    handle.shutdown_rx.clone(),
-                    std::sync::Arc::clone(&state.telemetry),
-                ));
-            }
+            // ADR-039: the effective relay address resolves LAZILY — the
+            // local `relay.addr` file wins (immediate, the F2B behavior);
+            // otherwise the supervisor waits for the tracker's first
+            // non-empty heartbeat `relayAddr` and starts then. Exactly
+            // one reservation supervisor per hosting session either way.
+
+            tokio::spawn(relay_config_supervisor(
+                inner.data_dir.clone(),
+                relay_config_rx,
+                relay_slot.clone(),
+                advertised_tx.clone(),
+                addr.clone(),
+                std::sync::Arc::clone(&relay_tickets),
+                handle.shutdown_rx.clone(),
+                std::sync::Arc::clone(&state.telemetry),
+            ));
 
             #[cfg(feature = "verifydrafts")]
             let (family_serving, family_status, family_engine) = compose_family_serving(
@@ -2964,6 +3063,9 @@ async fn set_hosting_inner(
     // ADR-038 §3.3/§6.4 row 8: the heartbeat response's `relayTicket`
     // populates the cache the relay paths present (moved into the task).
     let hb_relay_tickets = relay_tickets;
+    // ADR-039: the heartbeat's relayAddr feeds the lazy config supervisor
+    // (file-wins precedence resolves inside it) and the status surface.
+    let hb_relay_config_tx = relay_config_tx;
     let enrollment_view = Arc::new(tokio::sync::RwLock::new(EnrollmentView {
         phase: "enrolling".into(),
         ..EnrollmentView::default()
@@ -3132,6 +3234,21 @@ async fn set_hosting_inner(
                             // counts-only event name fits, per the
                             // ticket-cache handoff).
                             let _ = hb_relay_tickets.store_heartbeat(&response);
+                            // ADR-039: forward the tracker's relay address
+                            // when it changes (non-empty, multiaddr-shaped
+                            // — a leading '/' with no whitespace; garbage
+                            // is dropped silently-and-honestly: the
+                            // reservation supervisor would only fail on
+                            // it, throttled).
+                            let candidate = response.relay_addr.trim().to_string();
+                            if !candidate.is_empty()
+                                && candidate.starts_with('/')
+                                && !candidate.contains(char::is_whitespace)
+                                && hb_relay_config_tx.borrow().as_deref()
+                                    != Some(candidate.as_str())
+                            {
+                                let _ = hb_relay_config_tx.send(Some(candidate));
+                            }
                         })
                         .or_else(|_| {
                             // Lease lost (expiry/revocation): re-register next tick.
@@ -7006,6 +7123,7 @@ mod tests {
             swarm_lease: None,
             swarm_executor: None,
             relay_tickets: None,
+            relay_config: None,
             peer_metrics: None,
             license_accepted: true,
             artifact: None,
@@ -7662,6 +7780,24 @@ mod tests {
         // The pin constrains language only — no persona, no topics.
         assert!(CHAT_LANGUAGE_PIN_SUFFIX.contains("language"));
         assert!(!CHAT_LANGUAGE_PIN_SUFFIX.contains("You are"));
+    }
+
+    #[test]
+    fn effective_relay_precedence_file_wins() {
+        // ADR-039: the local relay.addr file wins over the tracker value;
+        // tracker alone works; neither -> null (today's behavior).
+        let file = Some("/ip4/10.0.0.1/udp/4001/quic-v1/p2p/FileRelay");
+        let tracker = Some("/ip4/152.69.218.106/udp/4001/quic-v1/p2p/TrackerRelay");
+        let v = effective_relay(file, tracker).unwrap();
+        assert_eq!(v["addr"], "/ip4/10.0.0.1/udp/4001/quic-v1/p2p/FileRelay");
+        assert_eq!(v["source"], "file");
+        let v = effective_relay(None, tracker).unwrap();
+        assert_eq!(v["source"], "tracker");
+        assert!(v["addr"]
+            .as_str()
+            .unwrap()
+            .starts_with("/ip4/152.69.218.106/"));
+        assert!(effective_relay(None, None).is_none());
     }
 
     #[test]

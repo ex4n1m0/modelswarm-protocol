@@ -54,9 +54,15 @@ export async function POST(req: Request) {
   );
 
   const notices = await ctx.store.drainNotices(body.leaseId);
+  // ADR-039: the operator-configured community relay multiaddr, handed to
+  // every enrolled installation on each heartbeat (empty string = not
+  // configured; absent env = the feature is off — deploy-order additive,
+  // the relayTicket precedent).
+  const relayAddr = (process.env.MSP_RELAY_ADDR ?? "").trim();
   return jsonOk({
     leaseExpiresAt: new Date(expiresAt).toISOString(),
     relayTicket: relayTicket.token,
+    relayAddr,
     notices,
   });
 }

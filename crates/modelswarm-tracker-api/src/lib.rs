@@ -177,6 +177,15 @@ pub struct HeartbeatResponse {
     /// parseable by a NEW client — empty string means "no ticket issued".
     #[serde(default, rename = "relayTicket")]
     pub relay_ticket: String,
+    /// ADR-039: the operator-configured community relay multiaddr handed
+    /// to every enrolled installation on each heartbeat — empty string
+    /// when not configured (absent env on the tracker = the feature is
+    /// off). Additive deploy-order field, the `relayTicket` precedent:
+    /// an OLD tracker deploy (field absent) parses as empty here, and an
+    /// OLD client ignores the extra field. Client precedence: the local
+    /// `relay.addr` file wins over this value.
+    #[serde(default, rename = "relayAddr")]
+    pub relay_addr: String,
     #[serde(default)]
     pub notices: Vec<Notice>,
 }
@@ -687,6 +696,31 @@ mod tests {
     // additive with tracker-first deploy order, so an OLD tracker response
     // (field absent) MUST keep parsing for a NEW client (serde default
     // tolerance), and a NEW response MUST carry the wire name `relayTicket`.
+    #[test]
+    fn heartbeat_response_relay_addr_deploy_skew_tolerance() {
+        // Old tracker deploy: field absent -> parses, empty string (the
+        // feature reads as "not configured" — today's behavior).
+        let old = serde_json::json!({ "leaseExpiresAt": "2026-10-16T00:00:00Z" });
+        let r: HeartbeatResponse = serde_json::from_value(old).expect("old tracker parses");
+        assert_eq!(r.relay_addr, "");
+
+        // New tracker: the wire name is relayAddr (camelCase on the wire,
+        // snake_case here) and round-trips verbatim.
+        let new = serde_json::json!({
+            "leaseExpiresAt": "2026-10-16T00:00:00Z",
+            "relayAddr": "/ip4/152.69.218.106/udp/4001/quic-v1/p2p/12D3KooWKwGxyw6tgndYTxjRRcNrQck3W2f3yuG483vxXaVqbCtZ"
+        });
+        let r: HeartbeatResponse = serde_json::from_value(new).expect("new tracker parses");
+        assert!(r.relay_addr.starts_with("/ip4/152.69.218.106/"));
+        let back = serde_json::to_value(&r).expect("serializes");
+        assert_eq!(
+            back["relayAddr"].as_str().unwrap(),
+            r.relay_addr,
+            "the wire name is relayAddr"
+        );
+        assert!(back.get("relay_addr").is_none(), "no snake_case leak");
+    }
+
     #[test]
     fn heartbeat_response_relay_ticket_deploy_skew_tolerance() {
         // Old tracker deploy: field absent -> parses, empty string.

@@ -377,8 +377,9 @@
             <dt>Profile id</dt><dd id="profile-line">—</dd>
             <dt>Gateway</dt><dd id="gateway-line">—</dd>
             <dt>Installation</dt><dd id="install-line">—</dd>
+            <dt>Relay</dt><dd id="relay-detail-line">—</dd>
           </dl>
-          <p class="note" style="margin:4px 0 0">Beta boundary, never hidden: remote serving uses direct QUIC first with an honest relay fallback (F2B); no universal NAT-traversal claim is made — a failed dial is reported, never hidden.</p>
+          <p class="note" style="margin:4px 0 0">Beta boundary, never hidden: remote serving uses direct QUIC first with an honest relay fallback (F2B); no universal NAT-traversal claim is made — a failed dial is reported, never hidden. The community relay address comes from the tracker (or your local relay.addr file, which wins); relayed turns are slower by design, content-blind, and admission-ticketed.</p>
         </section>
 
         <section aria-labelledby="peers-h">
@@ -755,6 +756,11 @@
       $("profile-line").textContent = s.profile_id || "—";
       $("gateway-line").textContent = s.node.running ? s.node.gateway_addr : "—";
       $("install-line").textContent = s.node.installation_id || "—";
+      // ADR-039 disclosure: the effective relay + its source, or an
+      // honest "none" (which is also today's no-file behavior).
+      $("relay-detail-line").textContent = s.node.relay_config
+        ? `${s.node.relay_config.addr} (${s.node.relay_config.source})`
+        : "none";
       // Status strip (owner directive 2026-10-15): the relay chip shows
       // ONLY while a live reservation holds a circuit address — same
       // serving truth the remote-serve chip carries, no separate switch.

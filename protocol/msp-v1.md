@@ -113,7 +113,7 @@ installation**; referencing another installation's lease is `401 unauthorized`.
 |---|---|---|
 | `POST /peers/challenge/start` | `{leaseId, profileId}` | `{challengeId, challengePrompt, deadlineAt}`; one open challenge per lease+profile. `challengePrompt` is **nonce-bound** (D16, gate 2026-10-09 / ADR-028 §7): `"ModelSwarm readiness challenge <challengeId>"`, plus `"; greedy-canary sha256:<64hex>"` when the profile has a pinned possession digest (hash-only, content-blind; construction byte-pinned by `protocol/vectors/challenge-prompt-1.json`) |
 | `POST /peers/register` | `{peerId, addresses:[multiaddr], profiles:[profileId…], maxSlots, runtime:{name,build}}` | `{leaseId, leaseExpiresAt}` |
-| `POST /peers/heartbeat` | `{leaseId, activeProfiles:[profileId…], freeSlots, queueMs, draining:bool}` | `{leaseExpiresAt, relayTicket, notices:[Notice]}` (below; `relayTicket` is the §5a admission ticket string, issued on every successful heartbeat — ADR-038) |
+| `POST /peers/heartbeat` | `{leaseId, activeProfiles:[profileId…], freeSlots, queueMs, draining:bool}` | `{leaseExpiresAt, relayTicket, relayAddr, notices:[Notice]}` (below; `relayTicket` is the §5a admission ticket string, issued on every successful heartbeat — ADR-038; `relayAddr` is the operator-configured community relay multiaddr or the empty string, deploy-order additive — ADR-039) |
 | `POST /peers/drain` | `{leaseId}` | `{draining:true}` |
 | `POST /peers/challenge/complete` | `{leaseId, profileId, challengeId, timings:{firstTokenMs, totalMs}}` | `{passed, challengeId, capacityClass}`; token issuance moved to `/peers/lease` (ADR-012) |
 | `POST /peers/lease` | `{leaseId, profileId}` | `{token, lease}` — the hub-signed EligibilityLease (§5; ADR-012) |
@@ -411,4 +411,5 @@ undocumented amendments.
 (content-blind counters and installer downloads). They are NOT protocol
 endpoints, carry no peer state, and may change with the website without an
 ADR (ADR-028 §1).
+| 2026-10-16 | ADR-039 (tracker-distributed relay config) | §3.3 heartbeat response gains `relayAddr` (operator-configured community relay multiaddr, additive, empty = none); client precedence: local `relay.addr` file over tracker value |
 | 2026-10-15 | ADR-038 (relay admission tickets) | §3.3 heartbeat response gains `relayTicket`; §5a added (relay admission ticket, 600 s TTL, `/msp/relay-ticket/1`); §6 untouched |

@@ -138,6 +138,6 @@ fn build_countersign_and_digest_round_trip() {
 
     // The wire mirror is JSON-identical to the semantic object.
     let via_wire = serde_json::to_value(&wire).unwrap();
-    let via_semantic = serde_json::to_value(&receipt_to_wire(&semantic).unwrap()).unwrap();
+    let via_semantic = serde_json::to_value(receipt_to_wire(&semantic).unwrap()).unwrap();
     assert_eq!(via_wire, via_semantic);
 }

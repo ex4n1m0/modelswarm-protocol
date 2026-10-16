@@ -793,6 +793,7 @@ mod failover_tests {
         });
         tokio::spawn(serve_sessions(
             listener,
+            std::sync::Arc::new(crate::serving::lease_helpers::server_identity()),
             remote_executor.clone(),
             profile.into(),
             policy,
@@ -876,6 +877,7 @@ mod failover_tests {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         tokio::spawn(serve_sessions(
             listener,
+            std::sync::Arc::new(crate::serving::lease_helpers::server_identity()),
             Arc::new(CountingExecutor {
                 label: "REMOTE",
                 calls: AtomicUsize::new(0),
@@ -1158,6 +1160,7 @@ mod reuse_tests {
         });
         tokio::spawn(serve_sessions(
             listener,
+            std::sync::Arc::new(crate::serving::lease_helpers::server_identity()),
             served.clone(),
             profile.into(),
             policy,
@@ -1290,6 +1293,7 @@ mod measure_tests {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         tokio::spawn(serve_sessions(
             listener,
+            std::sync::Arc::new(crate::serving::lease_helpers::server_identity()),
             Arc::new(TwoTokenExecutor),
             profile_id.into(),
             policy,
@@ -1578,6 +1582,7 @@ mod shadow_tests {
         let (_tx_a, rx_a) = tokio::sync::watch::channel(false);
         tokio::spawn(serve_sessions(
             listener_first,
+            std::sync::Arc::new(crate::serving::lease_helpers::server_identity()),
             first_executor.clone(),
             profile_id.into(),
             policy_first,
@@ -1587,6 +1592,7 @@ mod shadow_tests {
         let (_tx_b, rx_b) = tokio::sync::watch::channel(false);
         tokio::spawn(serve_sessions(
             listener_fast,
+            std::sync::Arc::new(crate::serving::lease_helpers::server_identity()),
             Arc::new(CountingTwoTokenExecutor {
                 served: std::sync::atomic::AtomicUsize::new(0),
             }),
@@ -1910,6 +1916,7 @@ mod relay_fallback_tests {
         tokio::spawn(serve_sessions_relayed(
             listener,
             slot,
+            std::sync::Arc::new(crate::serving::lease_helpers::server_identity()),
             Arc::new(TwoTokenExecutor),
             profile.into(),
             policy,
@@ -2000,6 +2007,7 @@ mod relay_fallback_tests {
         tokio::spawn(serve_sessions_relayed(
             listener,
             slot,
+            std::sync::Arc::new(crate::serving::lease_helpers::server_identity()),
             Arc::new(TwoTokenExecutor),
             profile.into(),
             policy,
@@ -2121,6 +2129,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(serve_sessions(
             listener,
+            std::sync::Arc::new(crate::serving::lease_helpers::server_identity()),
             Arc::new(FixedExecutor),
             crate::serving::lease_helpers::TEST_PROFILE.into(),
             policy,

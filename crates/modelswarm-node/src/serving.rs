@@ -194,6 +194,7 @@ pub async fn serve_sessions(
 /// behind NAT that reserved nothing themselves but dial us through the
 /// relay we reserved on) land in the same admission- and lease-gated
 /// loop. Identical to [`serve_sessions`] when the slot is empty.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_sessions_relayed(
     listener: Libp2pListener,
     relay: RelaySlot,
@@ -471,6 +472,7 @@ async fn serve_one(
 /// session by its FIRST frame and hands it here pre-read, so the frame is
 /// never decoded twice. `None` (the [`serve_one`] path) reads the first
 /// frame below — behavior-identical to the pre-composition loop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_one_seeded(
     mut session: Libp2pSession,
     identity: std::sync::Arc<modelswarm_identity::InstallationIdentity>,
@@ -678,34 +680,30 @@ pub(crate) async fn serve_one_seeded(
                     // the wire. Construction failure (never for these
                     // inputs) degrades to a receipt-less Completed — the
                     // accounting simply doesn't happen, nothing breaks.
-                    let job_receipt = (|| {
-                        let (pt, ct, pf, dc) = last_usage.unwrap_or((0, 0, 0, 0));
-                        Some(
-                            crate::receipt_wire::build_server_receipt(
-                                &crate::receipt_wire::ReceiptContext {
-                                    request_id: &request.request_id,
-                                    profile_id: &profile_id,
-                                    requester: modelswarm_eligibility::receipt_v2::ReceiptPeer {
-                                        peer_id: peer_id.clone(),
-                                        installation_id: requester_installation.clone(),
-                                        role: "requester".into(),
-                                    },
-                                    server_identity: &identity,
-                                    started_at: request_started,
-                                    ended_at: time::OffsetDateTime::now_utc(),
-                                    finish_reason: &finish_reason_str,
-                                    accepted_tokens: ct,
-                                    verified_tokens: ct,
-                                    prompt_tokens: pt,
-                                    prefill_ms: pf,
-                                    decode_ms: dc,
-                                    deadline_ms,
-                                    max_tokens,
-                                },
-                            )
-                            .ok()?,
-                        )
-                    })();
+                    let (pt, ct, pf, dc) = last_usage.unwrap_or((0, 0, 0, 0));
+                    let job_receipt = crate::receipt_wire::build_server_receipt(
+                        &crate::receipt_wire::ReceiptContext {
+                            request_id: &request.request_id,
+                            profile_id: &profile_id,
+                            requester: modelswarm_eligibility::receipt_v2::ReceiptPeer {
+                                peer_id: peer_id.clone(),
+                                installation_id: requester_installation.clone(),
+                                role: "requester".into(),
+                            },
+                            server_identity: &identity,
+                            started_at: request_started,
+                            ended_at: time::OffsetDateTime::now_utc(),
+                            finish_reason: &finish_reason_str,
+                            accepted_tokens: ct,
+                            verified_tokens: ct,
+                            prompt_tokens: pt,
+                            prefill_ms: pf,
+                            decode_ms: dc,
+                            deadline_ms,
+                            max_tokens,
+                        },
+                    )
+                    .ok();
                     WireMessage::Completed(Completed {
                         request_id: request.request_id.clone(),
                         finish_reason: finish_reason_str.clone(),
@@ -854,6 +852,12 @@ pub(crate) mod lease_helpers {
     }
 
     /// A profile id that passes the ADR-011 format check in tests.
+    /// A deterministic serving identity for tests (stable seed; peer id
+    /// + installation id derive from it).
+    pub fn server_identity() -> modelswarm_identity::InstallationIdentity {
+        modelswarm_identity::InstallationIdentity::from_bytes(&[0xA7; 32])
+    }
+
     pub const TEST_PROFILE: &str =
         "msp1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -962,6 +966,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(serve_sessions(
             listener,
+            std::sync::Arc::new(super::lease_helpers::server_identity()),
             Arc::new(FixedExecutor),
             super::lease_helpers::TEST_PROFILE.into(),
             policy,
@@ -1053,6 +1058,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let serving = tokio::spawn(serve_sessions(
             listener,
+            std::sync::Arc::new(super::lease_helpers::server_identity()),
             Arc::new(NeverExecutor),
             super::lease_helpers::TEST_PROFILE.into(),
             super::LeasePolicy::production(),
@@ -1103,6 +1109,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(serve_sessions(
             listener,
+            std::sync::Arc::new(super::lease_helpers::server_identity()),
             Arc::new(NeverExecutor),
             super::lease_helpers::TEST_PROFILE.into(),
             super::LeasePolicy::production(),
@@ -1183,6 +1190,7 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         tokio::spawn(serve_sessions(
             listener,
+            std::sync::Arc::new(super::lease_helpers::server_identity()),
             Arc::new(NeverExecutor),
             super::lease_helpers::TEST_PROFILE.into(),
             policy,
@@ -1267,6 +1275,7 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         tokio::spawn(serve_sessions(
             listener,
+            std::sync::Arc::new(super::lease_helpers::server_identity()),
             Arc::new(NeverExecutor),
             super::lease_helpers::TEST_PROFILE.into(),
             policy,
@@ -1319,7 +1328,8 @@ mod tests {
         assert_eq!(
             Completed {
                 request_id: "r".into(),
-                finish_reason: "stop".into()
+                finish_reason: "stop".into(),
+                job_receipt: None,
             }
             .finish_reason,
             "stop"

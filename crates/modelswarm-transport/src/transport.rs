@@ -58,7 +58,7 @@ struct OutboundItem {
 /// valid JSON but not a typed message, the raw passthrough value delivered to
 /// [`Session::recv_json`] (extension namespaces, ADR-018 amended staging).
 enum InboundFrame {
-    Typed(WireMessage),
+    Typed(Box<WireMessage>),
     Raw(Value),
 }
 
@@ -174,7 +174,7 @@ fn spawn_session(stream: TcpStream) -> Session {
                     },
                 };
                 let msg = match serde_json::from_slice::<WireMessage>(&bytes) {
-                    Ok(msg) => InboundFrame::Typed(msg),
+                    Ok(msg) => InboundFrame::Typed(Box::new(msg)),
                     Err(_) => match serde_json::from_slice::<Value>(&bytes) {
                         Ok(value) => InboundFrame::Raw(value),
                         Err(e) => {
@@ -183,20 +183,22 @@ fn spawn_session(stream: TcpStream) -> Session {
                         }
                     },
                 };
-                if let InboundFrame::Typed(WireMessage::Control(control)) = &msg {
-                    if control.kind == Control::PING {
-                        let (ack_tx, _ack_rx) = oneshot::channel();
-                        let pong = OutboundItem {
-                            payload: serde_json::to_vec(&WireMessage::Control(Control::pong(
-                                &control.nonce,
-                            )))
-                            .expect("control pong serializes"),
-                            ack: ack_tx,
-                        };
-                        if pong_channel.send(pong).await.is_err() {
-                            break;
+                if let InboundFrame::Typed(typed) = &msg {
+                    if let WireMessage::Control(control) = typed.as_ref() {
+                        if control.kind == Control::PING {
+                            let (ack_tx, _ack_rx) = oneshot::channel();
+                            let pong = OutboundItem {
+                                payload: serde_json::to_vec(&WireMessage::Control(Control::pong(
+                                    &control.nonce,
+                                )))
+                                .expect("control pong serializes"),
+                                ack: ack_tx,
+                            };
+                            if pong_channel.send(pong).await.is_err() {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 }
                 if deliver.send(msg).await.is_err() {
@@ -297,7 +299,7 @@ impl Session {
                     return Ok(msg);
                 }
                 match self.inbound.recv().await {
-                    Some(InboundFrame::Typed(msg)) => return Ok(msg),
+                    Some(InboundFrame::Typed(msg)) => return Ok(*msg),
                     Some(InboundFrame::Raw(value)) => {
                         self.stashed_raw.push_back(value);
                     }
@@ -332,7 +334,7 @@ impl Session {
                 match self.inbound.recv().await {
                     Some(InboundFrame::Raw(value)) => return Ok(value),
                     Some(InboundFrame::Typed(msg)) => {
-                        self.stashed_typed.push_back(msg);
+                        self.stashed_typed.push_back(*msg);
                     }
                     None => {
                         return Err(self.state.take_terminal().unwrap_or(TransportError::Closed))

@@ -142,6 +142,8 @@ async fn serve(
                 WireMessage::Completed(Completed {
                     request_id: req.request_id.clone(),
                     finish_reason: "stop".to_string(),
+
+                    job_receipt: None,
                 }),
                 D,
             )
@@ -440,6 +442,8 @@ async fn four_concurrent_sessions_on_one_listener() {
                                 WireMessage::Completed(Completed {
                                     request_id: req.request_id.clone(),
                                     finish_reason: "stop".to_string(),
+
+                                    job_receipt: None,
                                 }),
                                 D,
                             )

@@ -192,6 +192,8 @@ async fn serve_canned(
                 WireMessage::Completed(Completed {
                     request_id: req.request_id.clone(),
                     finish_reason: "stop".to_string(),
+
+                    job_receipt: None,
                 }),
                 DEADLINE,
             )

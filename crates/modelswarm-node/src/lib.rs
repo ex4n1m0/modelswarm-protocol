@@ -54,6 +54,10 @@ pub mod engine;
 mod executor;
 #[cfg(feature = "libp2p-backend")]
 pub mod measure;
+/// Receipts v2 on the wire (ADR-030 B2) — the libp2p serving surface's
+/// companion; feature-gated with it.
+#[cfg(feature = "libp2p-backend")]
+pub mod receipt_wire;
 #[cfg(feature = "libp2p-backend")]
 pub mod relay_ticket_cache;
 #[cfg(feature = "libp2p-backend")]

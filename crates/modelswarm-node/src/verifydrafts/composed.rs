@@ -459,6 +459,7 @@ async fn demux_first_frame(session: &mut Libp2pSession, idle: Duration) -> First
 ///    the offer handed pre-read ([`PrefacedWire`]).
 pub async fn serve_sessions_composed(
     mut serving: crate::serving::ServingInbox,
+    identity: std::sync::Arc<modelswarm_identity::InstallationIdentity>,
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: LeasePolicy,
@@ -503,6 +504,7 @@ pub async fn serve_sessions_composed(
         let family_config = family.config.clone();
         let family_engine = Arc::clone(&family.engine);
         let family_lease = Arc::clone(&family.lease);
+        let composed_identity = Arc::clone(&identity);
         tokio::spawn(async move {
             let mut session = session;
             let _session_slot = match session_admission.admit_session(&peer_id) {
@@ -518,6 +520,7 @@ pub async fn serve_sessions_composed(
                 FirstFrame::MspV1(frame) => {
                     if let Err(code) = serve_one_seeded(
                         session,
+                        composed_identity,
                         executor,
                         profile,
                         &policy,

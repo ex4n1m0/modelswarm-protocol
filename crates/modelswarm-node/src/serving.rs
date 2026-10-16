@@ -169,6 +169,7 @@ impl ServingInbox {
 /// `StreamError` frame, then the session closes.
 pub async fn serve_sessions(
     listener: Libp2pListener,
+    identity: std::sync::Arc<modelswarm_identity::InstallationIdentity>,
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: LeasePolicy,
@@ -178,6 +179,7 @@ pub async fn serve_sessions(
     serve_sessions_relayed(
         listener,
         RelaySlot::empty(),
+        identity,
         executor,
         profile_id,
         lease_policy,
@@ -195,6 +197,7 @@ pub async fn serve_sessions(
 pub async fn serve_sessions_relayed(
     listener: Libp2pListener,
     relay: RelaySlot,
+    identity: std::sync::Arc<modelswarm_identity::InstallationIdentity>,
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: LeasePolicy,
@@ -203,6 +206,7 @@ pub async fn serve_sessions_relayed(
 ) {
     serve_inbox(
         ServingInbox::new(listener, relay),
+        identity,
         executor,
         profile_id,
         lease_policy,
@@ -215,6 +219,7 @@ pub async fn serve_sessions_relayed(
 /// The F0(3)/F2B serving loop over a [`ServingInbox`].
 async fn serve_inbox(
     mut inbox: ServingInbox,
+    identity: std::sync::Arc<modelswarm_identity::InstallationIdentity>,
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: LeasePolicy,
@@ -263,7 +268,9 @@ async fn serve_inbox(
         let policy = lease_policy.clone();
         let session_admission = admission.clone();
         let session_telemetry = Arc::clone(&telemetry);
+        let session_identity = Arc::clone(&identity);
         tokio::spawn(async move {
+            let identity = session_identity;
             let _session_slot = match session_admission.admit_session(&peer_id) {
                 Ok(guard) => guard,
                 Err(reason) => {
@@ -276,6 +283,7 @@ async fn serve_inbox(
             };
             if let Err(code) = serve_one(
                 session,
+                identity,
                 executor,
                 profile,
                 &policy,
@@ -321,6 +329,7 @@ fn wire_kind(m: &WireMessage) -> &'static str {
         WireMessage::TokenDelta(_) => "TokenDelta",
         WireMessage::Usage(_) => "Usage",
         WireMessage::StreamError(_) => "StreamError",
+        WireMessage::ReceiptAck(_) => "ReceiptAck",
         WireMessage::Cancelled(_) => "Cancelled",
         WireMessage::Completed(_) => "Completed",
         WireMessage::Cancel(_) => "Cancel",
@@ -437,6 +446,7 @@ impl Admission {
 
 async fn serve_one(
     session: Libp2pSession,
+    identity: std::sync::Arc<modelswarm_identity::InstallationIdentity>,
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: &LeasePolicy,
@@ -445,6 +455,7 @@ async fn serve_one(
 ) -> Result<(), String> {
     serve_one_seeded(
         session,
+        identity,
         executor,
         profile_id,
         lease_policy,
@@ -462,6 +473,7 @@ async fn serve_one(
 /// frame below — behavior-identical to the pre-composition loop.
 pub(crate) async fn serve_one_seeded(
     mut session: Libp2pSession,
+    identity: std::sync::Arc<modelswarm_identity::InstallationIdentity>,
     executor: Arc<dyn InferenceExecutor>,
     profile_id: String,
     lease_policy: &LeasePolicy,
@@ -529,6 +541,14 @@ pub(crate) async fn serve_one_seeded(
             return Err("replayed_request".into());
         }
 
+        // ADR-030 B2: the request's wall-clock start (receipt
+        // started_at/endpoint_seconds) + the requester's installation
+        // from the lease this gate is about to validate.
+        let request_started = time::OffsetDateTime::now_utc();
+        let requester_installation =
+            modelswarm_eligibility::EligibilityLease::from_wire(&request.capability_token)
+                .map(|lease| lease.installation_id)
+                .unwrap_or_default();
         // F3: the hub-signed lease gate. The remote's PeerId comes from the
         // QUIC handshake, so a lease issued to anyone else is worthless here.
         if let Err(why) = lease_policy.check(
@@ -636,6 +656,7 @@ pub(crate) async fn serve_one_seeded(
                     })
                 }
                 ExecutorEvent::Completed { finish_reason } => {
+                    let finish_reason_str = format!("{finish_reason:?}").to_lowercase();
                     // The clean-completion trace (ADR-039): counts only —
                     // peer id and token/timing counters, never content.
                     let (completion_tokens, prefill_ms, decode_ms) = match last_usage {
@@ -651,9 +672,44 @@ pub(crate) async fn serve_one_seeded(
                             ("decode_ms", decode_ms.as_str()),
                         ],
                     );
+                    // ADR-030 B2: attach the phase-1-signed work
+                    // receipt. Honest values only: single-mode path,
+                    // preset unspecified until ADR-029 negotiation rides
+                    // the wire. Construction failure (never for these
+                    // inputs) degrades to a receipt-less Completed — the
+                    // accounting simply doesn't happen, nothing breaks.
+                    let job_receipt = (|| {
+                        let (pt, ct, pf, dc) = last_usage.unwrap_or((0, 0, 0, 0));
+                        Some(
+                            crate::receipt_wire::build_server_receipt(
+                                &crate::receipt_wire::ReceiptContext {
+                                    request_id: &request.request_id,
+                                    profile_id: &profile_id,
+                                    requester: modelswarm_eligibility::receipt_v2::ReceiptPeer {
+                                        peer_id: peer_id.clone(),
+                                        installation_id: requester_installation.clone(),
+                                        role: "requester".into(),
+                                    },
+                                    server_identity: &identity,
+                                    started_at: request_started,
+                                    ended_at: time::OffsetDateTime::now_utc(),
+                                    finish_reason: &finish_reason_str,
+                                    accepted_tokens: ct,
+                                    verified_tokens: ct,
+                                    prompt_tokens: pt,
+                                    prefill_ms: pf,
+                                    decode_ms: dc,
+                                    deadline_ms,
+                                    max_tokens,
+                                },
+                            )
+                            .ok()?,
+                        )
+                    })();
                     WireMessage::Completed(Completed {
                         request_id: request.request_id.clone(),
-                        finish_reason: format!("{finish_reason:?}").to_lowercase(),
+                        finish_reason: finish_reason_str.clone(),
+                        job_receipt,
                     })
                 }
                 ExecutorEvent::Error {

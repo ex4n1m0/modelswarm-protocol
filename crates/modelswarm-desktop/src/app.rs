@@ -2895,6 +2895,13 @@ async fn set_hosting_inner(
     let relay_tickets =
         std::sync::Arc::new(modelswarm_node::relay_ticket_cache::RelayTicketCache::new());
     inner.relay_tickets = Some(std::sync::Arc::clone(&relay_tickets));
+    // ADR-030 B2: the serving-side receipt signer — THIS installation's
+    // identity (same seed the tracker client loads; peer id + key for the
+    // phase-1 receipt signature).
+    let serving_identity = std::sync::Arc::new(
+        modelswarm_node::load_or_create_identity(&inner.data_dir, &state.telemetry)
+            .map_err(|e| e.to_string())?,
+    );
     // ADR-039: the tracker-supplied relay address channel (heartbeat task
     // sends; the lazy supervisor and the status surface read).
     let (relay_config_tx, relay_config_rx) = tokio::sync::watch::channel::<Option<String>>(None);
@@ -2990,6 +2997,7 @@ async fn set_hosting_inner(
                                 listener,
                                 relay_slot.clone(),
                             ),
+                            std::sync::Arc::clone(&serving_identity),
                             executor,
                             profile,
                             modelswarm_node::serving::LeasePolicy::production(),
@@ -3004,6 +3012,7 @@ async fn set_hosting_inner(
                         tokio::spawn(modelswarm_node::serving::serve_sessions_relayed(
                             listener,
                             relay_slot.clone(),
+                            std::sync::Arc::clone(&serving_identity),
                             executor,
                             profile,
                             modelswarm_node::serving::LeasePolicy::production(),
@@ -3017,6 +3026,7 @@ async fn set_hosting_inner(
             tokio::spawn(modelswarm_node::serving::serve_sessions_relayed(
                 listener,
                 relay_slot.clone(),
+                std::sync::Arc::clone(&serving_identity),
                 executor,
                 profile,
                 modelswarm_node::serving::LeasePolicy::production(),

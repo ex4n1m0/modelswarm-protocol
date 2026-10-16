@@ -139,15 +139,63 @@ pub struct Cancelled {
 
 /// Stream event: successful termination (proto `Completed`).
 ///
-/// The `job_receipt` field of the proto `Completed` event is **not** carried
-/// in the Phase C staging surface: receipts (msp-v1 §7) land with the
-/// gateway/session layer. Field omission only — nothing renamed.
+/// ADR-030 B2: the proto `Completed` event's `job_receipt` field is now
+/// carried — the counter-signed-work receipts v2 surface (msp-v1 §7).
+/// Additive: `#[serde(default)]` keeps an OLD peer's receipt-less frame
+/// parsing here (`None`), and serde's ignore-unknown-fields default lets
+/// an OLD peer skip a NEW frame's receipt field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Completed {
     pub request_id: String,
     /// `stop` | `length` | `cancelled` | `error`.
     pub finish_reason: String,
+    /// ADR-030: phase-1 (server-signed) work receipt; `None` on old
+    /// peers and any path that cannot honestly account the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_receipt: Option<JobReceipt>,
+}
+
+/// The receipts-v2 wire object (ADR-030 §1) — field-for-field the JSON
+/// shape of `modelswarm_eligibility::receipt_v2::ReceiptV2` (both sides
+/// byte-pinned to `protocol/vectors/receipt-v2-1.json`), mirrored here so
+/// the transport stays layer-clean. Conversion lives node-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobReceipt {
+    pub request_id: String,
+    pub profile_id: String,
+    pub preset: String,
+    pub mode_id: String,
+    pub cohort_digest: String,
+    pub peers: Vec<JobReceiptPeer>,
+    pub started_at: String,
+    pub ended_at: String,
+    pub outcome: String,
+    pub accepted_tokens: u64,
+    pub verified_tokens: u64,
+    pub endpoint_seconds: u64,
+    pub usage_digest: String,
+    pub budgets: serde_json::Value,
+    pub server_signature: String,
+    pub requester_signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobReceiptPeer {
+    pub peer_id: String,
+    pub installation_id: String,
+    pub role: String,
+}
+
+/// ADR-030 B2 / msp-v1 §7 `receipt_ack`: the requester's best-effort
+/// confirmation that it received + counter-signed the receipt (the
+/// accounting POST to the tracker is the durable act; this frame only
+/// informs the serving peer). Old peers cannot parse this variant — the
+/// serving side awaits it with a timeout and moves on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReceiptAck {
+    pub request_id: String,
 }
 
 /// Cancellation request, either direction, anytime (proto `Cancel`).
@@ -211,6 +259,7 @@ pub enum WireMessage {
     Cancelled(Cancelled),
     Completed(Completed),
     Cancel(Cancel),
+    ReceiptAck(ReceiptAck),
     Control(Control),
 }
 
@@ -324,6 +373,7 @@ mod tests {
                 WireMessage::Completed(Completed {
                     request_id: "r".into(),
                     finish_reason: "stop".into(),
+                    job_receipt: None,
                 }),
                 "completed",
             ),

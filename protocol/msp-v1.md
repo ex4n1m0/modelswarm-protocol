@@ -329,6 +329,7 @@ runtime), `sampling: {temperature, top_p, top_k, seed?}`,
 | `error` | code, message, retryablePeerHint | stream terminates |
 | `cancelled` | reason | either side |
 | `completed` | finishReason (`stop`\|`length`\|`cancelled`\|`error`), jobReceipt | receipt carries the server's signature; the requester finalizes it with `receipt_ack` (§7) |
+| `receipt_ack` | requestId | the requester's best-effort confirmation it received + counter-signed the receipt (ADR-030 B2 implemented; the accounting POST to `/events/job-result` is the durable act — old peers cannot parse this variant and the serving side moves on after a timeout) |
 
 ### 6.4 Limits (defaults; env-tunable on each side)
 
@@ -424,6 +425,7 @@ undocumented amendments.
 (content-blind counters and installer downloads). They are NOT protocol
 endpoints, carry no peer state, and may change with the website without an
 ADR (ADR-028 §1).
+| 2026-10-16 | ADR-030 B2 | §6 message table gains the `receipt_ack` row (the §7 reservation implemented); `completed` now carries jobReceipt on the wire |
 | 2026-10-16 | ADR-030 (receipts v2) | §7 gains the additive ReceiptV2 object + the frozen receiptDigest preimage rule (the production wire landing follows) |
 | 2026-10-16 | ADR-039 (tracker-distributed relay config) | §3.3 heartbeat response gains `relayAddr` (operator-configured community relay multiaddr, additive, empty = none); client precedence: local `relay.addr` file over tracker value |
 | 2026-10-15 | ADR-038 (relay admission tickets) | §3.3 heartbeat response gains `relayTicket`; §5a added (relay admission ticket, 600 s TTL, `/msp/relay-ticket/1`); §6 untouched |

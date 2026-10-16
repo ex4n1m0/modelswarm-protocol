@@ -91,7 +91,7 @@ pub struct Libp2pSession {
 /// [`Libp2pSession::recv_json`] (extension namespaces, ADR-018 amended
 /// staging — mirrors the staged backend's reader task).
 enum InboundFrame {
-    Typed(WireMessage),
+    Typed(Box<WireMessage>),
     Raw(Value),
 }
 
@@ -273,14 +273,18 @@ impl Libp2pSession {
                 return Err(TransportError::Timeout);
             }
             match self.recv_frame(remaining).await? {
-                InboundFrame::Typed(WireMessage::Control(control))
-                    if control.kind == Control::PING =>
-                {
-                    let pong = Control::pong(&control.nonce);
-                    self.send(&WireMessage::Control(pong), remaining).await?;
-                    continue;
+                InboundFrame::Typed(msg) => {
+                    // PING control frames are answered inline; anything
+                    // else is the caller's message.
+                    if let WireMessage::Control(control) = &*msg {
+                        if control.kind == Control::PING {
+                            let pong = Control::pong(&control.nonce);
+                            self.send(&WireMessage::Control(pong), remaining).await?;
+                            continue;
+                        }
+                    }
+                    return Ok(*msg);
                 }
-                InboundFrame::Typed(msg) => return Ok(msg),
                 InboundFrame::Raw(value) => self.stashed_raw.push_back(value),
             }
         }
@@ -310,14 +314,16 @@ impl Libp2pSession {
                 return Err(TransportError::Timeout);
             }
             match self.recv_frame(remaining).await? {
-                InboundFrame::Typed(WireMessage::Control(control))
-                    if control.kind == Control::PING =>
-                {
-                    let pong = Control::pong(&control.nonce);
-                    self.send(&WireMessage::Control(pong), remaining).await?;
-                    continue;
+                InboundFrame::Typed(msg) => {
+                    if let WireMessage::Control(control) = &*msg {
+                        if control.kind == Control::PING {
+                            let pong = Control::pong(&control.nonce);
+                            self.send(&WireMessage::Control(pong), remaining).await?;
+                            continue;
+                        }
+                    }
+                    self.stashed_typed.push_back(*msg);
                 }
-                InboundFrame::Typed(msg) => self.stashed_typed.push_back(msg),
                 InboundFrame::Raw(value) => return Ok(value),
             }
         }
@@ -392,7 +398,7 @@ impl Libp2pSession {
         let tail = self.partial.split_off(len);
         let body = std::mem::replace(&mut self.partial, tail);
         match serde_json::from_slice::<WireMessage>(&body) {
-            Ok(msg) => Ok(InboundFrame::Typed(msg)),
+            Ok(msg) => Ok(InboundFrame::Typed(Box::new(msg))),
             Err(_) => match serde_json::from_slice::<Value>(&body) {
                 Ok(value) => Ok(InboundFrame::Raw(value)),
                 Err(e) => Err(TransportError::Io(invalid_data("frame decode", e))),

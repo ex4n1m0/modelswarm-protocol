@@ -430,6 +430,32 @@ impl TrackerClient {
         .await
     }
 
+    /// POST /events/job-result with the full counter-signed ReceiptV2
+    /// riding the event (ADR-030 B1/B3): intake validates the frozen
+    /// digest preimage + both signatures against the enrolled keys and
+    /// appends granted accounting rows; the response's `reason` says
+    /// which. `receipt_json` is the wire `JobReceipt` serialized as-is
+    /// (snake_case wire names — the same object the serving peer signed
+    /// and the requester counter-signed; byte-pinned by
+    /// `protocol/vectors/receipt-v2-1.json`).
+    pub async fn job_result_with_receipt(
+        &self,
+        receipt_digest: &str,
+        outcome: &str,
+        receipt_json: serde_json::Value,
+    ) -> Result<serde_json::Value, TrackerError> {
+        self.signed_json(
+            "POST",
+            &format!("{API_PREFIX}/events/job-result"),
+            serde_json::json!({
+                "receiptDigest": receipt_digest,
+                "outcome": outcome,
+                "receipt": receipt_json,
+            }),
+        )
+        .await
+    }
+
     // ---- internals -----------------------------------------------------
 
     async fn get_json(

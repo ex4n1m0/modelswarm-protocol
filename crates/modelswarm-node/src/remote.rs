@@ -46,8 +46,8 @@ use modelswarm_transport::libp2p_backend::{
     DialAttempt, DialPath, Libp2pSession, Libp2pTransport, PeerId,
 };
 use modelswarm_transport::message::{
-    ChatMessage as WireChat, InferenceRequest as WireRequest, Sampling as WireSampling,
-    StreamError as WireStreamError, WireMessage,
+    ChatMessage as WireChat, InferenceRequest as WireRequest, JobReceipt, ReceiptAck,
+    Sampling as WireSampling, StreamError as WireStreamError, WireMessage,
 };
 use modelswarm_transport::observe::{CompletionObservation, CompletionOutcome, UsageDigest};
 
@@ -65,6 +65,10 @@ const DIRECT_DIAL_DEADLINE: Duration = Duration::from_secs(5);
 /// CONNECT exchange (a few WAN RTTs).
 const RELAY_DIAL_DEADLINE: Duration = Duration::from_secs(10);
 const IO_DEADLINE: Duration = Duration::from_secs(30);
+/// ADR-030 B3: the receipt_ack is best-effort — a short deadline so a
+/// wedged send can never hang the stream tail (the serving side moves
+/// on after its own timeout; the accounting POST is the durable act).
+const ACK_DEADLINE: Duration = Duration::from_secs(2);
 /// F15: ping/pong probes per post-completion RTT batch.
 const RTT_PROBE_SAMPLES: usize = 3;
 /// F15: bound for one full probe batch (all samples).
@@ -121,6 +125,13 @@ pub struct RemoteExecutor {
     /// verbatim label. When attached, every FRESH dial transport
     /// presents the cached ticket on its relay legs.
     relay_tickets: Option<Arc<RelayTicketCache>>,
+    /// ADR-030 B3: the counter-signed receipt of the most recent
+    /// completed request (stashed by the stream tail, taken by the
+    /// requester-side caller for the accounting POST). One chat turn at
+    /// a time on the desktop path; a pooled executor shared by
+    /// concurrent streams would race this slot — documented, not
+    /// designed for, in v0.2.30.
+    last_receipt: Arc<StdMutex<Option<JobReceipt>>>,
 }
 
 impl RemoteExecutor {
@@ -135,6 +146,7 @@ impl RemoteExecutor {
             pooled_path: StdMutex::new(None),
             last_attempts: StdMutex::new(Vec::new()),
             relay_tickets: None,
+            last_receipt: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -185,6 +197,14 @@ impl RemoteExecutor {
     /// yet (or the executor is un-pooled test usage).
     pub fn pooled_dial_path(&self) -> Option<DialPath> {
         self.pooled_path.lock().expect("dial path lock").clone()
+    }
+
+    /// ADR-030 B3: takes the counter-signed receipt the last completed
+    /// request stashed (None when the peer sent no receipt or the
+    /// countersign refused it). Taking clears the slot — one receipt is
+    /// POSTed exactly once.
+    pub fn take_last_receipt(&self) -> Option<JobReceipt> {
+        self.last_receipt.lock().expect("receipt stash lock").take()
     }
 
     /// F2B: the per-attempt failures of the most recent dial, in attempt
@@ -290,6 +310,11 @@ struct StreamContext {
     advertised_queue_ms: Option<u64>,
     admitted_at: Instant,
     metrics: Option<Arc<PeerMetrics>>,
+    /// ADR-030 B3: the requester identity (receipt countersign) and the
+    /// stash the counter-signed receipt lands in for the caller's
+    /// accounting POST.
+    identity: InstallationIdentity,
+    receipt_out: Arc<StdMutex<Option<JobReceipt>>>,
 }
 
 fn finalize_observation(ctx: &StreamContext, timeline: &Timeline, outcome: CompletionOutcome) {
@@ -430,6 +455,14 @@ fn stream_events(
                     ));
                 }
             };
+            // ADR-030 B3: capture the Completed frame's receipt before
+            // `frame_to_event` consumes it — the countersign happens in
+            // the Completed arm below, on the still-open session (the
+            // ack needs it before the session re-pools).
+            let receipt_wire = match &frame {
+                WireMessage::Completed(c) => c.job_receipt.clone(),
+                _ => None,
+            };
             match frame_to_event(frame) {
                 // Server closed the session: end cleanly, drop it — but
                 // the observation still records what was measured.
@@ -469,6 +502,38 @@ fn stream_events(
                             &timeline,
                             CompletionOutcome::Completed { finish_reason },
                         );
+                        // ADR-030 B3 (requester half): counter-sign the
+                        // server's receipt with THIS installation, ack it
+                        // best-effort on the open session, and stash the
+                        // final object for the caller's accounting POST.
+                        // A refused countersign (naming mismatch, absent
+                        // roles) degrades to a receipt-less completion —
+                        // the chat reply is never hostage to accounting.
+                        if let Some(wire) = receipt_wire {
+                            match crate::receipt_wire::countersign(
+                                &wire,
+                                &ctx.identity,
+                                &ctx.peer_id,
+                            ) {
+                                Ok(final_wire) => {
+                                    let ack = WireMessage::ReceiptAck(ReceiptAck {
+                                        request_id: final_wire.request_id.clone(),
+                                    });
+                                    if let Err(e) = session.send(&ack, ACK_DEADLINE).await {
+                                        eprintln!(
+                                            "modelswarm-node: receipt ack best-effort failed: {e}"
+                                        );
+                                    }
+                                    *ctx.receipt_out.lock().expect("receipt stash lock") =
+                                        Some(final_wire);
+                                }
+                                Err(why) => {
+                                    eprintln!(
+                                        "modelswarm-node: receipt countersign refused: {why}"
+                                    );
+                                }
+                            }
+                        }
                         match &ctx.metrics {
                             Some(metrics) => {
                                 let metrics = Arc::clone(metrics);
@@ -626,6 +691,9 @@ impl InferenceExecutor for RemoteExecutor {
         };
         drop(guard);
         let mut session = session;
+        // ADR-030 B3: one receipt slot per execution — a stale receipt
+        // from a previous request can never be POSTed for this one.
+        self.last_receipt.lock().expect("receipt stash lock").take();
         let ctx = StreamContext {
             peer_id: self.peer.peer_id.clone(),
             profile_id: request.profile_id.clone(),
@@ -637,6 +705,8 @@ impl InferenceExecutor for RemoteExecutor {
             // admission-to-first-token starts at this instant (F15).
             admitted_at: Instant::now(),
             metrics: self.metrics.clone(),
+            identity: self.identity.clone(),
+            receipt_out: Arc::clone(&self.last_receipt),
         };
         if let Err(e) = session
             .send(
@@ -2174,5 +2244,193 @@ mod tests {
         }
         assert_eq!(text, "remote answer");
         assert_eq!(finish, "Stop");
+    }
+}
+
+/// ADR-030 B3 (requester half) — the full receipt round-trip over a real
+/// loopback QUIC session: the server's Completed carries the phase-1
+/// receipt, the executor's stream tail counter-signs it with the
+/// requester's identity, sends the best-effort `receipt_ack`, and stashes
+/// the final object for the accounting POST. The serving loop must
+/// SURVIVE the ack frame (a pooled follow-up request still completes —
+/// the pre-B3 loop would have ended the session with `bad_frame`), and
+/// the serving side's telemetry must show the ack landed.
+#[cfg(test)]
+mod b3_receipt_roundtrip {
+    use super::*;
+    use crate::serving::{lease_helpers, serve_sessions};
+    use futures_util::stream;
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{NormalizedMessage, NormalizedRequest, Sampling};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct FixedExecutor;
+    #[async_trait::async_trait]
+    impl modelswarm_gateway::InferenceExecutor for FixedExecutor {
+        async fn execute(
+            &self,
+            _request: NormalizedRequest,
+        ) -> Result<ExecutorStream, ExecutorError> {
+            Ok(Box::pin(stream::iter(vec![
+                ExecutorEvent::Accepted {
+                    queue_position: 0,
+                    eta_ms: 0,
+                },
+                ExecutorEvent::TokenDelta {
+                    delta: "hi".into(),
+                    index: 0,
+                },
+                ExecutorEvent::Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    prefill_ms: 1.0,
+                    decode_ms: 1.0,
+                },
+                ExecutorEvent::Completed {
+                    finish_reason: modelswarm_gateway::FinishReason::Stop,
+                },
+            ])))
+        }
+    }
+
+    fn request(profile: &str, token: String, id: &str) -> NormalizedRequest {
+        NormalizedRequest {
+            request_id: id.into(),
+            profile_id: profile.into(),
+            capability_token: Some(token),
+            messages: vec![NormalizedMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            sampling: Sampling {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 40,
+                seed: None,
+            },
+            max_tokens: 8,
+            deadline_ms: 10_000,
+            stream: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn b3_receipt_counted_signed_acked_and_session_survives() {
+        let server_identity = lease_helpers::server_identity();
+        let client_identity = InstallationIdentity::from_bytes(&[0xB3; 32]);
+        let server = Libp2pTransport::new(&server_identity).unwrap();
+        let listener = server.listen("127.0.0.1:0").await.unwrap();
+        let bound = listener.bound_addr().to_string();
+        let server_peer = server.peer_id().to_string();
+        let (policy, token) = lease_helpers::policy_and_lease_for(
+            lease_helpers::TEST_PROFILE,
+            &client_identity.peer_id(),
+            &client_identity.installation_id(),
+        );
+        let (telemetry, sink) = modelswarm_telemetry::Telemetry::memory();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_sessions(
+            listener,
+            Arc::new(server_identity.clone()),
+            Arc::new(FixedExecutor),
+            lease_helpers::TEST_PROFILE.into(),
+            policy,
+            Arc::new(telemetry),
+            shutdown_rx,
+        ));
+
+        let remote = RemoteExecutor::new(
+            RemotePeer {
+                addr: bound,
+                peer_id: server_peer,
+            },
+            client_identity.clone(),
+        );
+
+        // Turn 1: completed remotely, receipt stashed + counter-signed.
+        let mut events = remote
+            .execute(request(
+                lease_helpers::TEST_PROFILE,
+                token.clone(),
+                "b3-turn-1",
+            ))
+            .await
+            .expect("first execute");
+        let mut completed = false;
+        while let Some(ev) = events.next().await {
+            if matches!(ev, ExecutorEvent::Completed { .. }) {
+                completed = true;
+            }
+        }
+        assert!(completed, "turn 1 completed remotely");
+
+        let wire = remote.take_last_receipt().expect("receipt stashed");
+        assert!(!wire.server_signature.is_empty(), "phase-1 sig present");
+        assert!(
+            !wire.requester_signature.is_empty(),
+            "phase-2 (requester) sig present"
+        );
+        assert!(
+            remote.take_last_receipt().is_none(),
+            "taking clears the slot"
+        );
+        assert_eq!(wire.request_id, "b3-turn-1");
+
+        // The final digest reproduces through the spec layer, and BOTH
+        // signatures verify against the signing identities' keys.
+        let receipt = crate::receipt_wire::wire_to_receipt(&wire).expect("wire -> spec");
+        let server_vk = ed25519_dalek::SigningKey::from_bytes(&[0xA7; 32]).verifying_key();
+        let client_vk = ed25519_dalek::SigningKey::from_bytes(&[0xB3; 32]).verifying_key();
+        receipt
+            .verify_signatures(&server_vk, &client_vk)
+            .expect("both signatures verify");
+        let digest = crate::receipt_wire::final_digest(&wire).expect("final digest");
+        assert_eq!(digest, receipt.receipt_digest().expect("spec digest"));
+
+        // Turn 2 on the SAME pooled session: the receipt_ack frame must
+        // not have ended the serving loop (pre-B3 that frame was a
+        // `bad_frame` session end).
+        let mut events = remote
+            .execute(request(lease_helpers::TEST_PROFILE, token, "b3-turn-2"))
+            .await
+            .expect("second execute (pooled session survived the ack)");
+        let mut completed2 = false;
+        while let Some(ev) = events.next().await {
+            if matches!(ev, ExecutorEvent::Completed { .. }) {
+                completed2 = true;
+            }
+        }
+        assert!(completed2, "turn 2 completed on the reused session");
+        assert_eq!(
+            remote
+                .take_last_receipt()
+                .expect("turn-2 receipt")
+                .request_id,
+            "b3-turn-2"
+        );
+
+        // The serving side saw the ack land (telemetry row; the serving
+        // task is concurrent, so poll briefly).
+        let saw_ack = {
+            let sink = sink.clone();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if sink
+                        .snapshot()
+                        .iter()
+                        .any(|row| row.contains("\"event\":\"receipt.acked\""))
+                    {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .unwrap_or(false)
+        };
+        assert!(saw_ack, "serving side logged receipt.acked");
+
+        shutdown_tx.send(true).ok();
     }
 }

@@ -772,7 +772,7 @@ async fn bind_serving_listener(
     // Engineer's ListenOptions landing, 8d2284c): the toggle-allowed bind
     // passes the typed opt-in — no process-global env detour. MSP_LISTENER
     // is retired; nothing reads it anymore.
-    let identity = match load_or_create_identity(data_dir, telemetry) {
+    let identity = match cached_identity(data_dir, telemetry) {
         Ok(identity) => identity,
         Err(e) => {
             let detail = format!("identity: {e}");
@@ -846,7 +846,7 @@ async fn reserve_relay_attempt(
     relay_addr: &str,
     tickets: &std::sync::Arc<modelswarm_node::relay_ticket_cache::RelayTicketCache>,
 ) -> Result<modelswarm_transport::relay_client::RelayReservation, String> {
-    let identity = load_or_create_identity(data_dir, telemetry).map_err(|e| e.to_string())?;
+    let identity = cached_identity(data_dir, telemetry)?;
     let backend = modelswarm_transport::libp2p_backend::Libp2pTransport::new(&identity)
         .map_err(|e| format!("transport backend: {e}"))?;
     // ADR-038 §6.4 row 8: fresh supply into the transport's ticket seam
@@ -1345,7 +1345,7 @@ async fn compose_family_serving(
     // The verifier identity: the SAME per-installation identity the
     // serving listener authenticated with — it signs every
     // VerifyDraftsResult (RC-2).
-    let Ok(verifier_identity) = load_or_create_identity(data_dir, telemetry) else {
+    let Ok(verifier_identity) = cached_identity(data_dir, telemetry) else {
         log_event(
             telemetry,
             "warn",
@@ -1600,12 +1600,32 @@ async fn compose_family_serving(
     )
 }
 
+/// Process-wide identity cache (2026-10-17, the identity.loaded-storm
+/// lesson: the UI polls get_status every 2 s and list_models every 15 s,
+/// and each poll re-read identity.seed from disk and log a row — 36
+/// rows/min on the live machine, ~9.5k/day, burying the real events).
+/// The seed never changes while the process runs; one load, then the
+/// cache answers. Same error semantics as the loader (the FIRST call's
+/// failure is sticky and surfaces exactly where it did before).
+static IDENTITY_CACHE: std::sync::OnceLock<
+    Result<modelswarm_identity::InstallationIdentity, String>,
+> = std::sync::OnceLock::new();
+
+fn cached_identity(
+    data_dir: &std::path::Path,
+    telemetry: &Telemetry,
+) -> Result<modelswarm_identity::InstallationIdentity, String> {
+    IDENTITY_CACHE
+        .get_or_init(|| load_or_create_identity(data_dir, telemetry).map_err(|e| e.to_string()))
+        .clone()
+}
+
 async fn tracker_client(
     tracker_url: &str,
     data_dir: &std::path::Path,
     telemetry: &Telemetry,
 ) -> Result<Arc<TrackerClient>, String> {
-    let identity = load_or_create_identity(data_dir, telemetry).map_err(|e| e.to_string())?;
+    let identity = cached_identity(data_dir, telemetry)?;
     let client = TrackerClient::new(tracker_url, Arc::new(identity));
     // Reuse the enrolled session (the roster/lookup endpoints require it).
     if let Ok(token) = std::fs::read_to_string(data_dir.join("session.token")) {
@@ -2766,13 +2786,23 @@ async fn set_hosting(
     window: tauri::Window,
     on: bool,
 ) -> Result<serde_json::Value, String> {
-    set_hosting_inner(&app, &state, &window, on).await
+    let _ = &window; // (kept for signature stability; the body ignores it)
+    set_hosting_inner(&app, &state, on).await
+}
+
+/// Owner directive (2026-10-17, the B-idle lesson): the hosting choice
+/// SURVIVES restarts. Presence of the marker file IS the choice — no
+/// content, no schema to version. Written only after a successful
+/// bring-up, removed on an explicit HOST OFF, so the marker always
+/// reflects the owner's last deliberate state ("everything on by
+/// design"; serving default-ON per the 2026-10-13 ruling).
+fn hosting_autostart_marker(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("hosting.autostart")
 }
 
 async fn set_hosting_inner(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, DesktopState>,
-    _window: &tauri::Window,
     on: bool,
 ) -> Result<serde_json::Value, String> {
     let mut inner = state.inner.lock().await;
@@ -2782,6 +2812,10 @@ async fn set_hosting_inner(
             running.heartbeat.abort();
             let _ = running.handle.stopped().await;
         }
+        // The explicit OFF is the owner's deliberate state — the resume
+        // marker dies with the node (auto-resume never overrides an
+        // explicit choice).
+        let _ = std::fs::remove_file(hosting_autostart_marker(&inner.data_dir));
         inner.listener_addr = None;
         inner.family = None;
         // ADR-038 §6.4 row 8: hosting off = no heartbeat = no fresh
@@ -2806,6 +2840,11 @@ async fn set_hosting_inner(
 
     if !inner.license_accepted {
         return Err("accept the privacy disclosure first".into());
+    }
+    // Idempotent when hosting already runs (the resume supervisor can
+    // race an owner click; one node, one bring-up, never two).
+    if inner.node.is_some() {
+        return Ok(serde_json::json!({ "hosting": true }));
     }
     let engine = engine_binary_path(app);
     if !engine.is_file() {
@@ -2899,8 +2938,7 @@ async fn set_hosting_inner(
     // identity (same seed the tracker client loads; peer id + key for the
     // phase-1 receipt signature).
     let serving_identity = std::sync::Arc::new(
-        modelswarm_node::load_or_create_identity(&inner.data_dir, &state.telemetry)
-            .map_err(|e| e.to_string())?,
+        cached_identity(&inner.data_dir, &state.telemetry).map_err(|e| e.to_string())?,
     );
     // ADR-039: the tracker-supplied relay address channel (heartbeat task
     // sends; the lazy supervisor and the status surface read).
@@ -3346,7 +3384,69 @@ async fn set_hosting_inner(
         enrollment: enrollment_view,
         advertised: advertised_tx,
     });
+    // The successful bring-up is the owner's "on" state — persist it for
+    // the next start's resume supervisor. Best-effort: an unwritable
+    // data dir only means the owner re-clicks HOST after a restart.
+    if let Err(e) = std::fs::write(hosting_autostart_marker(&inner.data_dir), b"") {
+        state.telemetry.warn(
+            "host.autostart",
+            &[("phase", "persist"), ("error", &e.to_string())],
+        );
+    }
     Ok(status)
+}
+
+/// The hosting AUTO-RESUME supervisor (owner directive 2026-10-17, the
+/// B-idle lesson): after start, when the marker says the owner left
+/// hosting on, bring it back — bounded honest retries (a tracker hiccup
+/// at boot must not permanently shrink the swarm), every outcome a
+/// telemetry row, never a dialog, never blocking the UI. Gives up after
+/// the last attempt with the exact reason logged; the owner's HOST
+/// click remains the always-works fallback.
+async fn hosting_resume_supervisor(app: tauri::AppHandle) {
+    const ATTEMPT_DELAYS: [Duration; 5] = [
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+        Duration::from_secs(120),
+        Duration::from_secs(600),
+        Duration::from_secs(1800),
+    ];
+    for (n, delay) in ATTEMPT_DELAYS.iter().enumerate() {
+        tokio::time::sleep(*delay).await;
+        let state = app.state::<DesktopState>();
+        let (marker, hosting, telemetry) = {
+            let inner = state.inner.lock().await;
+            (
+                hosting_autostart_marker(&inner.data_dir),
+                inner.node.is_some(),
+                std::sync::Arc::clone(&state.telemetry),
+            )
+        };
+        // The owner explicitly turned hosting off in a previous session,
+        // or turned it on manually just now — either way, nothing to do.
+        if !marker.is_file() || hosting {
+            return;
+        }
+        match set_hosting_inner(&app, &state, true).await {
+            Ok(_) => {
+                telemetry.info(
+                    "host.autostart",
+                    &[("outcome", "resumed"), ("attempt", &(n + 1).to_string())],
+                );
+                return;
+            }
+            Err(e) => {
+                if n + 1 == ATTEMPT_DELAYS.len() {
+                    telemetry.warn("host.autostart", &[("outcome", "gave_up"), ("error", &e)]);
+                } else {
+                    telemetry.info(
+                        "host.autostart",
+                        &[("outcome", "retry_scheduled"), ("error", &e)],
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// The picker's single action (owner UX spec): select a model → download or
@@ -3409,7 +3509,7 @@ async fn select_model(
         inner.profile_id = Some(profile_id.clone());
         persist_config(&inner)?;
     }
-    let result = set_hosting_inner(&app, &state, &window, true).await?;
+    let result = set_hosting_inner(&app, &state, true).await?;
     Ok(result)
 }
 
@@ -3569,7 +3669,7 @@ async fn family_probe(state: tauri::State<'_, DesktopState>) -> Result<serde_jso
             return Ok(fail("lookup_failed"));
         }
     };
-    let identity = match load_or_create_identity(&data_dir, &state.telemetry) {
+    let identity = match cached_identity(&data_dir, &state.telemetry) {
         Ok(i) => i,
         Err(_) => return Ok(fail("identity_unavailable")),
     };
@@ -4890,6 +4990,113 @@ async fn try_family_verified_chat(
 /// placeholder, not ourselves), and asks it first. The REMOTE executor is
 /// driven directly — not through FailoverExecutor — so the reply's mode
 /// honestly says who served: a remote peer, or this node as a logged
+/// ADR-030 B3: POST one counter-signed receipt to the live B1 intake
+/// (`POST /events/job-result` with the full object) and record the job
+/// locally (`Store::record_job`'s first production caller). Best-effort
+/// by design: every failure is a telemetry row, never a chat error —
+/// the reply has already been served by the time this runs.
+async fn post_counted_receipt(
+    tracker: std::sync::Arc<modelswarm_tracker_api::TrackerClient>,
+    telemetry: std::sync::Arc<Telemetry>,
+    data_dir: std::path::PathBuf,
+    peer_id: String,
+    receipt: modelswarm_transport::message::JobReceipt,
+) {
+    let digest = match modelswarm_node::receipt_wire::final_digest(&receipt) {
+        Ok(d) => d,
+        Err(e) => {
+            telemetry.warn(
+                "chat.receipt",
+                &[
+                    ("peer", peer_id.as_str()),
+                    ("phase", "digest"),
+                    ("error", &e),
+                ],
+            );
+            return;
+        }
+    };
+    // The intake's schema takes the bare hex (it re-prefixes for the
+    // preimage comparison — msp-v1 §3.3/§7).
+    let hex = digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&digest)
+        .to_string();
+    let receipt_json = match serde_json::to_value(&receipt) {
+        Ok(v) => v,
+        Err(e) => {
+            telemetry.warn(
+                "chat.receipt",
+                &[
+                    ("peer", peer_id.as_str()),
+                    ("phase", "encode"),
+                    ("error", &e.to_string()),
+                ],
+            );
+            return;
+        }
+    };
+    let outcome = receipt.outcome.clone();
+    match tracker
+        .job_result_with_receipt(&hex, &outcome, receipt_json)
+        .await
+    {
+        Ok(v) => {
+            let reason = v
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let grants = v
+                .get("grants")
+                .and_then(|g| g.as_array())
+                .map(|a| a.len().to_string())
+                .unwrap_or_else(|| "0".into());
+            telemetry.info(
+                "chat.receipt",
+                &[
+                    ("peer", peer_id.as_str()),
+                    ("reason", reason.as_str()),
+                    ("grants", grants.as_str()),
+                ],
+            );
+        }
+        Err(e) => {
+            telemetry.warn(
+                "chat.receipt",
+                &[
+                    ("peer", peer_id.as_str()),
+                    ("phase", "post"),
+                    ("error", &e.to_string()),
+                ],
+            );
+        }
+    }
+    // The local copy (ADR-030 §6: record_job gains real callers) — the
+    // requester's own job_accounting row from the receipt's signed
+    // values, server peer named.
+    if let Ok(store) = modelswarm_store::Store::open(data_dir.join("state.sqlite")) {
+        if let Err(e) = store.record_job(
+            &receipt.request_id,
+            &peer_id,
+            &receipt.profile_id,
+            &receipt.outcome,
+            &receipt.started_at,
+            &receipt.ended_at,
+            &receipt.usage_digest,
+        ) {
+            telemetry.warn(
+                "chat.receipt",
+                &[
+                    ("peer", peer_id.as_str()),
+                    ("phase", "local_record"),
+                    ("error", &e.to_string()),
+                ],
+            );
+        }
+    }
+}
+
 /// fallback. Returns None when no remote peer is known or both sides
 /// failed pre-token; the caller's local gateway path then serves.
 #[allow(clippy::too_many_arguments)]
@@ -4929,7 +5136,7 @@ async fn try_swarm_chat(
             return None;
         }
     };
-    let identity = match load_or_create_identity(data_dir, telemetry) {
+    let identity = match cached_identity(data_dir, telemetry) {
         Ok(i) => i,
         Err(_) => {
             // load_or_create_identity already warned with the cause.
@@ -5216,6 +5423,21 @@ async fn try_swarm_chat(
                         remote_peer_id.chars().take(12).collect::<String>(),
                         if relayed { " (relayed)" } else { "" }
                     );
+                    // ADR-030 B3 (the requester's accounting half): the
+                    // executor's stream tail already counter-signed the
+                    // receipt and acked it on the session; this side POSTs
+                    // the final object to the B1 intake and records the
+                    // job locally — spawned OFF the reply path (accounting
+                    // is never allowed to delay or fail a chat reply).
+                    if let Some(receipt) = remote.take_last_receipt() {
+                        let tracker = std::sync::Arc::clone(&tracker);
+                        let telemetry = std::sync::Arc::clone(telemetry);
+                        let data_dir = data_dir.to_path_buf();
+                        let peer = remote_peer_id.clone();
+                        tokio::spawn(async move {
+                            post_counted_receipt(tracker, telemetry, data_dir, peer, receipt).await;
+                        });
+                    }
                     (content, completion_tokens, label, true)
                 }
                 ChatOutcome::Failed(reason) => {
@@ -6114,11 +6336,16 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
+            let for_resume = handle.clone();
             let for_supervisor = handle.clone();
             tauri::async_runtime::block_on(async move {
                 let state = DesktopState::new().await;
                 handle.manage(state);
             });
+            // Hosting auto-resume (owner directive 2026-10-17): the
+            // swarm silently losing a machine on every restart ends
+            // here — the marker's choice comes back on its own.
+            tauri::async_runtime::spawn(hosting_resume_supervisor(for_resume));
             // One check on start, then every 6h; every failure degrades to
             // an honest status line. Dev opt-out: MSP_NO_AUTOUPDATE=1.
             updater::spawn_supervisor(for_supervisor);

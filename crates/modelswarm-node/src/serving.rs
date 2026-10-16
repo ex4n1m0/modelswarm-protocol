@@ -490,6 +490,9 @@ pub(crate) async fn serve_one_seeded(
     // session and the client re-dials self-healingly.
     const BETWEEN_REQUESTS: Duration = Duration::from_secs(300);
     let mut seeded = first;
+    // ADR-030 B3: the request this session last served — the receipt_ack
+    // arm below matches against it (a stale/mismatched ack is ignored).
+    let mut last_request_id: Option<String> = None;
     loop {
         let frame = match seeded.take() {
             Some(frame) => frame,
@@ -505,6 +508,24 @@ pub(crate) async fn serve_one_seeded(
             },
         };
         let request = match frame {
+            // ADR-030 B3 / msp-v1 §6 `receipt_ack`: the requester's
+            // best-effort confirmation it received + counter-signed the
+            // receipt this session's last completion carried. Never a
+            // session error, never new state — a matching id is visible
+            // in telemetry, anything else is swallowed (the accounting
+            // POST to the tracker is the durable act, not this frame).
+            WireMessage::ReceiptAck(ack) => {
+                if Some(ack.request_id.as_str()) == last_request_id.as_deref() {
+                    telemetry.info(
+                        "receipt.acked",
+                        &[
+                            ("peer", peer_id.as_str()),
+                            ("request", ack.request_id.as_str()),
+                        ],
+                    );
+                }
+                continue;
+            }
             WireMessage::InferenceRequest(r) => r,
             other => {
                 // Variant name only — the payload is peer-controlled text.
@@ -519,6 +540,7 @@ pub(crate) async fn serve_one_seeded(
                 return Err(code);
             }
         };
+        last_request_id = Some(request.request_id.clone());
         if request.profile_id != profile_id {
             send_error(
                 &mut session,
@@ -871,10 +893,22 @@ pub mod lease_helpers {
     /// Issues a consume lease for (profile, peer) under a fresh test hub
     /// key; returns (policy over that key, wire token).
     pub fn policy_and_lease(profile: &str, peer_id: &str) -> (LeasePolicy, String) {
+        policy_and_lease_for(profile, peer_id, "test-installation")
+    }
+
+    /// ADR-030 B3: the lease names the REQUESTER's real installation
+    /// (production shape — the tracker leases to the installation, and
+    /// the requester-side countersign refuses receipts whose requester
+    /// peer names any other installation).
+    pub fn policy_and_lease_for(
+        profile: &str,
+        peer_id: &str,
+        installation_id: &str,
+    ) -> (LeasePolicy, String) {
         let signing = SigningKey::generate(&mut rand_core::OsRng);
         let lease = EligibilityLease::issue(
             peer_id,
-            "test-installation",
+            installation_id,
             profile,
             rfc3339(-60),
             rfc3339(300),

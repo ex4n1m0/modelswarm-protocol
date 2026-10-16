@@ -425,6 +425,7 @@ undocumented amendments.
 (content-blind counters and installer downloads). They are NOT protocol
 endpoints, carry no peer state, and may change with the website without an
 ADR (ADR-028 §1).
+| 2026-10-17 | ADR-030 B3 | the requester half in production: the remote executor counter-signs the completed receipt, returns `receipt_ack` on the stream (the serving loop survives the frame and telemeters it), and the requester POSTs the counter-signed object to `/events/job-result` — granted accounting rows move (self-work and sybil rings excluded at intake) |
 | 2026-10-16 | ADR-030 B2 | §6 message table gains the `receipt_ack` row (the §7 reservation implemented); `completed` now carries jobReceipt on the wire |
 | 2026-10-16 | ADR-030 (receipts v2) | §7 gains the additive ReceiptV2 object + the frozen receiptDigest preimage rule (the production wire landing follows) |
 | 2026-10-16 | ADR-039 (tracker-distributed relay config) | §3.3 heartbeat response gains `relayAddr` (operator-configured community relay multiaddr, additive, empty = none); client precedence: local `relay.addr` file over tracker value |

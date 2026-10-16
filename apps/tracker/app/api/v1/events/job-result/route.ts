@@ -91,7 +91,19 @@ export async function POST(req: Request) {
     verifiedTokens: g.verified_tokens,
     grantedAt: ctx.now(),
   }));
-  await ctx.store.recordGrantedAccounting(rows);
+  try {
+    await ctx.store.recordGrantedAccounting(rows);
+  } catch (error) {
+    // The digest row is already recorded above; a grant-store failure
+    // (e.g. schema drift — the 2026-10-17 missing-0004 incident) must
+    // degrade to an honest no-grant reason, never a 5xx the client
+    // cannot distinguish from a broken intake.
+    return jsonOk({
+      recorded: true,
+      grants: [],
+      reason: `accounting_store_error:${String(error).slice(0, 120)}`,
+    });
+  }
   return jsonOk({
     recorded: true,
     grants: rows.map((r) => ({

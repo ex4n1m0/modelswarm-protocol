@@ -379,6 +379,19 @@ the digest to `/events/job-result`; each peer's copy feeds its local
 accounting. Receipts are the evidence base for reputation and later
 contribution policy.
 
+**Receipts v2 (ADR-030, 2026-10-16 — additive; the v1 shape above is
+untouched and old verifiers are unaffected):** the counter-signed
+`ReceiptV2` object adds the ADR-029 tier/mode, the cohort digest, the
+engaged peer set with roles, and machine-derived token/second counters.
+`receiptDigest` is frozen as `"sha256:" + hex(SHA-256(canonical JSON of the
+FINAL counter-signed object))` — both signatures present, canonical JSON per
+§2.2. A receipt without both signatures is never accounting evidence;
+granted counters move only on intake-validated receipts (self-work and
+sybil-ring work contribute zero). Byte-pinned by
+`protocol/vectors/receipt-v2-1.json`, consumed by both the Rust
+(`modelswarm-eligibility::receipt_v2`) and TS (tracker `lib/receipt-v2`)
+implementations.
+
 ## 8. Sequences worth re-reading before implementing
 
 - Cold start → catalog verify → register → heartbeat → challenge → token.
@@ -411,5 +424,6 @@ undocumented amendments.
 (content-blind counters and installer downloads). They are NOT protocol
 endpoints, carry no peer state, and may change with the website without an
 ADR (ADR-028 §1).
+| 2026-10-16 | ADR-030 (receipts v2) | §7 gains the additive ReceiptV2 object + the frozen receiptDigest preimage rule (the production wire landing follows) |
 | 2026-10-16 | ADR-039 (tracker-distributed relay config) | §3.3 heartbeat response gains `relayAddr` (operator-configured community relay multiaddr, additive, empty = none); client precedence: local `relay.addr` file over tracker value |
 | 2026-10-15 | ADR-038 (relay admission tickets) | §3.3 heartbeat response gains `relayTicket`; §5a added (relay admission ticket, 600 s TTL, `/msp/relay-ticket/1`); §6 untouched |

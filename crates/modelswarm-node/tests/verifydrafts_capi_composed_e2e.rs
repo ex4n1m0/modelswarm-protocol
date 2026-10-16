@@ -395,6 +395,9 @@ async fn real_capi_engine_serves_verifydrafts_through_composed_daemon() {
             listener,
             modelswarm_node::serving::RelaySlot::empty(),
         ),
+        std::sync::Arc::new(modelswarm_identity::InstallationIdentity::from_bytes(
+            &[0xA7; 32],
+        )),
         Arc::new(ComposedFixedExecutor),
         TEST_PROFILE.to_string(),
         policy,

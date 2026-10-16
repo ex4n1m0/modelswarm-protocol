@@ -832,7 +832,7 @@ impl LeasePolicy {
 }
 
 #[cfg(test)]
-pub(crate) mod lease_helpers {
+pub mod lease_helpers {
     use super::LeasePolicy;
     use ed25519_dalek::SigningKey;
     use modelswarm_eligibility::{CapacityClass, EligibilityLease};

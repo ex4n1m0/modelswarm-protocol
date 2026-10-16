@@ -225,6 +225,9 @@ async fn one_listener_serves_both_vocabularies() {
             listener,
             modelswarm_node::serving::RelaySlot::empty(),
         ),
+        std::sync::Arc::new(modelswarm_identity::InstallationIdentity::from_bytes(
+            &[0xA7; 32],
+        )),
         Arc::new(FixedExecutor),
         TEST_PROFILE.to_string(),
         policy,
@@ -346,6 +349,9 @@ async fn family_session_refused_without_lease() {
             listener,
             modelswarm_node::serving::RelaySlot::empty(),
         ),
+        std::sync::Arc::new(modelswarm_identity::InstallationIdentity::from_bytes(
+            &[0xA7; 32],
+        )),
         Arc::new(NeverExecutor),
         TEST_PROFILE.to_string(),
         policy,
@@ -436,6 +442,9 @@ async fn family_session_refused_on_wrong_profile_lease() {
             listener,
             modelswarm_node::serving::RelaySlot::empty(),
         ),
+        std::sync::Arc::new(modelswarm_identity::InstallationIdentity::from_bytes(
+            &[0xA7; 32],
+        )),
         Arc::new(NeverExecutor),
         TEST_PROFILE.to_string(),
         policy_over(&hub),

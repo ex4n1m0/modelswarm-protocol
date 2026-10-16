@@ -393,7 +393,7 @@ pub struct FamilyServing {
 /// winning serve path consumes it pre-read).
 enum FirstFrame {
     /// A typed msp-v1 frame won.
-    MspV1(WireMessage),
+    MspV1(Box<WireMessage>),
     /// A raw family frame won.
     Family(Value),
     /// The session went idle or vanished before any frame arrived.
@@ -413,7 +413,7 @@ async fn demux_first_frame(session: &mut Libp2pSession, idle: Duration) -> First
         }
         let poll = remaining.min(DEMUX_POLL);
         match session.recv(poll).await {
-            Ok(msg) => return FirstFrame::MspV1(msg),
+            Ok(msg) => return FirstFrame::MspV1(Box::new(msg)),
             Err(TransportError::Timeout) => {
                 // A raw family frame may have arrived and been stashed by
                 // the typed recv: the stash-first raw recv returns it
@@ -457,6 +457,7 @@ async fn demux_first_frame(session: &mut Libp2pSession, idle: Duration) -> First
 ///    constructed for a refused session), disclosure overridden with the
 ///    engine's real capabilities, then [`serve_verifydrafts_session`] with
 ///    the offer handed pre-read ([`PrefacedWire`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_sessions_composed(
     mut serving: crate::serving::ServingInbox,
     identity: std::sync::Arc<modelswarm_identity::InstallationIdentity>,
@@ -526,7 +527,7 @@ pub async fn serve_sessions_composed(
                         &policy,
                         &session_admission,
                         &session_telemetry,
-                        Some(frame),
+                        Some(*frame),
                     )
                     .await
                     {

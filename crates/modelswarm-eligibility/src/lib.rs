@@ -16,6 +16,7 @@
 pub mod canonical;
 pub mod lease;
 pub mod policy;
+pub mod receipt_v2;
 pub mod relay_ticket;
 
 pub use lease::{

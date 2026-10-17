@@ -148,7 +148,7 @@
         <div class="menu-panel" id="settings-menu-panel" role="menu" aria-label="Settings menu" hidden>
           <button type="button" class="menu-item" data-panel="panel-models" role="menuitem">Models — browse, download &amp; request…</button>
           <button type="button" class="menu-item" data-panel="panel-setup" role="menuitem">Cloud API key, tracker &amp; engine…</button>
-          <button type="button" class="menu-item" data-panel="panel-serving" role="menuitem">Swarm pairing &amp; content carriage…</button>
+          <button type="button" class="menu-item" data-panel="panel-serving" role="menuitem">Swarm pairing &amp; conversation carriage…</button>
           <button type="button" class="menu-item" data-panel="panel-temp" role="menuitem">Chat temperature…</button>
           <button type="button" class="menu-item" data-panel="panel-assistant-settings" role="menuitem">Assistant…</button>
         </div>
@@ -216,7 +216,7 @@
     </section>
 
     <section aria-labelledby="chat-h" class="fill">
-      <h2 id="chat-h">Test box — chat with the hosted model</h2>
+      <h2 id="chat-h">Chat with the hosted model</h2>
       <div id="chat">
         <div id="transcript" aria-live="polite"></div>
         <form id="chat-form">
@@ -281,8 +281,9 @@
               <option value="deepseek">DeepSeek</option>
               <option value="openrouter">OpenRouter</option>
             </select>
-            <input type="password" id="cloud-key" placeholder="sk-…" aria-label="Cloud API key" style="width:11em">
+            <input type="password" id="cloud-key" placeholder="sk-…" aria-label="Cloud API key" style="width:14em">
             <span id="cloud-key-state" class="meta"></span>
+            <div class="note" style="margin:4px 0 0">serving a cloud model goes through your key — your machine joins as 1 peer and every reply is honestly labeled cloud. The key is stored only on this machine and never shown again.</div>
           </dd>
           <dt>Engine</dt><dd id="engine-line">—</dd>
           <dt>Device approval</dt><dd><span id="enroll-line">—</span> <button class="ghost" id="enroll-open" hidden>approve this device…</button></dd>
@@ -294,7 +295,7 @@
         </div>
       </section>
 
-      <section id="panel-serving" data-title="Swarm pairing &amp; content carriage" hidden>
+      <section id="panel-serving" data-title="Swarm pairing &amp; conversation carriage" hidden>
         <h2>Serving consent</h2>
         <dl class="kv">
           <dt>Swarm pairing</dt><dd class="row" style="flex-wrap:nowrap;gap:8px;align-items:center">
@@ -562,15 +563,21 @@
         sel.innerHTML = '<option value="" disabled hidden' + (selModel ? "" : " selected") + '>choose a model…</option>'
           + models.map(m => {
             if (m.is_cloud) {
-              return `<option value="${m.profile_id}" disabled>${m.display_name} — cloud · next release</option>`;
+              // ADR-040 C3 is LIVE: cloud serves through the staged key.
+              // The row states the key truth — never a stale "next
+              // release" — and a missing key disables it with the exact
+              // way forward (same key detection as the model cards).
+              const keySet = lastStatus && lastStatus.cloud && lastStatus.cloud.configured
+                && lastStatus.cloud.provider === m.provider;
+              return `<option value="${m.profile_id}"${keySet ? "" : " disabled"}${m.selected ? " selected" : ""}>${m.display_name} — cloud · ${keySet ? "ready to join" : "add your " + m.provider + " key (Settings)"}</option>`;
             }
             const peers = m.peers == null ? "" : (m.peers >= 1 ? " · " + m.peers + (m.peers === 1 ? " peer" : " peers") : "");
             const dl = m.downloaded ? " · downloaded" : "";
-            return `<option value="${m.profile_id}"${m.selected ? " selected" : ""}>${m.display_name} (${m.quantization})${peers}${dl}</option>`;
+            return `<option value="${m.profile_id}"${m.selected ? " selected" : ""}>${m.display_name}${peers}${dl}</option>`;
           }).join("");
         sel.onchange = () => { if (sel.value) selectModel(sel.value); };
       } else {
-        sel.innerHTML = '<option>no models available — check Settings → Tracker</option>';
+        sel.innerHTML = '<option>no models available — check the tracker URL in Settings…</option>';
         sel.disabled = true;
       }
       // 2026-10-17 owner directive: ONE obvious path to join — local and
@@ -632,14 +639,17 @@
       }
       for (const btn of document.querySelectorAll("[data-start]")) {
         btn.onclick = () => {
+          // Visible feedback for the whole IPC: "joining…" stays pressed
+          // until select_model resolves (its trailing re-render replaces
+          // the card anyway); restoring synchronously would flash for a
+          // microtask and never be seen.
           const original = btn.textContent;
           btn.textContent = "joining…";
           btn.disabled = true;
-          selectModel(btn.dataset.start).finally?.(() => {});
-          // selectModel is async and re-renders on completion; restore is
-          // implicit through the re-render.
-          btn.textContent = original;
-          btn.disabled = false;
+          Promise.resolve(selectModel(btn.dataset.start)).finally(() => {
+            btn.textContent = original;
+            btn.disabled = false;
+          });
         };
       }
       for (const btn of document.querySelectorAll("[data-stop]")) {
@@ -843,7 +853,7 @@
           if (hostingOn) {
             sl.innerHTML = '<span style="color:var(--ok)">● in the swarm</span> — serving <b>' + nm + '</b>' + (selModel && selModel.is_cloud ? ' via your cloud key' : ' on this machine') + ' · your machine counts as 1 peer and can pull from every swarm.';
           } else {
-            sl.textContent = 'Not in the swarm — pick a model below and press “Join the swarm”.';
+            sl.textContent = 'Not in the swarm — pick a model in the picker above, or press “Join the swarm” in Settings → Models.';
           }
         }
       }
@@ -957,7 +967,7 @@
         $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">pick a model on the main page — the swarm starts on selection</td></tr>';
       }
       if (hostingOn && s.node.enrollment && s.node.enrollment.phase === "pending") {
-        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">device approval pending (code ' + s.node.enrollment.user_code + ') — use "approve this device…" in Settings → Tracker, engine & device; the roster joins automatically once approved</td></tr>';
+        $("peer-rows").innerHTML = '<tr><td colspan="3" class="note">device approval pending (code ' + s.node.enrollment.user_code + ') — use "approve this device…" in Settings → Cloud API key, tracker &amp; engine…; the roster joins automatically once approved</td></tr>';
       }
     }
 

@@ -1638,15 +1638,16 @@ async fn tracker_client(
 }
 
 /// The LOCAL manifest of a listing, or the honest refusal for the cloud
-/// family (no artifact exists; cloud hosting/serving lands with C3 — the
-/// picker shows cloud models as next-release until then).
+/// family (no artifact exists; cloud serving through the staged API key is
+/// live since ADR-040 C3 — this fires only on local-artifact paths a cloud
+/// profile should never reach, and says where to go instead).
 fn local_manifest_of(
     listing: &modelswarm_node::catalog::ProfileListing,
 ) -> Result<&modelswarm_node::LocalManifest, String> {
     match &listing.kind {
         modelswarm_node::catalog::ProfileKind::Local(m) => Ok(m),
         modelswarm_node::catalog::ProfileKind::Cloud(_) => Err(format!(
-            "{} is a cloud model: no download and no local hosting yet — cloud serving lands in the next release (ADR-040)",
+            "{} is a cloud model — it has no local download; join it from the model picker (it serves through your cloud API key)",
             listing.display_name
         )),
     }

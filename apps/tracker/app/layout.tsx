@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
+import "./globals.css";
 
 const SITE_URL = "https://modelswarm.deepflux.space";
 const TITLE = "ModelSwarm — Decentralized Cooperative Inference";

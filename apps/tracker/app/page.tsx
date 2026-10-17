@@ -13,95 +13,31 @@
 //   get people to test it": a minimal honest download section is restored
 //   below — same copy rules apply: no engine/format names, honest tense)
 // - 2026-10-12 owner directive "move the live swarm census to the top": the
-//   census is the first section under the lede (before "The one rule")
+//   census is the first section under the lede (before "How it works")
 // - 2026-10-15 visual redesign (visual layer only): dark-navy palette
 //   (#080C14 page / #111927 surfaces / cyan #38D9F5 accent), sans body with
-//   mono reserved for labels/code, restyled header/tables/footer, skip link
-//   + sr-only H1. Copy, links, download URLs, the online-badge/census script
-//   and its DOM ids (online-badge, census-body), and section order are
-//   UNCHANGED. Download links carry v0.2.25 from release-train commit 96adf68
-//   (the train parked this redesign mid-flight and restored the tree to HEAD;
-//   this re-application folds its 0.2.24->0.2.25 retarget in).
-// - 2026-10-15 (later): v0.2.26 retarget (release train — the language-pin
-//   fix); 5 functional replacements, same copy rules.
+//   mono reserved for labels/code, restyled header/tables/footer, skip link.
+//   Download URLs, the online-badge/census script and its DOM ids
+//   (online-badge, census-body) are unchanged on every retarget.
+// - 2026-10-17 usability pass (owner directive "improve so that it is much
+//   easier to understand and to use"): the shared design system moved to
+//   app/globals.css (fixes /reference, which referenced these classes but
+//   rendered browser-default — dark on dark); a REAL visible h1 + subhead +
+//   CTA band under the hero artwork (the only headline was baked into the
+//   image and the only CTA was a small nav button); a "How it works" section
+//   (three honest steps, present tense for what ships today) AFTER the
+//   census; downloads restyled as OS-labeled buttons with Windows primary;
+//   census gains a 4 s honest fallback so a stalled fetch shows "census
+//   unavailable" instead of "loading…" forever. Same copy rules apply:
+//   honest tense, no engine/format names, no payments/credits, census first
+//   under the lede, ids online-badge/census-body preserved.
 
 // Presets + the tracker API table moved to /reference (owner directive
 // 2026-10-17: keep the main page minimal).
 
-
-const css = `
-  :root {
-    color-scheme: dark;
-    --bg: #080C14;
-    --bg-hero: #00060f; /* modal backdrop of hero.png (edges #00040a–#000811) so the artwork bleeds into the page */
-    --surface: #111927;
-    --surface-2: #162133;
-    --text: #F3F6FC;
-    --text-2: #B2BDCD;
-    --text-3: #8CA0BC;
-    --accent: #38D9F5;
-    --accent-2: #A69BFF;
-    --ok: #7FE0B8;
-    --border: #24334C;
-    --border-soft: #1B2638;
-    --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html { scroll-behavior: smooth; }
-  body { background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; line-height: 1.65; -webkit-font-smoothing: antialiased; }
-  a { color: var(--accent); text-decoration: underline; text-decoration-color: rgba(56, 217, 245, 0.35); text-underline-offset: 3px; }
-  a:hover { text-decoration-color: currentColor; }
-  a:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; border-radius: 4px; }
-  .skip { position: absolute; left: -9999px; top: 0; z-index: 10; background: var(--accent); color: #06131D; font-weight: 650; padding: 0.6rem 1.1rem; border-radius: 0 0 10px 0; text-decoration: none; }
-  .skip:focus { left: 0; }
-  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
-  .wrap { max-width: 1200px; margin: 0 auto; padding: 0 1.5rem; }
-  /* Hero zone keeps the artwork's own backdrop pure under the whole image (85%) and blends into the page navy below. */
-  .top { background: linear-gradient(180deg, var(--bg-hero) 0%, var(--bg-hero) 85%, var(--bg) 100%); }
-  nav { display: flex; align-items: center; gap: 0.9rem; padding: 1.15rem 0 0.95rem; font-size: 0.86rem; flex-wrap: wrap; }
-  nav .brand { color: var(--text); font-family: var(--mono); font-weight: 700; letter-spacing: 0.08em; margin-right: 0.25rem; }
-  nav .spacer { flex: 1; }
-  nav .navlink { color: var(--text-2); text-decoration: none; padding: 0.45rem 0.15rem; }
-  nav .navlink:hover { color: var(--accent); }
-  .btn { display: inline-block; background: var(--accent); color: #06131D; font-weight: 650; font-size: 0.85rem; border: 1px solid transparent; border-radius: 8px; padding: 0.5rem 1rem; text-decoration: none; }
-  .btn:hover { background: #62E2F8; color: #06131D; }
-  .badge { border: 1px solid rgba(56, 217, 245, 0.45); background: rgba(56, 217, 245, 0.08); color: var(--accent); border-radius: 999px; padding: 0.18rem 0.7rem; font-size: 0.72rem; letter-spacing: 0.1em; font-family: var(--mono); white-space: nowrap; }
-  .hero { width: min(920px, 88%); height: auto; display: block; margin: 0 auto; }
-  .lede { text-align: center; color: var(--text-2); padding: 2.1rem 1rem 0.2rem; font-size: 1.06rem; line-height: 1.78; max-width: 56rem; margin: 0 auto; }
-  .lede b { color: var(--text); font-weight: 600; }
-  section { padding: 2.6rem 0 0.2rem; scroll-margin-top: 1rem; }
-  h2 { display: flex; align-items: center; gap: 1rem; font-family: var(--mono); font-size: 0.78rem; font-weight: 600; letter-spacing: 0.22em; text-transform: uppercase; color: var(--accent); margin-bottom: 1.15rem; }
-  h2::after { content: ""; flex: 1; height: 1px; background: var(--border-soft); }
-  .rule { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent); padding: 1.15rem 1.3rem; border-radius: 0 12px 12px 0; color: var(--text-2); font-size: 0.95rem; }
-  .rule b { color: var(--text); }
-  .rule ul { margin: 0.9rem 0 0; padding: 0 0 0 1.15rem; line-height: 1.9; }
-  code { color: var(--accent-2); font-family: var(--mono); font-size: 0.85em; }
-  .tblcard { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.35rem 1.25rem 0.55rem; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; color: var(--text-2); }
-  td, th { padding: 0.5rem 0.9rem 0.5rem 0; border-bottom: 1px solid var(--border-soft); text-align: left; vertical-align: top; }
-  tbody tr:last-child td { border-bottom: none; }
-  td { transition: background-color 0.12s ease; }
-  td:first-child { color: var(--accent); font-family: var(--mono); font-size: 0.8rem; white-space: nowrap; }
-  th { color: var(--text-3); font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; }
-  .note { font-size: 0.8rem; color: var(--text-3); margin: 1rem 0 0; max-width: 46rem; line-height: 1.7; }
-  footer { border-top: 1px solid var(--border-soft); margin-top: 3.2rem; padding: 2.2rem 0 2.6rem; color: var(--text-3); font-size: 0.78rem; text-align: center; line-height: 1.8; }
-  footer a { color: var(--text-2); }
-  @media (hover: hover) { tbody tr:hover td { background: var(--surface-2); } }
-  @media (max-width: 720px) {
-    .wrap { padding: 0 1.25rem; }
-    table { font-size: 0.78rem; }
-    td:first-child { white-space: normal; overflow-wrap: anywhere; }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    html { scroll-behavior: auto; }
-    *, *::before, *::after { transition: none !important; }
-  }
-`;
-
 export default function Home() {
   return (
     <main>
-      <style dangerouslySetInnerHTML={{ __html: css }} />
       <a className="skip" href="#content">Skip to content</a>
 
       <div className="top">
@@ -119,8 +55,9 @@ export default function Home() {
           </nav>
         </div>
 
-        {/* The hero artwork carries its own title lockup — full-bleed, no overlay text. */}
-        <h1 className="sr-only">ModelSwarm — Decentralized Cooperative Inference Protocol</h1>
+        {/* The hero artwork carries its own title lockup; the band below it
+            adds the readable headline + call to action the image cannot
+            provide (screen readers and first-time visitors both need it). */}
         <img
           src="/hero.png"
           alt="ModelSwarm — Decentralized Cooperative Inference Protocol: a glowing network of peer nodes converging into a central verification tree above a laptop"
@@ -128,14 +65,25 @@ export default function Home() {
           width={1672}
           height={941}
         />
+        <div className="hero-band">
+          <h1>Your computers, one AI swarm.</h1>
+          <p>
+            Install the app and pick a model — your machine hosts it, and
+            peers running the <b>exact same model</b> cross-check your
+            answers. No accounts, no payments: hosting is what earns you
+            swarm access.
+          </p>
+          <div className="cta-row">
+            <a className="btn" href="#get">Get the app</a>
+            <a className="btn ghost" href="#how">How it works</a>
+          </div>
+        </div>
       </div>
 
       <div className="wrap" id="content" tabIndex={-1}>
         <p className="lede">
-          ModelSwarm pools computers hosting verified models into <b>swarms</b> —
-          same-model swarms cooperate for <b>faster or better</b> answers; later,
-          mixed models work together as <b>solvers, skeptics, and judges</b>.
-          Host to participate.
+          Coming next: mixed models working together as <b>solvers, skeptics,
+          and judges</b> — behind their own correctness gates.
         </p>
 
         <section id="census" aria-labelledby="census-heading">
@@ -151,6 +99,39 @@ export default function Home() {
             <p className="note" id="clients-served" style={{ marginTop: "0.5rem" }}>
               &nbsp;
             </p>
+          </div>
+        </section>
+
+        <section id="how" aria-labelledby="how-heading">
+          <h2 id="how-heading">How it works</h2>
+          <div className="steps">
+            <div className="step">
+              <span className="n">STEP 1</span>
+              <h3>Install the app</h3>
+              <p>
+                One download for Windows, macOS, or Linux. From then on the
+                app verifies and installs its own updates — this is the
+                last manual download.
+              </p>
+            </div>
+            <div className="step">
+              <span className="n">STEP 2</span>
+              <h3>Join a swarm</h3>
+              <p>
+                Pick a model and press Join — it downloads and hosts on
+                your machine, or serve a cloud model through your own
+                provider key. Either way your machine counts as one peer.
+              </p>
+            </div>
+            <div className="step">
+              <span className="n">STEP 3</span>
+              <h3>Ask anything</h3>
+              <p>
+                Chat in the app or through the local API on the same
+                machine. Peers hosting the exact same model cross-check
+                every reply — slower by design, verified by cohort.
+              </p>
+            </div>
           </div>
         </section>
 
@@ -191,25 +172,24 @@ export default function Home() {
             verified-accurate answers, never worse than the
             fastest single host) works between two peers on a direct or LAN
             network; the app reports honest status for anything not engaged.
-            <ul style={{ margin: "0.8rem 0 0", padding: "0 0 0 1.15rem" }}>
-              <li>
-                <a href="/api/download/ModelSwarm-Setup-0.2.33-windows-x64.exe">
-                  Windows installer (.exe)
-                </a>
-              </li>
-              <li>
-                <a href="/api/download/ModelSwarm-0.2.33-linux-amd64.deb">Linux (.deb)</a>
-                {" · "}
-                <a href="/api/download/ModelSwarm-0.2.33-linux-amd64.AppImage">
-                  AppImage (self-updating)
-                </a>
-              </li>
-              <li>
-                <a href="/api/download/ModelSwarm-0.2.33-macos-arm64.dmg">
-                  macOS (Apple Silicon, .dmg)
-                </a>
-              </li>
-            </ul>
+            <div className="dl-grid">
+              <a className="dl primary" href="/api/download/ModelSwarm-Setup-0.2.33-windows-x64.exe">
+                <span className="os">Windows</span>
+                <span className="fmt">installer · .exe · x64</span>
+              </a>
+              <a className="dl" href="/api/download/ModelSwarm-0.2.33-macos-arm64.dmg">
+                <span className="os">macOS</span>
+                <span className="fmt">Apple Silicon · .dmg</span>
+              </a>
+              <a className="dl" href="/api/download/ModelSwarm-0.2.33-linux-amd64.deb">
+                <span className="os">Linux</span>
+                <span className="fmt">.deb · amd64</span>
+              </a>
+              <a className="dl" href="/api/download/ModelSwarm-0.2.33-linux-amd64.AppImage">
+                <span className="os">Linux</span>
+                <span className="fmt">AppImage · self-updating</span>
+              </a>
+            </div>
             <p className="note" style={{ marginTop: "0.6rem" }}>
               First hosting start enrolls the device (auto-approved under
               the test cap) and downloads the chosen model from its original
@@ -224,6 +204,13 @@ export default function Home() {
 (async () => {
   const badge = document.getElementById('online-badge');
   const census = document.getElementById('census-body');
+  // Honest fallback: if the first poll has not landed within 4 s, say so
+  // instead of showing "loading…" forever (a late success still replaces
+  // this on arrival — the 30 s refresh keeps running either way).
+  setTimeout(() => {
+    if (census.textContent === 'loading…') census.textContent = 'census unavailable — still trying…';
+    if (badge.textContent === '… online') badge.textContent = '— online';
+  }, 4000);
   const update = async () => {
     let peersOnline;
     try {
@@ -267,13 +254,13 @@ export default function Home() {
 })();`,
           }}
         />
-      <footer>
-          ModelSwarm Protocol · source:{" "}
-          <a href="https://github.com/ex4n1m0/modelswarm-protocol">github.com/ex4n1m0/modelswarm-protocol</a>{" "}
-          · control plane only — never carries prompts, completions, or model
-          files (ADR-001) · protocol v1
-        </footer>
       </div>
+      <footer>
+        ModelSwarm Protocol · source:{" "}
+        <a href="https://github.com/ex4n1m0/modelswarm-protocol">github.com/ex4n1m0/modelswarm-protocol</a>{" "}
+        · control plane only — never carries prompts, completions, or model
+        files (ADR-001) · protocol v1
+      </footer>
     </main>
   );
 }

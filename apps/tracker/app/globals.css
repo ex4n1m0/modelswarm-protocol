@@ -1,0 +1,106 @@
+/* Shared site stylesheet (2026-10-17 usability pass, owner directive
+   "make the website easier to understand and use").
+   Until now the whole design system lived in an inline <style> on the
+   landing page only, so every other route (/reference, /verify fallbacks)
+   rendered with browser defaults — /reference was dark text on the dark
+   <body> background once color-scheme: dark applied. The tokens and rules
+   below are the 2026-10-15 dark-navy/cyan redesign moved here verbatim,
+   plus the shared blocks the landing page needs. Routes may still add
+   route-specific inline styles; they must not redefine these tokens. */
+
+:root {
+  color-scheme: dark;
+  --bg: #080C14;
+  --bg-hero: #00060f; /* modal backdrop of hero.png (edges #00040a–#000811) so the artwork bleeds into the page */
+  --surface: #111927;
+  --surface-2: #162133;
+  --text: #F3F6FC;
+  --text-2: #B2BDCD;
+  --text-3: #8CA0BC;
+  --accent: #38D9F5;
+  --accent-2: #A69BFF;
+  --ok: #7FE0B8;
+  --border: #24334C;
+  --border-soft: #1B2638;
+  --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body { background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; line-height: 1.65; -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); text-decoration: underline; text-decoration-color: rgba(56, 217, 245, 0.35); text-underline-offset: 3px; }
+a:hover { text-decoration-color: currentColor; }
+a:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; border-radius: 4px; }
+.skip { position: absolute; left: -9999px; top: 0; z-index: 10; background: var(--accent); color: #06131D; font-weight: 650; padding: 0.6rem 1.1rem; border-radius: 0 0 10px 0; text-decoration: none; }
+.skip:focus { left: 0; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.wrap { max-width: 1200px; margin: 0 auto; padding: 0 1.5rem; }
+/* Hero zone keeps the artwork's own backdrop pure under the whole image (85%) and blends into the page navy below. */
+.top { background: linear-gradient(180deg, var(--bg-hero) 0%, var(--bg-hero) 85%, var(--bg) 100%); }
+nav { display: flex; align-items: center; gap: 0.9rem; padding: 1.15rem 0 0.95rem; font-size: 0.86rem; flex-wrap: wrap; }
+nav .brand { color: var(--text); font-family: var(--mono); font-weight: 700; letter-spacing: 0.08em; margin-right: 0.25rem; }
+nav .spacer { flex: 1; }
+nav .navlink { color: var(--text-2); text-decoration: none; padding: 0.45rem 0.15rem; }
+nav .navlink:hover { color: var(--accent); }
+.btn { display: inline-block; background: var(--accent); color: #06131D; font-weight: 650; font-size: 0.85rem; border: 1px solid transparent; border-radius: 8px; padding: 0.5rem 1rem; text-decoration: none; }
+.btn:hover { background: #62E2F8; color: #06131D; }
+.btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+.btn.ghost:hover { background: transparent; border-color: var(--accent); color: var(--accent); }
+.badge { border: 1px solid rgba(56, 217, 245, 0.45); background: rgba(56, 217, 245, 0.08); color: var(--accent); border-radius: 999px; padding: 0.18rem 0.7rem; font-size: 0.72rem; letter-spacing: 0.1em; font-family: var(--mono); white-space: nowrap; }
+.hero { width: min(920px, 88%); height: auto; display: block; margin: 0 auto; }
+/* Headline band (2026-10-17): a real, visible h1 + subhead + CTA under the
+   hero artwork. Previously the only headline was baked into the artwork
+   and the only CTA was a small nav button — first-time visitors could not
+   tell what the product is or what to do next. */
+.hero-band { text-align: center; padding: 1.3rem 1rem 0.3rem; max-width: 56rem; margin: 0 auto; }
+.hero-band h1 { font-size: clamp(1.65rem, 3.4vw, 2.5rem); line-height: 1.22; letter-spacing: -0.01em; font-weight: 700; }
+.hero-band p { color: var(--text-2); margin: 0.75rem auto 0; max-width: 44rem; font-size: 1.02rem; }
+.hero-band .cta-row { display: flex; gap: 0.7rem; justify-content: center; margin-top: 1.1rem; flex-wrap: wrap; }
+.hero-band .cta-row .btn { font-size: 0.95rem; padding: 0.65rem 1.25rem; }
+.lede { text-align: center; color: var(--text-2); padding: 1.5rem 1rem 0.2rem; font-size: 1.02rem; line-height: 1.75; max-width: 56rem; margin: 0 auto; }
+.lede b { color: var(--text); font-weight: 600; }
+section { padding: 2.4rem 0 0.2rem; scroll-margin-top: 1rem; }
+h2 { display: flex; align-items: center; gap: 1rem; font-family: var(--mono); font-size: 0.78rem; font-weight: 600; letter-spacing: 0.22em; text-transform: uppercase; color: var(--accent); margin-bottom: 1.15rem; }
+h2::after { content: ""; flex: 1; height: 1px; background: var(--border-soft); }
+.rule { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent); padding: 1.15rem 1.3rem; border-radius: 0 12px 12px 0; color: var(--text-2); font-size: 0.95rem; }
+.rule b { color: var(--text); }
+.rule ul { margin: 0.9rem 0 0; padding: 0 0 0 1.15rem; line-height: 1.9; }
+code { color: var(--accent-2); font-family: var(--mono); font-size: 0.85em; }
+.tblcard { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.35rem 1.25rem 0.55rem; }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; color: var(--text-2); }
+td, th { padding: 0.5rem 0.9rem 0.5rem 0; border-bottom: 1px solid var(--border-soft); text-align: left; vertical-align: top; }
+tbody tr:last-child td { border-bottom: none; }
+td { transition: background-color 0.12s ease; }
+td:first-child { color: var(--accent); font-family: var(--mono); font-size: 0.8rem; white-space: nowrap; }
+th { color: var(--text-3); font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; }
+.note { font-size: 0.8rem; color: var(--text-3); margin: 1rem 0 0; max-width: 46rem; line-height: 1.7; }
+footer { border-top: 1px solid var(--border-soft); margin-top: 3.2rem; padding: 2.2rem 0 2.6rem; color: var(--text-3); font-size: 0.78rem; text-align: center; line-height: 1.8; }
+footer a { color: var(--text-2); }
+/* How it works (2026-10-17): three plain steps, after the census (the
+   census stays the first section under the lede — owner directive
+   2026-10-12). */
+.steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.9rem; }
+.step { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.95rem 1.05rem; }
+.step .n { font-family: var(--mono); color: var(--accent); font-size: 0.72rem; letter-spacing: 0.16em; }
+.step h3 { font-size: 0.98rem; margin: 0.4rem 0 0.3rem; }
+.step p { color: var(--text-2); font-size: 0.88rem; margin: 0; line-height: 1.6; }
+/* Downloads (2026-10-17): OS-labeled buttons instead of a bare link list —
+   a Windows user should find their installer in one glance. */
+.dl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.7rem; margin-top: 0.9rem; }
+a.dl { display: flex; flex-direction: column; gap: 0.2rem; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 0.7rem 0.95rem; text-decoration: none; }
+a.dl:hover { border-color: var(--accent); }
+a.dl .os { font-weight: 650; color: var(--text); font-size: 0.95rem; }
+a.dl .fmt { color: var(--text-3); font-family: var(--mono); font-size: 0.72rem; }
+a.dl.primary { border-color: rgba(56, 217, 245, 0.5); background: linear-gradient(180deg, rgba(56, 217, 245, 0.10), rgba(56, 217, 245, 0.03)); }
+@media (hover: hover) { tbody tr:hover td { background: var(--surface-2); } }
+@media (max-width: 900px) {
+  .steps { grid-template-columns: 1fr; }
+}
+@media (max-width: 720px) {
+  .wrap { padding: 0 1.25rem; }
+  table { font-size: 0.78rem; }
+  td:first-child { white-space: normal; overflow-wrap: anywhere; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { transition: none !important; }
+}

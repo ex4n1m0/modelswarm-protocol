@@ -2925,9 +2925,11 @@ async fn set_hosting_inner(
             };
             let key = match staged.as_ref().filter(|k| k.provider == provider) {
                 Some(k) => k.api_key.clone(),
-                None => return Err(format!(
+                None => {
+                    return Err(format!(
                     "add your {provider} API key in Settings first — the key stays on this machine"
-                )),
+                ))
+                }
             };
             let provider_kind = match cloud.provider() {
                 modelswarm_node::catalog::CloudProviderId::DeepSeek => {

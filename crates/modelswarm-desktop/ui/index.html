@@ -210,6 +210,9 @@
         <div class="meter"><span class="mlabel">GPU</span><div class="bar" aria-hidden="true"><div id="bar-gpu"></div></div><span class="mval" id="val-gpu">n/a</span></div>
       </div>
       <p class="note" style="margin:4px 0 0;font-size:10.5px">CPU + working set: this app + supervised engines · RAM %: whole system · GPU: busiest adapter. n/a = not measurable this tick.</p>
+      <!-- Swarm status HUD (owner directive 2026-10-17): one line that
+           always answers "am I in, and as what?" -->
+      <p class="note" id="swarm-line" style="margin:6px 0 0;font-size:11.5px;color:var(--muted)">…</p>
     </section>
 
     <section aria-labelledby="chat-h" class="fill">
@@ -570,7 +573,14 @@
         sel.innerHTML = '<option>no models available — check Settings → Tracker</option>';
         sel.disabled = true;
       }
-      $("model-cards").innerHTML = visible.map(m => {
+      // 2026-10-17 owner directive: ONE obvious path to join — local and
+      // cloud grouped, one 'Join the swarm' action per model, honest
+      // states everywhere.
+      const locals = visible.filter(m => !m.is_cloud);
+      const clouds = visible.filter(m => m.is_cloud);
+      const groupHeader = (title, sub) =>
+        `<div style="margin:0.9rem 0 0.35rem;font-size:0.78rem;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted)">${title}<span style="text-transform:none;letter-spacing:0;margin-left:0.5rem">· ${sub}</span></div>`;
+      const cardsHtml = (list) => list.map(m => {
         if (m.is_cloud) {
           // ADR-040 C3: cloud models serve through the user's staged
           // provider key (Settings → cloud API key). No key yet = the
@@ -583,17 +593,17 @@
                <div class="meta">cloud model · ${m.provider} ${m.model} · no download</div>
                <div class="meta" style="margin-top:2px">${keySet ? "serves the swarm via your key · your replies are labeled cloud" : "add your " + m.provider + " API key in Settings to serve"}</div></div>
           <div class="action-row"><div class="meta">cloud</div>${keySet
-            ? `<button type="button" data-start="${m.profile_id}">Start</button>`
-            : `<span class="meta" style="color:var(--muted)">key needed</span>`}</div>
+            ? `<button type="button" data-start="${m.profile_id}">Join the swarm</button>`
+            : `<button type="button" class="ghost" data-open-setup>add your ${m.provider} key…</button>`}</div>
         </div>`;
         }
         const running = hostingOn && m.selected;
         const badge = running
-          ? `<span class="running-badge">● hosting</span>`
+          ? `<span class="running-badge">● serving the swarm</span>`
           : (m.downloaded ? "downloaded · " + (m.downloaded.bytes > 0 ? (m.downloaded.bytes / 1e6).toFixed(0) + " MB" : "present") : "not downloaded");
         const action = running
           ? `<button type="button" class="stop-card" data-stop="${m.profile_id}">Stop</button>`
-          : `<button type="button" data-start="${m.profile_id}">${m.downloaded ? "Start" : "Download & start"}</button>`;
+          : `<button type="button" data-start="${m.profile_id}">${m.downloaded ? "Join the swarm" : "Download & join"}</button>`;
         const fit = m.fit ? `<span style="color:var(--accent)">${FIT_BADGE[m.fit] ?? ""}</span> · ` : "";
         const censusNote = " · " + (m.census_chip ?? "census n/a");
         return `
@@ -605,13 +615,32 @@
           <div class="action-row"><div class="meta">${badge}</div>${action}</div>
         </div>`;
       }).join("");
+      $("model-cards").innerHTML =
+        (locals.length ? groupHeader("Local models", "run on your hardware") + cardsHtml(locals) : "")
+        + (clouds.length ? groupHeader("Cloud models", "serve through your API key — joins as 1 peer") + cardsHtml(clouds) : "");
+      const _unusedCards = null;
+      for (const btn of document.querySelectorAll("[data-open-setup]")) {
+        btn.onclick = () => {
+          const item = document.querySelector('[data-panel="panel-setup"]');
+          if (item) item.click();
+        };
+      }
       for (const card of document.querySelectorAll(".card")) {
         const pick = () => { if (!hostingOn || card.dataset.id !== selectedProfile()) selectModel(card.dataset.id); };
         card.onclick = (e) => { if (e.target.closest("button")) return; pick(); };
         card.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } };
       }
       for (const btn of document.querySelectorAll("[data-start]")) {
-        btn.onclick = () => selectModel(btn.dataset.start);
+        btn.onclick = () => {
+          const original = btn.textContent;
+          btn.textContent = "joining…";
+          btn.disabled = true;
+          selectModel(btn.dataset.start).finally?.(() => {});
+          // selectModel is async and re-renders on completion; restore is
+          // implicit through the re-render.
+          btn.textContent = original;
+          btn.disabled = false;
+        };
       }
       for (const btn of document.querySelectorAll("[data-stop]")) {
         btn.onclick = () => stopHosting();
@@ -647,15 +676,28 @@
       busy = false; refresh(); refreshModels();
     }
 
+    // 2026-10-17: failures say what to DO, not just what broke.
+    const friendlyJoinError = (raw) => {
+      const e = String(raw);
+      if (e.includes("API key in Settings"))
+        return "Cloud key needed — Settings → 'Cloud API key, tracker & engine…' → paste your key, save, then press Join again.";
+      if (e.includes("cloud_http_401") || e.includes("cloud_http_403"))
+        return "Your cloud key was rejected by the provider — open Settings and check the key (wrong, expired, or no credit).";
+      if (e.includes("cloud_http_429"))
+        return "The provider rate-limited this key — wait a moment and press Join again.";
+      if (e.includes("not found next to the app"))
+        return "The local engine is missing — reinstall the app and try again.";
+      return e;
+    };
     async function selectModel(profileId) {
       if (busy) return; busy = true; error("");
       $("dl-label").textContent = hostingOn
         ? "switching — the current swarm keeps serving until the new model is ready…"
-        : "preparing…";
+        : "joining the swarm…";
       try {
         const r = await invoke("select_model", { profileId });
         $("dl-label").textContent = r.hosting ? "swarm running · " + r.gateway_addr : "";
-      } catch (e) { error(String(e)); $("dl-label").textContent = ""; }
+      } catch (e) { error(friendlyJoinError(e)); $("dl-label").textContent = ""; }
       busy = false; refresh(); refreshModels();
     }
 
@@ -792,6 +834,19 @@
       verifiedLine.textContent = verified.disclosure
         || ("Family verification ON: your conversation — in a form the receiving computers can read — goes to every verification peer this turn (" + (verified.cohort ?? 1) + "). It is slower than single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees any of it.");
       hostingOn = s.node.hosting;
+      // Swarm HUD: am I in, and as what? (cloud vs local honestly labeled)
+      {
+        const sl = $("swarm-line");
+        if (sl) {
+          const selModel = (lastModels || []).find(m => m.profile_id === s.profile_id);
+          const nm = selModel ? selModel.display_name : (s.profile_id ? s.profile_id.slice(0, 14) + "…" : "");
+          if (hostingOn) {
+            sl.innerHTML = '<span style="color:var(--ok)">● in the swarm</span> — serving <b>' + nm + '</b>' + (selModel && selModel.is_cloud ? ' via your cloud key' : ' on this machine') + ' · your machine counts as 1 peer and can pull from every swarm.';
+          } else {
+            sl.textContent = 'Not in the swarm — pick a model below and press “Join the swarm”.';
+          }
+        }
+      }
       $("hosting-switch").dataset.on = hostingOn;
       $("hosting-switch").setAttribute("aria-checked", hostingOn);
       $("hosting-word").dataset.on = hostingOn;

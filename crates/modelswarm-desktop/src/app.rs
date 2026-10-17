@@ -212,6 +212,11 @@ struct Inner {
     peer_metrics: Option<std::sync::Arc<modelswarm_node::measure::PeerMetrics>>,
     license_accepted: bool,
     artifact: Option<EnsuredArtifact>,
+    /// ADR-040 §4: the honest mode label of whatever THIS node serves —
+    /// None = the local-engine default ("local single"); Some("cloud — …")
+    /// when the hosted profile is a cloud one. Every chat reply that this
+    /// machine served locally carries it.
+    serving_mode_label: Option<String>,
     node: Option<RunningNode>,
     chat_log: Vec<ChatTurn>,
     /// The "allow swarm pairing" settings toggle (owner directive
@@ -509,6 +514,7 @@ impl DesktopState {
                 profile_id: config.profile_id,
                 license_accepted,
                 artifact: None,
+                serving_mode_label: None,
                 node: None,
                 chat_log: Vec::new(),
                 allow_swarm_pairing: config.allow_swarm_pairing,
@@ -2413,6 +2419,7 @@ async fn list_models(
                 modelswarm_node::catalog::CloudProviderId::DeepSeek => "deepseek",
                 modelswarm_node::catalog::CloudProviderId::OpenRouter => "openrouter",
             };
+            let model_label = cloud.model().to_string();
             out.push(serde_json::json!({
                 "profile_id": p.profile_id,
                 "display_name": p.display_name,
@@ -2901,6 +2908,7 @@ async fn set_hosting_inner(
         // overrides an explicit choice).
         let _ = std::fs::remove_file(hosting_autostart_marker(&inner.data_dir));
         hosting_autostart_db_set(&inner.data_dir, false);
+        inner.serving_mode_label = None;
         inner.listener_addr = None;
         inner.family = None;
         // ADR-038 §6.4 row 8: hosting off = no heartbeat = no fresh
@@ -3537,6 +3545,19 @@ async fn set_hosting_inner(
         );
     }
     hosting_autostart_db_set(&inner.data_dir, true);
+    // The honest serve label (ADR-040 §4): cloud hosting announces the
+    // provider + model on every reply this machine serves.
+    inner.serving_mode_label = match &listing.kind {
+        modelswarm_node::catalog::ProfileKind::Cloud(c) => Some(format!(
+            "cloud — {} {} (API)",
+            match c.provider() {
+                modelswarm_node::catalog::CloudProviderId::DeepSeek => "deepseek",
+                modelswarm_node::catalog::CloudProviderId::OpenRouter => "openrouter",
+            },
+            c.model()
+        )),
+        modelswarm_node::catalog::ProfileKind::Local(_) => None,
+    };
     Ok(status)
 }
 
@@ -5651,12 +5672,22 @@ async fn try_swarm_chat(
                             ChatOutcome::Served {
                                 content,
                                 completion_tokens,
-                            } => (
-                                content,
-                                completion_tokens,
-                                format!("local (remote failed: {reason})"),
-                                false,
-                            ),
+                            } => {
+                                // The fallback served on THIS machine —
+                                // cloud hosting labels itself (ADR-040 §4).
+                                let base = inner
+                                    .lock()
+                                    .await
+                                    .serving_mode_label
+                                    .clone()
+                                    .unwrap_or_else(|| "local".into());
+                                (
+                                    content,
+                                    completion_tokens,
+                                    format!("{base} (remote failed: {reason})"),
+                                    false,
+                                )
+                            }
                             ChatOutcome::Failed(local_reason) => {
                                 telemetry.warn(
                                     "chat.swarm.error",
@@ -6207,13 +6238,17 @@ async fn finish_local_turn(
             content: content.clone(),
         });
     }
+    let (mode, served_by) = match inner.serving_mode_label.clone() {
+        Some(label) => (label, "cloud"),
+        None => ("local single".to_string(), "local"),
+    };
     Ok(serde_json::json!({
         "content": content,
         "completion_tokens": completion_tokens,
         "elapsed_ms": elapsed_ms,
         "tokens_per_second": tok_s,
-        "mode": "local single",
-        "served_by": "local",
+        "mode": mode,
+        "served_by": served_by,
     }))
 }
 

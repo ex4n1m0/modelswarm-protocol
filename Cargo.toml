@@ -34,7 +34,7 @@ exclude = ["tests/updater-manifest-verify"]
 # desktop-installer build (its push.paths includes Cargo.toml): the
 # bump commit is exactly where shippable artifacts must come from.
 [workspace.package]
-version = "0.2.36"
+version = "0.2.37"
 edition = "2021"
 license = "Proprietary"
 repository = "modelswarm"

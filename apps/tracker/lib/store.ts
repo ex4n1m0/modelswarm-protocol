@@ -34,7 +34,7 @@ export type ProfileStatus = "candidate" | "active" | "deprecated";
 export type CapacityClass = "cpu" | "gpu_entry" | "gpu_mid" | "gpu_high";
 export type ChallengeOutcome = "open" | "passed" | "failed";
 
-export interface Manifest {
+export interface LocalManifest {
   schema_version: 2;
   hf_repo: string;
   hf_revision: string;
@@ -48,6 +48,21 @@ export interface Manifest {
   speculative_capabilities: string[];
   [key: string]: unknown; // closed by the zod schema at the edge; index kept for canonicalization
 }
+
+/** ADR-040 cloud profile manifest: provider + exact model id + policy is
+ *  the exactness (no artifact exists to hash). */
+export interface CloudManifest {
+  schema_version: 2;
+  family: "cloud";
+  provider: "deepseek" | "openrouter";
+  model: string;
+  context_tokens: number;
+  max_output_tokens: number;
+  wire: "openai-chat-v1";
+  [key: string]: unknown;
+}
+
+export type Manifest = LocalManifest | CloudManifest;
 
 export interface Provenance {
   resolvedBy?: string;
@@ -385,8 +400,11 @@ export interface TrackerStore {
    *  posting installation IS the requester. Re-posts are no-ops. */
   recordConsumption(row: { installationId: string; receiptDigest: string; tokens: number; at: number }): Promise<void>;
   /** Decayed consumed tokens for one installation (same half-life form
-   *  as grantedCounters — the two sides must average over one window). */
+   *  as grantedCounters — display/accounting continuity). */
   consumedTokensDecayed(installationId: string, halfLifeSecs: number): Promise<{ decayed: number; raw: number; rows: number }>;
+  /** ADR-041 (capacity rule): plain tokens consumed in the trailing
+   *  window — the rate gate's input. */
+  consumedInWindow(installationId: string, windowSecs: number): Promise<number>;
 
   // -- rate-limit counters (persisted observability; the live limiter is the
   //    in-memory fixed-window buckets per msp-v1 §3.4) -------------------------
@@ -1053,6 +1071,15 @@ export class MemoryStore implements TrackerStore {
 
   async recordConsumption(row: { installationId: string; receiptDigest: string; tokens: number; at: number }): Promise<void> {
     this.consumed.set(`${row.installationId}:${row.receiptDigest}`, { ...row });
+  }
+
+  async consumedInWindow(installationId: string, windowSecs: number): Promise<number> {
+    const cutoff = this.now() - windowSecs * 1000;
+    let total = 0;
+    for (const row of this.consumed.values()) {
+      if (row.installationId === installationId && row.at >= cutoff) total += row.tokens;
+    }
+    return total;
   }
 
   async consumedTokensDecayed(
@@ -2119,6 +2146,16 @@ export class PgStore implements TrackerStore {
        ON CONFLICT (installation_id, receipt_digest) DO NOTHING`,
       [row.installationId, row.receiptDigest, row.tokens, PgStore.iso(row.at)],
     );
+  }
+
+  async consumedInWindow(installationId: string, windowSecs: number): Promise<number> {
+    const res = (await this.query(
+      `SELECT COALESCE(SUM(tokens), 0) AS total
+         FROM consumed_accounting
+        WHERE installation_id = $1 AND consumed_at > now() - make_interval(secs => $2)`,
+      [installationId, windowSecs],
+    )) as Record<string, unknown>[];
+    return Number(res[0]?.total ?? 0);
   }
 
   async consumedTokensDecayed(

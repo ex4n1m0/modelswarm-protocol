@@ -14,50 +14,49 @@ what its own serving upstreams, in tokens. "Same capacity to start"
 local model serves the swarm's tasks for it while you consume other
 profiles' answers.
 
-## Decision
+## Decision (REVISED 2026-10-17, later the same night — the torrent lesson)
 
-1. **Mechanism: the decayed two-sided balance.** Every installation
-   accumulates `granted_tokens` (ADR-030 granted accounting, all
-   profiles) and `consumed_tokens` (recorded at receipt intake, where
-   the posting installation IS the requester). Both use the same
-   7-day-half-life read-time decay. Consumption is allowed while:
+The owner rejected history-based gating from experience: "sometimes it is
+very hard to gain ratio due to no one pulling from your model… base the
+design on the CAPACITY, not the actual operation history." The rule:
+
+1. **Mechanism: capacity, not history.**
 
    ```text
-   decayed_consumed ≤ k × decayed_granted + BOOTSTRAP_TOKENS
+   tokens consumed in the trailing WINDOW
+     <= k × capacity_tokens_per_sec(verified CapacityClass) × WINDOW
    ```
 
-   In steady state this is exactly "pull at most k× your push rate";
-   the half-life is the averaging window and the anti-farm horizon
-   (old credit dies; standing is maintained by serving now).
+   The verified CapacityClass (cpu / gpu_entry / gpu_mid / gpu_high) is
+   assigned from MEASURED challenge timings (D7/ADR-012 — self-reported
+   hardware never raises it): "capacity due to my hardware and model
+   type," exactly. Nobody pulling from you never matters — the unpopular-
+   torrent spiral cannot occur.
 
-2. **Constants are operator policy, not code releases.**
-   `MSP_SWARM_BALANCE_K` (default **1.0**; `0` disables the gate) and
-   `MSP_SWARM_BOOTSTRAP_TOKENS` (default 100_000, one-time headroom per
-   installation so a fresh peer's first hours work; it is NOT granted
-   credit and never counts as served work).
+2. **The rolling window IS the allowance.** WINDOW defaults to 1 h
+   (`MSP_SWARM_BALANCE_WINDOW_SECS`): it is simultaneously the burst
+   headroom and the cold start — a fresh host can pull its full window
+   budget immediately; no bootstrap, no debt. The window refills
+   continuously.
 
-3. **Enforcement point: lease issuance.** `POST /peers/lease` is the
-   single choke point every consume credential already passes through.
-   A peer over balance receives `403 balance_exceeded` with its actual
-   numbers (`granted`, `consumed`, `k`) — the app renders the honest
-   "swarm balance" line from them. No other surface changes.
+3. **Constants are operator policy, not code releases.** k default 1.0
+   (`MSP_SWARM_BALANCE_K`; 0 disables). The class capacity table
+   (cpu 8 · gpu_entry 15 · gpu_mid 40 · gpu_high 90 tok/s) is the
+   measured-honesty anchor set, revisitable by release with data.
 
-4. **Shadow first.** `MSP_SWARM_BALANCE_ENFORCE` (default **off**):
-   the balance is ALWAYS computed and logged at issuance
-   (`balance.shadow` telemetry row: would-pass / would-block + numbers);
-   blocking starts only after real traffic shapes the constants. The
-   owner's own machines cannot be stranded by a brand-new rule.
+4. **Enforcement point: lease issuance** (unchanged). The balance view
+   rides every issuance (additive `balance` field: capacity, consumed,
+   budget, headroom); a peer over budget gets `403 balance_exceeded`
+   with its actual numbers. **Ships DARK** — `MSP_SWARM_BALANCE_ENFORCE`
+   (default off) gates blocking.
 
-5. **Network-wide across profiles.** Granted tokens from ANY profile
-   (local or cloud) count toward consumption of ANY profile — this is
-   what makes "serve local tasks, consume smarter models" work (the
-   owner's stated trade). Per-profile balances are a future policy
-   refinement, not v1.
+5. **The receipts ledger remains the evidence base** (granted +
+   consumed, ADR-030/0007) for accounting, the UI display, and the
+   future reputation chassis — it no longer GATES consumption. The
+   consumption rows still move only on intake-validated receipts.
 
-6. **Evidence discipline unchanged.** Both sides move ONLY on
-   intake-validated receipts (signed, both signatures, enrolled keys).
-   Nothing self-reported; a sybil ring still grants nothing (ADR-030
-   §4), so rings cannot manufacture balance.
+6. **Network-wide across profiles** (unchanged): any granted capacity
+   spends anywhere — serve local tasks, pull smarter models.
 
 ## Consequences
 

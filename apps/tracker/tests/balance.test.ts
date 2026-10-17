@@ -1,9 +1,17 @@
-// ADR-041 swarm balance: policy vectors + the lease-route integration
-// (dark mode by default — always computed and surfaced, never blocking;
-// enforcement only under MSP_SWARM_BALANCE_ENFORCE=on).
+// ADR-041 swarm balance, CAPACITY rule (owner revision 2026-10-17, the
+// torrent lesson): the gate keys on the verified serving class (hardware
+// + model type, assigned from measured challenge timings) — NEVER on
+// operational history. Rolling window = the burst allowance AND the cold
+// start (a fresh host pulls its full window budget immediately; no
+// bootstrap, no unpopular-torrent spiral).
 
 import { beforeEach, describe, expect, it } from "vitest";
-import { balanceDecision, DEFAULT_BALANCE_K, DEFAULT_BOOTSTRAP_TOKENS } from "@/lib/balance";
+import {
+  balanceDecision,
+  CLASS_TOKENS_PER_SEC,
+  DEFAULT_BALANCE_K,
+  DEFAULT_WINDOW_SECS,
+} from "@/lib/balance";
 import {
   makeRig,
   seedActiveProfile,
@@ -12,32 +20,32 @@ import {
   register,
   passChallenge,
   peersLease,
+  heartbeat,
   signedRequest,
   type TestRig,
 } from "./helpers";
 
-describe("ADR-041 policy table (pure)", () => {
-  it("defaults: k=1, bootstrap on, gate satisfied", () => {
-    expect(DEFAULT_BALANCE_K).toBe(1);
-    expect(DEFAULT_BOOTSTRAP_TOKENS).toBeGreaterThan(0);
-    const d = balanceDecision(0, 0);
-    expect(d.ok).toBe(true); // bootstrap covers the cold start
-    expect(d.headroom).toBe(DEFAULT_BOOTSTRAP_TOKENS);
+describe("ADR-041 capacity policy (pure)", () => {
+  it("budget = k × class capacity × window", () => {
+    const d = balanceDecision("gpu_mid", 0);
+    expect(d.capacityTokensPerSec).toBe(CLASS_TOKENS_PER_SEC.gpu_mid);
+    expect(d.budget).toBe(DEFAULT_BALANCE_K * CLASS_TOKENS_PER_SEC.gpu_mid! * DEFAULT_WINDOW_SECS);
+    expect(d.ok).toBe(true);
+    expect(d.headroom).toBe(d.budget);
   });
 
-  it("pull within k*push + bootstrap passes; beyond fails", () => {
-    expect(balanceDecision(1_000, 1_000).ok).toBe(true); // exactly k=1
-    expect(balanceDecision(1_000, 1_000 + DEFAULT_BOOTSTRAP_TOKENS).ok).toBe(true); // boundary
-    expect(balanceDecision(1_000, 1_000 + DEFAULT_BOOTSTRAP_TOKENS + 1).ok).toBe(false);
+  it("within budget passes; beyond fails — no history input exists", () => {
+    const budget = balanceDecision("gpu_mid", 0).budget;
+    expect(balanceDecision("gpu_mid", budget).ok).toBe(true);
+    expect(balanceDecision("gpu_mid", budget + 1).ok).toBe(false);
   });
 
-  it("decayed numbers arrive from the ledger — the fn is scale-free", () => {
-    const d = balanceDecision(12_345.6, 999);
-    expect(d.headroom).toBeCloseTo(12_345.6 + DEFAULT_BOOTSTRAP_TOKENS - 999, 5);
+  it("unknown class falls back to the honest floor (cpu)", () => {
+    expect(balanceDecision("mystery", 0).capacityTokensPerSec).toBe(CLASS_TOKENS_PER_SEC.cpu);
   });
 });
 
-describe("ADR-041 lease-route integration", () => {
+describe("ADR-041 lease-route integration (dark by default)", () => {
   let rig: TestRig;
   let profile: string;
   beforeEach(async () => {
@@ -54,54 +62,53 @@ describe("ADR-041 lease-route integration", () => {
     return { who, leaseId };
   }
 
-  it("every issuance carries the balance view (dark: never blocks)", async () => {
+  const call = (who: { keys: ReturnType<typeof Object> } & any, leaseId: string) =>
+    peersLease.POST(
+      signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/lease", JSON.stringify({ leaseId, profileId: profile }), rig.ctx.now),
+    );
+
+  it("every issuance carries the balance view; over-budget still 200 (dark)", async () => {
     const { who, leaseId } = await eligibleLease();
-    // Over-balance by pure consumption, zero granted:
     await rig.store.recordConsumption({
       installationId: who.installationId,
       receiptDigest: "a".repeat(64),
-      tokens: DEFAULT_BOOTSTRAP_TOKENS + 5_000,
+      tokens: balanceDecision("gpu_high", 0).budget + 5_000,
       at: rig.ctx.now(),
     });
-    const res = await peersLease.POST(
-      signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/lease", JSON.stringify({ leaseId, profileId: profile }), rig.ctx.now),
-    );
-    expect(res.status).toBe(200); // dark mode: surfaced, not blocking
-    const body = (await res.json()) as { balance: { ok: boolean; consumed: number } };
-    expect(body.balance.ok).toBe(false); // the honest number is right there
-    expect(body.balance.consumed).toBeGreaterThan(DEFAULT_BOOTSTRAP_TOKENS);
+    const res = await call(who, leaseId);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { balance: { ok: boolean; consumedInWindow: number } };
+    expect(body.balance.ok).toBe(false);
+    expect(body.balance.consumedInWindow).toBeGreaterThan(balanceDecision("gpu_high", 0).budget);
   });
 
-  it("enforcement on: over-balance blocks with balance_exceeded; serving refills", async () => {
+  it("enforcement on: over-budget blocks; the window refills with time", async () => {
     process.env.MSP_SWARM_BALANCE_ENFORCE = "on";
     const { who, leaseId } = await eligibleLease();
+    const budget = balanceDecision("gpu_high", 0).budget; // the challenge timings map the lease to the top class; over-spend past even that
     await rig.store.recordConsumption({
       installationId: who.installationId,
       receiptDigest: "b".repeat(64),
-      tokens: DEFAULT_BOOTSTRAP_TOKENS + 5_000,
+      tokens: budget + 5_000,
       at: rig.ctx.now(),
     });
-    const call = () =>
-      peersLease.POST(
-        signedRequest(who.keys, who.installationId, who.session, "/api/v1/peers/lease", JSON.stringify({ leaseId, profileId: profile }), rig.ctx.now),
-      );
-    const blocked = await call();
+    const blocked = await call(who, leaseId);
     expect(blocked.status).toBe(403);
     expect(((await blocked.json()) as { error: { code: string } }).error.code).toBe("balance_exceeded");
-
-    // Serve enough (granted tokens for this peer) and the same call passes.
-    await rig.store.recordGrantedAccounting([
-      {
-        receiptDigest: "c".repeat(64),
-        peerId: who.peerId,
-        installationId: who.installationId,
-        profileId: profile,
-        endpointSeconds: 60,
-        verifiedTokens: 20_000,
-        grantedAt: rig.ctx.now(),
-      },
-    ]);
-    const ok = await call();
+    // The window refills: after a full window with no consumption the same
+    // peer is back in budget (the torrent-lesson fix — nothing about its
+    // SERVING history mattered at any point). The lease TTL is 75 s, so
+    // walk the hour one beat at a time.
+    for (let t = 0; t < DEFAULT_WINDOW_SECS + 120; t += 60) {
+      rig.advance(60_000);
+      await heartbeat(rig, who, leaseId); // keep the 75 s lease alive
+    }
+    // The passed challenge aged out over the walk — pass a fresh one
+    // (this is the normal serving cadence) and the lease is back.
+    await passChallenge(rig, who, leaseId, profile);
+    const ok = await call(who, leaseId);
     expect(ok.status).toBe(200);
+    const body = (await ok.json()) as { balance: { ok: boolean } };
+    expect(body.balance.ok).toBe(true);
   });
 });

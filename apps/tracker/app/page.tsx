@@ -169,15 +169,14 @@ export default function Home() {
         <section id="trade" aria-labelledby="trade-heading">
           <h2 id="trade-heading">The trade</h2>
           <div className="rule">
-            <b>One to one, token for token.</b> You may pull from the swarm
-            up to what your own serving pushes upstream — your local model
-            handles other people&apos;s tasks while other models handle
-            yours. Both sides are measured on cryptographically signed work
-            receipts and time-averaged over recent activity, so the balance
-            tracks what you actually do, not what you claim. A fresh peer
-            starts with a working allowance; after that, serve to refill.
-            The rule ships in watch mode first — balances are measured and
-            shown before they bind.
+            <b>One to one, token for token.</b> You may pull from the
+            swarm up to what your own hardware and model can serve — a
+            capacity measured when you prove hosting, not a debt earned
+            from others using you. Whether or not anyone is pulling from
+            your model right now never matters: your pull budget is your
+            verified serving capacity, refilled continuously. The rule
+            ships in watch mode first — budgets are measured and shown
+            before they bind.
           </div>
         </section>
 

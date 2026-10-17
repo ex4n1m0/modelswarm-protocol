@@ -3,8 +3,7 @@ import { jsonError, jsonOk } from "@/lib/errors";
 import { guardPeerRequest } from "@/lib/guard";
 import { leaseBindingError } from "@/lib/leases";
 import { PeerLeaseSchema } from "@/lib/schemas";
-import { balanceDecision, balanceEnforced } from "@/lib/balance";
-import { GRANTED_HALF_LIFE_SECS } from "@/lib/constants";
+import { balanceDecision, balanceEnforced, balanceWindowSecs } from "@/lib/balance";
 
 // POST /api/v1/peers/lease — consolidated EligibilityLease issuance/refresh
 // (ADR-012; Phase B per DESIGN.md). Requires: active lease bound to the
@@ -60,18 +59,19 @@ export async function POST(req: Request) {
     return jsonError(403, "ineligible", "audit epoch stale; re-run the hosting challenge");
   }
 
-  // ADR-041 swarm balance (ships DARK): always computed and surfaced on
-  // every issuance; blocks only when MSP_SWARM_BALANCE_ENFORCE=on.
-  const [grantedView, consumedView] = await Promise.all([
-    ctx.store.grantedCounters(lease.peerId, GRANTED_HALF_LIFE_SECS),
-    ctx.store.consumedTokensDecayed(installationId, GRANTED_HALF_LIFE_SECS),
-  ]);
-  const balance = balanceDecision(grantedView.verifiedTokensDecayed, consumedView.decayed);
+  // ADR-041 swarm balance, CAPACITY rule (owner revision 2026-10-17: the
+  // torrent lesson — the gate keys on what your verified hardware+model
+  // can push, never on whether anyone pulled from you). Ships DARK:
+  // always computed and surfaced; blocks only under ENFORCE=on.
+  const balance = balanceDecision(
+    lease.capacityClass,
+    await ctx.store.consumedInWindow(installationId, balanceWindowSecs()),
+  );
   if (!balance.ok && balanceEnforced()) {
     return jsonError(
       403,
       "balance_exceeded",
-      `swarm balance exceeded: consumed ${Math.round(balance.consumed)} > k*granted+bootstrap ${Math.round(balance.k * balance.granted + balance.bootstrap)} (k=${balance.k}); serve the swarm to refill`,
+      `swarm balance exceeded: consumed ${Math.round(balance.consumedInWindow)} of ${Math.round(balance.budget)} tokens in the last ${Math.round(balance.windowSecs / 60)} min (capacity ${balance.capacityTokensPerSec} tok/s, k=${balance.k}); the window refills continuously`,
     );
   }
 

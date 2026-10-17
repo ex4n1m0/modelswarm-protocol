@@ -1,30 +1,48 @@
-// ADR-041 swarm balance: the decayed two-sided reciprocity check.
-// Pure decision-making here; the ledger reads live in the store.
+// ADR-041 swarm balance, REVISED per owner ruling 2026-10-17 (the
+// torrent lesson): the gate keys on CAPACITY, not operational history —
+// "I host a model with a certain capacity due to my hardware and model
+// type; I can pull that many tokens per second, even if nobody is
+// pulling from mine at that moment or in the past."
 //
-//   allowed while: decayed_consumed <= k * decayed_granted + BOOTSTRAP
+//   allowed while: tokens consumed in the trailing WINDOW
+//                  <= k * capacity_tokens_per_sec(verified class) * WINDOW
 //
-// In steady state that is exactly "pull at most k× your push rate"
-// (owner ruling 2026-10-17: k = 1 to start, operator-tunable). Both
-// sides decay with the same half-life, so the window and the anti-farm
-// horizon are one mechanism. Constants come from env (policy, not
-// releases); enforcement ships DARK first (measured, surfaced, never
-// blocking) until real traffic shapes them.
+// The verified CapacityClass is ASSIGNED from measured challenge timings
+// (D7/ADR-012 — self-reported hardware never raises it): hardware +
+// model type, exactly the owner's phrasing. A rolling window (default
+// 1 h) IS the burst allowance and the cold start — a fresh host can pull
+// its full window budget immediately; no bootstrap, no history debt, no
+// unpopular-torrent spiral. The receipts ledger (granted + consumed)
+// remains the evidence base for accounting, display, and the future
+// reputation chassis — it just no longer GATES consumption.
+//
+// Ships DARK (computed + surfaced on every issuance; blocks only under
+// MSP_SWARM_BALANCE_ENFORCE=on).
 
 export const ENV_BALANCE_K = "MSP_SWARM_BALANCE_K";
-export const ENV_BALANCE_BOOTSTRAP = "MSP_SWARM_BOOTSTRAP_TOKENS";
 export const ENV_BALANCE_ENFORCE = "MSP_SWARM_BALANCE_ENFORCE";
+export const ENV_BALANCE_WINDOW_SECS = "MSP_SWARM_BALANCE_WINDOW_SECS";
 
 export const DEFAULT_BALANCE_K = 1.0;
-export const DEFAULT_BOOTSTRAP_TOKENS = 100_000;
+export const DEFAULT_WINDOW_SECS = 3600;
+
+/** Verified-class capacity table (policy constants, ADR-041 §2): the
+ *  measured serving speed a peer of this class honestly sustains. */
+export const CLASS_TOKENS_PER_SEC: Record<string, number> = {
+  cpu: 8,
+  gpu_entry: 15,
+  gpu_mid: 40,
+  gpu_high: 90,
+};
 
 export function balanceK(): number {
   const raw = Number.parseFloat(process.env[ENV_BALANCE_K] ?? "");
   return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_BALANCE_K;
 }
 
-export function bootstrapTokens(): number {
-  const raw = Number.parseInt(process.env[ENV_BALANCE_BOOTSTRAP] ?? "", 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_BOOTSTRAP_TOKENS;
+export function balanceWindowSecs(): number {
+  const raw = Number.parseInt(process.env[ENV_BALANCE_WINDOW_SECS] ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_WINDOW_SECS;
 }
 
 export function balanceEnforced(): boolean {
@@ -32,27 +50,35 @@ export function balanceEnforced(): boolean {
 }
 
 export interface BalanceView {
-  /** Decayed granted tokens (all profiles, the push side). */
-  granted: number;
-  /** Decayed consumed tokens (the pull side). */
-  consumed: number;
+  /** The verified capacity this peer may pull at (tokens/sec, all profiles). */
+  capacityTokensPerSec: number;
+  /** Tokens consumed inside the current window. */
+  consumedInWindow: number;
+  /** The current window budget (k * capacity * window). */
+  budget: number;
   k: number;
-  bootstrap: number;
-  /** The allowance still unspent under the rule. */
+  windowSecs: number;
+  /** allowance still unspent. */
   headroom: number;
   /** consumption allowed under the current constants? */
   ok: boolean;
 }
 
-export function balanceDecision(granted: number, consumed: number): BalanceView {
+export function balanceDecision(
+  capacityClass: string,
+  consumedInWindow: number,
+): BalanceView {
   const k = balanceK();
-  const bootstrap = bootstrapTokens();
-  const headroom = k * granted + bootstrap - consumed;
+  const windowSecs = balanceWindowSecs();
+  const capacityTokensPerSec = CLASS_TOKENS_PER_SEC[capacityClass] ?? CLASS_TOKENS_PER_SEC.cpu!;
+  const budget = k * capacityTokensPerSec * windowSecs;
+  const headroom = budget - consumedInWindow;
   return {
-    granted,
-    consumed,
+    capacityTokensPerSec,
+    consumedInWindow,
+    budget,
     k,
-    bootstrap,
+    windowSecs,
     headroom,
     ok: k === 0 || headroom >= 0, // k=0 disables the gate (policy off)
   };

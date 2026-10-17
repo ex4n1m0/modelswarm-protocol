@@ -167,7 +167,7 @@ export const AuditSchema = z
 
 // -- catalog admin -----------------------------------------------------------
 
-export const ManifestSchema = z
+const LocalManifestSchema = z
   .object({
     schema_version: z.literal(2),
     hf_repo: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
@@ -206,6 +206,25 @@ export const ManifestSchema = z
       .max(8),
   })
   .strict();
+
+// ADR-040 cloud family: a cloud profile pins provider + the provider's
+// exact model id + context policy — no artifact exists to hash, the
+// provider pins ARE the exactness. Field names feed the SAME canonical
+// profile-id derivation as local manifests (both sides canonicalize).
+const CloudManifestSchema = z
+  .object({
+    schema_version: z.literal(2),
+    family: z.literal("cloud"),
+    provider: z.enum(["deepseek", "openrouter"]),
+    model: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/),
+    context_tokens: z.number().int().min(1024).max(2_000_000),
+    max_output_tokens: z.number().int().min(1).max(1_000_000),
+    // The pinned request wire (the runtime analogue for cloud profiles).
+    wire: z.literal("openai-chat-v1"),
+  })
+  .strict();
+
+export const ManifestSchema = z.union([LocalManifestSchema, CloudManifestSchema]);
 
 export const CandidateSchema = z
   .object({

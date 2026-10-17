@@ -2419,7 +2419,6 @@ async fn list_models(
                 modelswarm_node::catalog::CloudProviderId::DeepSeek => "deepseek",
                 modelswarm_node::catalog::CloudProviderId::OpenRouter => "openrouter",
             };
-            let model_label = cloud.model().to_string();
             out.push(serde_json::json!({
                 "profile_id": p.profile_id,
                 "display_name": p.display_name,
@@ -6024,7 +6023,11 @@ async fn send_chat(
                 now_ms,
             )
             .await;
-            if let Some(mut reply) = try_swarm_chat(
+            // Owner directive 2026-10-17: swarm-first across the WHOLE
+            // network — exact-profile peers first (the rich path), then
+            // the OTHER families' peers (the mixed-swarm case), and local
+            // only when no swarm peer answered.
+            let mut reply = match try_swarm_chat(
                 &state.inner,
                 &tracker_url,
                 &data_dir,
@@ -6039,6 +6042,23 @@ async fn send_chat(
             )
             .await
             {
+                Some(r) => Some(r),
+                None => {
+                    try_swarm_chat_cross(
+                        &state.inner,
+                        &tracker_url,
+                        &data_dir,
+                        &state.telemetry,
+                        &profile,
+                        &request_log,
+                        max_tokens,
+                        temperature,
+                        &on_delta,
+                    )
+                    .await
+                }
+            };
+            if let Some(mut reply) = reply.take() {
                 // The remote peer's reply enters the rendered history too
                 // — without it, multi-turn swarm transcripts send only
                 // user turns and drift from local behavior.
@@ -6181,6 +6201,201 @@ async fn send_chat(
         }));
     }
     unreachable!("stream_error is set on every non-success path")
+}
+
+/// Owner directive 2026-10-17 ("enforce that all responses come from the
+/// swarm, and only local if there is no swarm"): the CROSS-FAMILY swarm
+/// attempt. After the exact-profile path finds no peer, this walks the
+/// OTHER active profiles with live peers — the mixed-swarm case (e.g. a
+/// Qwen-hosting machine pulling from the DeepSeek cloud peers). Each
+/// target needs its own capability token (minted per turn from the
+/// registration lease in `lease.id`; the tracker's amended rule decides
+/// eligibility — a cloud stake grants every profile, hosting grants the
+/// hosted one). The reply is labeled with the serving peer AND the
+/// model that actually answered.
+#[allow(clippy::too_many_arguments)]
+async fn try_swarm_chat_cross(
+    inner: &tokio::sync::Mutex<Inner>,
+    tracker_url: &str,
+    data_dir: &std::path::Path,
+    telemetry: &std::sync::Arc<Telemetry>,
+    hosted_profile: &str,
+    log: &[ChatTurn],
+    max_tokens: Option<u32>,
+    temperature: f32,
+    on_delta: &(dyn Fn(&str) + Send + Sync),
+) -> Option<serde_json::Value> {
+    let tracker = match tracker_client(tracker_url, data_dir, telemetry).await {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    let own_peer_id = cached_identity(data_dir, telemetry)
+        .map(|i| i.peer_id())
+        .unwrap_or_default();
+    // The registration lease id (the node refreshes it each hosting
+    // session; the LAN proof reads the same file).
+    let registration_lease = std::fs::read_to_string(data_dir.join("lease.id"))
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())?;
+
+    let profiles = catalog::active_profiles(&tracker).await.ok()?;
+    for listing in profiles.iter().take(6) {
+        if listing.profile_id == hosted_profile {
+            continue;
+        }
+        let peers = match tracker.lookup(&listing.profile_id, 10).await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let Some(candidate) = peers.into_iter().find(|p| {
+            p.peer_id != own_peer_id
+                && p.free_slots > 0
+                && p.addresses.iter().any(|a| peer_addr_dialable(a))
+        }) else {
+            continue;
+        };
+        let Some(addr) = candidate.addresses.iter().find(|a| peer_addr_dialable(a)) else {
+            continue;
+        };
+        // The capability token for THIS profile (eligibility per the
+        // amended rule; a refusal just skips the profile honestly).
+        let token = match tracker
+            .request_lease(&registration_lease, &listing.profile_id)
+            .await
+        {
+            Ok(issued) => issued.lease,
+            Err(e) => {
+                telemetry.info(
+                    "chat.swarm.cross",
+                    &[
+                        ("profile", listing.profile_id.as_str()),
+                        ("phase", "lease"),
+                        ("error", &e.to_string()),
+                    ],
+                );
+                continue;
+            }
+        };
+        let remote_peer_id = candidate.peer_id.clone();
+        telemetry.info(
+            "chat.swarm.cross",
+            &[
+                ("peer", remote_peer_id.as_str()),
+                ("profile", listing.profile_id.as_str()),
+                ("model", listing.display_name.as_str()),
+            ],
+        );
+        let peer = modelswarm_node::remote::RemotePeer {
+            addr: addr.clone(),
+            peer_id: remote_peer_id.clone(),
+        };
+        let key = format!("{}|{}", listing.profile_id, peer.peer_id);
+        let remote = {
+            let mut inner_state = inner.lock().await;
+            match &inner_state.swarm_executor {
+                Some((k, exec)) if k == &key => std::sync::Arc::clone(exec),
+                _ => {
+                    let mut executor = modelswarm_node::remote::RemoteExecutor::new(
+                        peer,
+                        cached_identity(data_dir, telemetry).ok()?,
+                    );
+                    if let Some(tickets) = inner_state.relay_tickets.clone() {
+                        executor = executor.with_relay_tickets(tickets);
+                    }
+                    let exec = std::sync::Arc::new(executor);
+                    inner_state.swarm_executor = Some((key, std::sync::Arc::clone(&exec)));
+                    exec
+                }
+            }
+        };
+        let request = modelswarm_gateway::NormalizedRequest {
+            request_id: format!("chat-{}", modelswarm_identity::new_nonce()),
+            profile_id: listing.profile_id.clone(),
+            capability_token: Some(token),
+            messages: log
+                .iter()
+                .map(|t| modelswarm_gateway::NormalizedMessage {
+                    role: t.role.clone(),
+                    content: t.content.clone(),
+                })
+                .collect(),
+            sampling: modelswarm_gateway::Sampling {
+                temperature,
+                top_p: 1.0,
+                top_k: 40,
+                seed: None,
+            },
+            max_tokens: max_tokens.unwrap_or(256),
+            deadline_ms: 120_000,
+            stream: true,
+        };
+        use futures_util::StreamExt;
+        use modelswarm_gateway::{ExecutorEvent, InferenceExecutor};
+        use std::time::Instant;
+        let started = Instant::now();
+        let mut stream = remote.execute(request).await.ok()?;
+        let mut content = String::new();
+        let mut completion_tokens = 0u64;
+        let mut served = false;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                ExecutorEvent::TokenDelta { delta, .. } => {
+                    on_delta(&delta);
+                    content.push_str(&delta);
+                }
+                ExecutorEvent::Usage {
+                    completion_tokens: c,
+                    ..
+                } => completion_tokens = u64::from(c),
+                ExecutorEvent::Completed { .. } => {
+                    served = true;
+                    break;
+                }
+                ExecutorEvent::Error { code, .. } => {
+                    telemetry.warn(
+                        "chat.swarm.cross",
+                        &[
+                            ("peer", remote_peer_id.as_str()),
+                            ("phase", "serve"),
+                            ("error", code.as_str()),
+                        ],
+                    );
+                    break;
+                }
+                ExecutorEvent::Accepted { .. } => {}
+            }
+        }
+        if !served {
+            continue; // next profile — local remains the final fallback
+        }
+        let relayed = matches!(
+            remote.pooled_dial_path(),
+            Some(modelswarm_transport::libp2p_backend::DialPath::Relayed { .. })
+        );
+        let label = format!(
+            "swarm — remote peer {}…{} · {}",
+            remote_peer_id.chars().take(12).collect::<String>(),
+            if relayed { " (relayed)" } else { "" },
+            listing.display_name
+        );
+        let elapsed = started.elapsed().as_millis() as u64;
+        let tok_s = if elapsed > 0 && completion_tokens > 0 {
+            completion_tokens as f64 * 1000.0 / elapsed as f64
+        } else {
+            0.0
+        };
+        return Some(serde_json::json!({
+            "content": content.trim(),
+            "completion_tokens": completion_tokens,
+            "elapsed_ms": elapsed,
+            "tokens_per_second": tok_s,
+            "mode": label,
+            "served_by": "swarm",
+            "family_engage": { "engaged": false },
+        }));
+    }
+    None
 }
 
 /// Tiny helper: the raw body of an unrecognized error response, for the
@@ -7605,6 +7820,7 @@ mod tests {
             peer_metrics: None,
             license_accepted: true,
             artifact: None,
+            serving_mode_label: None,
             node: None,
             chat_log: Vec::new(),
             allow_swarm_pairing: true,

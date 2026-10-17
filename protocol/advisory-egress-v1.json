@@ -374,7 +374,8 @@
       "serving.completed": "excluded",
       "chat.receipt": "excluded",
       "host.autostart": "excluded",
-      "receipt.acked": "excluded"
+      "receipt.acked": "excluded",
+      "chat.swarm.cross": "excluded"
     }
   }
 }

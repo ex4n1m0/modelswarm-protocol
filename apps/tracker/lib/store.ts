@@ -355,6 +355,9 @@ export interface TrackerStore {
   insertProfile(rec: ProfileRecord): Promise<InsertProfileResult>;
   getProfile(profileId: string): Promise<ProfileRecord | null>;
   listProfiles(status?: ProfileStatus): Promise<ProfileRecord[]>;
+  /** Lifecycle status lever (admin/catalog/status): content stays
+   *  immutable (ADR-005) — status is candidate|active|deprecated. */
+  setProfileStatus(profileId: string, status: ProfileStatus): Promise<boolean>;
   promoteProfile(profileId: string): Promise<boolean>;
   catalogVersion(): Promise<number>;
 
@@ -921,6 +924,14 @@ export class MemoryStore implements TrackerStore {
       .filter((p) => !status || p.status === status)
       .sort((a, b) => (a.profileId < b.profileId ? -1 : 1));
     return out.map((p) => ({ ...p }));
+  }
+
+  async setProfileStatus(profileId: string, status: ProfileStatus): Promise<boolean> {
+    const rec = this.profiles.get(profileId);
+    if (!rec) return false;
+    rec.status = status;
+    this.version += 1;
+    return true;
   }
 
   async promoteProfile(profileId: string): Promise<boolean> {
@@ -1938,6 +1949,14 @@ export class PgStore implements TrackerStore {
       provenance: (row.provenance as Provenance | null) ?? undefined,
       createdAt: (row.created_at as Date).getTime(),
     }));
+  }
+
+  async setProfileStatus(profileId: string, status: ProfileStatus): Promise<boolean> {
+    const rows = await this.query(
+      `UPDATE model_profiles SET status = $2 WHERE profile_id = $1 RETURNING profile_id`,
+      [profileId, status],
+    );
+    return rows.length > 0;
   }
 
   async promoteProfile(profileId: string): Promise<boolean> {

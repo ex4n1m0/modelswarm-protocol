@@ -7,9 +7,12 @@ Read it, `docs/architecture.md`, and every ADR under `docs/adr/` **before** writ
 
 > An installation may consume swarm inference for model profile P only while it is
 > actively and verifiably hosting the same exact profile P with at least one
-> advertised serving slot — **or, since ADR-040 (owner ruling 2026-10-17), while it
-> is actively serving at least one cloud profile through a configured provider key
-> with an advertised slot (the cloud stake).**
+> advertised serving slot — **or, since ADR-042 (owner ruling 2026-10-17 night:
+> the capacity stake), while it is actively serving ANY profile (local or cloud)
+> with an advertised slot, in which case it may consume the swarm's cloud
+> profiles bounded by its machine's measured serving capacity (ADR-041 window/k,
+> receipt-anchored per ADR-042). ADR-040's provider-key stake is retired as a
+> consumption gate.**
 
 "Exact" means: same Hugging Face repository, full revision commit hash, GGUF filename,
 artifact SHA-256, quantization, context policy, and compatible pinned runtime — not
@@ -18,7 +21,9 @@ exact provider model id + context policy (no artifact digest exists). This rule 
 enforced at the tracker, at the requesting gateway, and at the serving peer. It is
 prototype-grade deterrence, not remote attestation (see `docs/threat-model.md`).
 Provider keys live ONLY in the desktop app — never in the hub, telemetry, or logs;
-fairness rules for the cloud stake are deferred to a future ratio ADR (ADR-040 §7).
+the capacity fairness rules are ADR-041 (window/k mechanics) + ADR-042 (measured
+per-machine anchor; cloud-lease enforcement on; cost protection explicitly NOT a
+protocol goal per the same owner ruling).
 
 ## Hard architectural constraints
 

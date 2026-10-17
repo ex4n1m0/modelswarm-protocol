@@ -3433,7 +3433,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-bench"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "async-trait",
  "ed25519-dalek 2.2.0",
@@ -3462,7 +3462,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-desktop"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "async-trait",
  "axum",
@@ -3493,7 +3493,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-eligibility"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3507,7 +3507,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-gateway"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "async-trait",
  "axum",
@@ -3525,7 +3525,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-identity"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -3541,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-node"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "async-trait",
  "axum",
@@ -3577,7 +3577,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-relay"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-runtime"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3621,7 +3621,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-scheduler"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "modelswarm-transport",
  "modelswarm-types",
@@ -3632,7 +3632,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-session"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3654,7 +3654,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-sim"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3672,11 +3672,11 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-speculation"
-version = "0.2.33"
+version = "0.2.34"
 
 [[package]]
 name = "modelswarm-store"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -3685,11 +3685,11 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-telemetry"
-version = "0.2.33"
+version = "0.2.34"
 
 [[package]]
 name = "modelswarm-tracker-api"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3704,7 +3704,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-transport"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3721,7 +3721,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-types"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "hex",
  "serde",

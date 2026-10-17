@@ -16,7 +16,8 @@ pub use gguf::{
     GgufIdentityHashes, GgufValue, TokenVocab,
 };
 pub use manifest::{
-    ArtifactHash, ManifestError, ModelProfileManifest, QuantizationDescriptor, RuntimeDescriptor,
+    ArtifactHash, CloudFamily, CloudManifestError, CloudProfileManifest, CloudProviderId,
+    CloudWire, ManifestError, ModelProfileManifest, QuantizationDescriptor, RuntimeDescriptor,
     SpecCapability, MANIFEST_SCHEMA_VERSION, PROFILE_ID_PREFIX,
 };
 

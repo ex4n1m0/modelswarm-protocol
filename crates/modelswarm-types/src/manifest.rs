@@ -442,6 +442,185 @@ impl ModelProfileManifest {
     }
 }
 
+/// The cloud-family manifest (ADR-040 §1): a cloud profile pins the
+/// provider, the provider's EXACT model id, and the context policy — no
+/// artifact exists to hash, the provider pins ARE the exactness. Same
+/// canonical-JSON profile-id derivation as the local family (keys sort,
+/// so only field names + values matter for cross-implementation parity
+/// with the tracker's TS derivation).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudProfileManifest {
+    schema_version: u16,
+    family: CloudFamily,
+    provider: CloudProviderId,
+    model: String,
+    context_tokens: u32,
+    max_output_tokens: u32,
+    wire: CloudWire,
+}
+
+/// The family discriminator (`"cloud"`; local manifests carry no field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloudFamily {
+    #[serde(rename = "cloud")]
+    Cloud,
+}
+
+/// The two default providers (ADR-040 §5; more need an owner gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloudProviderId {
+    #[serde(rename = "deepseek")]
+    DeepSeek,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+}
+
+/// The pinned request wire (the runtime analogue for cloud profiles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloudWire {
+    #[serde(rename = "openai-chat-v1")]
+    OpenAiChatV1,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloudManifestError {
+    BadSchemaVersion,
+    BadModelId,
+    BadContextTokens,
+    BadMaxOutputTokens,
+}
+
+impl fmt::Display for CloudManifestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CloudManifestError::BadSchemaVersion => write!(f, "schema_version must be 2"),
+            CloudManifestError::BadModelId => {
+                write!(
+                    f,
+                    "model id must be 1..=100 chars of [A-Za-z0-9._/-] starting alnum"
+                )
+            }
+            CloudManifestError::BadContextTokens => {
+                write!(f, "context_tokens out of range (1024..=2_000_000)")
+            }
+            CloudManifestError::BadMaxOutputTokens => {
+                write!(f, "max_output_tokens out of range (1..=1_000_000)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CloudManifestError {}
+
+impl CloudProfileManifest {
+    /// Field-for-field validating constructor, the local-family
+    /// discipline: `schema_version` is the constant, never a parameter.
+    pub fn new(
+        provider: CloudProviderId,
+        model: impl Into<String>,
+        context_tokens: u32,
+        max_output_tokens: u32,
+    ) -> Result<Self, CloudManifestError> {
+        let model = model.into();
+        if model.is_empty()
+            || model.len() > 100
+            || !model
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric())
+            || !model
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+        {
+            return Err(CloudManifestError::BadModelId);
+        }
+        if !(1024..=2_000_000).contains(&context_tokens) {
+            return Err(CloudManifestError::BadContextTokens);
+        }
+        if max_output_tokens == 0 || max_output_tokens > 1_000_000 {
+            return Err(CloudManifestError::BadMaxOutputTokens);
+        }
+        Ok(Self {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            family: CloudFamily::Cloud,
+            provider,
+            model,
+            context_tokens,
+            max_output_tokens,
+            wire: CloudWire::OpenAiChatV1,
+        })
+    }
+
+    /// Re-checks every invariant on a DESERIALIZED value (the catalog
+    /// layer calls this — deserialization alone is shape-only).
+    pub fn validated(self) -> Result<Self, CloudManifestError> {
+        if self.schema_version != MANIFEST_SCHEMA_VERSION {
+            return Err(CloudManifestError::BadSchemaVersion);
+        }
+        CloudProfileManifest::new(
+            self.provider,
+            self.model.clone(),
+            self.context_tokens,
+            self.max_output_tokens,
+        )?;
+        Ok(self)
+    }
+
+    /// The provider pin (read accessors; fields stay private like local).
+    pub fn provider(&self) -> CloudProviderId {
+        self.provider
+    }
+
+    /// The provider's exact model id.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Canonical JSON (sorted keys) — the derivation preimage.
+    pub fn canonical_json(&self) -> String {
+        let value = serde_json::to_value(self).expect("cloud manifest serializes to JSON");
+        crate::canonical::canonical_json(&value).expect("cloud manifests contain no floats")
+    }
+
+    /// Derives the profile id: `"msp1:" + hex(sha256(canonical_json))`.
+    pub fn derive_profile_id(&self) -> String {
+        let digest = Sha256::digest(self.canonical_json().as_bytes());
+        format!("{PROFILE_ID_PREFIX}{}", hex::encode(digest))
+    }
+}
+
+/// ADR-040: the Rust cloud derivation MUST reproduce the id the tracker
+/// (TS) derived for the live DeepSeek Chat (cloud) profile — the
+/// cross-implementation pin (both canonicalizations sort keys, so only
+/// field names + values may differ).
+#[test]
+fn cloud_manifest_derivation_matches_the_live_tracker_profile() {
+    let cloud = CloudProfileManifest::new(CloudProviderId::DeepSeek, "deepseek-chat", 65536, 8192)
+        .expect("valid cloud manifest");
+    assert_eq!(
+        cloud.derive_profile_id(),
+        "msp1:595bce607085cbde88a5e8a5ce26e06f686819a9deaaffd6d6346c01b172c1f0"
+    );
+}
+
+#[test]
+fn cloud_manifest_round_trips_and_rejects_unknown_fields() {
+    let cloud = CloudProfileManifest::new(
+        CloudProviderId::OpenRouter,
+        "meta-llama/llama-3.3-70b-instruct",
+        131072,
+        16384,
+    )
+    .expect("valid");
+    let json = serde_json::to_string(&cloud).unwrap();
+    let parsed: CloudProfileManifest = serde_json::from_str(&json).unwrap();
+    let back = parsed.validated().unwrap();
+    assert_eq!(back.derive_profile_id(), cloud.derive_profile_id());
+    let dirty = json.replace(",\"wire\":", ",\"not_a_field\":1,\"wire\":");
+    assert!(serde_json::from_str::<CloudProfileManifest>(&dirty).is_err());
+}
+
 fn valid_hf_repo(repo: &str) -> bool {
     let Some((org, name)) = repo.split_once('/') else {
         return false;

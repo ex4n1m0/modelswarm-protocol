@@ -6,18 +6,35 @@
 //! verification is an error — the client never trusts an unsigned catalog.
 
 use modelswarm_tracker_api::{TrackerClient, TrackerError};
-use modelswarm_types::ModelProfileManifest;
+use modelswarm_types::{CloudProfileManifest, ModelProfileManifest};
+
+pub use modelswarm_types::{CloudProviderId, CloudWire};
 
 /// Pinned hub public key (Ed25519, 64 lowercase hex). Rotation = re-release
 /// of the client (deployment.md rotation procedure).
 pub const HUB_PUBLIC_KEY_HEX: &str = include_str!("../../../protocol/keys/hub-public.hex");
 
-/// One active profile from the verified catalog.
+/// One active profile from the verified catalog — the LOCAL family
+/// (pinned artifact) or the CLOUD family (ADR-040: provider + exact
+/// model id + policy; no artifact exists).
 #[derive(Debug, Clone)]
 pub struct ProfileListing {
     pub profile_id: String,
     pub display_name: String,
-    pub manifest: ModelProfileManifest,
+    pub kind: ProfileKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProfileKind {
+    Local(Box<ModelProfileManifest>),
+    Cloud(Box<CloudProfileManifest>),
+}
+
+impl ProfileKind {
+    /// True for the cloud family (no download, key-backed serving).
+    pub fn is_cloud(&self) -> bool {
+        matches!(self, ProfileKind::Cloud(_))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,29 +67,54 @@ pub async fn active_profiles(tracker: &TrackerClient) -> Result<Vec<ProfileListi
             .and_then(|s| s.as_str())
             .unwrap_or(&profile_id)
             .to_string();
-        let manifest: ModelProfileManifest =
-            serde_json::from_value(profile.get("manifest").cloned().ok_or_else(|| {
-                CatalogError::InvalidEntry {
+        let manifest_value =
+            profile
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| CatalogError::InvalidEntry {
                     profile_id: profile_id.clone(),
                     message: "missing manifest".into(),
-                }
-            })?)
-            .map_err(|e| CatalogError::InvalidEntry {
-                profile_id: profile_id.clone(),
-                message: e.to_string(),
-            })?;
-        // Defense in depth: the id in the signed record must be the id the
-        // manifest derives (the tracker derives server-side, but verify).
-        if manifest.derive_profile_id() != profile_id {
-            return Err(CatalogError::InvalidEntry {
-                profile_id,
-                message: "profile_id does not match the manifest derivation".into(),
-            });
-        }
+                })?;
+        // Family dispatch (ADR-040): the cloud family carries the tag; the
+        // local family never did. Both parse STRICTLY and both derive the
+        // same canonical profile id — verified against the signed record.
+        let kind = if manifest_value.get("family").and_then(|f| f.as_str()) == Some("cloud") {
+            let cloud: CloudProfileManifest =
+                serde_json::from_value::<CloudProfileManifest>(manifest_value)
+                    .map_err(|e| CatalogError::InvalidEntry {
+                        profile_id: profile_id.clone(),
+                        message: e.to_string(),
+                    })?
+                    .validated()
+                    .map_err(|e| CatalogError::InvalidEntry {
+                        profile_id: profile_id.clone(),
+                        message: e.to_string(),
+                    })?;
+            if cloud.derive_profile_id() != profile_id {
+                return Err(CatalogError::InvalidEntry {
+                    profile_id,
+                    message: "profile_id does not match the cloud manifest derivation".into(),
+                });
+            }
+            ProfileKind::Cloud(Box::new(cloud))
+        } else {
+            let manifest: ModelProfileManifest =
+                serde_json::from_value(manifest_value).map_err(|e| CatalogError::InvalidEntry {
+                    profile_id: profile_id.clone(),
+                    message: e.to_string(),
+                })?;
+            if manifest.derive_profile_id() != profile_id {
+                return Err(CatalogError::InvalidEntry {
+                    profile_id,
+                    message: "profile_id does not match the manifest derivation".into(),
+                });
+            }
+            ProfileKind::Local(Box::new(manifest))
+        };
         out.push(ProfileListing {
             profile_id,
             display_name,
-            manifest,
+            kind,
         });
     }
     Ok(out)

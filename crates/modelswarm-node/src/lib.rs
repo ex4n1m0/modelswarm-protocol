@@ -50,6 +50,7 @@
 pub mod advisory;
 pub mod artifact;
 pub mod catalog;
+pub use modelswarm_types::ModelProfileManifest as LocalManifest;
 /// ADR-040 cloud executor: one OpenAI-compatible provider API behind the
 /// gateway's InferenceExecutor (DeepSeek, OpenRouter). Key discipline:
 /// the key is desktop-local, never logged, never hub-sent.

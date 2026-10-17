@@ -1637,6 +1637,21 @@ async fn tracker_client(
     Ok(Arc::new(client))
 }
 
+/// The LOCAL manifest of a listing, or the honest refusal for the cloud
+/// family (no artifact exists; cloud hosting/serving lands with C3 — the
+/// picker shows cloud models as next-release until then).
+fn local_manifest_of(
+    listing: &modelswarm_node::catalog::ProfileListing,
+) -> Result<&modelswarm_node::LocalManifest, String> {
+    match &listing.kind {
+        modelswarm_node::catalog::ProfileKind::Local(m) => Ok(m),
+        modelswarm_node::catalog::ProfileKind::Cloud(_) => Err(format!(
+            "{} is a cloud model: no download and no local hosting yet — cloud serving lands in the next release (ADR-040)",
+            listing.display_name
+        )),
+    }
+}
+
 /// Resolves a profile from the verified catalog: by id when given, else the
 /// first active one.
 async fn resolve_profile(
@@ -2020,6 +2035,10 @@ async fn get_status(
         // request 2026-10-12). Never a block on app usage.
         "updater": inner.updater.view(),
         "chat_turns": inner.chat_log.len(),
+        // ADR-040: which provider key is staged, if any — presence only;
+        // the key itself never crosses into the webview.
+        "cloud": read_cloud_key(&inner.data_dir)
+            .map(|r| serde_json::json!({ "provider": r.provider, "configured": true })),
         // ADR-037 §3.6 as rewired 2026-10-15: the assistant panel's
         // honest mode facts — which mode it is in and why (labels only;
         // the helper-identity banner text rides the panel, the reply
@@ -2327,8 +2346,9 @@ async fn list_models(
             .flatten()
             .map(|(_, _, bytes, _state)| serde_json::json!({ "bytes": bytes }))
             .or_else(|| {
+                let manifest = local_manifest_of(&p).ok()?;
                 manager
-                    .artifact_path(&p.manifest)
+                    .artifact_path(manifest)
                     .ok()
                     .filter(|path| path.exists())
                     .map(|_| serde_json::json!({ "bytes": 0 }))
@@ -2343,14 +2363,19 @@ async fn list_models(
                     .size_cache
                     .get(&p.profile_id)
                     .is_some_and(|(_, at)| now_ms.saturating_sub(*at) < SIZE_TTL_MS);
-                if fresh {
+                if p.kind.is_cloud() {
+                    // Cloud rows have no artifact to size (no download);
+                    // the picker renders the cloud marker instead.
+                    None
+                } else if fresh {
                     inner.size_cache.get(&p.profile_id).map(|(bytes, _)| *bytes)
                 } else {
+                    let manifest = local_manifest_of(&p).expect("non-cloud checked above");
                     let url = format!(
                         "https://huggingface.co/{}/resolve/{}/{}",
-                        p.manifest.hf_repo(),
-                        p.manifest.hf_revision(),
-                        p.manifest.artifact_hashes()[0].path(),
+                        manifest.hf_repo(),
+                        manifest.hf_revision(),
+                        manifest.artifact_hashes()[0].path(),
                     );
                     let bytes = artifact_size(&head_client, &url).await;
                     if let Some(bytes) = bytes {
@@ -2375,16 +2400,42 @@ async fn list_models(
         } else {
             None
         };
+        // ADR-040: cloud rows carry the family marker — the picker renders
+        // them as next-release (no download, key-backed when C3 lands);
+        // local rows keep their exact shape.
+        if p.kind.is_cloud() {
+            let cloud = match &p.kind {
+                modelswarm_node::catalog::ProfileKind::Cloud(c) => c,
+                _ => unreachable!(),
+            };
+            let provider = match cloud.provider() {
+                modelswarm_node::catalog::CloudProviderId::DeepSeek => "deepseek",
+                modelswarm_node::catalog::CloudProviderId::OpenRouter => "openrouter",
+            };
+            out.push(serde_json::json!({
+                "profile_id": p.profile_id,
+                "display_name": p.display_name,
+                "is_cloud": true,
+                "provider": provider,
+                "model": cloud.model(),
+                "downloaded": serde_json::json!({ "bytes": 0 }),
+                "hw": hw_json,
+                "fit": ranked.map(|(fit, _)| fit.label()),
+                "feasible": true,
+            }));
+            continue;
+        }
+        let manifest = local_manifest_of(&p)?;
         out.push(serde_json::json!({
             "profile_id": p.profile_id,
             "display_name": p.display_name,
-            "quantization": format!("{} ({} bit)", p.manifest.quantization().method(), p.manifest.quantization().bits()),
+            "quantization": format!("{} ({} bit)", manifest.quantization().method(), manifest.quantization().bits()),
             // Structured twins of the rendered quantization line (the
             // assistant panel's picker rows read these typed fields —
             // the signed catalog's method/bits, never a re-parse).
-            "quant_method": p.manifest.quantization().method(),
-            "quant_bits": p.manifest.quantization().bits(),
-            "runtime": p.manifest.runtime().version(),
+            "quant_method": manifest.quantization().method(),
+            "quant_bits": manifest.quantization().bits(),
+            "runtime": manifest.runtime().version(),
             "downloaded": downloaded,
             "hw": hw_json,
             "fit": ranked.map(|(fit, _)| fit.label()),
@@ -2760,7 +2811,7 @@ async fn download_model(
         modelswarm_store::Store::open(data_dir.join("state.sqlite")).map_err(|e| e.to_string())?,
     );
     let ensured = manager
-        .ensure_artifact(&profile.manifest, &store, |done, total| {
+        .ensure_artifact(local_manifest_of(&profile)?, &store, |done, total| {
             let _ = window.emit(
                 "download",
                 serde_json::json!({ "done": done, "total": total }),
@@ -2861,13 +2912,14 @@ async fn set_hosting_inner(
     )
     .await
     .map_err(|e| format!("catalog: {e}"))?;
+    let serving_manifest = local_manifest_of(&listing)?;
     let manager = ArtifactManager::new(&inner.data_dir);
     let store = std::sync::Mutex::new(
         modelswarm_store::Store::open(inner.data_dir.join("state.sqlite"))
             .map_err(|e| e.to_string())?,
     );
     let ensured = manager
-        .ensure_artifact(&listing.manifest, &store, |_, _| {})
+        .ensure_artifact(serving_manifest, &store, |_, _| {})
         .await
         .map_err(|e| format!("artifact: {e}"))?;
 
@@ -3104,7 +3156,10 @@ async fn set_hosting_inner(
     // peerId is derived inside the heartbeat task (ADR-020); the
     // installation_id stays a UI label.
     let profile_id = listing.profile_id.clone();
-    let build = listing.manifest.runtime().build_hash().to_string();
+    let build = local_manifest_of(&listing)?
+        .runtime()
+        .build_hash()
+        .to_string();
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
     let hb_data_dir = inner.data_dir.clone();
     let hb_telemetry = std::sync::Arc::clone(&state.telemetry);
@@ -3486,8 +3541,9 @@ async fn select_model(
     let store = std::sync::Mutex::new(
         modelswarm_store::Store::open(data_dir.join("state.sqlite")).map_err(|e| e.to_string())?,
     );
+    let swap_manifest = local_manifest_of(&listing)?;
     manager
-        .ensure_artifact(&listing.manifest, &store, |done, total| {
+        .ensure_artifact(swap_manifest, &store, |done, total| {
             let _ = window.emit(
                 "download",
                 serde_json::json!({ "done": done, "total": total }),
@@ -4990,6 +5046,60 @@ async fn try_family_verified_chat(
 /// placeholder, not ourselves), and asks it first. The REMOTE executor is
 /// driven directly — not through FailoverExecutor — so the reply's mode
 /// honestly says who served: a remote peer, or this node as a logged
+/// ADR-040 cloud key storage — the key lives ONLY here (a local file in
+/// the data dir, the relay.addr/identity.seed discipline): never in the
+/// webview beyond this command's call, never in telemetry, never sent to
+/// the hub. C3 (cloud serving) consumes it; v0.2.31 only stores it.
+fn cloud_key_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("cloud_key.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct CloudKeyRecord {
+    provider: String,
+    api_key: String,
+}
+
+#[tauri::command]
+async fn set_cloud_key(
+    state: tauri::State<'_, DesktopState>,
+    provider: String,
+    key: String,
+) -> Result<serde_json::Value, String> {
+    if !matches!(provider.as_str(), "deepseek" | "openrouter") {
+        return Err("provider must be deepseek or openrouter".into());
+    }
+    let key = key.trim().to_string();
+    if key.is_empty() || key.len() > 400 {
+        return Err("key must be 1..=400 characters".into());
+    }
+    let inner = state.inner.lock().await;
+    let rec = CloudKeyRecord {
+        provider,
+        api_key: key,
+    };
+    let json = serde_json::to_string(&rec).map_err(|e| e.to_string())?;
+    std::fs::write(cloud_key_path(&inner.data_dir), json).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "stored": true }))
+}
+
+#[tauri::command]
+async fn clear_cloud_key(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<serde_json::Value, String> {
+    let inner = state.inner.lock().await;
+    let _ = std::fs::remove_file(cloud_key_path(&inner.data_dir));
+    Ok(serde_json::json!({ "stored": false }))
+}
+
+/// Reads the stored cloud key record, if any ( Rust-side consumers only —
+/// the api_key never crosses into the webview).
+pub(crate) fn read_cloud_key(data_dir: &std::path::Path) -> Option<CloudKeyRecord> {
+    std::fs::read_to_string(cloud_key_path(data_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
 /// ADR-030 B3: POST one counter-signed receipt to the live B1 intake
 /// (`POST /events/job-result` with the full object) and record the job
 /// locally (`Store::record_job`'s first production caller). Best-effort
@@ -6362,6 +6472,8 @@ pub fn run() {
             resource_sample,
             download_model,
             set_hosting,
+            set_cloud_key,
+            clear_cloud_key,
             select_model,
             lookup_peers,
             family_probe,

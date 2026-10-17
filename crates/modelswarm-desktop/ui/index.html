@@ -548,6 +548,9 @@
         const selModel = models.find(m => m.selected);
         sel.innerHTML = '<option value="" disabled hidden' + (selModel ? "" : " selected") + '>choose a model…</option>'
           + models.map(m => {
+            if (m.is_cloud) {
+              return `<option value="${m.profile_id}" disabled>${m.display_name} — cloud · next release</option>`;
+            }
             const peers = m.peers == null ? "" : (m.peers >= 1 ? " · " + m.peers + (m.peers === 1 ? " peer" : " peers") : "");
             const dl = m.downloaded ? " · downloaded" : "";
             return `<option value="${m.profile_id}"${m.selected ? " selected" : ""}>${m.display_name} (${m.quantization})${peers}${dl}</option>`;
@@ -558,6 +561,18 @@
         sel.disabled = true;
       }
       $("model-cards").innerHTML = visible.map(m => {
+        if (m.is_cloud) {
+          // ADR-040: cloud models join the swarm via a provider key —
+          // visible now, selectable when cloud serving lands (next
+          // release). Honest marker, no fake download.
+          return `
+        <div class="card" style="opacity:0.75" aria-disabled="true">
+          <div><div class="name">${m.display_name}</div>
+               <div class="meta">cloud model · ${m.provider} ${m.model} · no download</div>
+               <div class="meta" style="margin-top:2px">joins via your ${m.provider} API key — next release</div></div>
+          <div class="action-row"><div class="meta">cloud</div><span class="meta" style="color:var(--muted)">coming soon</span></div>
+        </div>`;
+        }
         const running = hostingOn && m.selected;
         const badge = running
           ? `<span class="running-badge">● hosting</span>`

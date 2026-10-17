@@ -6207,7 +6207,7 @@ async fn send_chat(
 /// swarm, and only local if there is no swarm"): the CROSS-FAMILY swarm
 /// attempt. After the exact-profile path finds no peer, this walks the
 /// OTHER active profiles with live peers — the mixed-swarm case (e.g. a
-/// Qwen-hosting machine pulling from the DeepSeek cloud peers). Each
+/// local-family host pulling from the cloud-family peers). Each
 /// target needs its own capability token (minted per turn from the
 /// registration lease in `lease.id`; the tracker's amended rule decides
 /// eligibility — a cloud stake grants every profile, hosting grants the
@@ -6240,21 +6240,45 @@ async fn try_swarm_chat_cross(
         .filter(|s| !s.is_empty())?;
 
     let profiles = catalog::active_profiles(&tracker).await.ok()?;
-    for listing in profiles.iter().take(6) {
-        if listing.profile_id == hosted_profile {
-            continue;
-        }
-        let peers = match tracker.lookup(&listing.profile_id, 10).await {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let Some(candidate) = peers.into_iter().find(|p| {
-            p.peer_id != own_peer_id
-                && p.free_slots > 0
-                && p.addresses.iter().any(|a| peer_addr_dialable(a))
-        }) else {
-            continue;
-        };
+    // take(6) defect (found live 2026-10-17 night): the walk stopped at the
+    // catalog's first six id-sorted entries, and with 16 active profiles the
+    // family Qwen host sorts 15th — the mixed swarm silently never engaged
+    // while the owner watched local fallbacks with zero cross rows logged.
+    // Lookup EVERY other active profile concurrently (one round trip, not N
+    // sequential) and keep, in catalog order, only profiles with a live
+    // eligible peer; the walk cap now counts LIVE candidates, matching the
+    // handoff's stated intent ("other active profiles with live peers, ≤6").
+    let others: Vec<&catalog::ProfileListing> = profiles
+        .iter()
+        .filter(|listing| listing.profile_id != hosted_profile)
+        .collect();
+    let live: Vec<(&catalog::ProfileListing, modelswarm_tracker_api::PeerEntry)> = {
+        let lookups = others
+            .iter()
+            .map(|listing| tracker.lookup(&listing.profile_id, 10));
+        let results = futures_util::future::join_all(lookups).await;
+        others
+            .iter()
+            .zip(results)
+            .filter_map(|(listing, result)| {
+                let candidate = result.ok()?.into_iter().find(|p| {
+                    p.peer_id != own_peer_id
+                        && p.free_slots > 0
+                        && p.addresses.iter().any(|a| peer_addr_dialable(a))
+                })?;
+                Some((*listing, candidate))
+            })
+            .collect()
+    };
+    telemetry.info(
+        "chat.swarm.cross",
+        &[
+            ("phase", "scan"),
+            ("profiles", &others.len().to_string()),
+            ("live", &live.len().to_string()),
+        ],
+    );
+    for (listing, candidate) in live.into_iter().take(6) {
         let Some(addr) = candidate.addresses.iter().find(|a| peer_addr_dialable(a)) else {
             continue;
         };
@@ -6334,7 +6358,23 @@ async fn try_swarm_chat_cross(
         use modelswarm_gateway::{ExecutorEvent, InferenceExecutor};
         use std::time::Instant;
         let started = Instant::now();
-        let mut stream = remote.execute(request).await.ok()?;
+        // A dial/carrier failure here is pre-first-token: try the NEXT live
+        // candidate honestly instead of abandoning the cross walk entirely
+        // (the old `.ok()?` returned None on the first candidate's failure).
+        let mut stream = match remote.execute(request).await {
+            Ok(s) => s,
+            Err(e) => {
+                telemetry.warn(
+                    "chat.swarm.cross",
+                    &[
+                        ("peer", remote_peer_id.as_str()),
+                        ("phase", "dial"),
+                        ("error", &e.to_string()),
+                    ],
+                );
+                continue;
+            }
+        };
         let mut content = String::new();
         let mut completion_tokens = 0u64;
         let mut served = false;

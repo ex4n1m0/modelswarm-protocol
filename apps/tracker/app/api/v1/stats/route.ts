@@ -16,11 +16,14 @@ export async function GET(req: Request) {
   if (!ctx.limiter.hit(`public:${ip}`, ctx.limits.publicPerIp)) {
     return jsonError(429, "rate_limited", "rate limit exceeded", true);
   }
-  const [peersOnline, byProfile, downloads] = await Promise.all([
+  const [peersOnline, byProfile, downloads, clientsServed] = await Promise.all([
     ctx.store.countOnlinePeers(),
     ctx.store.countOnlinePeersByProfile(),
     ctx.store.downloadCounts(),
+    ctx.store.clientServesTotal(),
   ]);
   const models = Object.entries(byProfile).map(([profileId, peers]) => ({ profileId, peers }));
-  return jsonOk({ peersOnline, models, downloads });
+  // clientsServed: every installer download (any OS) + every self-update
+  // counts as one client served (owner directive 2026-10-17).
+  return jsonOk({ peersOnline, models, downloads, clientsServed });
 }

@@ -284,6 +284,11 @@ export interface TrackerStore {
   bumpDownloadCount(file: string): Promise<number>;
   /** All download counters (public, for the website buttons). */
   downloadCounts(): Promise<Record<string, number>>;
+  /** Owner directive 2026-10-17: the unified CLIENT counter — every
+   *  installer download (any OS) AND every self-update artifact fetch
+   *  counts as exactly one client served (updates pull the versioned
+   *  artifact through the same counted route). */
+  clientServesTotal(): Promise<number>;
   /** Authoritative audit epoch for a peer (0 default). Leases pin the epoch at
    *  registration; sweeps bump this counter only (ADR-012). */
   peerEpoch(peerId: string): Promise<number>;
@@ -658,6 +663,12 @@ export class MemoryStore implements TrackerStore {
     const out: Record<string, number> = {};
     for (const [file, entry] of this.downloads) out[file] = entry.count;
     return out;
+  }
+
+  async clientServesTotal(): Promise<number> {
+    let total = 0;
+    for (const entry of this.downloads.values()) total += entry.count;
+    return total;
   }
 
   async countOnlinePeersByProfile(): Promise<Record<string, number>> {
@@ -1477,6 +1488,14 @@ export class PgStore implements TrackerStore {
       [file],
     );
     return Number((rows[0] as { count: string | number }).count);
+  }
+
+  async clientServesTotal(): Promise<number> {
+    const rows = await this.query(
+      `SELECT COALESCE(SUM(count), 0) AS total FROM download_counts`,
+      [],
+    );
+    return Number((rows[0] as { total: string | number }).total);
   }
 
   async downloadCounts(): Promise<Record<string, number>> {

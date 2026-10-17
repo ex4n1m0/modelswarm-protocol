@@ -177,6 +177,9 @@ export default function Home() {
               Models other peers are hosting right now — picking one of
               these means the swarm can cooperate from your first session.
             </p>
+            <p className="note" id="clients-served" style={{ marginTop: "0.5rem" }}>
+              &nbsp;
+            </p>
           </div>
         </section>
 
@@ -293,8 +296,14 @@ export default function Home() {
     try {
       const r = await fetch('/api/v1/stats');
       if (!r.ok) throw 0;
-      ({ peersOnline } = await r.json());
+      ({ peersOnline, clientsServed } = await r.json());
       badge.textContent = peersOnline + (peersOnline === 1 ? ' peer online' : ' peers online');
+      const served = document.getElementById('clients-served');
+      if (served && Number.isFinite(clientsServed)) {
+        served.textContent = clientsServed + (clientsServed === 1
+          ? ' client served so far (installer downloads and automatic updates, all operating systems, each count as one).'
+          : ' clients served so far (installer downloads and automatic updates, all operating systems, each count as one).');
+      }
     } catch { badge.textContent = '— online'; }
     try {
       const [s, c] = await Promise.all([fetch('/api/v1/stats'), fetch('/api/v1/catalog')]);

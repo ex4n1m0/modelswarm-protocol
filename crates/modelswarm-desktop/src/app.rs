@@ -230,6 +230,10 @@ struct Inner {
     /// an opted-out peer refuses pin carriers with the honest
     /// `content_carriage_refused` reject.
     allow_content_carriage: bool,
+    /// ADR-042 §5: the cross-family cross-check gate (config.json
+    /// `allow_cross_check`, DEFAULT ON). Startup-config snapshot — the
+    /// opt-out is a config flip + restart, never a hosting restart.
+    allow_cross_check: bool,
     /// The cohort size of the most recent ELECTED family-verified turn
     /// (the §3.1 disclosure's N — the ACTUAL count for that turn, bounded
     /// by the preset cohort cap and the budget's `max_endpoints`; 1 in
@@ -519,6 +523,7 @@ impl DesktopState {
                 chat_log: Vec::new(),
                 allow_swarm_pairing: config.allow_swarm_pairing,
                 allow_content_carriage: config.allow_content_carriage,
+                allow_cross_check: config.allow_cross_check,
                 #[cfg(feature = "verifydrafts")]
                 last_family_cohort: None,
                 #[cfg(feature = "verifydrafts")]
@@ -602,6 +607,15 @@ struct PersistedConfig {
     /// contradict the setting).
     #[serde(default = "default_allow_content_carriage")]
     allow_content_carriage: bool,
+    /// ADR-042 §5 (owner ruling 2026-10-17 night — "all models cross
+    /// check answers and work as one"): the cross-family Verified
+    /// preset. Every completed chat reply is offered to a DIFFERENT
+    /// model in the swarm for a greedy, bounded, best-effort
+    /// cross-check; the label names the checker and its verdict, and
+    /// the answer itself is NEVER rewritten. DEFAULT ON; every failure
+    /// engages honestly (reason surfaced, the chat never errors).
+    #[serde(default = "default_allow_cross_check")]
+    allow_cross_check: bool,
     /// ADR-036 §3.1/§3.3: the REQUESTER-side election for
     /// family-verified chat — DEFAULT OFF. Election is the USER's choice
     /// (only the serving side is default-on): while elected, chat turns
@@ -622,6 +636,10 @@ struct PersistedConfig {
 }
 
 fn default_assistant_enabled() -> bool {
+    true
+}
+
+fn default_allow_cross_check() -> bool {
     true
 }
 
@@ -649,6 +667,7 @@ impl Default for PersistedConfig {
             profile_id: None,
             allow_swarm_pairing: default_allow_swarm_pairing(),
             allow_content_carriage: default_allow_content_carriage(),
+            allow_cross_check: default_allow_cross_check(),
             assistant_acknowledged: false,
             assistant_enabled: default_assistant_enabled(),
         }
@@ -6072,6 +6091,37 @@ async fn send_chat(
                     });
                 }
                 reply["served_by"] = serde_json::json!("swarm");
+                // ADR-042 §5: cross-check every completed reply with a
+                // DIFFERENT model in the swarm (best-effort, honest label,
+                // never rewrites). The answering profile rides the cross
+                // reply; the exact-profile path served the chat profile.
+                {
+                    let (allow_cross, cross_tracker_url, cross_data_dir) = {
+                        let inner_g = state.inner.lock().await;
+                        (
+                            inner_g.allow_cross_check,
+                            inner_g.tracker_url.clone(),
+                            inner_g.data_dir.clone(),
+                        )
+                    };
+                    if allow_cross {
+                        let served_profile = reply
+                            .get("served_profile")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(profile.as_str())
+                            .to_string();
+                        try_cross_check(
+                            &state.inner,
+                            &cross_tracker_url,
+                            &cross_data_dir,
+                            &state.telemetry,
+                            &mut reply,
+                            &served_profile,
+                            &request_log,
+                        )
+                        .await;
+                    }
+                }
                 return Ok(reply);
             }
         }
@@ -6165,7 +6215,7 @@ async fn send_chat(
                 }
             }
         }
-        return finish_local_turn(
+        let mut local_reply = finish_local_turn(
             &state,
             started,
             log,
@@ -6173,7 +6223,33 @@ async fn send_chat(
             completion_tokens,
             stream_error,
         )
-        .await;
+        .await?;
+        // ADR-042 §5: the local path (own engine or own cloud key) gets
+        // the same cross-check — a different swarm model verifies the
+        // reply when one is reachable.
+        {
+            let (allow_cross, cross_tracker_url, cross_data_dir) = {
+                let inner_g = state.inner.lock().await;
+                (
+                    inner_g.allow_cross_check,
+                    inner_g.tracker_url.clone(),
+                    inner_g.data_dir.clone(),
+                )
+            };
+            if allow_cross {
+                try_cross_check(
+                    &state.inner,
+                    &cross_tracker_url,
+                    &cross_data_dir,
+                    &state.telemetry,
+                    &mut local_reply,
+                    &profile,
+                    &request_log,
+                )
+                .await;
+            }
+        }
+        return Ok(local_reply);
     }
 
     // A gateway error body (engine crash, restart budget exhausted,
@@ -6239,42 +6315,21 @@ async fn try_swarm_chat_cross(
         .ok()
         .filter(|s| !s.is_empty())?;
 
-    let profiles = catalog::active_profiles(&tracker).await.ok()?;
     // take(6) defect (found live 2026-10-17 night): the walk stopped at the
     // catalog's first six id-sorted entries, and with 16 active profiles the
     // family Qwen host sorts 15th — the mixed swarm silently never engaged
     // while the owner watched local fallbacks with zero cross rows logged.
-    // Lookup EVERY other active profile concurrently (one round trip, not N
-    // sequential) and keep, in catalog order, only profiles with a live
-    // eligible peer; the walk cap now counts LIVE candidates, matching the
-    // handoff's stated intent ("other active profiles with live peers, ≤6").
-    let others: Vec<&catalog::ProfileListing> = profiles
-        .iter()
-        .filter(|listing| listing.profile_id != hosted_profile)
-        .collect();
-    let live: Vec<(&catalog::ProfileListing, modelswarm_tracker_api::PeerEntry)> = {
-        let lookups = others
-            .iter()
-            .map(|listing| tracker.lookup(&listing.profile_id, 10));
-        let results = futures_util::future::join_all(lookups).await;
-        others
-            .iter()
-            .zip(results)
-            .filter_map(|(listing, result)| {
-                let candidate = result.ok()?.into_iter().find(|p| {
-                    p.peer_id != own_peer_id
-                        && p.free_slots > 0
-                        && p.addresses.iter().any(|a| peer_addr_dialable(a))
-                })?;
-                Some((*listing, candidate))
-            })
-            .collect()
-    };
+    // The shared scan (below) looks up EVERY other active profile
+    // concurrently (one round trip, not N sequential) and keeps, in catalog
+    // order, only profiles with a live eligible peer; the walk cap counts
+    // LIVE candidates, matching the handoff's stated intent ("other active
+    // profiles with live peers, ≤6").
+    let (live, scanned) = live_cross_candidates(&tracker, &own_peer_id, hosted_profile).await;
     telemetry.info(
         "chat.swarm.cross",
         &[
             ("phase", "scan"),
-            ("profiles", &others.len().to_string()),
+            ("profiles", &scanned.to_string()),
             ("live", &live.len().to_string()),
         ],
     );
@@ -6432,10 +6487,297 @@ async fn try_swarm_chat_cross(
             "tokens_per_second": tok_s,
             "mode": label,
             "served_by": "swarm",
-            "family_engage": { "engaged": false },
+            // ADR-042 §5: the answering profile id rides the reply so the
+            // cross-check pass can exclude the answering model as verifier.
+            "served_profile": listing.profile_id,
+            "family_engage": { "engaged": false, "reason": "cross_family_single_peer" },
         }));
     }
     None
+}
+
+/// Shared cross-family roster scan (the 2026-10-17 take(6) fix): every
+/// OTHER active catalog profile, each looked up concurrently (one round
+/// trip, not N sequential), kept in catalog order when some live
+/// eligible peer (not us, free slots, a dialable address) hosts it.
+/// Returns (live candidates, count of other profiles scanned). Used by
+/// the cross-family chat walk and the ADR-042 §5 cross-check verifier
+/// pick alike.
+async fn live_cross_candidates(
+    tracker: &modelswarm_tracker_api::TrackerClient,
+    own_peer_id: &str,
+    exclude_profile: &str,
+) -> (
+    Vec<(catalog::ProfileListing, modelswarm_tracker_api::PeerEntry)>,
+    usize,
+) {
+    let profiles = match catalog::active_profiles(tracker).await {
+        Ok(p) => p,
+        Err(_) => return (Vec::new(), 0),
+    };
+    let others: Vec<&catalog::ProfileListing> = profiles
+        .iter()
+        .filter(|listing| listing.profile_id != exclude_profile)
+        .collect();
+    let scanned = others.len();
+    let lookups = others
+        .iter()
+        .map(|listing| tracker.lookup(&listing.profile_id, 10));
+    let results = futures_util::future::join_all(lookups).await;
+    let live = others
+        .iter()
+        .zip(results)
+        .filter_map(|(listing, result)| {
+            let candidate = result.ok()?.into_iter().find(|p| {
+                p.peer_id != own_peer_id
+                    && p.free_slots > 0
+                    && p.addresses.iter().any(|a| peer_addr_dialable(a))
+            })?;
+            Some(((*listing).clone(), candidate))
+        })
+        .collect();
+    (live, scanned)
+}
+
+/// The ADR-042 §5 verification prompt: strict, greedy-contract shaped
+/// (the pairing-draft discipline — an exact reply format the verifier
+/// must follow), bounded inputs so the verifier cost stays fixed.
+pub(crate) fn cross_check_prompt(user_turn: &str, draft_answer: &str) -> String {
+    let user: String = user_turn.chars().take(2000).collect();
+    let draft: String = draft_answer.chars().take(4000).collect();
+    format!(
+        "You are the independent verifier in a model swarm. A different \
+         model answered a user's message. Check that answer for factual \
+         errors, contradictions with the question, and wrong refusals. Do \
+         not rewrite it and do not answer the question yourself. Reply \
+         with EXACTLY one first line, in English:\nVERDICT: CONFIRMED\nor\
+         \nVERDICT: DISAGREE — one short reason\nThen stop.\n\nUSER \
+         MESSAGE:\n{user}\n\nANSWER TO CHECK:\n{draft}"
+    )
+}
+
+/// Parses the verifier's reply. Returns (verdict, reason) with verdict
+/// one of "confirmed" | "disagree" | "inconclusive". Tolerates preamble
+/// text before the verdict line and any reason language after the dash.
+pub(crate) fn parse_cross_check_verdict(reply: &str) -> (&'static str, Option<String>) {
+    for line in reply.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.to_ascii_lowercase().strip_prefix("verdict:") {
+            let rest = rest.trim();
+            if rest.starts_with("confirmed") {
+                return ("confirmed", None);
+            }
+            if rest.starts_with("disagree") {
+                let reason = rest
+                    .trim_start_matches("disagree")
+                    .trim()
+                    .trim_start_matches(['—', '-', ':'])
+                    .trim()
+                    .to_string();
+                let reason = if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason)
+                };
+                return ("disagree", reason);
+            }
+            return ("inconclusive", Some(trimmed.to_string()));
+        }
+    }
+    ("inconclusive", None)
+}
+
+/// ADR-042 §5 — the cross-family cross-check (the owner's "all models
+/// cross check answers and work as one" ruling, 2026-10-17 night). After
+/// a completed chat reply, ONE different model in the swarm (never the
+/// profile that answered, never ourselves) re-reads the question and the
+/// draft under a greedy, bounded, best-effort contract and returns a
+/// verdict. The reply's label gains " · cross-checked by <model>
+/// (<verdict>)"; the ANSWER IS NEVER REWRITTEN. Every failure engages
+/// honestly as `cross_check: {engaged:false, reason}` and never errors
+/// the chat — this is a disclosure surface, not a gate.
+#[allow(clippy::too_many_arguments)]
+async fn try_cross_check(
+    inner: &tokio::sync::Mutex<Inner>,
+    tracker_url: &str,
+    data_dir: &std::path::Path,
+    telemetry: &std::sync::Arc<Telemetry>,
+    reply: &mut serde_json::Value,
+    served_profile: &str,
+    request_log: &[ChatTurn],
+) {
+    let content = reply["content"].as_str().unwrap_or_default().to_string();
+    if content.trim().is_empty() || reply.get("error").is_some() {
+        reply["cross_check"] = serde_json::json!({ "engaged": false, "reason": "no_reply" });
+        return;
+    }
+    let last_user = request_log
+        .iter()
+        .rev()
+        .find(|t| t.role == "user")
+        .map(|t| t.content.clone())
+        .unwrap_or_default();
+    if last_user.trim().is_empty() {
+        reply["cross_check"] = serde_json::json!({ "engaged": false, "reason": "no_user_turn" });
+        return;
+    }
+    let tracker = match tracker_client(tracker_url, data_dir, telemetry).await {
+        Ok(t) => t,
+        Err(e) => {
+            reply["cross_check"] =
+                serde_json::json!({ "engaged": false, "reason": "tracker_unavailable" });
+            telemetry.warn("chat.crosscheck", &[("phase", "tracker"), ("error", &e)]);
+            return;
+        }
+    };
+    let own_peer_id = cached_identity(data_dir, telemetry)
+        .map(|i| i.peer_id())
+        .unwrap_or_default();
+    let registration_lease = std::fs::read_to_string(data_dir.join("lease.id"))
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty());
+    let Some(registration_lease) = registration_lease else {
+        reply["cross_check"] = serde_json::json!({ "engaged": false, "reason": "no_lease" });
+        return;
+    };
+    let (live, _scanned) = live_cross_candidates(&tracker, &own_peer_id, served_profile).await;
+    let Some((listing, candidate)) = live.into_iter().next() else {
+        reply["cross_check"] =
+            serde_json::json!({ "engaged": false, "reason": "no_verifier_peer" });
+        return;
+    };
+    let Some(addr) = candidate.addresses.iter().find(|a| peer_addr_dialable(a)) else {
+        reply["cross_check"] =
+            serde_json::json!({ "engaged": false, "reason": "no_dialable_addr" });
+        return;
+    };
+    // The verifier's capability token (the ADR-042 capacity stake grants
+    // it; a refusal engages honestly and the chat is already served).
+    let token = match tracker
+        .request_lease(&registration_lease, &listing.profile_id)
+        .await
+    {
+        Ok(issued) => issued.lease,
+        Err(e) => {
+            reply["cross_check"] =
+                serde_json::json!({ "engaged": false, "reason": "lease_refused" });
+            telemetry.info(
+                "chat.crosscheck",
+                &[
+                    ("phase", "lease"),
+                    ("profile", listing.profile_id.as_str()),
+                    ("error", &e.to_string()),
+                ],
+            );
+            return;
+        }
+    };
+    let peer = modelswarm_node::remote::RemotePeer {
+        addr: addr.clone(),
+        peer_id: candidate.peer_id.clone(),
+    };
+    let key = format!("{}|{}", listing.profile_id, peer.peer_id);
+    let remote = {
+        let mut inner_state = inner.lock().await;
+        match &inner_state.swarm_executor {
+            Some((k, exec)) if k == &key => std::sync::Arc::clone(exec),
+            _ => {
+                let mut executor = modelswarm_node::remote::RemoteExecutor::new(
+                    peer,
+                    match cached_identity(data_dir, telemetry) {
+                        Ok(i) => i,
+                        Err(_) => {
+                            reply["cross_check"] =
+                                serde_json::json!({ "engaged": false, "reason": "identity" });
+                            return;
+                        }
+                    },
+                );
+                if let Some(tickets) = inner_state.relay_tickets.clone() {
+                    executor = executor.with_relay_tickets(tickets);
+                }
+                let exec = std::sync::Arc::new(executor);
+                inner_state.swarm_executor = Some((key, std::sync::Arc::clone(&exec)));
+                exec
+            }
+        }
+    };
+    let request = modelswarm_gateway::NormalizedRequest {
+        request_id: format!("crosscheck-{}", modelswarm_identity::new_nonce()),
+        profile_id: listing.profile_id.clone(),
+        capability_token: Some(token),
+        messages: vec![modelswarm_gateway::NormalizedMessage {
+            role: "user".into(),
+            content: cross_check_prompt(&last_user, &content),
+        }],
+        sampling: modelswarm_gateway::Sampling {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 40,
+            seed: None,
+        },
+        max_tokens: 96,
+        deadline_ms: 20_000,
+        stream: true,
+    };
+    use futures_util::StreamExt;
+    use modelswarm_gateway::{ExecutorEvent, InferenceExecutor};
+    let mut stream = match remote.execute(request).await {
+        Ok(s) => s,
+        Err(e) => {
+            reply["cross_check"] = serde_json::json!({ "engaged": false, "reason": "dial_failed" });
+            telemetry.warn(
+                "chat.crosscheck",
+                &[
+                    ("peer", candidate.peer_id.as_str()),
+                    ("phase", "dial"),
+                    ("error", &e.to_string()),
+                ],
+            );
+            return;
+        }
+    };
+    let mut verdict_reply = String::new();
+    while let Some(ev) = stream.next().await {
+        match ev {
+            ExecutorEvent::TokenDelta { delta, .. } => verdict_reply.push_str(&delta),
+            ExecutorEvent::Completed { .. } => break,
+            ExecutorEvent::Error { code, .. } => {
+                telemetry.warn(
+                    "chat.crosscheck",
+                    &[
+                        ("peer", candidate.peer_id.as_str()),
+                        ("phase", "serve"),
+                        ("error", code.as_str()),
+                    ],
+                );
+                break;
+            }
+            ExecutorEvent::Usage { .. } | ExecutorEvent::Accepted { .. } => {}
+        }
+    }
+    let (verdict, reason) = parse_cross_check_verdict(&verdict_reply);
+    let started_note = format!("cross-checked by {} ({})", listing.display_name, verdict);
+    if let Some(mode) = reply["mode"].as_str() {
+        reply["mode"] = serde_json::json!(format!("{mode} · {started_note}"));
+    }
+    reply["cross_check"] = serde_json::json!({
+        "engaged": true,
+        "by": listing.display_name,
+        "peer": candidate.peer_id.chars().take(12).collect::<String>(),
+        "verdict": verdict,
+        "reason": reason,
+    });
+    telemetry.info(
+        "chat.crosscheck",
+        &[
+            ("peer", candidate.peer_id.as_str()),
+            ("profile", listing.profile_id.as_str()),
+            ("model", listing.display_name.as_str()),
+            ("verdict", verdict),
+        ],
+    );
 }
 
 /// Tiny helper: the raw body of an unrecognized error response, for the
@@ -7865,6 +8207,7 @@ mod tests {
             chat_log: Vec::new(),
             allow_swarm_pairing: true,
             allow_content_carriage: true,
+            allow_cross_check: true,
             #[cfg(feature = "verifydrafts")]
             last_family_cohort: None,
             #[cfg(feature = "verifydrafts")]
@@ -9148,5 +9491,89 @@ mod tests {
                 assert!(line.contains("\"event\":\"assistant."), "{line}");
             }
         }
+    }
+
+    // ADR-042 §5 — the cross-family cross-check contract.
+    #[test]
+    fn cross_check_verdict_parses_confirmed_disagree_and_inconclusive() {
+        // The exact contract shape, alone.
+        assert_eq!(
+            parse_cross_check_verdict("VERDICT: CONFIRMED"),
+            ("confirmed", None)
+        );
+        // Preamble before the verdict line is tolerated (models like to
+        // think out loud despite the greedy pin).
+        assert_eq!(
+            parse_cross_check_verdict("Let me check.\nVERDICT: CONFIRMED\nextra text after"),
+            ("confirmed", None)
+        );
+        // Disagree with the reason after an em dash; any reason language
+        // rides along verbatim.
+        assert_eq!(
+            parse_cross_check_verdict("VERDICT: DISAGREE — 2+2 is 4, not 5"),
+            ("disagree", Some("2+2 is 4, not 5".to_string()))
+        );
+        assert_eq!(
+            parse_cross_check_verdict("VERDICT: DISAGREE — 答案计算错误"),
+            ("disagree", Some("答案计算错误".to_string()))
+        );
+        // Plain-dash and colon reason separators (defensive).
+        assert_eq!(
+            parse_cross_check_verdict("VERDICT: DISAGREE: wrong date"),
+            ("disagree", Some("wrong date".to_string()))
+        );
+        assert_eq!(
+            parse_cross_check_verdict("VERDICT: DISAGREE"),
+            ("disagree", None)
+        );
+        // Unparseable / empty verifier output never fabricates a verdict.
+        assert_eq!(parse_cross_check_verdict(""), ("inconclusive", None));
+        assert_eq!(
+            parse_cross_check_verdict("I think the answer looks fine."),
+            ("inconclusive", None)
+        );
+        // A malformed verdict line is inconclusive WITH the line kept for
+        // the disclosure surface.
+        assert_eq!(
+            parse_cross_check_verdict("VERDICT: MAYBE"),
+            ("inconclusive", Some("VERDICT: MAYBE".to_string()))
+        );
+    }
+
+    #[test]
+    fn cross_check_prompt_is_bounded_and_carries_the_contract() {
+        let long_user: String = "用户 ".repeat(4000);
+        let long_draft: String = "answer ".repeat(4000);
+        let prompt = cross_check_prompt(&long_user, &long_draft);
+        // The fixed contract is present verbatim (the greedy shape the
+        // verifier must follow), and both inputs are char-truncated to
+        // their bounds so verifier cost stays fixed regardless of turn
+        // length.
+        assert!(prompt.contains("VERDICT: CONFIRMED"));
+        assert!(prompt.contains("VERDICT: DISAGREE"));
+        assert!(prompt.contains("USER MESSAGE:\n"));
+        assert!(prompt.contains("ANSWER TO CHECK:\n"));
+        let user_part = prompt
+            .split("USER MESSAGE:\n")
+            .nth(1)
+            .unwrap()
+            .split("\n\nANSWER TO CHECK:")
+            .next()
+            .unwrap();
+        assert!(
+            user_part.chars().count() <= 2000,
+            "{}",
+            user_part.chars().count()
+        );
+        let draft_part = prompt.split("ANSWER TO CHECK:\n").nth(1).unwrap();
+        assert!(
+            draft_part.chars().count() <= 4000,
+            "{}",
+            draft_part.chars().count()
+        );
+        // Short inputs ride through untouched.
+        let short = cross_check_prompt("hi", "hello");
+        assert!(short.contains("USER MESSAGE:\nhi\n"));
+        assert!(short.ends_with("ANSWER TO CHECK:\nhello"));
     }
 }

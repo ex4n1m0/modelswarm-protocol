@@ -176,6 +176,7 @@
       <ul style="margin:6px 0 10px;padding-left:20px;font-size:12.5px">
         <li>No telemetry by default; diagnostics export is opt-in and excludes prompt/completion content.</li>
         <li>Cooperative modes deliver the prompt to the whole micro-swarm roster (mode + peer count shown before each request).</li>
+        <li>Cross-check (on by default): after each reply, a different model in the swarm re-reads the question and the answer and returns a verdict shown on the reply label — the answer itself is never rewritten (config: allow_cross_check).</li>
       </ul>
       <button id="accept-btn">I understand — activate this installation</button>
     </div>
@@ -1185,8 +1186,17 @@
             ? ` · family: verified by cohort ${r.family_engage.cohort ?? 1} (slower by design)`
             : ` · family: not engaged (${r.family_engage.reason || "?"})`
           : "";
+        // ADR-042 §5 cross-check disclosure: a DIFFERENT model in the
+        // swarm verified the reply (never rewrites it). Verdicts:
+        // confirmed / disagree (reason shown) / inconclusive; honest
+        // not-engaged reason when no verifier was reachable.
+        const ccNote = r.cross_check
+          ? r.cross_check.engaged
+            ? ` · cross-checked by ${r.cross_check.by ?? "peer"} (${r.cross_check.verdict ?? "?"}${r.cross_check.reason ? `: ${r.cross_check.reason}` : ""})`
+            : ` · cross-check: not engaged (${r.cross_check.reason || "unavailable"})`
+          : "";
         const tempNote = temperature > 0 ? ` · temp ${temperature.toFixed(2)}` : "";
-        const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms${tempNote}${famNote}`;
+        const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms${tempNote}${famNote}${ccNote}`;
         if (r.error) addMsg("assistant", `⚠ local engine failed (${r.error.code}) — ${r.error.message || "see Diagnostics/logs/node.jsonl"}. Restart hosting or try another model.`, meta);
         else if (r.content) addMsg("assistant", r.content, meta);
         else addMsg("assistant", "(no reply — the model ended its turn before the first token; rephrase the message and send again)", meta);

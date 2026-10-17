@@ -43,6 +43,14 @@ export async function POST(req: Request) {
   }
 
   const now = ctx.now();
+  // ADR-012: suspension is PEER-keyed — a fresh registration cannot escape
+  // it. The clamped lease stores 0 slots (the 0005 CHECK allows it); the
+  // remembered count restores when the backoff window ages out. Aged-out
+  // rows clear right here (row-aging, no background process).
+  await ctx.store.recoverSuspensionIfDue(body.peerId, now);
+  const suspension = await ctx.store.getSuspension(body.peerId);
+  const effectiveSlots =
+    suspension && suspension.untilAt > now ? 0 : body.maxSlots;
   const leaseId = randomId128();
   const lease: LeaseRecord = {
     leaseId,
@@ -52,8 +60,8 @@ export async function POST(req: Request) {
     expiresAt: now + LEASE_TTL_MS,
     profiles: body.profiles,
     addresses: body.addresses,
-    maxSlots: body.maxSlots,
-    freeSlots: body.maxSlots,
+    maxSlots: effectiveSlots,
+    freeSlots: effectiveSlots,
     queueMs: 0,
     draining: false,
     capacityClass: "cpu",

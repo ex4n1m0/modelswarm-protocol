@@ -172,7 +172,7 @@ describe("D7 timing plausibility at challenge/complete", () => {
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe("invalid_body");
   });
 
-  it("rejects firstTokenMs > totalMs and leaves the challenge open", async () => {
+  it("rejects firstTokenMs > totalMs, finalizes it failed (ADR-012 invalid tick); an honest retry starts fresh", async () => {
     const who = await enroll(rig, "198.51.100.68");
     const { leaseId } = await register(rig, who, [profileId]);
     const { challengeId } = (await (await start(who, leaseId, profileId)).json()) as {
@@ -181,8 +181,16 @@ describe("D7 timing plausibility at challenge/complete", () => {
     const res = await complete(who, leaseId, profileId, challengeId, { firstTokenMs: 900, totalMs: 500 });
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe("invalid_body");
-    // the challenge stays open for an honest retry
-    const retry = await complete(who, leaseId, profileId, challengeId, { firstTokenMs: 100, totalMs: 500 });
+    // ADR-012 suspension wiring: an implausible completion is an
+    // 'invalid'-class failure — the challenge finalizes failed (the
+    // 3-strike window provides the grace, not challenge re-use); an
+    // honest retry starts a FRESH challenge and passes.
+    const ch = await rig.store.getChallenge(challengeId);
+    expect(ch?.outcome).toBe("failed");
+    expect(ch?.failureClass).toBe("invalid");
+    const retryOpen = await (await start(who, leaseId, profileId)).json() as { challengeId: string };
+    expect(retryOpen.challengeId).not.toBe(challengeId);
+    const retry = await complete(who, leaseId, profileId, retryOpen.challengeId, { firstTokenMs: 100, totalMs: 500 });
     expect(retry.status).toBe(200);
   });
 

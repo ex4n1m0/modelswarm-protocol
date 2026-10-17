@@ -4,6 +4,7 @@ import { leaseBindingError } from "@/lib/leases";
 import { HeartbeatSchema } from "@/lib/schemas";
 import { LEASE_TTL_MS } from "@/lib/constants";
 import { issueRelayAdmissionTicket } from "@/lib/relay-ticket";
+import { evaluateSuspension } from "@/lib/suspension";
 
 // POST /api/v1/peers/heartbeat (msp-v1 §3.3): extends the lease (row-aging
 // TTL), records an observation, and drains revocation notices (delete-on-read).
@@ -27,6 +28,11 @@ export async function POST(req: Request) {
   const lease = await ctx.store.getLease(body.leaseId);
   const binding = leaseBindingError(lease, installationId, now);
   if (binding || !lease) return binding ?? jsonOk({});
+
+  // ADR-012 suspension evaluation rides the regular touch: expired-open
+  // challenges become failures, an aged-out suspension recovers, a new
+  // threshold breach suspends (the notice drains below).
+  const suspension = await evaluateSuspension(ctx, lease, now);
 
   const expiresAt = now + LEASE_TTL_MS;
   await ctx.store.updateLease(body.leaseId, {
@@ -64,5 +70,6 @@ export async function POST(req: Request) {
     relayTicket: relayTicket.token,
     relayAddr,
     notices,
+    suspendedUntilAt: suspension ? new Date(suspension.untilAt).toISOString() : null,
   });
 }

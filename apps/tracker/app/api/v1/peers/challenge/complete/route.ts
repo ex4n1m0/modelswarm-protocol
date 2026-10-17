@@ -41,17 +41,23 @@ export async function POST(req: Request) {
     return jsonError(403, "forbidden", "challenge already finalized");
   }
   if (now > challenge.deadlineAt) {
+    // ADR-012: a late completion is a 'timeout'-class failure — the peer
+    // held the challenge past its deadline either way.
+    await ctx.store.failChallenge(body.challengeId, "timeout", now);
     return jsonError(403, "forbidden", "challenge deadline exceeded");
   }
 
   // Plausibility (audit T1/§4-A): a zero-duration completion or a first
   // token after the total is not credible telemetry. These reject obvious
   // fabrications; they do NOT make the numbers verified (see D7 note above).
+  // ADR-012: an implausible completion is an 'invalid'-class failure.
   const { firstTokenMs, totalMs } = body.timings;
   if (totalMs <= 0) {
+    await ctx.store.failChallenge(body.challengeId, "invalid", now);
     return jsonError(400, "invalid_body", "timings.totalMs must be > 0");
   }
   if (firstTokenMs > totalMs) {
+    await ctx.store.failChallenge(body.challengeId, "invalid", now);
     return jsonError(400, "invalid_body", "timings.firstTokenMs must be <= timings.totalMs");
   }
 

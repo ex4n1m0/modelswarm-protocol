@@ -45,6 +45,11 @@ export async function POST(req: Request) {
     );
   }
 
+  // ADR-012: expired-open challenges on this lease become 'timeout'
+  // failures BEFORE the open-challenge reuse below — an ignored challenge
+  // can never be re-handed out past its deadline (and it already counts).
+  await ctx.store.failExpiredChallenges(body.leaseId, now);
+
   const open = await ctx.store.getOpenChallenge(body.leaseId, body.profileId);
   const challengeId = open?.challengeId ?? randomId128();
   const prompt = buildChallengePrompt(challengeId, canaryDigest);

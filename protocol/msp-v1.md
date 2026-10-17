@@ -113,7 +113,7 @@ installation**; referencing another installation's lease is `401 unauthorized`.
 |---|---|---|
 | `POST /peers/challenge/start` | `{leaseId, profileId}` | `{challengeId, challengePrompt, deadlineAt}`; one open challenge per lease+profile. `challengePrompt` is **nonce-bound** (D16, gate 2026-10-09 / ADR-028 §7): `"ModelSwarm readiness challenge <challengeId>"`, plus `"; greedy-canary sha256:<64hex>"` when the profile has a pinned possession digest (hash-only, content-blind; construction byte-pinned by `protocol/vectors/challenge-prompt-1.json`) |
 | `POST /peers/register` | `{peerId, addresses:[multiaddr], profiles:[profileId…], maxSlots, runtime:{name,build}}` | `{leaseId, leaseExpiresAt}` |
-| `POST /peers/heartbeat` | `{leaseId, activeProfiles:[profileId…], freeSlots, queueMs, draining:bool}` | `{leaseExpiresAt, relayTicket, relayAddr, notices:[Notice]}` (below; `relayTicket` is the §5a admission ticket string, issued on every successful heartbeat — ADR-038; `relayAddr` is the operator-configured community relay multiaddr or the empty string, deploy-order additive — ADR-039) |
+| `POST /peers/heartbeat` | `{leaseId, activeProfiles:[profileId…], freeSlots, queueMs, draining:bool}` | `{leaseExpiresAt, relayTicket, relayAddr, notices:[Notice], suspendedUntilAt}` (below; `relayTicket` is the §5a admission ticket string, issued on every successful heartbeat — ADR-038; `relayAddr` is the operator-configured community relay multiaddr or the empty string, deploy-order additive — ADR-039; `suspendedUntilAt` is null on every healthy heartbeat, ISO timestamp while ADR-012 suspension holds this peer's slots at zero — deploy-order additive) |
 | `POST /peers/drain` | `{leaseId}` | `{draining:true}` |
 | `POST /peers/challenge/complete` | `{leaseId, profileId, challengeId, timings:{firstTokenMs, totalMs}}` | `{passed, challengeId, capacityClass}`; token issuance moved to `/peers/lease` (ADR-012) |
 | `POST /peers/lease` | `{leaseId, profileId}` | `{token, lease}` — the hub-signed EligibilityLease (§5; ADR-012) |
@@ -138,6 +138,7 @@ Heartbeat cadence 15–30 s; lease TTL 60–90 s; expiry is row-aging, no timers
 { "type": "revoked_peers", "peerIds": ["12D3Koo…"] }
 { "type": "revoked_tokens", "tokenNonces": ["…"] }
 { "type": "catalog_update", "catalogVersion": 18 }
+{ "type": "suspended", "untilAt": "2026-10-17T…Z", "reason": "challenge_failures" }
 ```
 
 Serving peers must stop serving/accepting anything named in a notice
@@ -425,6 +426,7 @@ undocumented amendments.
 (content-blind counters and installer downloads). They are NOT protocol
 endpoints, carry no peer state, and may change with the website without an
 ADR (ADR-028 §1).
+| 2026-10-17 | ADR-012 (suspension wiring) | §3.3 Notice gains `suspended` and heartbeat gains `suspendedUntilAt` (both deploy-order additive). Suspension is peer-keyed (re-registration cannot escape it): 3 challenge failures in a trailing 24 h window zero the peer's slots for an escalating backoff (15 m · 1 h · 6 h · 24 h cap); expired-open challenges sweep to `failed` lazily on touch (row-aging); recovery restores the remembered slot count when the window ages out |
 | 2026-10-17 | ADR-030 B3 | the requester half in production: the remote executor counter-signs the completed receipt, returns `receipt_ack` on the stream (the serving loop survives the frame and telemeters it), and the requester POSTs the counter-signed object to `/events/job-result` — granted accounting rows move (self-work and sybil rings excluded at intake) |
 | 2026-10-16 | ADR-030 B2 | §6 message table gains the `receipt_ack` row (the §7 reservation implemented); `completed` now carries jobReceipt on the wire |
 | 2026-10-16 | ADR-030 (receipts v2) | §7 gains the additive ReceiptV2 object + the frozen receiptDigest preimage rule (the production wire landing follows) |

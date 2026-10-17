@@ -126,6 +126,17 @@ export interface ChallengeRecord {
   firstTokenMs: number | null;
   totalMs: number | null;
   completedAt: number | null;
+  /** ADR-012 suspension forensics: which class ended a 'failed' challenge. */
+  failureClass?: "timeout" | "invalid" | null;
+}
+
+/** Peer-keyed suspension state (ADR-012; migration 0005). */
+export interface SuspensionRecord {
+  peerId: string;
+  untilAt: number;
+  reason: string;
+  suspensionCount: number;
+  prevMaxSlots: number;
 }
 
 /** EligibilityLease / capability token record (ADR-006 + ADR-012). */
@@ -153,7 +164,9 @@ export type TokenAuthority =
 export type Notice =
   | { type: "revoked_peers"; peerIds: string[] }
   | { type: "revoked_tokens"; tokenNonces: string[] }
-  | { type: "catalog_update"; catalogVersion: number };
+  | { type: "catalog_update"; catalogVersion: number }
+  /** ADR-012 suspension propagation (msp-v1 §3.3; migration 0005). */
+  | { type: "suspended"; untilAt: string; reason: string };
 
 export interface RendezvousItem {
   fromPeerId: string;
@@ -288,6 +301,27 @@ export interface TrackerStore {
     completedAt: number,
   ): Promise<boolean>;
   getPassedChallenge(leaseId: string, profileId: string): Promise<ChallengeRecord | null>;
+  // -- ADR-012 suspension (migration 0005) -----------------------------------
+  /** Marks one open challenge failed with its class (invalid completions). */
+  failChallenge(challengeId: string, failureClass: "timeout" | "invalid", at: number): Promise<boolean>;
+  /** Row-aging sweep: open challenges past deadline become failed('timeout'). */
+  failExpiredChallenges(leaseId: string, now: number): Promise<number>;
+  /** The peer's failed challenges inside [since, now] (across ALL leases). */
+  recentChallengeFailures(
+    peerId: string,
+    sinceMs: number,
+    nowMs: number,
+  ): Promise<{ failureClass: "timeout" | "invalid"; at: number }[]>;
+  getSuspension(peerId: string): Promise<SuspensionRecord | null>;
+  /** Persists the suspension AND clamps the peer's lease rows to 0 slots. */
+  applySuspension(state: SuspensionRecord, now: number): Promise<void>;
+  /** Aged-out suspension: restores slots; KEEPS the row (escalation
+   *  memory) with until_at in the past until redemption clears it. */
+  recoverSuspensionIfDue(peerId: string, now: number): Promise<void>;
+  /** Full redemption / aged-out memory: the row is deleted entirely. */
+  clearSuspension(peerId: string, now: number): Promise<void>;
+  /** The peer's newest passed challenge (redemption evidence), if any. */
+  lastChallengePassAt(peerId: string): Promise<number | null>;
 
   // -- capability tokens / eligibility leases --------------------------------
   recordToken(rec: TokenRecord): Promise<void>;
@@ -375,6 +409,7 @@ export class MemoryStore implements TrackerStore {
   private downloads = new Map<string, { count: number; lastAt: number }>();
   private leases = new Map<string, LeaseRecord>();
   private challenges = new Map<string, ChallengeRecord>();
+  private suspensions = new Map<string, SuspensionRecord>();
   private tokens = new Map<string, TokenRecord>();
   private profiles = new Map<string, ProfileRecord>();
   private modelRequests = new Map<number, ModelRequestRecord>();
@@ -584,11 +619,15 @@ export class MemoryStore implements TrackerStore {
     for (const rec of this.leases.values()) {
       if (!this.isLive(rec, now)) continue;
       if (filter.profileId && !rec.profiles.includes(filter.profileId)) continue;
+      // ADR-012: an actively suspended peer reports ZERO free slots no
+      // matter what its heartbeats claim (the roster is the swarm's truth).
+      const suspended = this.suspensions.get(rec.peerId);
+      const freeSlots = suspended && suspended.untilAt > now ? 0 : rec.freeSlots;
       out.push({
         peerId: rec.peerId,
         addresses: [...rec.addresses],
         queueMs: rec.queueMs,
-        freeSlots: rec.freeSlots,
+        freeSlots,
         leaseExpiresAt: rec.expiresAt,
         lastSeenAt: rec.lastSeenAt,
         capacityClass: rec.capacityClass,
@@ -692,6 +731,103 @@ export class MemoryStore implements TrackerStore {
       }
     }
     return null;
+  }
+
+  async failChallenge(challengeId: string, failureClass: "timeout" | "invalid", at: number): Promise<boolean> {
+    const rec = this.challenges.get(challengeId);
+    if (!rec || rec.outcome !== "open") return false;
+    rec.outcome = "failed";
+    rec.failureClass = failureClass;
+    rec.completedAt = failureClass === "invalid" ? at : null;
+    return true;
+  }
+
+  async failExpiredChallenges(leaseId: string, now: number): Promise<number> {
+    let marked = 0;
+    for (const rec of this.challenges.values()) {
+      if (rec.leaseId === leaseId && rec.outcome === "open" && now > rec.deadlineAt) {
+        rec.outcome = "failed";
+        rec.failureClass = "timeout";
+        rec.completedAt = null;
+        marked += 1;
+      }
+    }
+    return marked;
+  }
+
+  async recentChallengeFailures(
+    peerId: string,
+    sinceMs: number,
+    nowMs: number,
+  ): Promise<{ failureClass: "timeout" | "invalid"; at: number }[]> {
+    const leaseIds = new Set(
+      [...this.leases.values()].filter((l) => l.peerId === peerId).map((l) => l.leaseId),
+    );
+    const out: { failureClass: "timeout" | "invalid"; at: number }[] = [];
+    for (const rec of this.challenges.values()) {
+      if (!leaseIds.has(rec.leaseId) || rec.outcome !== "failed") continue;
+      // 'when': the deadline for ignored challenges, the completion for
+      // invalid ones (matching the Pg SQL below).
+      const at = rec.failureClass === "invalid" ? (rec.completedAt ?? rec.deadlineAt) : rec.deadlineAt;
+      if (at >= sinceMs && at <= nowMs) {
+        out.push({ failureClass: rec.failureClass ?? "timeout", at });
+      }
+    }
+    return out;
+  }
+
+  async getSuspension(peerId: string): Promise<SuspensionRecord | null> {
+    const rec = this.suspensions.get(peerId);
+    return rec ? { ...rec } : null;
+  }
+
+  async applySuspension(state: SuspensionRecord, _now: number): Promise<void> {
+    this.suspensions.set(state.peerId, { ...state });
+    for (const rec of this.leases.values()) {
+      if (rec.peerId === state.peerId && rec.maxSlots > 0) {
+        rec.maxSlots = 0;
+        rec.freeSlots = 0;
+      }
+    }
+  }
+
+  async recoverSuspensionIfDue(peerId: string, now: number): Promise<void> {
+    const rec = this.suspensions.get(peerId);
+    if (!rec || rec.untilAt > now) return;
+    for (const lease of this.leases.values()) {
+      if (lease.peerId === peerId && lease.maxSlots === 0) {
+        lease.maxSlots = rec.prevMaxSlots;
+        lease.freeSlots = Math.min(lease.freeSlots, rec.prevMaxSlots);
+      }
+    }
+    // The row stays (suspension_count = escalation memory) with a spent
+    // window; clearSuspension removes it on redemption or window-empty.
+    rec.untilAt = now - 1;
+  }
+
+  async clearSuspension(peerId: string, _now: number): Promise<void> {
+    const rec = this.suspensions.get(peerId);
+    this.suspensions.delete(peerId);
+    if (!rec) return;
+    for (const lease of this.leases.values()) {
+      if (lease.peerId === peerId && lease.maxSlots === 0) {
+        lease.maxSlots = rec.prevMaxSlots;
+        lease.freeSlots = Math.min(lease.freeSlots, rec.prevMaxSlots);
+      }
+    }
+  }
+
+  async lastChallengePassAt(peerId: string): Promise<number | null> {
+    const leaseIds = new Set(
+      [...this.leases.values()].filter((l) => l.peerId === peerId).map((l) => l.leaseId),
+    );
+    let newest: number | null = null;
+    for (const rec of this.challenges.values()) {
+      if (leaseIds.has(rec.leaseId) && rec.outcome === "passed" && rec.completedAt !== null) {
+        newest = Math.max(newest ?? 0, rec.completedAt);
+      }
+    }
+    return newest;
   }
 
   async recordToken(rec: TokenRecord): Promise<void> {
@@ -1285,18 +1421,23 @@ export class PgStore implements TrackerStore {
 
   async listPeers(filter: { profileId?: string; limit: number }): Promise<PeerView[]> {
     const rows = await this.query(
-      `SELECT * FROM peer_leases
-       WHERE expires_at > $1 AND draining = false
-         AND ($2::text IS NULL OR profiles @> to_jsonb(ARRAY[$2::text]))
-       ORDER BY peer_id ASC
-       LIMIT $3`,
+      `SELECT l.*, s.until_at AS suspended_until
+         FROM peer_leases l
+         LEFT JOIN peer_suspensions s ON s.peer_id = l.peer_id AND s.until_at > $1::timestamptz
+        WHERE l.expires_at > $1 AND l.draining = false
+          AND ($2::text IS NULL OR l.profiles @> to_jsonb(ARRAY[$2::text]))
+        ORDER BY l.peer_id ASC
+        LIMIT $3`,
       [PgStore.iso(this.clock()), filter.profileId ?? null, filter.limit],
     );
     return (rows as Record<string, unknown>[]).map((row) => ({
       peerId: row.peer_id as string,
       addresses: row.addresses as string[],
       queueMs: row.queue_ms as number,
-      freeSlots: row.free_slots as number,
+      // ADR-012: actively suspended peers roster at zero free slots.
+      freeSlots: row.suspended_until === null || row.suspended_until === undefined
+        ? (row.free_slots as number)
+        : 0,
       leaseExpiresAt: (row.expires_at as Date).getTime(),
       lastSeenAt: (row.last_heartbeat_at as Date).getTime(),
       capacityClass: row.capacity_class as CapacityClass,
@@ -1375,6 +1516,9 @@ export class PgStore implements TrackerStore {
     );
   }
 
+  // (failure_class persists via failChallenge/failExpiredChallenges only —
+  // challenges are never created in a failed state.)
+
   private static rowToChallenge(row: Record<string, unknown>): ChallengeRecord {
     return {
       challengeId: row.challenge_id as string,
@@ -1390,6 +1534,7 @@ export class PgStore implements TrackerStore {
       firstTokenMs: row.first_token_ms === null ? null : Number(row.first_token_ms),
       totalMs: row.total_ms === null ? null : Number(row.total_ms),
       completedAt: row.completed_at === null ? null : (row.completed_at as Date).getTime(),
+      failureClass: (row.failure_class as "timeout" | "invalid" | null) ?? null,
     };
   }
 
@@ -1440,6 +1585,129 @@ export class PgStore implements TrackerStore {
     const rec = PgStore.rowToChallenge(row as Record<string, unknown>);
     if (this.clock() > rec.deadlineAt + 60_000) return null;
     return rec;
+  }
+
+  async failChallenge(challengeId: string, failureClass: "timeout" | "invalid", at: number): Promise<boolean> {
+    const rows = await this.query(
+      `UPDATE hosting_challenges
+         SET outcome = 'failed', failure_class = $2,
+             completed_at = CASE WHEN $2 = 'invalid' THEN $3::timestamptz ELSE NULL END
+       WHERE challenge_id = $1 AND outcome = 'open'
+       RETURNING challenge_id`,
+      [challengeId, failureClass, PgStore.iso(at)],
+    );
+    return rows.length > 0;
+  }
+
+  async failExpiredChallenges(leaseId: string, now: number): Promise<number> {
+    const rows = await this.query(
+      `UPDATE hosting_challenges
+         SET outcome = 'failed', failure_class = 'timeout', completed_at = NULL
+       WHERE lease_id = $1 AND outcome = 'open' AND deadline_at < $2::timestamptz
+       RETURNING challenge_id`,
+      [leaseId, PgStore.iso(now)],
+    );
+    return rows.length;
+  }
+
+  async recentChallengeFailures(
+    peerId: string,
+    sinceMs: number,
+    nowMs: number,
+  ): Promise<{ failureClass: "timeout" | "invalid"; at: number }[]> {
+    const rows = await this.query(
+      `SELECT c.failure_class,
+              COALESCE(c.completed_at, c.deadline_at) AS at
+         FROM hosting_challenges c
+         JOIN peer_leases l ON l.lease_id = c.lease_id
+        WHERE l.peer_id = $1 AND c.outcome = 'failed'
+          AND COALESCE(c.completed_at, c.deadline_at) BETWEEN $2::timestamptz AND $3::timestamptz`,
+      [peerId, PgStore.iso(sinceMs), PgStore.iso(nowMs)],
+    );
+    return (rows as Record<string, unknown>[]).map((row) => ({
+      failureClass: (row.failure_class as "timeout" | "invalid") ?? "timeout",
+      at: (row.at as Date).getTime(),
+    }));
+  }
+
+  private static rowToSuspension(row: Record<string, unknown>): SuspensionRecord {
+    return {
+      peerId: row.peer_id as string,
+      untilAt: (row.until_at as Date).getTime(),
+      reason: row.reason as string,
+      suspensionCount: Number(row.suspension_count),
+      prevMaxSlots: Number(row.prev_max_slots),
+    };
+  }
+
+  async getSuspension(peerId: string): Promise<SuspensionRecord | null> {
+    const rows = await this.query(
+      `SELECT * FROM peer_suspensions WHERE peer_id = $1`,
+      [peerId],
+    );
+    const row = rows[0];
+    return row ? PgStore.rowToSuspension(row as Record<string, unknown>) : null;
+  }
+
+  async applySuspension(state: SuspensionRecord, now: number): Promise<void> {
+    await this.query(
+      `INSERT INTO peer_suspensions (peer_id, until_at, reason, suspension_count, prev_max_slots, suspended_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (peer_id) DO UPDATE
+         SET until_at = $2, reason = $3, suspension_count = $4,
+             prev_max_slots = GREATEST(peer_suspensions.prev_max_slots, $5)`,
+      [state.peerId, PgStore.iso(state.untilAt), state.reason, state.suspensionCount, state.prevMaxSlots, PgStore.iso(now)],
+    );
+    await this.query(
+      `UPDATE peer_leases SET max_slots = 0, free_slots = 0
+       WHERE peer_id = $1 AND max_slots > 0`,
+      [state.peerId],
+    );
+  }
+
+  async recoverSuspensionIfDue(peerId: string, now: number): Promise<void> {
+    const rows = await this.query(
+      `UPDATE peer_suspensions
+          SET until_at = $2::timestamptz - make_interval(secs => 1)
+        WHERE peer_id = $1 AND until_at <= $2::timestamptz
+        RETURNING prev_max_slots`,
+      [peerId, PgStore.iso(now)],
+    );
+    const row = rows[0] as Record<string, unknown> | undefined;
+    if (!row) return;
+    await this.query(
+      `UPDATE peer_leases
+         SET max_slots = $2, free_slots = LEAST(free_slots, $2)
+       WHERE peer_id = $1 AND max_slots = 0`,
+      [peerId, Number(row.prev_max_slots)],
+    );
+  }
+
+  async clearSuspension(peerId: string, _now: number): Promise<void> {
+    const rows = await this.query(
+      `DELETE FROM peer_suspensions WHERE peer_id = $1 RETURNING prev_max_slots`,
+      [peerId],
+    );
+    const row = rows[0] as Record<string, unknown> | undefined;
+    if (!row) return;
+    await this.query(
+      `UPDATE peer_leases
+         SET max_slots = $2, free_slots = LEAST(free_slots, $2)
+       WHERE peer_id = $1 AND max_slots = 0`,
+      [peerId, Number(row.prev_max_slots)],
+    );
+  }
+
+  async lastChallengePassAt(peerId: string): Promise<number | null> {
+    const rows = await this.query(
+      `SELECT MAX(c.completed_at) AS newest
+         FROM hosting_challenges c
+         JOIN peer_leases l ON l.lease_id = c.lease_id
+        WHERE l.peer_id = $1 AND c.outcome = 'passed' AND c.completed_at IS NOT NULL`,
+      [peerId],
+    );
+    const row = rows[0] as Record<string, unknown> | undefined;
+    return row && row.newest !== null ? (row.newest as Date).getTime() : null;
   }
 
   async recordToken(rec: TokenRecord): Promise<void> {

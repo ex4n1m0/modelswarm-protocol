@@ -34,6 +34,16 @@ export async function POST(req: Request) {
   if (await ctx.store.isPeerBlocked(lease.peerId)) {
     return jsonError(403, "forbidden", "peer is blocked");
   }
+  // ADR-012 suspension (row-aging: an aged-out window recovers right here).
+  await ctx.store.recoverSuspensionIfDue(lease.peerId, now);
+  const suspension = await ctx.store.getSuspension(lease.peerId);
+  if (suspension && suspension.untilAt > now) {
+    return jsonError(
+      403,
+      "ineligible",
+      `peer is suspended until ${new Date(suspension.untilAt).toISOString()} (${suspension.reason})`,
+    );
+  }
   if (lease.maxSlots < 1) {
     return jsonError(403, "ineligible", "no serving slot available");
   }

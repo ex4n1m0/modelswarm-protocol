@@ -163,6 +163,12 @@ pub struct Notice {
     pub token_nonces: Vec<String>,
     #[serde(default, rename = "catalogVersion")]
     pub catalog_version: Option<u64>,
+    /// ADR-012 suspension notice (deploy-order additive): when `kind` is
+    /// "suspended", the backoff window's end and the bounded reason.
+    #[serde(default, rename = "untilAt")]
+    pub until_at: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +192,11 @@ pub struct HeartbeatResponse {
     /// `relay.addr` file wins over this value.
     #[serde(default, rename = "relayAddr")]
     pub relay_addr: String,
+    /// ADR-012 suspension (deploy-order additive): non-null while this
+    /// peer's serving slots are suspended to zero — the honest status the
+    /// node surfaces; null on every healthy heartbeat.
+    #[serde(default, rename = "suspendedUntilAt")]
+    pub suspended_until_at: Option<String>,
     #[serde(default)]
     pub notices: Vec<Notice>,
 }

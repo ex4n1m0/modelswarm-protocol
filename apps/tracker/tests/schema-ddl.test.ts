@@ -3,12 +3,18 @@
 
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const ddlPath = join(here, "..", "migrations", "0001_init.sql");
+// Every migration is parsed (A2/A3 must hold across the whole schema as it
+// evolves, not just the initial file — 0005 added the suspension columns).
+const migrationsDir = join(here, "..", "migrations");
+const ddlFiles = readdirSync(migrationsDir)
+  .filter((f) => f.endsWith(".sql"))
+  .sort();
+const ddlPath = join(migrationsDir, "0001_init.sql");
 
 interface Column {
   table: string;
@@ -23,6 +29,21 @@ function parseColumns(sql: string): Column[] {
   for (const rawLine of sql.split(/\r?\n/)) {
     const line = rawLine.replace(/--.*$/, "").trim();
     if (line.length === 0) continue;
+    // ALTER COLUMN overrides (since 0006): the rules govern the CUMULATIVE
+    // schema — a later TYPE change wins over the CREATE's original type.
+    const alterMatch =
+      /^ALTER\s+TABLE\s+([a-z_]+)\s+ALTER\s+COLUMN\s+([a-z_][a-z0-9_]*)\s+TYPE\s+([a-z_]+(?:\s*\([^)]*\))?)/i.exec(
+        line,
+      );
+    if (alterMatch) {
+      const target = columns.find(
+        (c) => c.table === alterMatch[1] && c.name === alterMatch[2]!.toLowerCase(),
+      );
+      if (target) target.type = alterMatch[3]!.replace(/\s+/g, "");
+      continue;
+    }
+    // Any other ALTER (constraint swaps, index drops) shapes no column.
+    if (/^ALTER\b/i.test(line)) continue;
     const createMatch = /^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z_]+)/i.exec(line);
     if (createMatch) {
       table = createMatch[1]!;
@@ -44,7 +65,11 @@ function parseColumns(sql: string): Column[] {
   return columns;
 }
 
-const columns = parseColumns(readFileSync(ddlPath, "utf8"));
+// Parsed as ONE corpus so later migrations' ALTER COLUMN overrides apply
+// to earlier files' CREATEs (the cumulative schema is what the rules govern).
+const columns = parseColumns(
+  ddlFiles.map((f) => readFileSync(join(migrationsDir, f), "utf8")).join("\n"),
+);
 
 const FORBIDDEN_NAMES = [
   "prompt",
@@ -119,12 +144,14 @@ describe("A3 timestamps are timestamptz UTC", () => {
   it("every *_at column is timestamptz", () => {
     const at = columns.filter((c) => c.name.endsWith("_at"));
     expect(at.length).toBeGreaterThan(10);
-    const offenders = at.filter((c) => c.type !== "timestamptz");
+    const offenders = at.filter((c) => c.type.toLowerCase() !== "timestamptz");
     expect(offenders.map((c) => `${c.table}.${c.name}:${c.type}`)).toEqual([]);
   });
 
   it("no timestamp column escapes the *_at naming convention", () => {
-    const offenders = columns.filter((c) => c.type === "timestamptz" && !c.name.endsWith("_at"));
+    const offenders = columns.filter(
+      (c) => c.type.toLowerCase() === "timestamptz" && !c.name.endsWith("_at"),
+    );
     expect(offenders.map((c) => `${c.table}.${c.name}`)).toEqual([]);
   });
 });

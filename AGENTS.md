@@ -9,9 +9,10 @@ Read it, `docs/architecture.md`, and every ADR under `docs/adr/` **before** writ
 > actively and verifiably hosting the same exact profile P with at least one
 > advertised serving slot — **or, since ADR-042 (owner ruling 2026-10-17 night:
 > the capacity stake), while it is actively serving ANY profile (local or cloud)
-> with an advertised slot, in which case it may consume the swarm's cloud
-> profiles bounded by its machine's measured serving capacity (ADR-041 window/k,
-> receipt-anchored per ADR-042). ADR-040's provider-key stake is retired as a
+> with an advertised slot and a passed hosting challenge, in which case it may
+> consume ANY profile in the swarm bounded by its machine's measured serving
+> capacity (ADR-041 window/k, receipt-anchored per ADR-042; cloud leases enforce
+> the balance by default). ADR-040's provider-key stake is retired as a
 > consumption gate.**
 
 "Exact" means: same Hugging Face repository, full revision commit hash, GGUF filename,

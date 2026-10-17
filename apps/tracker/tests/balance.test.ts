@@ -43,6 +43,21 @@ describe("ADR-041 capacity policy (pure)", () => {
   it("unknown class falls back to the honest floor (cpu)", () => {
     expect(balanceDecision("mystery", 0).capacityTokensPerSec).toBe(CLASS_TOKENS_PER_SEC.cpu);
   });
+
+  it("ADR-042 §2: the measured anchor replaces the class once serving evidence is sufficient", () => {
+    // 180k served tokens over 3600 served seconds = 50 tok/s — the
+    // machine's OWN number (utilization-independent), even on gpu_high.
+    const d = balanceDecision("gpu_high", 0, { tokens: 180_000, seconds: 3_600 });
+    expect(d.capacitySource).toBe("measured");
+    expect(d.capacityTokensPerSec).toBeCloseTo(50, 5);
+    expect(d.budget).toBeCloseTo(DEFAULT_BALANCE_K * 50 * DEFAULT_WINDOW_SECS, 0);
+  });
+
+  it("ADR-042 §2: under-threshold serving evidence keeps the class anchor (cold start)", () => {
+    const d = balanceDecision("gpu_high", 0, { tokens: 50, seconds: 1 }); // < MIN_SERVED_SECONDS
+    expect(d.capacitySource).toBe("class");
+    expect(d.capacityTokensPerSec).toBe(CLASS_TOKENS_PER_SEC.gpu_high);
+  });
 });
 
 describe("ADR-041 lease-route integration (dark by default)", () => {

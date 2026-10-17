@@ -4,7 +4,7 @@ import { guardPeerRequest } from "@/lib/guard";
 import { leaseBindingError } from "@/lib/leases";
 import { PeerLeaseSchema } from "@/lib/schemas";
 import type { LeaseRecord, TrackerStore } from "@/lib/store";
-import { balanceDecision, balanceEnforced, balanceWindowSecs } from "@/lib/balance";
+import { balanceDecision, balanceEnforced, balanceWindowSecs, cloudBalanceEnforced } from "@/lib/balance";
 
 // POST /api/v1/peers/lease — consolidated EligibilityLease issuance/refresh
 // (ADR-012; Phase B per DESIGN.md). Requires: active lease bound to the
@@ -12,6 +12,13 @@ import { balanceDecision, balanceEnforced, balanceWindowSecs } from "@/lib/balan
 // (else 403 no_capability) + not draining (403 ineligible) + a current audit
 // epoch (stale epoch -> 403 ineligible). Token expiry is capped at
 // leaseExpiresAt + 60 s. Serialized: base64url(json) "." base64url(sig).
+//
+// ADR-042 (owner ruling 2026-10-17 night) amends the capability rule: a
+// passed hosting challenge for ANY profile this lease actively hosts (the
+// capacity stake — local or cloud) grants cross-profile consumption of the
+// whole swarm; ADR-040's provider-key stake is retired as a consumption
+// gate. Cloud-family leases also enforce the swarm balance BY DEFAULT
+// (born limited); local-family leases keep ADR-041's dark default.
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -51,7 +58,8 @@ export async function POST(req: Request) {
   }
 
   const challenge = await ctx.store.getPassedChallenge(body.leaseId, body.profileId);
-  const challengeRec = challenge ?? (await cloudStakeChallenge(ctx, lease)) ?? null;
+  const targetIsCloud = (profile.manifest as { family?: string }).family === "cloud";
+  const challengeRec = challenge ?? (await capacityStakeChallenge(ctx, lease)) ?? null;
   if (!challengeRec) {
     return jsonError(403, "no_capability", "no passed hosting challenge for this lease+profile");
   }
@@ -63,13 +71,17 @@ export async function POST(req: Request) {
 
   // ADR-041 swarm balance, CAPACITY rule (owner revision 2026-10-17: the
   // torrent lesson — the gate keys on what your verified hardware+model
-  // can push, never on whether anyone pulled from you). Ships DARK:
-  // always computed and surfaced; blocks only under ENFORCE=on.
+  // can push, never on whether anyone pulled from you). ADR-042 §2: the
+  // anchor is the machine's OWN receipt-backed trailing served tok/s
+  // (class table only as cold-start fallback). Dark for ordinary leases;
+  // ON by default for cloud leases (§3 — the capacity-stake path is born
+  // limited).
   const balance = balanceDecision(
     lease.capacityClass,
     await ctx.store.consumedInWindow(installationId, balanceWindowSecs()),
+    await ctx.store.servedThroughputInWindow(lease.peerId, balanceWindowSecs()),
   );
-  if (!balance.ok && balanceEnforced()) {
+  if (!balance.ok && (balanceEnforced() || (targetIsCloud && cloudBalanceEnforced()))) {
     return jsonError(
       403,
       "balance_exceeded",
@@ -105,19 +117,20 @@ export async function POST(req: Request) {
   return jsonOk({ token: issued.token, lease: issued.fields, balance });
 }
 
-/// ADR-040 §3 path (b) — the cloud stake: an installation ACTIVELY
-/// serving a cloud profile (it registered that profile on this lease)
-/// may consume ANY profile, not only the ones it hosts. The evidence it
-/// must still show: a passed hosting challenge for one of ITS cloud
-/// profiles (the serving proof). The token itself stays bound to the
-/// requested profile + this peer exactly as path (a) tokens are.
-async function cloudStakeChallenge(
-  ctx: { store: Pick<TrackerStore, "getProfile" | "getPassedChallenge"> },
+/// ADR-042 (owner ruling 2026-10-17 night) — the CAPACITY stake, which
+/// retires ADR-040 §3 path (b)'s key stake: an installation ACTIVELY
+/// hosting ANY profile (local or cloud — it registered the profile on
+/// this lease and passed that profile's hosting challenge, the serving
+/// proof) may consume ANY profile in the swarm, not only the ones it
+/// hosts ("all as one": local hosts pull cloud keys; cloud hosts keep
+/// pulling local models exactly as ADR-040 path (b) already did live).
+/// The token itself stays bound to the requested profile + this peer
+/// exactly as path (a) tokens are.
+async function capacityStakeChallenge(
+  ctx: { store: Pick<TrackerStore, "getPassedChallenge"> },
   lease: LeaseRecord,
 ) {
   for (const profileId of lease.profiles) {
-    const profile = await ctx.store.getProfile(profileId);
-    if (!profile || (profile.manifest as { family?: string }).family !== "cloud") continue;
     const challenge = await ctx.store.getPassedChallenge(lease.leaseId, profileId);
     if (challenge) return challenge;
   }

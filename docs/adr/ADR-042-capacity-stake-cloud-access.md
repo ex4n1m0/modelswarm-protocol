@@ -27,10 +27,14 @@ behind a payment wall.
 ## Decision
 
 1. **Eligibility (amends ADR-040).** Any peer with a verified, active
-   serving slot for ANY profile (local or cloud) may consume leases
-   for CLOUD profiles. The provider-key stake is retired as a
-   consumption gate; serving is the stake. Exact-profile hosting
-   eligibility (same P) is unchanged.
+   serving slot for ANY profile (local or cloud) may consume leases for
+   ANY profile in the swarm — cross-profile consumption granted by the
+   capacity stake. This preserves ADR-040 path (b)'s proven live shape
+   (a cloud host consuming a local family profile) AND opens the ruled
+   direction (a local host pulling cloud keys with no key staged). The
+   provider-key stake is retired as a consumption gate; serving is the
+   stake. Exact-profile hosting (same P) remains the always-available
+   base path.
 
 2. **Capacity source (refines ADR-041 §1).** The allowance anchor is
    the machine's OWN measured serving throughput: trailing served
@@ -40,11 +44,11 @@ behind a payment wall.
    WINDOW unchanged (1.0 / 1 h; `MSP_SWARM_BALANCE_K`,
    `MSP_SWARM_BALANCE_WINDOW_SECS`).
 
-3. **Enforcement is ON for cloud-profile leases.** The new access path
-   is born limited — a cloud lease request over the machine's window
-   budget is refused `403 balance_exceeded` with its actual numbers.
-   ADR-041's dark default for other leases is unchanged until its own
-   deliberate flip.
+3. **Enforcement is ON for cloud-profile leases.** The new local→cloud
+   access path is born limited — a cloud lease request over the
+   machine's window budget is refused `403 balance_exceeded` with its
+   actual numbers. Local-family leases keep ADR-041's dark default
+   until its own deliberate flip.
 
 4. **Consent model.** Staging a provider key + advertising a cloud
    slot = consent to serve the swarm. Consuming cloud = the user's

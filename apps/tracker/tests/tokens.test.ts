@@ -100,7 +100,7 @@ describe("E2 issuance requires a passed challenge", () => {
     expect(ok.status).toBe(200);
   });
 
-  it("challenge for a different profile does not grant this one", async () => {
+  it("ADR-042 capacity stake: a passed challenge for another HOSTED profile grants this one", async () => {
     const otherProfile = await seedActiveProfile(
       rig,
       testManifest({ hf_revision: "c".repeat(40), runtime: { name: "rt-test", version: "b2", build_hash: "2".repeat(64) } }),
@@ -109,9 +109,14 @@ describe("E2 issuance requires a passed challenge", () => {
     const { leaseId } = await register(rig, who, [profileId, otherProfile]);
     await passChallenge(rig, who, leaseId, otherProfile);
 
+    // Superseded exact-only expectation (pre-ADR-040/042): this used to be
+    // 403. ADR-042's capacity stake: the serving proof on any HOSTED
+    // profile grants cross-profile consumption. (A passed challenge for
+    // the requested profile itself has always granted via the exact path
+    // — the D16 canary IS the serving proof — and no challenge at all
+    // still refuses, per the test above.)
     const res = await requestEligibilityLease(rig, who, leaseId, profileId);
-    expect(res.status).toBe(403);
-    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("no_capability");
+    expect(res.status).toBe(200);
   });
 });
 

@@ -408,6 +408,14 @@ export interface TrackerStore {
   /** ADR-041 (capacity rule): plain tokens consumed in the trailing
    *  window — the rate gate's input. */
   consumedInWindow(installationId: string, windowSecs: number): Promise<number>;
+  /** ADR-042 §2 (measured capacity anchor): tokens served and endpoint
+   *  seconds accumulated by one PEER in the trailing window, from
+   *  intake-validated granted-accounting rows — tokens/seconds is the
+   *  machine's own sustained serving throughput (utilization-independent). */
+  servedThroughputInWindow(
+    peerId: string,
+    windowSecs: number,
+  ): Promise<{ tokens: number; seconds: number }>;
 
   // -- rate-limit counters (persisted observability; the live limiter is the
   //    in-memory fixed-window buckets per msp-v1 §3.4) -------------------------
@@ -1091,6 +1099,22 @@ export class MemoryStore implements TrackerStore {
       if (row.installationId === installationId && row.at >= cutoff) total += row.tokens;
     }
     return total;
+  }
+
+  async servedThroughputInWindow(
+    peerId: string,
+    windowSecs: number,
+  ): Promise<{ tokens: number; seconds: number }> {
+    const cutoff = this.now() - windowSecs * 1000;
+    let tokens = 0;
+    let seconds = 0;
+    for (const row of this.granted.values()) {
+      if (row.peerId === peerId && row.grantedAt >= cutoff) {
+        tokens += row.verifiedTokens;
+        seconds += row.endpointSeconds;
+      }
+    }
+    return { tokens, seconds };
   }
 
   async consumedTokensDecayed(
@@ -2175,6 +2199,21 @@ export class PgStore implements TrackerStore {
       [installationId, windowSecs],
     )) as Record<string, unknown>[];
     return Number(res[0]?.total ?? 0);
+  }
+
+  async servedThroughputInWindow(
+    peerId: string,
+    windowSecs: number,
+  ): Promise<{ tokens: number; seconds: number }> {
+    const res = (await this.query(
+      `SELECT COALESCE(SUM(verified_tokens), 0) AS tokens,
+              COALESCE(SUM(endpoint_seconds), 0) AS seconds
+         FROM granted_accounting
+        WHERE peer_id = $1 AND granted_at > now() - make_interval(secs => $2)`,
+      [peerId, windowSecs],
+    )) as Record<string, unknown>[];
+    const r = res[0] ?? {};
+    return { tokens: Number(r.tokens ?? 0), seconds: Number(r.seconds ?? 0) };
   }
 
   async consumedTokensDecayed(

@@ -137,6 +137,12 @@ pub struct NodeConfig {
     pub engine_model: Option<PathBuf>,
     /// Compute threads for the engine; `None` = engine default.
     pub engine_threads: Option<u32>,
+    /// ADR-040 C3: serve a CLOUD profile through a provider API instead
+    /// of a local engine — the node serves through
+    /// [`crate::cloud_executor::CloudApiExecutor`], no engine is spawned,
+    /// and the profile advertised is the cloud profile. Mutually
+    /// exclusive with the engine fields (start refuses both set).
+    pub cloud: Option<crate::cloud_executor::CloudApiConfig>,
 }
 
 impl Default for NodeConfig {
@@ -151,6 +157,7 @@ impl Default for NodeConfig {
             engine_gpu_binary: None,
             engine_model: None,
             engine_threads: None,
+            cloud: None,
         }
     }
 }
@@ -224,6 +231,10 @@ pub enum NodeError {
     /// Gateway bind/serve failure.
     #[error("gateway error: {0}")]
     Gateway(#[from] GatewayError),
+    /// ADR-040 C3: the cloud executor could not be constructed (client
+    /// build failure — never carries the key).
+    #[error("cloud executor error: {0}")]
+    CloudExecutor(String),
     /// `mock: true` was requested but the mock runtime is not compiled in
     /// (ADR-019 compile gate).
     #[error(
@@ -412,11 +423,24 @@ impl Node {
         // while hosting. The chat-wall suite pins that nothing in this
         // composition ever calls it.)
 
-        // Gateway wiring.
-        let executor = Arc::new(
-            SingleLocalExecutor::new(runtime, config.profile_id.clone())
-                .with_telemetry(Arc::clone(&telemetry)),
-        );
+        // Gateway wiring. ADR-040 C3: a cloud configuration serves
+        // through the provider executor (no engine, no runtime); the
+        // local path is unchanged.
+        if config.cloud.is_some() && config.engine_binary.is_some() {
+            return Err(NodeError::CloudExecutor(
+                "cloud and engine_binary are mutually exclusive".into(),
+            ));
+        }
+        let executor: Arc<dyn modelswarm_gateway::InferenceExecutor> = match &config.cloud {
+            Some(cloud_cfg) => Arc::new(
+                crate::cloud_executor::CloudApiExecutor::new(cloud_cfg.clone())
+                    .map_err(NodeError::CloudExecutor)?,
+            ),
+            None => Arc::new(
+                SingleLocalExecutor::new(runtime, config.profile_id.clone())
+                    .with_telemetry(Arc::clone(&telemetry)),
+            ),
+        };
         let profiles: Arc<dyn ProfileProvider> = match &config.profile_id {
             Some(profile) => Arc::new(StaticProfiles::new(vec![ModelInfo {
                 id: profile.clone(),

@@ -2912,21 +2912,60 @@ async fn set_hosting_inner(
     )
     .await
     .map_err(|e| format!("catalog: {e}"))?;
-    let serving_manifest = local_manifest_of(&listing)?;
-    let manager = ArtifactManager::new(&inner.data_dir);
-    let store = std::sync::Mutex::new(
-        modelswarm_store::Store::open(inner.data_dir.join("state.sqlite"))
-            .map_err(|e| e.to_string())?,
-    );
-    let ensured = manager
-        .ensure_artifact(serving_manifest, &store, |_, _| {})
-        .await
-        .map_err(|e| format!("artifact: {e}"))?;
+    // ADR-040 C3: the CLOUD branch — a staged provider key serves the
+    // cloud profile through the provider API (no engine, no artifact);
+    // the entire serving/heartbeat/relay/receipt machinery is identical.
+    // The honest refusal fires when no key is staged for the provider.
+    let cloud_cfg = match &listing.kind {
+        modelswarm_node::catalog::ProfileKind::Cloud(cloud) => {
+            let staged = read_cloud_key(&inner.data_dir);
+            let provider = match cloud.provider() {
+                modelswarm_node::catalog::CloudProviderId::DeepSeek => "deepseek",
+                modelswarm_node::catalog::CloudProviderId::OpenRouter => "openrouter",
+            };
+            let key = match staged.as_ref().filter(|k| k.provider == provider) {
+                Some(k) => k.api_key.clone(),
+                None => return Err(format!(
+                    "add your {provider} API key in Settings first — the key stays on this machine"
+                )),
+            };
+            let provider_kind = match cloud.provider() {
+                modelswarm_node::catalog::CloudProviderId::DeepSeek => {
+                    modelswarm_node::cloud_executor::CloudProvider::DeepSeek
+                }
+                modelswarm_node::catalog::CloudProviderId::OpenRouter => {
+                    modelswarm_node::cloud_executor::CloudProvider::OpenRouter
+                }
+            };
+            Some(modelswarm_node::cloud_executor::CloudApiConfig {
+                provider: provider_kind,
+                model: cloud.model().to_string(),
+                api_key: key,
+                request_timeout: std::time::Duration::from_secs(120),
+                base_url_override: None,
+            })
+        }
+        modelswarm_node::catalog::ProfileKind::Local(_) => None,
+    };
+    let (ensured, engine, gpu_engine) = if cloud_cfg.is_some() {
+        (None, None, None)
+    } else {
+        let serving_manifest = local_manifest_of(&listing)?;
+        let manager = ArtifactManager::new(&inner.data_dir);
+        let store = std::sync::Mutex::new(
+            modelswarm_store::Store::open(inner.data_dir.join("state.sqlite"))
+                .map_err(|e| e.to_string())?,
+        );
+        let ensured = manager
+            .ensure_artifact(serving_manifest, &store, |_, _| {})
+            .await
+            .map_err(|e| format!("artifact: {e}"))?;
+        // ADR-024: prefer the GPU (Vulkan) engine variant when the bundle
+        // is present; the node falls back to the CPU engine visibly.
+        (Some(ensured), Some(engine), engine_gpu_binary_path(app))
+    };
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    // ADR-024: prefer the GPU (Vulkan) engine variant when the bundle is
-    // present; the node falls back to the CPU engine visibly on any failure.
-    let gpu_engine = engine_gpu_binary_path(app);
     let mut config = NodeConfig {
         tracker_base: Some(inner.tracker_url.clone()),
         // Stable local API first (DEFAULT_PORT 11435); fall back to an
@@ -2935,10 +2974,11 @@ async fn set_hosting_inner(
         data_dir: inner.data_dir.clone(),
         profile_id: Some(listing.profile_id.clone()),
         mock: false,
-        engine_binary: Some(engine),
+        engine_binary: engine,
         engine_gpu_binary: gpu_engine,
-        engine_model: Some(ensured.path.clone()),
+        engine_model: ensured.as_ref().map(|e| e.path.clone()),
         engine_threads: None,
+        cloud: cloud_cfg,
     };
     let handle = match Node::start(config.clone(), shutdown_tx.subscribe()).await {
         Ok(handle) => handle,
@@ -3057,8 +3097,15 @@ async fn set_hosting_inner(
                 app,
                 &inner.data_dir,
                 &profile,
-                &ensured.path,
-                ensured.bytes,
+                // Cloud serving has no local engine file: the family
+                // tier's engine spawn fails and the daemon degrades
+                // HONESTLY to the plain msp-v1 bridge (the designed
+                // path — a logged reason, never a silent family-off).
+                ensured
+                    .as_ref()
+                    .map(|e| e.path.as_path())
+                    .unwrap_or_else(|| std::path::Path::new("")),
+                ensured.as_ref().map(|e| e.bytes).unwrap_or(0),
                 &hardware,
                 &handle,
                 inner.allow_content_carriage,
@@ -3156,10 +3203,15 @@ async fn set_hosting_inner(
     // peerId is derived inside the heartbeat task (ADR-020); the
     // installation_id stays a UI label.
     let profile_id = listing.profile_id.clone();
-    let build = local_manifest_of(&listing)?
-        .runtime()
-        .build_hash()
-        .to_string();
+    // The register body's runtime label: the pinned engine build for
+    // local profiles; the pinned WIRE + provider for cloud (ADR-040 —
+    // the provider pin is the runtime analogue).
+    let build = match &listing.kind {
+        modelswarm_node::catalog::ProfileKind::Local(m) => m.runtime().build_hash().to_string(),
+        modelswarm_node::catalog::ProfileKind::Cloud(c) => {
+            format!("openai-chat-v1:{}", c.model())
+        }
+    };
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
     let hb_data_dir = inner.data_dir.clone();
     let hb_telemetry = std::sync::Arc::clone(&state.telemetry);
@@ -3431,7 +3483,7 @@ async fn set_hosting_inner(
         "installation_id": handle.installation_id,
     });
     inner.profile_id = Some(listing.profile_id.clone());
-    inner.artifact = Some(ensured);
+    inner.artifact = ensured;
     inner.node = Some(RunningNode {
         handle,
         shutdown: shutdown_tx,
@@ -3541,16 +3593,20 @@ async fn select_model(
     let store = std::sync::Mutex::new(
         modelswarm_store::Store::open(data_dir.join("state.sqlite")).map_err(|e| e.to_string())?,
     );
-    let swap_manifest = local_manifest_of(&listing)?;
-    manager
-        .ensure_artifact(swap_manifest, &store, |done, total| {
-            let _ = window.emit(
-                "download",
-                serde_json::json!({ "done": done, "total": total }),
-            );
-        })
-        .await
-        .map_err(|e| format!("artifact: {e}"))?;
+    // ADR-040 C3: cloud selections have no artifact — the swap goes
+    // straight to the hosting path (which requires the staged key).
+    if !listing.kind.is_cloud() {
+        let swap_manifest = local_manifest_of(&listing)?;
+        manager
+            .ensure_artifact(swap_manifest, &store, |done, total| {
+                let _ = window.emit(
+                    "download",
+                    serde_json::json!({ "done": done, "total": total }),
+                );
+            })
+            .await
+            .map_err(|e| format!("artifact: {e}"))?;
+    }
 
     // Artifact ready: stop the old node (if any), then start the new one
     // via the normal hosting path — ensure_artifact hits the cache, so

@@ -273,11 +273,21 @@
         <h2 id="setup-h">Setup</h2>
         <dl class="kv">
           <dt>Tracker</dt><dd><input type="text" id="tracker-url" aria-label="Tracker base URL"></dd>
+          <dt>Cloud API key</dt><dd>
+            <select id="cloud-provider" aria-label="Cloud provider">
+              <option value="deepseek">DeepSeek</option>
+              <option value="openrouter">OpenRouter</option>
+            </select>
+            <input type="password" id="cloud-key" placeholder="sk-…" aria-label="Cloud API key" style="width:11em">
+            <span id="cloud-key-state" class="meta"></span>
+          </dd>
           <dt>Engine</dt><dd id="engine-line">—</dd>
           <dt>Device approval</dt><dd><span id="enroll-line">—</span> <button class="ghost" id="enroll-open" hidden>approve this device…</button></dd>
         </dl>
         <div class="row" style="margin-top:8px">
           <button class="ghost" id="save-tracker">save tracker</button>
+          <button class="ghost" id="save-cloud-key">save key</button>
+          <button class="ghost" id="clear-cloud-key">clear key</button>
         </div>
       </section>
 
@@ -562,15 +572,19 @@
       }
       $("model-cards").innerHTML = visible.map(m => {
         if (m.is_cloud) {
-          // ADR-040: cloud models join the swarm via a provider key —
-          // visible now, selectable when cloud serving lands (next
-          // release). Honest marker, no fake download.
+          // ADR-040 C3: cloud models serve through the user's staged
+          // provider key (Settings → cloud API key). No key yet = the
+          // honest pointer to Settings, never a fake download.
+          const keySet = lastStatus && lastStatus.cloud && lastStatus.cloud.configured
+            && lastStatus.cloud.provider === m.provider;
           return `
-        <div class="card" style="opacity:0.75" aria-disabled="true">
+        <div class="card" style="${keySet ? "" : "opacity:0.85"}">
           <div><div class="name">${m.display_name}</div>
                <div class="meta">cloud model · ${m.provider} ${m.model} · no download</div>
-               <div class="meta" style="margin-top:2px">joins via your ${m.provider} API key — next release</div></div>
-          <div class="action-row"><div class="meta">cloud</div><span class="meta" style="color:var(--muted)">coming soon</span></div>
+               <div class="meta" style="margin-top:2px">${keySet ? "serves the swarm via your key · your replies are labeled cloud" : "add your " + m.provider + " API key in Settings to serve"}</div></div>
+          <div class="action-row"><div class="meta">cloud</div>${keySet
+            ? `<button type="button" data-start="${m.profile_id}">Start</button>`
+            : `<span class="meta" style="color:var(--muted)">key needed</span>`}</div>
         </div>`;
         }
         const running = hostingOn && m.selected;
@@ -702,11 +716,20 @@
       } catch (e) { hfResults().textContent = "file listing failed: " + e; }
     }
 
+    let lastStatus = null;
     async function refresh() {
       let s;
-      try { s = await invoke("get_status"); $("conn-note").textContent = "live"; error(""); }
+      try { s = await invoke("get_status"); lastStatus = s; $("conn-note").textContent = "live"; error(""); }
       catch (e) { $("conn-note").textContent = "ipc error"; return; }
       $("tracker-url").value = s.tracker;
+      // ADR-040 cloud stake: presence only — the key itself never returns.
+      const ck = $("cloud-key-state");
+      if (ck) {
+        if (s.cloud && s.cloud.configured) {
+          ck.textContent = s.cloud.provider + " key set ✓";
+          $("cloud-provider").value = s.cloud.provider;
+        } else { ck.textContent = "no key set"; }
+      }
       $("version-tag").textContent = "v" + s.version;
       $("foot-version").textContent = "v" + s.version + " ";
       $("about-version").textContent = "v" + s.version + " (internal test build)";
@@ -884,6 +907,18 @@
     }
 
     $("save-tracker").onclick = async () => { try { await invoke("set_tracker", { url: $("tracker-url").value }); error(""); } catch (e) { error(String(e)); } };
+    // ADR-040: the key stays on this machine — stored, never displayed back.
+    $("save-cloud-key").onclick = async () => {
+      try {
+        await invoke("set_cloud_key", { provider: $("cloud-provider").value, key: $("cloud-key").value });
+        $("cloud-key").value = "";
+        error("");
+        await refresh();
+      } catch (e) { error(String(e)); }
+    };
+    $("clear-cloud-key").onclick = async () => {
+      try { await invoke("clear_cloud_key"); $("cloud-key").value = ""; error(""); await refresh(); } catch (e) { error(String(e)); }
+    };
     $("accept-btn").onclick = async () => { try { await invoke("accept_privacy"); } catch (e) { error(String(e)); } refresh(); };
     // The pairing toggle writes the persisted key through the daemon; the
     // daemon refuses while hosting (the live listener must not contradict

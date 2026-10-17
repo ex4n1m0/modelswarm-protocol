@@ -3,6 +3,7 @@ import { jsonError, jsonOk } from "@/lib/errors";
 import { guardPeerRequest } from "@/lib/guard";
 import { leaseBindingError } from "@/lib/leases";
 import { PeerLeaseSchema } from "@/lib/schemas";
+import type { LeaseRecord, TrackerStore } from "@/lib/store";
 import { balanceDecision, balanceEnforced, balanceWindowSecs } from "@/lib/balance";
 
 // POST /api/v1/peers/lease — consolidated EligibilityLease issuance/refresh
@@ -50,7 +51,8 @@ export async function POST(req: Request) {
   }
 
   const challenge = await ctx.store.getPassedChallenge(body.leaseId, body.profileId);
-  if (!challenge) {
+  const challengeRec = challenge ?? (await cloudStakeChallenge(ctx, lease)) ?? null;
+  if (!challengeRec) {
     return jsonError(403, "no_capability", "no passed hosting challenge for this lease+profile");
   }
 
@@ -77,7 +79,7 @@ export async function POST(req: Request) {
 
   const issued = issueEligibilityLease(
     lease,
-    challenge,
+    challengeRec,
     body.profileId,
     auditEpoch,
     now,
@@ -90,7 +92,7 @@ export async function POST(req: Request) {
     peerId: lease.peerId,
     installationId: lease.installationId,
     profileId: body.profileId,
-    challengeId: challenge.challengeId,
+    challengeId: challengeRec.challengeId,
     canHost: issued.fields.can_host,
     canConsume: issued.fields.can_consume,
     slots: issued.fields.slots,
@@ -101,4 +103,23 @@ export async function POST(req: Request) {
   });
 
   return jsonOk({ token: issued.token, lease: issued.fields, balance });
+}
+
+/// ADR-040 §3 path (b) — the cloud stake: an installation ACTIVELY
+/// serving a cloud profile (it registered that profile on this lease)
+/// may consume ANY profile, not only the ones it hosts. The evidence it
+/// must still show: a passed hosting challenge for one of ITS cloud
+/// profiles (the serving proof). The token itself stays bound to the
+/// requested profile + this peer exactly as path (a) tokens are.
+async function cloudStakeChallenge(
+  ctx: { store: Pick<TrackerStore, "getProfile" | "getPassedChallenge"> },
+  lease: LeaseRecord,
+) {
+  for (const profileId of lease.profiles) {
+    const profile = await ctx.store.getProfile(profileId);
+    if (!profile || (profile.manifest as { family?: string }).family !== "cloud") continue;
+    const challenge = await ctx.store.getPassedChallenge(lease.leaseId, profileId);
+    if (challenge) return challenge;
+  }
+  return undefined;
 }

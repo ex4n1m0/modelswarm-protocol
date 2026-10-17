@@ -54,3 +54,5 @@ apps/tracker/public/downloads/latest.json
 crates/modelswarm-desktop/engine/
 # Staged GPU engine variant (ADR-024); never committed
 crates/modelswarm-desktop/engine-vulkan/
+
+__pycache__/

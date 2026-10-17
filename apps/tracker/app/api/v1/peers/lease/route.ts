@@ -3,6 +3,8 @@ import { jsonError, jsonOk } from "@/lib/errors";
 import { guardPeerRequest } from "@/lib/guard";
 import { leaseBindingError } from "@/lib/leases";
 import { PeerLeaseSchema } from "@/lib/schemas";
+import { balanceDecision, balanceEnforced } from "@/lib/balance";
+import { GRANTED_HALF_LIFE_SECS } from "@/lib/constants";
 
 // POST /api/v1/peers/lease — consolidated EligibilityLease issuance/refresh
 // (ADR-012; Phase B per DESIGN.md). Requires: active lease bound to the
@@ -58,6 +60,21 @@ export async function POST(req: Request) {
     return jsonError(403, "ineligible", "audit epoch stale; re-run the hosting challenge");
   }
 
+  // ADR-041 swarm balance (ships DARK): always computed and surfaced on
+  // every issuance; blocks only when MSP_SWARM_BALANCE_ENFORCE=on.
+  const [grantedView, consumedView] = await Promise.all([
+    ctx.store.grantedCounters(lease.peerId, GRANTED_HALF_LIFE_SECS),
+    ctx.store.consumedTokensDecayed(installationId, GRANTED_HALF_LIFE_SECS),
+  ]);
+  const balance = balanceDecision(grantedView.verifiedTokensDecayed, consumedView.decayed);
+  if (!balance.ok && balanceEnforced()) {
+    return jsonError(
+      403,
+      "balance_exceeded",
+      `swarm balance exceeded: consumed ${Math.round(balance.consumed)} > k*granted+bootstrap ${Math.round(balance.k * balance.granted + balance.bootstrap)} (k=${balance.k}); serve the swarm to refill`,
+    );
+  }
+
   const issued = issueEligibilityLease(
     lease,
     challenge,
@@ -83,5 +100,5 @@ export async function POST(req: Request) {
     expiresAt: lease.expiresAt + 60_000,
   });
 
-  return jsonOk({ token: issued.token, lease: issued.fields });
+  return jsonOk({ token: issued.token, lease: issued.fields, balance });
 }

@@ -25,39 +25,9 @@
 // - 2026-10-15 (later): v0.2.26 retarget (release train — the language-pin
 //   fix); 5 functional replacements, same copy rules.
 
-// Protocol-level execution presets (ADR-029 §1; master prompt §3).
-const PRESETS: Array<{ name: string; allows: string; correctness: string }> = [
-  { name: "FAST", allows: "single host", correctness: "lossless — the baseline" },
-  { name: "BALANCED", allows: "single + hedged (≤3 raced peers)", correctness: "lossless" },
-  { name: "DEEP", allows: "best-of-n + deliberation roles", correctness: "approximate — never lossless" },
-  { name: "VERIFIED", allows: "BALANCED + audited chain", correctness: "carries audit proofs" },
-  { name: "MAXIMUM", allows: "sanctioned composition of gated modes", correctness: "union of component labels" },
-];
+// Presets + the tracker API table moved to /reference (owner directive
+// 2026-10-17: keep the main page minimal).
 
-const ENDPOINTS: Array<{ method: string; path: string; note: string }> = [
-  { method: "GET", path: "/api/v1/health", note: "liveness + protocol version" },
-  { method: "GET", path: "/api/v1/catalog", note: "signed catalog envelope (schema v2)" },
-  { method: "GET", path: "/api/v1/catalog/{profile_id}", note: "single-profile envelope" },
-  { method: "POST", path: "/api/v1/auth/device/start", note: "device enrollment start" },
-  { method: "POST", path: "/api/v1/auth/device/complete", note: "session issuance (403 pending until approved)" },
-  { method: "POST", path: "/api/v1/admin/devices/approve", note: "device approval by pairing code (admin, /verify page)" },
-  { method: "POST", path: "/api/v1/peers/register", note: "lease issuance (60–90 s TTL)" },
-  { method: "POST", path: "/api/v1/peers/heartbeat", note: "lease extension + revocation notices" },
-  { method: "POST", path: "/api/v1/peers/drain", note: "exclude peer from lookups" },
-  { method: "POST", path: "/api/v1/peers/challenge/start", note: "hosting challenge" },
-  { method: "POST", path: "/api/v1/peers/challenge/complete", note: "record timings, mark passed" },
-  { method: "POST", path: "/api/v1/peers/lease", note: "eligibility lease issuance (ADR-012)" },
-  { method: "GET", path: "/api/v1/peers?profile_id=…", note: "peer lookup, limit ≤ 50" },
-  { method: "POST", path: "/api/v1/rendezvous/offer", note: "signaling relay" },
-  { method: "POST", path: "/api/v1/rendezvous/answer", note: "signaling relay" },
-  { method: "GET", path: "/api/v1/rendezvous/pending", note: "mailbox drain (delete-on-read)" },
-  { method: "POST", path: "/api/v1/events/job-result", note: "receipt digest + outcome" },
-  { method: "POST", path: "/api/v1/receipt", note: "canonical receipt intake" },
-  { method: "POST", path: "/api/v1/session-authorize", note: "cooperative session metadata" },
-  { method: "POST", path: "/api/v1/audit", note: "audit-epoch sweep (admin)" },
-  { method: "POST", path: "/api/v1/admin/catalog/candidates", note: "candidate insert (admin)" },
-  { method: "POST", path: "/api/v1/admin/catalog/promote", note: "candidate → active (admin)" },
-];
 
 const css = `
   :root {
@@ -141,6 +111,7 @@ export default function Home() {
             <span className="badge" title="Tracker status: check /api/v1/health">TRACKER LIVE</span>
             <span className="badge" id="online-badge" title="Peers with a live lease right now (GET /api/v1/stats)" style={{ borderColor: "rgba(127, 224, 184, 0.45)", background: "rgba(127, 224, 184, 0.08)", color: "#7FE0B8" }}>… online</span>
             <span className="spacer" />
+            <a className="navlink" href="/reference">reference</a>
             <a className="navlink" href="/api/v1/health">status</a>
             <a className="navlink" href="/api/v1/catalog">catalog</a>
             <a className="navlink" href="https://github.com/ex4n1m0/modelswarm-protocol" aria-label="ModelSwarm Protocol source code on GitHub">github</a>
@@ -186,44 +157,28 @@ export default function Home() {
         <section id="rule" aria-labelledby="rule-heading">
           <h2 id="rule-heading">The one rule</h2>
           <div className="rule">
-            <b>Host to consume.</b> A peer earns swarm access only by
-            verifiably hosting the models it uses — contribution is checked,
-            not paid for. No credits, no payments. Prompts and completions
-            never touch this site.
+            <b>Host to consume — or stake a cloud key.</b> A peer earns swarm
+            access by verifiably hosting the models it uses, or by serving a
+            cloud model through its own provider key (DeepSeek or OpenRouter
+            — joining with just a key lands in the next app release).
+            Contribution is checked, not paid for: no credits, no payments,
+            and prompts and completions never touch this site.
           </div>
         </section>
 
-        <section id="presets" aria-labelledby="presets-heading">
-          <h2 id="presets-heading">Presets</h2>
-          <div className="tblcard">
-            <table>
-              <caption className="sr-only">
-                Execution presets
-              </caption>
-              <thead>
-                <tr>
-                  <th scope="col">Preset</th>
-                  <th scope="col">What runs</th>
-                  <th scope="col">Correctness</th>
-                </tr>
-              </thead>
-              <tbody>
-                {PRESETS.map((p) => (
-                  <tr key={p.name}>
-                    <td>{p.name}</td>
-                    <td>{p.allows}</td>
-                    <td>{p.correctness}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+        <section id="trade" aria-labelledby="trade-heading">
+          <h2 id="trade-heading">The trade</h2>
+          <div className="rule">
+            <b>One to one, token for token.</b> You may pull from the swarm
+            up to what your own serving pushes upstream — your local model
+            handles other people&apos;s tasks while other models handle
+            yours. Both sides are measured on cryptographically signed work
+            receipts and time-averaged over recent activity, so the balance
+            tracks what you actually do, not what you claim. A fresh peer
+            starts with a working allowance; after that, serve to refill.
+            The rule ships in watch mode first — balances are measured and
+            shown before they bind.
           </div>
-          <p className="note">
-            Swarm modes engage only when measured to beat the fastest eligible
-            single host — otherwise automatic fallback. Accuracy benefits
-            (better answers, even when slower) and mixed-model work stay
-            behind their own correctness gates.
-          </p>
         </section>
 
         <section id="get" aria-labelledby="get-heading">
@@ -261,27 +216,6 @@ export default function Home() {
               the test cap) and downloads the chosen model from its original
               source. Checksums: /downloads/SHA256SUMS.txt.
             </p>
-          </div>
-        </section>
-
-        <section id="api" aria-labelledby="api-heading">
-          <h2 id="api-heading">Tracker API (v1)</h2>
-          <div className="tblcard">
-            <table>
-              <caption className="sr-only">
-                Implemented tracker API endpoints
-              </caption>
-              <tbody>
-                {ENDPOINTS.map((e) => (
-                  <tr key={`${e.method} ${e.path}`}>
-                    <td>
-                      {e.method} {e.path}
-                    </td>
-                    <td>{e.note}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
           </div>
         </section>
 

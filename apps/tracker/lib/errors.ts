@@ -17,11 +17,13 @@ export type ErrorCode =
   | "revoked"
   | "lease_expired"
   | "no_capability"
-  | "ineligible";
+  | "ineligible"
+  | "balance_exceeded";
 
 /** Frozen mapping (msp-v1 §3.4). unknown_profile is 404 on public catalog
  * reads and 400 on request-body validation; call sites pick explicitly. */
 export const ERROR_STATUS: Record<ErrorCode, number> = {
+  balance_exceeded: 403,
   unauthorized: 401,
   unsigned_request: 401,
   stale_timestamp: 400,

@@ -40,6 +40,7 @@ export async function POST(req: Request) {
     receivedAt: ctx.now(),
   });
 
+
   // v1-compat: the no-receipt response stays byte-identical (the
   // phaseb.test pin); the extra fields appear only when a receipt rides.
   if (!body.receipt) {
@@ -79,6 +80,17 @@ export async function POST(req: Request) {
     serverKey,
     requesterKey,
   );
+  // ADR-041 consumed side: the posting installation IS the requester, and
+  // the balance moves ONLY on validated evidence (same rule as grants).
+  // Zero-grant-but-valid receipts (e.g. ring-excluded) still consumed.
+  if (grants !== null) {
+    await ctx.store.recordConsumption({
+      installationId,
+      receiptDigest: body.receiptDigest,
+      tokens: receipt.accepted_tokens ?? 0,
+      at: ctx.now(),
+    });
+  }
   if (grants === null || grants.length === 0) {
     return jsonOk({ recorded: true, grants: [], reason: "receipt_not_valid_evidence" });
   }

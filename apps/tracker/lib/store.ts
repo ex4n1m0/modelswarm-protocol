@@ -381,6 +381,12 @@ export interface TrackerStore {
     rows: number;
   }>;
   getReceipt(receiptDigest: string): Promise<ReceiptRecord | null>;
+  /** ADR-041 consumed side: one row per (installation, receipt) — the
+   *  posting installation IS the requester. Re-posts are no-ops. */
+  recordConsumption(row: { installationId: string; receiptDigest: string; tokens: number; at: number }): Promise<void>;
+  /** Decayed consumed tokens for one installation (same half-life form
+   *  as grantedCounters — the two sides must average over one window). */
+  consumedTokensDecayed(installationId: string, halfLifeSecs: number): Promise<{ decayed: number; raw: number; rows: number }>;
 
   // -- rate-limit counters (persisted observability; the live limiter is the
   //    in-memory fixed-window buckets per msp-v1 §3.4) -------------------------
@@ -1041,6 +1047,29 @@ export class MemoryStore implements TrackerStore {
       verifiedTokensRaw += row.verifiedTokens;
     }
     return { endpointSecondsDecayed, verifiedTokensDecayed, endpointSecondsRaw, verifiedTokensRaw, rows };
+  }
+
+  private consumed = new Map<string, { installationId: string; receiptDigest: string; tokens: number; at: number }>();
+
+  async recordConsumption(row: { installationId: string; receiptDigest: string; tokens: number; at: number }): Promise<void> {
+    this.consumed.set(`${row.installationId}:${row.receiptDigest}`, { ...row });
+  }
+
+  async consumedTokensDecayed(
+    installationId: string,
+    halfLifeSecs: number,
+  ): Promise<{ decayed: number; raw: number; rows: number }> {
+    let decayed = 0;
+    let raw = 0;
+    let rows = 0;
+    for (const row of this.consumed.values()) {
+      if (row.installationId !== installationId) continue;
+      rows += 1;
+      const ageSecs = Math.max(0, (this.now() - row.at) / 1000);
+      decayed += row.tokens * Math.pow(0.5, ageSecs / halfLifeSecs);
+      raw += row.tokens;
+    }
+    return { decayed, raw, rows };
   }
 
   async bumpRateCounter(bucketKey: string, windowStart: number): Promise<number> {
@@ -2081,6 +2110,35 @@ export class PgStore implements TrackerStore {
        ON CONFLICT (receipt_digest, peer_id) DO NOTHING`,
       values,
     );
+  }
+
+  async recordConsumption(row: { installationId: string; receiptDigest: string; tokens: number; at: number }): Promise<void> {
+    await this.query(
+      `INSERT INTO consumed_accounting (installation_id, receipt_digest, tokens, consumed_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (installation_id, receipt_digest) DO NOTHING`,
+      [row.installationId, row.receiptDigest, row.tokens, PgStore.iso(row.at)],
+    );
+  }
+
+  async consumedTokensDecayed(
+    installationId: string,
+    halfLifeSecs: number,
+  ): Promise<{ decayed: number; raw: number; rows: number }> {
+    const res = (await this.query(
+      `SELECT
+         COALESCE(SUM(tokens * pow(0.5, extract(epoch FROM (now() - consumed_at)) / $2)), 0) AS decayed,
+         COALESCE(SUM(tokens), 0) AS raw,
+         COUNT(*) AS rows
+       FROM consumed_accounting WHERE installation_id = $1`,
+      [installationId, halfLifeSecs],
+    )) as Record<string, unknown>[];
+    const r = res[0] ?? {};
+    return {
+      decayed: Number(r.decayed ?? 0),
+      raw: Number(r.raw ?? 0),
+      rows: Number(r.rows ?? 0),
+    };
   }
 
   async grantedCounters(

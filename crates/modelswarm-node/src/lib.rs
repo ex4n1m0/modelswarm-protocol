@@ -50,6 +50,10 @@
 pub mod advisory;
 pub mod artifact;
 pub mod catalog;
+/// ADR-040 cloud executor: one OpenAI-compatible provider API behind the
+/// gateway's InferenceExecutor (DeepSeek, OpenRouter). Key discipline:
+/// the key is desktop-local, never logged, never hub-sent.
+pub mod cloud_executor;
 pub mod engine;
 mod executor;
 #[cfg(feature = "libp2p-backend")]

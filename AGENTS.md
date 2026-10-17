@@ -7,13 +7,18 @@ Read it, `docs/architecture.md`, and every ADR under `docs/adr/` **before** writ
 
 > An installation may consume swarm inference for model profile P only while it is
 > actively and verifiably hosting the same exact profile P with at least one
-> advertised serving slot.
+> advertised serving slot — **or, since ADR-040 (owner ruling 2026-10-17), while it
+> is actively serving at least one cloud profile through a configured provider key
+> with an advertised slot (the cloud stake).**
 
 "Exact" means: same Hugging Face repository, full revision commit hash, GGUF filename,
 artifact SHA-256, quantization, context policy, and compatible pinned runtime — not
-merely the same model name. This rule is enforced at the tracker, at the requesting
-gateway, and at the serving peer. It is prototype-grade deterrence, not remote
-attestation (see `docs/threat-model.md`).
+merely the same model name. For cloud profiles (ADR-040) exactness pins provider +
+exact provider model id + context policy (no artifact digest exists). This rule is
+enforced at the tracker, at the requesting gateway, and at the serving peer. It is
+prototype-grade deterrence, not remote attestation (see `docs/threat-model.md`).
+Provider keys live ONLY in the desktop app — never in the hub, telemetry, or logs;
+fairness rules for the cloud stake are deferred to a future ratio ADR (ADR-040 §7).
 
 ## Hard architectural constraints
 

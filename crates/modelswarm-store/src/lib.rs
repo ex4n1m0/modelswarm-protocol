@@ -493,6 +493,16 @@ impl Store {
     }
 
     /// Whether this installation accepted the given profile's license.
+    /// Removes one acknowledgement row (the hosting-preference kv user,
+    /// 2026-10-17 hardening). Missing row = no-op.
+    pub fn remove_license(&self, installation_id: &str, profile_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM license_acceptances WHERE installation_id = ?1 AND profile_id = ?2",
+            rusqlite::params![installation_id, profile_id],
+        )?;
+        Ok(())
+    }
+
     pub fn has_license(&self, installation_id: &str, profile_id: &str) -> Result<bool> {
         let found = self
             .conn

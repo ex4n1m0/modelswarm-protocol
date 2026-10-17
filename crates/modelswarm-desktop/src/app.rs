@@ -2852,6 +2852,38 @@ fn hosting_autostart_marker(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("hosting.autostart")
 }
 
+/// The SECOND copy of the hosting preference (2026-10-17 hardening: the
+/// marker file vanished twice across update cycles on one machine — a
+/// DB row survives whatever ate the file). Same lifecycle: written on
+/// successful bring-up, removed on explicit OFF.
+fn hosting_autostart_db_get(data_dir: &std::path::Path) -> bool {
+    let Ok(store) = modelswarm_store::Store::open(data_dir.join("state.sqlite")) else {
+        return false;
+    };
+    let Ok(seed) = load_or_create_identity(data_dir, &Telemetry::memory().0) else {
+        return false;
+    };
+    store
+        .has_license(&seed.installation_id(), "hosting-autostart")
+        .unwrap_or(false)
+}
+
+fn hosting_autostart_db_set(data_dir: &std::path::Path, on: bool) {
+    let Ok(store) = modelswarm_store::Store::open(data_dir.join("state.sqlite")) else {
+        return;
+    };
+    let Ok(seed) = load_or_create_identity(data_dir, &Telemetry::memory().0) else {
+        return;
+    };
+    let id = seed.installation_id();
+    if on {
+        let _ = store.record_license(&id, "hosting-autostart");
+    } else {
+        let _ = store.remove_license(&id, "hosting-autostart");
+    }
+    let _ = id;
+}
+
 async fn set_hosting_inner(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, DesktopState>,
@@ -2865,9 +2897,10 @@ async fn set_hosting_inner(
             let _ = running.handle.stopped().await;
         }
         // The explicit OFF is the owner's deliberate state — the resume
-        // marker dies with the node (auto-resume never overrides an
-        // explicit choice).
+        // preference (both copies) dies with the node (auto-resume never
+        // overrides an explicit choice).
         let _ = std::fs::remove_file(hosting_autostart_marker(&inner.data_dir));
+        hosting_autostart_db_set(&inner.data_dir, false);
         inner.listener_addr = None;
         inner.family = None;
         // ADR-038 §6.4 row 8: hosting off = no heartbeat = no fresh
@@ -3503,6 +3536,7 @@ async fn set_hosting_inner(
             &[("phase", "persist"), ("error", &e.to_string())],
         );
     }
+    hosting_autostart_db_set(&inner.data_dir, true);
     Ok(status)
 }
 
@@ -3524,17 +3558,18 @@ async fn hosting_resume_supervisor(app: tauri::AppHandle) {
     for (n, delay) in ATTEMPT_DELAYS.iter().enumerate() {
         tokio::time::sleep(*delay).await;
         let state = app.state::<DesktopState>();
-        let (marker, hosting, telemetry) = {
+        let (marker, data_dir, hosting, telemetry) = {
             let inner = state.inner.lock().await;
             (
                 hosting_autostart_marker(&inner.data_dir),
+                inner.data_dir.clone(),
                 inner.node.is_some(),
                 std::sync::Arc::clone(&state.telemetry),
             )
         };
         // The owner explicitly turned hosting off in a previous session,
         // or turned it on manually just now — either way, nothing to do.
-        if !marker.is_file() || hosting {
+        if hosting || (!marker.is_file() && !hosting_autostart_db_get(&data_dir)) {
             return;
         }
         match set_hosting_inner(&app, &state, true).await {

@@ -135,6 +135,12 @@ export default function ReferencePage() {
           </div>
         </section>
       </div>
+      <footer>
+        ModelSwarm Protocol · source:{" "}
+        <a href="https://github.com/ex4n1m0/modelswarm-protocol">github.com/ex4n1m0/modelswarm-protocol</a>{" "}
+        · control plane only — never carries prompts, completions, or model
+        files (ADR-001) · protocol v1
+      </footer>
     </main>
   );
 }

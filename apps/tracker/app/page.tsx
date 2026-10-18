@@ -79,8 +79,11 @@ export default function Home() {
 
         <section id="how" aria-labelledby="how-heading">
           <h2 id="how-heading">How it works</h2>
+          <p className="note" style={{ margin: "0.3rem 0 1rem" }}>
+            Hover a step — or tap it — to see its details.
+          </p>
           <div className="steps">
-            <div className="step">
+            <div className="step" tabIndex={0}>
               <span className="n">STEP 1</span>
               <h3>Install the app</h3>
               <p>
@@ -89,7 +92,7 @@ export default function Home() {
                 last manual download.
               </p>
             </div>
-            <div className="step">
+            <div className="step" tabIndex={0}>
               <span className="n">STEP 2</span>
               <h3>Join a swarm</h3>
               <p>
@@ -98,7 +101,7 @@ export default function Home() {
                 provider key. Either way your machine counts as one peer.
               </p>
             </div>
-            <div className="step">
+            <div className="step" tabIndex={0}>
               <span className="n">STEP 3</span>
               <h3>Ask anything</h3>
               <p>

@@ -77,12 +77,18 @@ footer { border-top: 1px solid var(--border-soft); margin-top: 3.2rem; padding: 
 footer a { color: var(--text-2); }
 /* How it works (2026-10-17): three plain steps, after the census (the
    census stays the first section under the lede — owner directive
-   2026-10-12). */
+   2026-10-12). 2026-10-18: descriptions hidden until the step card is
+   hovered (mouse) or focused (tap / keyboard) — owner directive; the
+   +/− marker on the title is the affordance. */
 .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.9rem; }
 .step { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.95rem 1.05rem; }
 .step .n { font-family: var(--mono); color: var(--accent); font-size: 0.72rem; letter-spacing: 0.16em; }
-.step h3 { font-size: 0.98rem; margin: 0.4rem 0 0.3rem; }
-.step p { color: var(--text-2); font-size: 0.88rem; margin: 0; line-height: 1.6; }
+.step h3 { font-size: 0.98rem; margin: 0.4rem 0 0; cursor: pointer; }
+.step h3::after { content: " +"; color: var(--text-3); font-weight: 400; }
+.step:hover h3, .step:focus-within h3 { color: var(--accent); }
+.step:hover h3::after, .step:focus-within h3::after { content: " -"; }
+.step p { color: var(--text-2); font-size: 0.88rem; margin: 0.3rem 0 0; line-height: 1.6; display: none; }
+.step:hover p, .step:focus-within p { display: block; }
 /* Downloads (2026-10-17): OS-labeled buttons instead of a bare link list —
    a Windows user should find their installer in one glance. */
 .dl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.7rem; margin-top: 0.9rem; }

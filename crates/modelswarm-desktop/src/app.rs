@@ -6091,6 +6091,12 @@ async fn send_chat(
                     });
                 }
                 reply["served_by"] = serde_json::json!("swarm");
+                // The chat_log guard MUST drop here: the cross-check below
+                // takes the same mutex (v0.2.38 deadlocked exactly here —
+                // the streamed reply rendered, then the turn hung and the
+                // status line never appeared; tokio's Mutex is not
+                // reentrant).
+                drop(inner);
                 // ADR-042 §5: cross-check every completed reply with a
                 // DIFFERENT model in the swarm (best-effort, honest label,
                 // never rewrites). The answering profile rides the cross
@@ -6110,6 +6116,10 @@ async fn send_chat(
                             .and_then(|v| v.as_str())
                             .unwrap_or(profile.as_str())
                             .to_string();
+                        // Inside this branch the hosted profile IS the
+                        // chat profile (the gate above proved it) — the
+                        // local-verifier fallback keys off it.
+                        let hosted_for_check = Some(profile.clone());
                         try_cross_check(
                             &state.inner,
                             &cross_tracker_url,
@@ -6117,6 +6127,8 @@ async fn send_chat(
                             &state.telemetry,
                             &mut reply,
                             &served_profile,
+                            hosted_for_check.as_deref(),
+                            &gateway,
                             &request_log,
                         )
                         .await;
@@ -6226,7 +6238,9 @@ async fn send_chat(
         .await?;
         // ADR-042 §5: the local path (own engine or own cloud key) gets
         // the same cross-check — a different swarm model verifies the
-        // reply when one is reachable.
+        // reply when one is reachable; the OWN hosted model verifies
+        // locally when it differs from the chat profile (the 2-machine
+        // household shape: the remote scan finds only ourselves).
         {
             let (allow_cross, cross_tracker_url, cross_data_dir) = {
                 let inner_g = state.inner.lock().await;
@@ -6237,6 +6251,7 @@ async fn send_chat(
                 )
             };
             if allow_cross {
+                let hosted_for_check = node_ctx.as_ref().and_then(|(_, hp)| hp.clone());
                 try_cross_check(
                     &state.inner,
                     &cross_tracker_url,
@@ -6244,6 +6259,8 @@ async fn send_chat(
                     &state.telemetry,
                     &mut local_reply,
                     &profile,
+                    hosted_for_check.as_deref(),
+                    &gateway,
                     &request_log,
                 )
                 .await;
@@ -6604,6 +6621,8 @@ async fn try_cross_check(
     telemetry: &std::sync::Arc<Telemetry>,
     reply: &mut serde_json::Value,
     served_profile: &str,
+    hosted_profile: Option<&str>,
+    gateway: &str,
     request_log: &[ChatTurn],
 ) {
     let content = reply["content"].as_str().unwrap_or_default().to_string();
@@ -6621,163 +6640,285 @@ async fn try_cross_check(
         reply["cross_check"] = serde_json::json!({ "engaged": false, "reason": "no_user_turn" });
         return;
     }
-    let tracker = match tracker_client(tracker_url, data_dir, telemetry).await {
-        Ok(t) => t,
-        Err(e) => {
-            reply["cross_check"] =
-                serde_json::json!({ "engaged": false, "reason": "tracker_unavailable" });
-            telemetry.warn("chat.crosscheck", &[("phase", "tracker"), ("error", &e)]);
-            return;
+    let prompt = cross_check_prompt(&last_user, &content);
+    // The engagement writer shared by both verifier origins.
+    let engage = |reply: &mut serde_json::Value,
+                  display: &str,
+                  peer: Option<&str>,
+                  verdict: &'static str,
+                  reason: Option<String>,
+                  origin: &'static str| {
+        if let Some(mode) = reply["mode"].as_str() {
+            reply["mode"] =
+                serde_json::json!(format!("{mode} · cross-checked by {display} ({verdict})"));
         }
+        reply["cross_check"] = serde_json::json!({
+            "engaged": true,
+            "by": display,
+            "peer": peer,
+            "verdict": verdict,
+            "reason": reason,
+            "origin": origin,
+        });
     };
-    let own_peer_id = cached_identity(data_dir, telemetry)
-        .map(|i| i.peer_id())
-        .unwrap_or_default();
-    let registration_lease = std::fs::read_to_string(data_dir.join("lease.id"))
-        .map(|s| s.trim().to_string())
-        .ok()
-        .filter(|s| !s.is_empty());
-    let Some(registration_lease) = registration_lease else {
-        reply["cross_check"] = serde_json::json!({ "engaged": false, "reason": "no_lease" });
-        return;
-    };
-    let (live, _scanned) = live_cross_candidates(&tracker, &own_peer_id, served_profile).await;
-    let Some((listing, candidate)) = live.into_iter().next() else {
-        reply["cross_check"] =
-            serde_json::json!({ "engaged": false, "reason": "no_verifier_peer" });
-        return;
-    };
-    let Some(addr) = candidate.addresses.iter().find(|a| peer_addr_dialable(a)) else {
-        reply["cross_check"] =
-            serde_json::json!({ "engaged": false, "reason": "no_dialable_addr" });
-        return;
-    };
-    // The verifier's capability token (the ADR-042 capacity stake grants
-    // it; a refusal engages honestly and the chat is already served).
-    let token = match tracker
-        .request_lease(&registration_lease, &listing.profile_id)
-        .await
-    {
-        Ok(issued) => issued.lease,
-        Err(e) => {
-            reply["cross_check"] =
-                serde_json::json!({ "engaged": false, "reason": "lease_refused" });
-            telemetry.info(
-                "chat.crosscheck",
-                &[
-                    ("phase", "lease"),
-                    ("profile", listing.profile_id.as_str()),
-                    ("error", &e.to_string()),
-                ],
-            );
-            return;
+
+    // ---- REMOTE verifier first (swarm-first): a different model on
+    // another machine. In a 2-machine/2-profile household this finds
+    // nothing (the only other model is ourselves — filtered out), which
+    // is exactly what the local fallback below covers.
+    let mut remote_reason: Option<&'static str> = None;
+    if let Ok(tracker) = tracker_client(tracker_url, data_dir, telemetry).await {
+        let own_peer_id = cached_identity(data_dir, telemetry)
+            .map(|i| i.peer_id())
+            .unwrap_or_default();
+        let registration_lease = std::fs::read_to_string(data_dir.join("lease.id"))
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty());
+        let (live, _scanned) = live_cross_candidates(&tracker, &own_peer_id, served_profile).await;
+        telemetry.info(
+            "chat.crosscheck",
+            &[("phase", "start"), ("remote_live", &live.len().to_string())],
+        );
+        if registration_lease.is_none() {
+            remote_reason = Some("no_lease");
         }
-    };
-    let peer = modelswarm_node::remote::RemotePeer {
-        addr: addr.clone(),
-        peer_id: candidate.peer_id.clone(),
-    };
-    let key = format!("{}|{}", listing.profile_id, peer.peer_id);
-    let remote = {
-        let mut inner_state = inner.lock().await;
-        match &inner_state.swarm_executor {
-            Some((k, exec)) if k == &key => std::sync::Arc::clone(exec),
-            _ => {
-                let mut executor = modelswarm_node::remote::RemoteExecutor::new(
-                    peer,
-                    match cached_identity(data_dir, telemetry) {
-                        Ok(i) => i,
-                        Err(_) => {
+        if let (Some(registration_lease), Some((listing, candidate))) =
+            (registration_lease, live.into_iter().next())
+        {
+            if let Some(addr) = candidate.addresses.iter().find(|a| peer_addr_dialable(a)) {
+                match tracker
+                    .request_lease(&registration_lease, &listing.profile_id)
+                    .await
+                {
+                    Ok(issued) => {
+                        let peer = modelswarm_node::remote::RemotePeer {
+                            addr: addr.clone(),
+                            peer_id: candidate.peer_id.clone(),
+                        };
+                        let key = format!("{}|{}", listing.profile_id, peer.peer_id);
+                        let remote = {
+                            let mut inner_state = inner.lock().await;
+                            match &inner_state.swarm_executor {
+                                Some((k, exec)) if k == &key => std::sync::Arc::clone(exec),
+                                _ => {
+                                    let mut executor = modelswarm_node::remote::RemoteExecutor::new(
+                                        peer,
+                                        match cached_identity(data_dir, telemetry) {
+                                            Ok(i) => i,
+                                            Err(_) => {
+                                                reply["cross_check"] = serde_json::json!(
+                                                    { "engaged": false, "reason": "identity" }
+                                                );
+                                                return;
+                                            }
+                                        },
+                                    );
+                                    if let Some(tickets) = inner_state.relay_tickets.clone() {
+                                        executor = executor.with_relay_tickets(tickets);
+                                    }
+                                    let exec = std::sync::Arc::new(executor);
+                                    inner_state.swarm_executor =
+                                        Some((key, std::sync::Arc::clone(&exec)));
+                                    exec
+                                }
+                            }
+                        };
+                        let request = modelswarm_gateway::NormalizedRequest {
+                            request_id: format!("crosscheck-{}", modelswarm_identity::new_nonce()),
+                            profile_id: listing.profile_id.clone(),
+                            capability_token: Some(issued.lease),
+                            messages: vec![modelswarm_gateway::NormalizedMessage {
+                                role: "user".into(),
+                                content: prompt.clone(),
+                            }],
+                            sampling: modelswarm_gateway::Sampling {
+                                temperature: 0.0,
+                                top_p: 1.0,
+                                top_k: 40,
+                                seed: None,
+                            },
+                            max_tokens: 96,
+                            deadline_ms: 20_000,
+                            stream: true,
+                        };
+                        use futures_util::StreamExt;
+                        use modelswarm_gateway::{ExecutorEvent, InferenceExecutor};
+                        match remote.execute(request).await {
+                            Ok(mut stream) => {
+                                let mut verdict_reply = String::new();
+                                while let Some(ev) = stream.next().await {
+                                    match ev {
+                                        ExecutorEvent::TokenDelta { delta, .. } => {
+                                            verdict_reply.push_str(&delta)
+                                        }
+                                        ExecutorEvent::Completed { .. } => break,
+                                        ExecutorEvent::Error { code, .. } => {
+                                            telemetry.warn(
+                                                "chat.crosscheck",
+                                                &[
+                                                    ("peer", candidate.peer_id.as_str()),
+                                                    ("phase", "serve"),
+                                                    ("error", code.as_str()),
+                                                ],
+                                            );
+                                            break;
+                                        }
+                                        ExecutorEvent::Usage { .. }
+                                        | ExecutorEvent::Accepted { .. } => {}
+                                    }
+                                }
+                                let (verdict, reason) = parse_cross_check_verdict(&verdict_reply);
+                                let peer_note: String =
+                                    candidate.peer_id.chars().take(12).collect();
+                                engage(
+                                    reply,
+                                    &listing.display_name,
+                                    Some(&peer_note),
+                                    verdict,
+                                    reason,
+                                    "remote",
+                                );
+                                telemetry.info(
+                                    "chat.crosscheck",
+                                    &[
+                                        ("peer", candidate.peer_id.as_str()),
+                                        ("profile", listing.profile_id.as_str()),
+                                        ("model", listing.display_name.as_str()),
+                                        ("verdict", verdict),
+                                    ],
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                remote_reason = Some("dial_failed");
+                                telemetry.warn(
+                                    "chat.crosscheck",
+                                    &[
+                                        ("peer", candidate.peer_id.as_str()),
+                                        ("phase", "dial"),
+                                        ("error", &e.to_string()),
+                                    ],
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        remote_reason = Some("lease_refused");
+                        telemetry.info(
+                            "chat.crosscheck",
+                            &[
+                                ("phase", "lease"),
+                                ("profile", listing.profile_id.as_str()),
+                                ("error", &e.to_string()),
+                            ],
+                        );
+                    }
+                }
+            } else {
+                remote_reason = Some("no_dialable_addr");
+            }
+        } else if remote_reason.is_none() {
+            remote_reason = Some("no_verifier_peer");
+        }
+    } else {
+        remote_reason = Some("tracker_unavailable");
+    }
+
+    // ---- LOCAL verifier fallback: when this machine's OWN hosted model
+    // differs from the one that answered, it verifies through the local
+    // gateway (own engine or own provider key) — the 2-machine household
+    // shape, and the answer to "the remote scan only finds ourselves".
+    if let Some(hosted) = hosted_profile.filter(|h| *h != served_profile) {
+        let display = match tracker_client(tracker_url, data_dir, telemetry).await {
+            Ok(t) => catalog::active_profiles(&t)
+                .await
+                .ok()
+                .and_then(|ps| {
+                    ps.into_iter()
+                        .find(|p| p.profile_id == hosted)
+                        .map(|p| p.display_name)
+                })
+                .unwrap_or_else(|| "own hosted model".to_string()),
+            Err(_) => "own hosted model".to_string(),
+        };
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(45))
+            .build();
+        let sent = match http {
+            Ok(client) => {
+                client
+                    .post(format!("http://{gateway}/v1/chat/completions"))
+                    .json(&serde_json::json!({
+                        "model": hosted,
+                        "messages": [{ "role": "user", "content": prompt }],
+                        "max_tokens": 96,
+                        "temperature": 0.0,
+                        "stream": false,
+                    }))
+                    .send()
+                    .await
+            }
+            Err(_) => {
+                reply["cross_check"] =
+                    serde_json::json!({ "engaged": false, "reason": "verifier_http" });
+                return;
+            }
+        };
+        match sent {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let verdict_text = body["choices"][0]["message"]["content"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        if verdict_text.trim().is_empty() {
                             reply["cross_check"] =
-                                serde_json::json!({ "engaged": false, "reason": "identity" });
+                                serde_json::json!({ "engaged": false, "reason": "verifier_empty" });
                             return;
                         }
-                    },
-                );
-                if let Some(tickets) = inner_state.relay_tickets.clone() {
-                    executor = executor.with_relay_tickets(tickets);
+                        let (verdict, reason) = parse_cross_check_verdict(&verdict_text);
+                        engage(reply, &display, None, verdict, reason, "local");
+                        telemetry.info(
+                            "chat.crosscheck",
+                            &[
+                                ("model", display.as_str()),
+                                ("verdict", verdict),
+                                ("origin", "local"),
+                            ],
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        telemetry.warn(
+                            "chat.crosscheck",
+                            &[("phase", "local_body"), ("error", &e.to_string())],
+                        );
+                    }
                 }
-                let exec = std::sync::Arc::new(executor);
-                inner_state.swarm_executor = Some((key, std::sync::Arc::clone(&exec)));
-                exec
             }
-        }
-    };
-    let request = modelswarm_gateway::NormalizedRequest {
-        request_id: format!("crosscheck-{}", modelswarm_identity::new_nonce()),
-        profile_id: listing.profile_id.clone(),
-        capability_token: Some(token),
-        messages: vec![modelswarm_gateway::NormalizedMessage {
-            role: "user".into(),
-            content: cross_check_prompt(&last_user, &content),
-        }],
-        sampling: modelswarm_gateway::Sampling {
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 40,
-            seed: None,
-        },
-        max_tokens: 96,
-        deadline_ms: 20_000,
-        stream: true,
-    };
-    use futures_util::StreamExt;
-    use modelswarm_gateway::{ExecutorEvent, InferenceExecutor};
-    let mut stream = match remote.execute(request).await {
-        Ok(s) => s,
-        Err(e) => {
-            reply["cross_check"] = serde_json::json!({ "engaged": false, "reason": "dial_failed" });
-            telemetry.warn(
-                "chat.crosscheck",
-                &[
-                    ("peer", candidate.peer_id.as_str()),
-                    ("phase", "dial"),
-                    ("error", &e.to_string()),
-                ],
-            );
-            return;
-        }
-    };
-    let mut verdict_reply = String::new();
-    while let Some(ev) = stream.next().await {
-        match ev {
-            ExecutorEvent::TokenDelta { delta, .. } => verdict_reply.push_str(&delta),
-            ExecutorEvent::Completed { .. } => break,
-            ExecutorEvent::Error { code, .. } => {
+            Ok(resp) => {
                 telemetry.warn(
                     "chat.crosscheck",
                     &[
-                        ("peer", candidate.peer_id.as_str()),
-                        ("phase", "serve"),
-                        ("error", code.as_str()),
+                        ("phase", "local_status"),
+                        ("status", &resp.status().to_string()),
                     ],
                 );
-                break;
             }
-            ExecutorEvent::Usage { .. } | ExecutorEvent::Accepted { .. } => {}
+            Err(e) => {
+                telemetry.warn(
+                    "chat.crosscheck",
+                    &[("phase", "local_dial"), ("error", &e.to_string())],
+                );
+            }
         }
     }
-    let (verdict, reason) = parse_cross_check_verdict(&verdict_reply);
-    let started_note = format!("cross-checked by {} ({})", listing.display_name, verdict);
-    if let Some(mode) = reply["mode"].as_str() {
-        reply["mode"] = serde_json::json!(format!("{mode} · {started_note}"));
-    }
     reply["cross_check"] = serde_json::json!({
-        "engaged": true,
-        "by": listing.display_name,
-        "peer": candidate.peer_id.chars().take(12).collect::<String>(),
-        "verdict": verdict,
-        "reason": reason,
+        "engaged": false,
+        "reason": remote_reason.unwrap_or("no_verifier"),
     });
-    telemetry.info(
-        "chat.crosscheck",
-        &[
-            ("peer", candidate.peer_id.as_str()),
-            ("profile", listing.profile_id.as_str()),
-            ("model", listing.display_name.as_str()),
-            ("verdict", verdict),
-        ],
-    );
 }
 
 /// Tiny helper: the raw body of an unrecognized error response, for the

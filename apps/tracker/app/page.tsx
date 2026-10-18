@@ -138,6 +138,9 @@ export default function Home() {
             <span id="census-body" style={{ fontSize: "0.95rem" }}>
               loading…
             </span>
+            <p className="note" id="peers-count" style={{ marginTop: "0.6rem" }}>
+              &nbsp;
+            </p>
           </div>
         </section>
 
@@ -161,6 +164,10 @@ export default function Home() {
       if (!r.ok) throw 0;
       ({ peersOnline, clientsServed } = await r.json());
       badge.textContent = peersOnline + (peersOnline === 1 ? ' peer online' : ' peers online');
+      const peersCount = document.getElementById('peers-count');
+      if (peersCount && Number.isFinite(peersOnline)) {
+        peersCount.textContent = peersOnline + (peersOnline === 1 ? ' peer' : ' peers');
+      }
       const served = document.getElementById('clients-served');
       if (served && Number.isFinite(clientsServed)) {
         served.textContent = clientsServed + (clientsServed === 1 ? ' download' : ' downloads');

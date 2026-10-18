@@ -54,10 +54,36 @@ export default function ReferencePage() {
       <div className="wrap" style={{ maxWidth: "60rem", margin: "0 auto", padding: "2.4rem 1.2rem 4rem" }}>
         <h1 style={{ fontSize: "1.6rem" }}>Reference</h1>
         <p className="note" style={{ marginBottom: "2rem" }}>
-          Execution presets and the tracker API surface — moved here from
-          the main page (2026-10-17). The protocol spec lives in the
-          repository under protocol/msp-v1.md.
+          The one rule, the trade, execution presets, and the tracker API
+          surface — moved here from the main page (2026-10-17/18). The
+          protocol spec lives in the repository under protocol/msp-v1.md.
         </p>
+
+        <section id="rule" aria-labelledby="rule-heading">
+          <h2 id="rule-heading">The one rule</h2>
+          <div className="rule">
+            <b>Host to consume — or stake a cloud key.</b> A peer earns swarm
+            access by verifiably hosting the models it uses, or by serving a
+            cloud model through its own provider key (DeepSeek or OpenRouter
+            — joining with just a key lands in the next app release).
+            Contribution is checked, not paid for: no credits, no payments,
+            and prompts and completions never touch this site.
+          </div>
+        </section>
+
+        <section id="trade" aria-labelledby="trade-heading">
+          <h2 id="trade-heading">The trade</h2>
+          <div className="rule">
+            <b>One to one, token for token.</b> You may pull from the
+            swarm up to what your own hardware and model can serve — a
+            capacity measured when you prove hosting, not a debt earned
+            from others using you. Whether or not anyone is pulling from
+            your model right now never matters: your pull budget is your
+            verified serving capacity, refilled continuously. The rule
+            ships in watch mode first — budgets are measured and shown
+            before they bind.
+          </div>
+        </section>
 
         <section id="presets" aria-labelledby="presets-heading">
           <h2 id="presets-heading">Presets</h2>

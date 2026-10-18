@@ -55,8 +55,9 @@ export default function Home() {
           </nav>
         </div>
 
-        {/* The hero artwork carries its own title lockup; the band below it
-            adds the call to action the image cannot provide. */}
+        {/* The hero artwork carries its own title lockup; there is no text
+            band below it (owner directive 2026-10-18) — the artwork alt
+            text is the page's readable title. */}
         <img
           src="/hero.png"
           alt="ModelSwarm — Decentralized Cooperative Inference Protocol: a glowing network of peer nodes converging into a central verification tree above a laptop"
@@ -64,12 +65,6 @@ export default function Home() {
           width={1672}
           height={941}
         />
-        <div className="hero-band">
-          <div className="cta-row">
-            <a className="btn" href="#get">Get the app</a>
-            <a className="btn ghost" href="#how">How it works</a>
-          </div>
-        </div>
       </div>
 
       <div className="wrap" id="content" tabIndex={-1}>
@@ -119,32 +114,6 @@ export default function Home() {
                 every reply — slower by design, verified by cohort.
               </p>
             </div>
-          </div>
-        </section>
-
-        <section id="rule" aria-labelledby="rule-heading">
-          <h2 id="rule-heading">The one rule</h2>
-          <div className="rule">
-            <b>Host to consume — or stake a cloud key.</b> A peer earns swarm
-            access by verifiably hosting the models it uses, or by serving a
-            cloud model through its own provider key (DeepSeek or OpenRouter
-            — joining with just a key lands in the next app release).
-            Contribution is checked, not paid for: no credits, no payments,
-            and prompts and completions never touch this site.
-          </div>
-        </section>
-
-        <section id="trade" aria-labelledby="trade-heading">
-          <h2 id="trade-heading">The trade</h2>
-          <div className="rule">
-            <b>One to one, token for token.</b> You may pull from the
-            swarm up to what your own hardware and model can serve — a
-            capacity measured when you prove hosting, not a debt earned
-            from others using you. Whether or not anyone is pulling from
-            your model right now never matters: your pull budget is your
-            verified serving capacity, refilled continuously. The rule
-            ships in watch mode first — budgets are measured and shown
-            before they bind.
           </div>
         </section>
 

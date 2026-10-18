@@ -87,7 +87,7 @@ export default function Home() {
               <span className="n">STEP 1</span>
               <h3>Install the app</h3>
               <p>
-                One download for Windows, macOS, or Linux. From then on the
+                Download for Windows, macOS, or Linux. From then on the
                 app verifies and installs its own updates — this is the
                 last manual download.
               </p>
@@ -96,7 +96,8 @@ export default function Home() {
               <span className="n">STEP 2</span>
               <h3>Join a swarm</h3>
               <p>
-                Pick a model and press Join — it downloads and hosts on
+                Pick a model for the pre selected list recommended for
+                your hardware and press Join — it downloads and hosts on
                 your machine, or serve a cloud model through your own
                 provider key. Either way your machine counts as one peer.
               </p>
@@ -106,8 +107,7 @@ export default function Home() {
               <h3>Ask anything</h3>
               <p>
                 Chat in the app or through the local API on the same
-                machine. Peers hosting the exact same model cross-check
-                every reply — slower by design, verified by cohort.
+                machine. You get responses from the Swarm.
               </p>
             </div>
           </div>

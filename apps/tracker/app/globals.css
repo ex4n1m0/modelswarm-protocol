@@ -75,9 +75,9 @@ th { color: var(--text-3); font-family: var(--mono); font-size: 0.68rem; letter-
 .note { font-size: 0.8rem; color: var(--text-3); margin: 1rem 0 0; max-width: 46rem; line-height: 1.7; }
 footer { border-top: 1px solid var(--border-soft); margin-top: 3.2rem; padding: 2.2rem 0 2.6rem; color: var(--text-3); font-size: 0.78rem; text-align: center; line-height: 1.8; }
 footer a { color: var(--text-2); }
-/* How it works (2026-10-17): three plain steps, after the census (the
-   census stays the first section under the lede — owner directive
-   2026-10-12). 2026-10-18: descriptions hidden until the step card is
+/* How it works (2026-10-17): three plain steps. 2026-10-19: census moved
+   below Desktop app, steps are the first section under the hero (owner
+   directive). 2026-10-18: descriptions hidden until the step card is
    hovered (mouse) or focused (tap / keyboard) — owner directive; the
    +/− marker on the title is the affordance. */
 .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.9rem; }

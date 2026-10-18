@@ -78,11 +78,11 @@ denies access.
 
 ## Implementation map (three seats)
 
-| Seat | Change |
-|---|---|
-| Tracker | `queue_weight` bucketing at lease issuance (`lib/eligibility.ts` + `grantedCounters`); msp-v1 §3.3/§5 lease-field row + §9 changelog row closing the ADR-028 deferral |
-| Node serving (`serving.rs`) | bounded wait queue + DRR scheduler + 10 s deadline + `queue_deadline` reason + `accepted` emission |
-| Test & Release | golden vector for the `accepted` frame; lease-with-`queue_weight` vector; guards vocabulary row for `queue_deadline`; contended-admission-order test (class 4 beats class 1 under saturation) |
+| Seat | Change | Status |
+|---|---|---|
+| Lease (Rust) | `queue_weight: u8` — serde-default 1, OMITTED from the signed payload at base weight (legacy tokens + golden vectors stay byte-identical; `issue()` clamps ≥ 1) | **landed bd3e22d** (4 adr043 tests, all feature combos) |
+| Tracker | `queueWeightClass` bucketing from decayed granted tok/s at issuance; env `MSP_FAIR_WEIGHT_T2`/`T3` (defaults 1/5); `fair-weight.test.ts` 7/7, vectors 25/25 | **landed bd3e22d** |
+| Node serving (`serving.rs`) | bounded wait queue + DRR + 10 s deadline + `queue_deadline` reason + `accepted` emission | **next** — design note: the weight arrives INSIDE the lease token (handshake stage), so the queue implementation must read/verify the handshake BEFORE acquiring the admission slot, then wait weight-ordered; the wire-compat golden vector (accepted on a queued stream) is a release gate |
 
 ## Honesty note
 

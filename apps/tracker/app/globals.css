@@ -45,7 +45,7 @@ nav .navlink:hover { color: var(--accent); }
 .btn:hover { background: #62E2F8; color: #06131D; }
 .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
 .btn.ghost:hover { background: transparent; border-color: var(--accent); color: var(--accent); }
-.badge { border: 1px solid rgba(56, 217, 245, 0.45); background: rgba(56, 217, 245, 0.08); color: var(--accent); border-radius: 999px; padding: 0.18rem 0.7rem; font-size: 0.72rem; letter-spacing: 0.1em; font-family: var(--mono); white-space: nowrap; }
+.badge { border: 1px solid rgba(56, 217, 245, 0.45); background: transparent; color: var(--accent); border-radius: 999px; padding: 0.18rem 0.7rem; font-size: 0.72rem; letter-spacing: 0.1em; font-family: var(--mono); white-space: nowrap; }
 .hero { width: min(920px, 88%); height: auto; display: block; margin: 0 auto; }
 /* Headline band (2026-10-17): a real, visible h1 + subhead + CTA under the
    hero artwork. Previously the only headline was baked into the artwork
@@ -96,7 +96,7 @@ a.dl { display: flex; flex-direction: column; gap: 0.2rem; background: var(--sur
 a.dl:hover { border-color: var(--accent); }
 a.dl .os { font-weight: 650; color: var(--text); font-size: 0.95rem; }
 a.dl .fmt { color: var(--text-3); font-family: var(--mono); font-size: 0.72rem; }
-a.dl.primary { border-color: rgba(56, 217, 245, 0.5); background: linear-gradient(180deg, rgba(56, 217, 245, 0.10), rgba(56, 217, 245, 0.03)); }
+a.dl.primary { border-color: rgba(56, 217, 245, 0.5); background: transparent; }
 @media (hover: hover) { tbody tr:hover td { background: var(--surface-2); } }
 @media (max-width: 900px) {
   .steps { grid-template-columns: 1fr; }

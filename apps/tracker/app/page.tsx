@@ -184,7 +184,7 @@ export default function Home() {
           ...rows.map((row) => {
             const el = document.createElement('span');
             el.textContent = row.name + ' · ' + row.peers + (row.peers === 1 ? ' peer' : ' peers');
-            el.style.cssText = 'display:inline-block;margin:0 0.6rem 0.4rem 0;padding:0.2rem 0.7rem;border:1px solid rgba(56,217,245,0.35);background:#0D1524;border-radius:999px;font-size:0.9rem;white-space:nowrap;color:#DCE6F5;';
+            el.style.cssText = 'display:inline-block;margin:0 0.6rem 0.4rem 0;padding:0.2rem 0.7rem;border:1px solid rgba(56,217,245,0.35);background:transparent;border-radius:999px;font-size:0.9rem;white-space:nowrap;color:#DCE6F5;';
             return el;
           }),
         );

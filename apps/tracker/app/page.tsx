@@ -56,8 +56,7 @@ export default function Home() {
         </div>
 
         {/* The hero artwork carries its own title lockup; the band below it
-            adds the readable headline + call to action the image cannot
-            provide (screen readers and first-time visitors both need it). */}
+            adds the call to action the image cannot provide. */}
         <img
           src="/hero.png"
           alt="ModelSwarm — Decentralized Cooperative Inference Protocol: a glowing network of peer nodes converging into a central verification tree above a laptop"
@@ -66,13 +65,6 @@ export default function Home() {
           height={941}
         />
         <div className="hero-band">
-          <h1>Your computers, one AI swarm.</h1>
-          <p>
-            Install the app and pick a model — your machine hosts it, and
-            peers running the <b>exact same model</b> cross-check your
-            answers. No accounts, no payments: hosting is what earns you
-            swarm access.
-          </p>
           <div className="cta-row">
             <a className="btn" href="#get">Get the app</a>
             <a className="btn ghost" href="#how">How it works</a>
@@ -81,11 +73,6 @@ export default function Home() {
       </div>
 
       <div className="wrap" id="content" tabIndex={-1}>
-        <p className="lede">
-          Coming next: mixed models working together as <b>solvers, skeptics,
-          and judges</b> — behind their own correctness gates.
-        </p>
-
         <section id="census" aria-labelledby="census-heading">
           <h2 id="census-heading">Live swarm census</h2>
           <div className="rule">

@@ -46,7 +46,7 @@ nav .navlink:hover { color: var(--accent); }
 .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
 .btn.ghost:hover { background: transparent; border-color: var(--accent); color: var(--accent); }
 .badge { border: 1px solid rgba(56, 217, 245, 0.45); background: transparent; color: var(--accent); border-radius: 999px; padding: 0.18rem 0.7rem; font-size: 0.72rem; letter-spacing: 0.1em; font-family: var(--mono); white-space: nowrap; }
-.hero { width: min(920px, 88%); height: auto; display: block; margin: 0 auto; }
+.hero { width: min(1152px, calc(100% - 3rem)); height: auto; display: block; margin: 0 auto; }
 /* Headline band (2026-10-17): a real, visible h1 + subhead + CTA under the
    hero artwork. Previously the only headline was baked into the artwork
    and the only CTA was a small nav button — first-time visitors could not
@@ -92,17 +92,17 @@ footer a { color: var(--text-2); }
 /* Downloads (2026-10-17): OS-labeled buttons instead of a bare link list —
    a Windows user should find their installer in one glance. */
 .dl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.7rem; margin-top: 0.9rem; }
-a.dl { display: flex; flex-direction: column; gap: 0.2rem; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 0.7rem 0.95rem; text-decoration: none; }
+a.dl { display: flex; flex-direction: column; gap: 0.2rem; background: transparent; border: 1px solid rgba(56, 217, 245, 0.5); border-radius: 10px; padding: 0.7rem 0.95rem; text-decoration: none; }
 a.dl:hover { border-color: var(--accent); }
 a.dl .os { font-weight: 650; color: var(--text); font-size: 0.95rem; }
 a.dl .fmt { color: var(--text-3); font-family: var(--mono); font-size: 0.72rem; }
-a.dl.primary { border-color: rgba(56, 217, 245, 0.5); background: transparent; }
 @media (hover: hover) { tbody tr:hover td { background: var(--surface-2); } }
 @media (max-width: 900px) {
   .steps { grid-template-columns: 1fr; }
 }
 @media (max-width: 720px) {
   .wrap { padding: 0 1.25rem; }
+  .hero { width: calc(100% - 2.5rem); }
   table { font-size: 0.78rem; }
   td:first-child { white-space: normal; overflow-wrap: anywhere; }
 }

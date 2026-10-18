@@ -109,7 +109,7 @@ export default function Home() {
           <div className="rule">
             <b>v0.2.39</b>
             <div className="dl-grid">
-              <a className="dl primary" href="/api/download/ModelSwarm-Setup-0.2.39-windows-x64.exe">
+              <a className="dl" href="/api/download/ModelSwarm-Setup-0.2.39-windows-x64.exe">
                 <span className="os">Windows</span>
                 <span className="fmt">installer · .exe · x64</span>
               </a>

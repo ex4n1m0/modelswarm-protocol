@@ -502,6 +502,7 @@ pub fn mint_lease(
         1,
         "pass1-challenge",
         "pass1-nonce",
+        1,
         &signing,
     );
     let token = lease.to_wire();
@@ -580,6 +581,9 @@ pub async fn spawn_bridge(
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     tokio::spawn(serve_sessions(
         listener,
+        std::sync::Arc::new(InstallationIdentity::from_bytes(&bridge_identity_seed(
+            config.seed,
+        ))),
         shimmed,
         profile_id.to_string(),
         policy,

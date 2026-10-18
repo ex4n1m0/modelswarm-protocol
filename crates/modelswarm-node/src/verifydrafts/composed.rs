@@ -826,6 +826,7 @@ mod tests {
             1,
             "test-challenge",
             "test-nonce",
+            1,
             key,
         )
         .to_wire()
@@ -1017,6 +1018,7 @@ mod tests {
             1,
             "test-challenge",
             "test-nonce",
+            1,
             &key,
         )
         .to_wire();

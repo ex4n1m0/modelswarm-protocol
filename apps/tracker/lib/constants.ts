@@ -52,3 +52,9 @@ export const EXPIRED_ROW_GRACE_MS = 24 * 60 * 60 * 1000;
  * frozen INITIAL value (tunable, measurement-informed later; the decay
  * SHAPE is what is frozen). */
 export const GRANTED_HALF_LIFE_SECS = 7 * 24 * 60 * 60;
+
+/** ADR-043 fair queueing: default decayed-served tok/s thresholds that earn
+ * queue weight 2 and 4 (owner go 2026-10-18; env-tunable via
+ * MSP_FAIR_WEIGHT_T2 / MSP_FAIR_WEIGHT_T3 — operator policy, no release). */
+export const DEFAULT_FAIR_WEIGHT_T2 = 1;
+export const DEFAULT_FAIR_WEIGHT_T3 = 5;

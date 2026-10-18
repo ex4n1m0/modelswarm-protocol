@@ -29,6 +29,12 @@ export interface EligibilityLeaseFields {
   audit_epoch: number;
   challenge_id: string;
   nonce: string;
+  /** ADR-043 fair-queueing weight class (1 base, 2 / 4 for sustained
+   *  contributors). OPTIONAL and set ONLY when > 1 so the canonical
+   *  payload — and therefore the hub signature — of a base lease is
+   *  byte-identical before and after this field existed (mirrors the
+   *  Rust `skip_serializing_if` rule; golden vectors stay valid). */
+  queue_weight?: number;
 }
 
 export interface IssuedEligibilityLease {
@@ -63,8 +69,27 @@ export function capacityRank(c: CapacityClass): number {
 }
 
 /**
+ * ADR-043 fair-queueing weight class from the peer's receipt-backed decayed
+ * served tok/s (granted accounting, 7-day half-life — M10 ordering: the hub
+ * reads its own counters; peers never self-report a class). Classes:
+ * 1 = any valid lease (base), 2 = sustained ≥ t2 tok/s, 4 = ≥ t3 tok/s.
+ * Both thresholds are operator policy (env-tunable, no code release).
+ */
+export function queueWeightClass(
+  decayedTokensPerSec: number,
+  t2: number,
+  t3: number,
+): 1 | 2 | 4 {
+  if (decayedTokensPerSec >= t3 && t3 > t2) return 4;
+  if (decayedTokensPerSec >= t2) return 2;
+  return 1;
+}
+
+/**
  * Build + sign an EligibilityLease. `expires_at` is hard-capped at the
  * issuing lease's expiry + 60 s grace (msp-v1 §5 / ADR-012).
+ * `queueWeight` (ADR-043) is clamped to ≥ 1 and OMITTED from the signed
+ * payload when 1 (legacy byte-compatibility).
  */
 export function issueEligibilityLease(
   lease: LeaseRecord,
@@ -73,7 +98,9 @@ export function issueEligibilityLease(
   auditEpoch: number,
   now: number,
   secretKey: Uint8Array,
+  queueWeight: number = 1,
 ): IssuedEligibilityLease {
+  const weight = Math.max(1, Math.floor(queueWeight));
   const fields: EligibilityLeaseFields = {
     peer_id: lease.peerId,
     installation_id: lease.installationId,
@@ -88,6 +115,7 @@ export function issueEligibilityLease(
     audit_epoch: auditEpoch,
     challenge_id: challenge.challengeId,
     nonce: randomId128(),
+    ...(weight > 1 ? { queue_weight: weight } : {}),
   };
   const json = canonicalJson(fields);
   // Detached Ed25519 signature over the canonical JSON, base64url-encoded

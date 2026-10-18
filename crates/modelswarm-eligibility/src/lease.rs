@@ -115,6 +115,18 @@ pub struct EligibilityLease {
     pub slots: u8,
     /// Measured capacity class.
     pub verified_capacity: CapacityClass,
+    /// ADR-043 fair-queueing weight class (1 base, 2 / 4 for sustained
+    /// contributors, bucketed by the tracker from decayed granted tok/s).
+    /// Serialized ONLY when it differs from the default so the canonical
+    /// payload — and therefore the hub signature — of a base lease is
+    /// byte-identical before and after this field existed (old binaries
+    /// verify base leases unchanged; a >1 weight is meaningful only to
+    /// ADR-043-aware serving peers).
+    #[serde(
+        default = "default_queue_weight",
+        skip_serializing_if = "is_base_queue_weight"
+    )]
+    pub queue_weight: u8,
     /// Revocation/audit sweep counter; leases older than the tracker's
     /// current epoch for the peer are rejected without a lookup.
     pub audit_epoch: u64,
@@ -127,6 +139,15 @@ pub struct EligibilityLease {
     /// defaults to empty and is re-attached after transport.
     #[serde(skip_serializing, default)]
     pub issuer_signature: String,
+}
+
+/// ADR-043 base queue weight: every valid lease carries at least 1.
+fn default_queue_weight() -> u8 {
+    1
+}
+
+fn is_base_queue_weight(w: &u8) -> bool {
+    *w == default_queue_weight()
 }
 
 impl EligibilityLease {
@@ -153,6 +174,7 @@ impl EligibilityLease {
         audit_epoch: u64,
         challenge_id: impl Into<String>,
         nonce: impl Into<String>,
+        queue_weight: u8,
         hub_key: &SigningKey,
     ) -> Self {
         let mut lease = Self {
@@ -169,6 +191,7 @@ impl EligibilityLease {
             audit_epoch,
             challenge_id: challenge_id.into(),
             nonce: nonce.into(),
+            queue_weight: queue_weight.max(default_queue_weight()),
             issuer_signature: String::new(),
         };
         let signature = hub_key.sign(lease.signed_payload().as_bytes());
@@ -321,6 +344,7 @@ mod tests {
             7,
             "challenge-1",
             "nonce-1",
+            1,
             key,
         )
     }
@@ -430,6 +454,7 @@ mod tests {
             1,
             "c",
             "n",
+            1,
             &key,
         );
         assert_eq!(
@@ -451,6 +476,7 @@ mod tests {
             1,
             "c",
             "n2",
+            1,
             &key,
         );
         assert!(at_cap.verify(&key.verifying_key(), &ts(T0 + 10)).is_ok());
@@ -481,6 +507,7 @@ mod tests {
                 1,
                 "c",
                 "n",
+                1,
                 &key,
             );
             assert_eq!(
@@ -510,6 +537,7 @@ mod tests {
             1,
             "c",
             "n",
+            1,
             &key,
         );
         assert_eq!(
@@ -624,5 +652,94 @@ mod tests {
         let tampered: String = tampered.into_iter().collect();
         let result = EligibilityLease::from_wire(&tampered).and_then(|l| l.verify(&key, verify_at));
         assert!(result.is_err(), "tampered token must fail verification");
+    }
+
+    #[test]
+    fn adr043_base_weight_is_absent_from_the_wire_form() {
+        let key = hub();
+        let lease = valid_lease(&key);
+        let value = serde_json::to_value(&lease).expect("lease to value");
+        assert!(
+            value.get("queue_weight").is_none(),
+            "a base (weight 1) lease must serialize exactly like a pre-ADR-043 lease"
+        );
+        assert!(lease.verify(&key.verifying_key(), &ts(T0 + 10)).is_ok());
+    }
+
+    #[test]
+    fn adr043_weighted_lease_carries_and_verifies_the_field() {
+        let key = hub();
+        let lease = EligibilityLease::issue(
+            "peer-contributor",
+            "install-a",
+            PROFILE,
+            ts(T0),
+            ts(T0 + 90),
+            ts(T0 + 60),
+            true,
+            true,
+            2,
+            CapacityClass::GpuMid,
+            7,
+            "challenge-1",
+            "nonce-w",
+            4,
+            &key,
+        );
+        assert_eq!(lease.queue_weight, 4);
+        let value = serde_json::to_value(&lease).expect("lease to value");
+        assert_eq!(value.get("queue_weight").and_then(|v| v.as_u64()), Some(4));
+        assert!(lease.verify(&key.verifying_key(), &ts(T0 + 10)).is_ok());
+        // The wire round-trip preserves the weight.
+        let back = EligibilityLease::from_wire(&lease.to_wire()).expect("round-trip");
+        assert_eq!(back.queue_weight, 4);
+    }
+
+    #[test]
+    fn adr043_pre_field_lease_json_still_parses_and_verifies() {
+        let key = hub();
+        let lease = valid_lease(&key);
+        // Simulate a pre-ADR-043 issued token: the wire form of a base
+        // lease omits queue_weight, exactly like every lease minted
+        // before the field existed.
+        let legacy = lease.to_wire();
+        let payload = legacy.split('.').next().expect("wire token payload");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("payload decodes");
+        let payload_json = String::from_utf8(decoded).expect("payload is JSON");
+        assert!(
+            !payload_json.contains("queue_weight"),
+            "base lease wire payload is byte-shaped like a legacy token"
+        );
+        let parsed = EligibilityLease::from_wire(&legacy).expect("legacy token parses");
+        assert_eq!(parsed.queue_weight, 1);
+        // The signature computed over the (field-less) canonical payload
+        // verifies, because the parsed struct re-serializes identically.
+        assert!(parsed.verify(&key.verifying_key(), &ts(T0 + 10)).is_ok());
+    }
+
+    #[test]
+    fn adr043_issue_clamps_zero_to_base_weight() {
+        let key = hub();
+        let lease = EligibilityLease::issue(
+            "peer-a",
+            "install-a",
+            PROFILE,
+            ts(T0),
+            ts(T0 + 90),
+            ts(T0 + 60),
+            true,
+            true,
+            1,
+            CapacityClass::Cpu,
+            1,
+            "c",
+            "n-clamp",
+            0,
+            &key,
+        );
+        assert_eq!(lease.queue_weight, 1, "no lease may carry weight 0");
+        assert!(lease.verify(&key.verifying_key(), &ts(T0 + 10)).is_ok());
     }
 }

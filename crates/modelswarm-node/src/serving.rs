@@ -920,6 +920,7 @@ pub mod lease_helpers {
             1,
             "test-challenge",
             "test-nonce",
+            1,
             &signing,
         );
         let token = lease.to_wire();

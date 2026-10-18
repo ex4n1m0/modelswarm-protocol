@@ -772,6 +772,7 @@ mod presented_lease {
             1,
             "test-challenge",
             "test-nonce",
+            1,
             key,
         )
         .to_wire()

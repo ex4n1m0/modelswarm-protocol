@@ -1,10 +1,11 @@
-import { issueEligibilityLease } from "@/lib/eligibility";
+import { issueEligibilityLease, queueWeightClass } from "@/lib/eligibility";
 import { jsonError, jsonOk } from "@/lib/errors";
 import { guardPeerRequest } from "@/lib/guard";
 import { leaseBindingError } from "@/lib/leases";
 import { PeerLeaseSchema } from "@/lib/schemas";
 import type { LeaseRecord, TrackerStore } from "@/lib/store";
 import { balanceDecision, balanceEnforced, balanceWindowSecs, cloudBalanceEnforced } from "@/lib/balance";
+import { DEFAULT_FAIR_WEIGHT_T2, DEFAULT_FAIR_WEIGHT_T3, GRANTED_HALF_LIFE_SECS } from "@/lib/constants";
 
 // POST /api/v1/peers/lease — consolidated EligibilityLease issuance/refresh
 // (ADR-012; Phase B per DESIGN.md). Requires: active lease bound to the
@@ -89,6 +90,22 @@ export async function POST(req: Request) {
     );
   }
 
+  // ADR-043 fair queueing: the hub-signed queue weight class, bucketed from
+  // the peer's OWN receipt-backed decayed served tok/s (granted accounting,
+  // 7-day half-life). Serialized into the lease ONLY when > 1, so base
+  // leases stay byte-identical to pre-ADR-043 tokens. Thresholds are
+  // operator policy (env, defaults 1 / 5 decayed tok/s).
+  const granted = await ctx.store.grantedCounters(lease.peerId, GRANTED_HALF_LIFE_SECS);
+  const servedTokPerSec =
+    granted.endpointSecondsDecayed > 0
+      ? granted.verifiedTokensDecayed / granted.endpointSecondsDecayed
+      : 0;
+  const queueWeight = queueWeightClass(
+    servedTokPerSec,
+    fairThreshold(process.env.MSP_FAIR_WEIGHT_T2, DEFAULT_FAIR_WEIGHT_T2),
+    fairThreshold(process.env.MSP_FAIR_WEIGHT_T3, DEFAULT_FAIR_WEIGHT_T3),
+  );
+
   const issued = issueEligibilityLease(
     lease,
     challengeRec,
@@ -96,6 +113,7 @@ export async function POST(req: Request) {
     auditEpoch,
     now,
     ctx.keys.secretKey,
+    queueWeight,
   );
 
   await ctx.store.recordToken({
@@ -135,4 +153,12 @@ async function capacityStakeChallenge(
     if (challenge) return challenge;
   }
   return undefined;
+}
+
+/// ADR-043: env threshold parse — a missing or non-positive value falls back
+/// to the frozen default (never 0, which would make every valid lease a
+/// 2×-weighted contributor).
+function fairThreshold(raw: string | undefined, fallback: number): number {
+  const parsed = Number.parseFloat(raw ?? "");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }

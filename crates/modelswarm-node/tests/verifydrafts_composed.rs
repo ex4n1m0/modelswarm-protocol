@@ -164,6 +164,7 @@ fn lease_wire(key: &SigningKey, profile: &str, peer_id: &str) -> String {
         1,
         "test-challenge",
         "test-nonce",
+        1,
         key,
     )
     .to_wire()

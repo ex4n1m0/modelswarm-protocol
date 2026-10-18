@@ -217,6 +217,11 @@ struct Inner {
     /// when the hosted profile is a cloud one. Every chat reply that this
     /// machine served locally carries it.
     serving_mode_label: Option<String>,
+    /// Mixed hosting (2026-10-18): when local hosting is on AND a cloud
+    /// key is staged, the ALSO-served cloud profile id (a second serving
+    /// bridge + a second entry in the registration). None = single-profile
+    /// hosting as before.
+    cloud_side_profile: Option<String>,
     node: Option<RunningNode>,
     chat_log: Vec<ChatTurn>,
     /// The "allow swarm pairing" settings toggle (owner directive
@@ -519,6 +524,7 @@ impl DesktopState {
                 license_accepted,
                 artifact: None,
                 serving_mode_label: None,
+                cloud_side_profile: None,
                 node: None,
                 chat_log: Vec::new(),
                 allow_swarm_pairing: config.allow_swarm_pairing,
@@ -2877,6 +2883,90 @@ fn hosting_autostart_marker(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("hosting.autostart")
 }
 
+/// MIXED HOSTING: finds the first active CLOUD profile whose provider
+/// matches the staged key (or any cloud profile if no key preference).
+async fn find_staged_cloud_profile(
+    inner: &tokio::sync::MutexGuard<'_, Inner>,
+    telemetry: &std::sync::Arc<Telemetry>,
+) -> Option<modelswarm_node::catalog::ProfileListing> {
+    let staged = read_cloud_key(&inner.data_dir)?;
+    let tracker = tracker_client(&inner.tracker_url, &inner.data_dir, telemetry)
+        .await
+        .ok()?;
+    let profiles = catalog::active_profiles(&tracker).await.ok()?;
+    profiles.into_iter().find(|p| {
+        matches!(&p.kind, modelswarm_node::catalog::ProfileKind::Cloud(c) if {
+            let provider = match c.provider() {
+                modelswarm_node::catalog::CloudProviderId::DeepSeek => "deepseek",
+                modelswarm_node::catalog::CloudProviderId::OpenRouter => "openrouter",
+            };
+            provider == staged.provider
+        })
+    })
+}
+
+/// MIXED HOSTING: starts the second serving bridge (the cloud profile
+/// through the CloudApiExecutor) sharing the same identity and shutdown
+/// signal as the local node.
+async fn start_cloud_side_serve(
+    inner: &tokio::sync::MutexGuard<'_, Inner>,
+    state: &tauri::State<'_, DesktopState>,
+    listing: &modelswarm_node::catalog::ProfileListing,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let cloud = match &listing.kind {
+        modelswarm_node::catalog::ProfileKind::Cloud(c) => c,
+        _ => return Err("not a cloud profile".into()),
+    };
+    let staged =
+        read_cloud_key(&inner.data_dir).ok_or_else(|| "no cloud key staged".to_string())?;
+    let provider_kind = match cloud.provider() {
+        modelswarm_node::catalog::CloudProviderId::DeepSeek => {
+            modelswarm_node::cloud_executor::CloudProvider::DeepSeek
+        }
+        modelswarm_node::catalog::CloudProviderId::OpenRouter => {
+            modelswarm_node::cloud_executor::CloudProvider::OpenRouter
+        }
+    };
+    let config = modelswarm_node::cloud_executor::CloudApiConfig {
+        provider: provider_kind,
+        model: cloud.model().to_string(),
+        api_key: staged.api_key,
+        request_timeout: std::time::Duration::from_secs(120),
+        base_url_override: None,
+    };
+    let executor: std::sync::Arc<dyn modelswarm_gateway::InferenceExecutor> = std::sync::Arc::new(
+        modelswarm_node::cloud_executor::CloudApiExecutor::new(config)?,
+    );
+    // Second listener for the cloud profile (the transport creates a
+    // fresh QUIC socket; both advertise under the same peer identity).
+    let listener =
+        bind_serving_listener(&inner.data_dir, &state.telemetry, inner.allow_swarm_pairing).await;
+    match listener {
+        ListenerBind::Bound(l, _addr) => {
+            let serving_identity = std::sync::Arc::new(
+                cached_identity(&inner.data_dir, &state.telemetry).map_err(|e| e.to_string())?,
+            );
+            let telemetry = std::sync::Arc::clone(&state.telemetry);
+            let profile = listing.profile_id.clone();
+            let relay_slot = modelswarm_node::serving::RelaySlot::empty();
+            tokio::spawn(modelswarm_node::serving::serve_sessions_relayed(
+                l,
+                relay_slot,
+                serving_identity,
+                executor,
+                profile,
+                modelswarm_node::serving::LeasePolicy::production(),
+                telemetry,
+                shutdown,
+            ));
+            Ok(())
+        }
+        _ => Err("cloud side-serve listener failed to bind".into()),
+    }
+}
+
+/// successful bring-up, removed on explicit OFF.
 /// The SECOND copy of the hosting preference (2026-10-17 hardening: the
 /// marker file vanished twice across update cycles on one machine — a
 /// DB row survives whatever ate the file). Same lifecycle: written on
@@ -2927,6 +3017,7 @@ async fn set_hosting_inner(
         let _ = std::fs::remove_file(hosting_autostart_marker(&inner.data_dir));
         hosting_autostart_db_set(&inner.data_dir, false);
         inner.serving_mode_label = None;
+        inner.cloud_side_profile = None;
         inner.listener_addr = None;
         inner.family = None;
         // ADR-038 §6.4 row 8: hosting off = no heartbeat = no fresh
@@ -3277,6 +3368,9 @@ async fn set_hosting_inner(
     let mut heartbeat_shutdown = shutdown_tx.subscribe();
     let hb_data_dir = inner.data_dir.clone();
     let hb_telemetry = std::sync::Arc::clone(&state.telemetry);
+    // MIXED HOSTING: the cloud side-profile (if serving) rides the
+    // heartbeat registration — one peer, two advertised swarms.
+    let hb_cloud_profile: Option<String> = inner.cloud_side_profile.clone();
     // ADR-038 §3.3/§6.4 row 8: the heartbeat response's `relayTicket`
     // populates the cache the relay paths present (moved into the task).
     let hb_relay_tickets = relay_tickets;
@@ -3472,25 +3566,28 @@ async fn set_hosting_inner(
                             lease_id = None;
                             Ok(())
                         }),
-                    None => heartbeat_tracker
-                        .register(
-                            &peer_id,
-                            &addresses,
-                            std::slice::from_ref(&profile_id),
-                            1,
-                            runtime_desc.clone(),
-                        )
-                        .await
-                        .map(|response| {
-                            lease_id = response
-                                .get("leaseId")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string);
-                            // Persist for the swarm-chat lease chain (F3(2)).
-                            if let Some(id) = &lease_id {
-                                let _ = std::fs::write(hb_data_dir.join("lease.id"), id);
-                            }
-                        }),
+                    None => {
+                        // MIXED HOSTING: advertise BOTH profiles when the
+                        // cloud side-serve is active (one peer, two swarms).
+                        let profiles: Vec<String> =
+                            match hb_cloud_profile.as_ref().filter(|cp| *cp != &profile_id) {
+                                Some(cp) => vec![profile_id.clone(), cp.clone()],
+                                None => vec![profile_id.clone()],
+                            };
+                        heartbeat_tracker
+                            .register(&peer_id, &addresses, &profiles, 1, runtime_desc.clone())
+                            .await
+                    }
+                    .map(|response| {
+                        lease_id = response
+                            .get("leaseId")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        // Persist for the swarm-chat lease chain (F3(2)).
+                        if let Some(id) = &lease_id {
+                            let _ = std::fs::write(hb_data_dir.join("lease.id"), id);
+                        }
+                    }),
                 }
             } else {
                 Ok(())
@@ -3546,6 +3643,7 @@ async fn set_hosting_inner(
     });
     inner.profile_id = Some(listing.profile_id.clone());
     inner.artifact = ensured;
+    let cloud_shutdown = shutdown_tx.subscribe();
     inner.node = Some(RunningNode {
         handle,
         shutdown: shutdown_tx,
@@ -3563,6 +3661,37 @@ async fn set_hosting_inner(
         );
     }
     hosting_autostart_db_set(&inner.data_dir, true);
+
+    // MIXED HOSTING (2026-10-18 owner directive): when the hosted
+    // profile is LOCAL and a cloud key is staged, ALSO serve the cloud
+    // profile through a second serving bridge — one machine, two swarms.
+    inner.cloud_side_profile = None; // reset (set below if applicable)
+    if matches!(
+        listing.kind,
+        modelswarm_node::catalog::ProfileKind::Local(_)
+    ) {
+        if let Some(cloud_listing) = find_staged_cloud_profile(&inner, &state.telemetry).await {
+            match start_cloud_side_serve(&inner, state, &cloud_listing, cloud_shutdown).await {
+                Ok(()) => {
+                    inner.cloud_side_profile = Some(cloud_listing.profile_id.clone());
+                    state.telemetry.info(
+                        "host.mixed",
+                        &[
+                            ("local", listing.profile_id.as_str()),
+                            ("cloud", cloud_listing.profile_id.as_str()),
+                        ],
+                    );
+                }
+                Err(e) => {
+                    state.telemetry.warn(
+                        "host.mixed",
+                        &[("phase", "cloud_side_serve"), ("error", &e)],
+                    );
+                }
+            }
+        }
+    }
+
     // The honest serve label (ADR-040 §4): cloud hosting announces the
     // provider + model on every reply this machine serves.
     inner.serving_mode_label = match &listing.kind {
@@ -8344,6 +8473,7 @@ mod tests {
             license_accepted: true,
             artifact: None,
             serving_mode_label: None,
+            cloud_side_profile: None,
             node: None,
             chat_log: Vec::new(),
             allow_swarm_pairing: true,

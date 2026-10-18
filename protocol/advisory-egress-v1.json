@@ -375,7 +375,9 @@
       "chat.receipt": "excluded",
       "host.autostart": "excluded",
       "receipt.acked": "excluded",
-      "chat.swarm.cross": "excluded"
+      "chat.swarm.cross": "excluded",
+      "chat.crosscheck": "excluded",
+      "host.mixed": "excluded"
     }
   }
 }

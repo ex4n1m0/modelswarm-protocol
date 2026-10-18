@@ -68,15 +68,6 @@ export default function Home() {
       </div>
 
       <div className="wrap" id="content" tabIndex={-1}>
-        <section id="census" aria-labelledby="census-heading">
-          <h2 id="census-heading">Live swarm census</h2>
-          <div className="rule">
-            <span id="census-body" style={{ fontSize: "0.95rem" }}>
-              loading…
-            </span>
-          </div>
-        </section>
-
         <section id="how" aria-labelledby="how-heading">
           <h2 id="how-heading">How it works</h2>
           <p className="note" style={{ margin: "0.3rem 0 1rem" }}>
@@ -138,6 +129,15 @@ export default function Home() {
             <p className="note" id="clients-served" style={{ marginTop: "0.6rem" }}>
               &nbsp;
             </p>
+          </div>
+        </section>
+
+        <section id="census" aria-labelledby="census-heading">
+          <h2 id="census-heading">Live swarm census</h2>
+          <div className="rule">
+            <span id="census-body" style={{ fontSize: "0.95rem" }}>
+              loading…
+            </span>
           </div>
         </section>
 

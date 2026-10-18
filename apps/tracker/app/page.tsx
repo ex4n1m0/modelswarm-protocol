@@ -116,14 +116,7 @@ export default function Home() {
         <section id="get" aria-labelledby="get-heading">
           <h2 id="get-heading">Desktop app</h2>
           <div className="rule">
-            <b>v0.2.39</b> — test builds, unsigned. This build keeps
-            itself current: it checks for updates on start and every six
-            hours, verifies each update against a key built into the
-            app, and restarts to install — this is the last manual
-            download. Same-model cooperation (faster or
-            verified-accurate answers, never worse than the
-            fastest single host) works between two peers on a direct or LAN
-            network; the app reports honest status for anything not engaged.
+            <b>v0.2.39</b>
             <div className="dl-grid">
               <a className="dl primary" href="/api/download/ModelSwarm-Setup-0.2.39-windows-x64.exe">
                 <span className="os">Windows</span>
@@ -144,11 +137,6 @@ export default function Home() {
             </div>
             <p className="note" id="clients-served" style={{ marginTop: "0.6rem" }}>
               &nbsp;
-            </p>
-            <p className="note" style={{ marginTop: "0.6rem" }}>
-              First hosting start enrolls the device (auto-approved under
-              the test cap) and downloads the chosen model from its original
-              source. Checksums: /downloads/SHA256SUMS.txt.
             </p>
           </div>
         </section>

@@ -82,7 +82,7 @@ denies access.
 |---|---|---|
 | Lease (Rust) | `queue_weight: u8` — serde-default 1, OMITTED from the signed payload at base weight (legacy tokens + golden vectors stay byte-identical; `issue()` clamps ≥ 1) | **landed bd3e22d** (4 adr043 tests, all feature combos) |
 | Tracker | `queueWeightClass` bucketing from decayed granted tok/s at issuance; env `MSP_FAIR_WEIGHT_T2`/`T3` (defaults 1/5); `fair-weight.test.ts` 7/7, vectors 25/25 | **landed bd3e22d** |
-| Node serving (`serving.rs`) | bounded wait queue + DRR + 10 s deadline + `queue_deadline` reason + `accepted` emission | **next** — design note: the weight arrives INSIDE the lease token (handshake stage), so the queue implementation must read/verify the handshake BEFORE acquiring the admission slot, then wait weight-ordered; the wire-compat golden vector (accepted on a queued stream) is a release gate |
+| Node serving (`serving.rs`) | bounded wait queue (16) + WFQ + 10 s deadline + `queue_deadline` reason + `accepted` emission; first frame pre-read extracts the lease weight BEFORE the slot | **landed** (4 adr043 tests: contributor-priority, deadline, capacity, wire shape; full QUIC round-trip + all lease-refusal tests green through the restructured path) |
 
 ## Honesty note
 

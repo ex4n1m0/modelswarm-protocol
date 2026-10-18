@@ -198,6 +198,23 @@ pub struct ReceiptAck {
     pub request_id: String,
 }
 
+/// Stream event: admission confirmation (msp-v1 §6.3 `accepted`; emission
+/// un-deferred from ADR-028 by ADR-043). Emitted ONLY to sessions that
+/// actually waited in the serving fair-queue — an immediately admitted
+/// stream keeps today's silent admission, so the observable frame sequence
+/// of an uncontended stream is unchanged. Old peers cannot parse this
+/// variant (the `ReceiptAck` caveat); it appears only under real
+/// contention, which the current swarm never hits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Accepted {
+    pub request_id: String,
+    /// Position the request held when scheduled (0 = no wait left).
+    pub queue_position: u32,
+    /// Rough admission-pace estimate; 0 when admitted immediately.
+    pub eta_ms: u32,
+}
+
 /// Cancellation request, either direction, anytime (proto `Cancel`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -260,6 +277,7 @@ pub enum WireMessage {
     Completed(Completed),
     Cancel(Cancel),
     ReceiptAck(ReceiptAck),
+    Accepted(Accepted),
     Control(Control),
 }
 

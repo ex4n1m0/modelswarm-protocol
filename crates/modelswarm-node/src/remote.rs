@@ -273,6 +273,14 @@ fn frame_to_event(frame: WireMessage) -> Option<Result<ExecutorEvent, WireStream
             finish_reason: FinishReason::Cancelled,
         })),
         WireMessage::StreamError(e) => Some(Err(e)),
+        // ADR-043 §3: the §6.3 `accepted` admission confirmation from a
+        // serving peer's fair queue — informational; the stream continues
+        // exactly as before (the pre-existing Accepted arms downstream are
+        // no-ops by design).
+        WireMessage::Accepted(a) => Some(Ok(ExecutorEvent::Accepted {
+            queue_position: a.queue_position,
+            eta_ms: u64::from(a.eta_ms),
+        })),
         // Handshake frames never appear mid-request on this path.
         _ => None,
     }

@@ -24,7 +24,7 @@
 //! dedup) is prototype-grade hostile-peer resistance per
 //! docs/threat-model.md §4.2.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,7 @@ use modelswarm_gateway::{
 use modelswarm_telemetry::Telemetry;
 use modelswarm_transport::libp2p_backend::{Libp2pListener, Libp2pSession};
 use modelswarm_transport::message::{
-    ChatMessage, Completed, StreamError, TokenDelta, Usage, WireMessage,
+    Accepted, ChatMessage, Completed, StreamError, TokenDelta, Usage, WireMessage,
 };
 use modelswarm_transport::relay_client::RelayReservation;
 use modelswarm_transport::TransportError;
@@ -45,6 +45,19 @@ const IO_DEADLINE: Duration = Duration::from_secs(30);
 /// Serving-source poll cadence (the direct listener and the relay slot
 /// both wake at this period when idle).
 const SERVE_POLL: Duration = Duration::from_secs(1);
+
+/// ADR-043 §1: the queue admission deadline (msp-v1 §6.4) — a session that
+/// waits longer than this for a serving slot is refused `overloaded` with
+/// reason `queue_deadline` instead of waiting forever.
+const QUEUE_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
+/// ADR-043 §1: bounded wait-queue capacity; a session arriving at a FULL
+/// queue is refused immediately (today's `session_limit` behavior).
+const FAIR_QUEUE_CAPACITY: usize = 16;
+/// How long a freshly accepted connection may take to send its first
+/// `InferenceRequest` before the pre-admission read gives up (the request
+/// carries the lease token the fair queue needs, so the read happens
+/// BEFORE a slot is taken — ADR-043 §2 design note).
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The serving side's relay reservation slot (F2B): a replaceable handle
 /// a supervisor task owns and [`ServingInbox`] polls. Installing a new
@@ -272,8 +285,34 @@ async fn serve_inbox(
         let session_identity = Arc::clone(&identity);
         tokio::spawn(async move {
             let identity = session_identity;
-            let _session_slot = match session_admission.admit_session(&peer_id) {
-                Ok(guard) => guard,
+            let mut session = session;
+            // ADR-043 §2: the queue weight lives INSIDE the lease token
+            // carried by the first InferenceRequest, so the first frame is
+            // read BEFORE a serving slot is taken; only then does the
+            // session admit (immediately, or via the bounded WFQ wait
+            // queue). A non-request first frame (defensive) takes the base
+            // weight — the full LeasePolicy check inside serve_one_seeded
+            // is unchanged.
+            let first = match session.recv(FIRST_FRAME_TIMEOUT).await {
+                Ok(frame) => frame,
+                Err(_) => {
+                    session_telemetry.warn("serving.first_frame_timeout", &[("peer", &peer_id)]);
+                    return;
+                }
+            };
+            let queue_weight = match &first {
+                WireMessage::InferenceRequest(r) => {
+                    modelswarm_eligibility::EligibilityLease::from_wire(&r.capability_token)
+                        .map(|lease| lease.queue_weight)
+                        .unwrap_or(1)
+                }
+                _ => 1,
+            };
+            let (guard, waited_at) = match session_admission
+                .admit_session_fair(&peer_id, queue_weight, QUEUE_ADMISSION_DEADLINE)
+                .await
+            {
+                Ok(v) => v,
                 Err(reason) => {
                     session_telemetry
                         .warn("serving.refused", &[("peer", &peer_id), ("reason", reason)]);
@@ -282,7 +321,40 @@ async fn serve_inbox(
                     return;
                 }
             };
-            if let Err(code) = serve_one(
+            let _session_slot = guard;
+            // ADR-043 §3: the §6.3 `accepted` emission, un-deferred from
+            // ADR-028 — ONLY for sessions that actually waited, so the
+            // frame sequence of an uncontended stream is unchanged (old
+            // peers never see the new variant in normal operation).
+            if let (Some(position), WireMessage::InferenceRequest(r)) = (waited_at, &first) {
+                let accepted = WireMessage::Accepted(Accepted {
+                    request_id: r.request_id.clone(),
+                    queue_position: position,
+                    eta_ms: 0,
+                });
+                let mut session = session;
+                let _ = session.send(&accepted, IO_DEADLINE).await;
+                session_telemetry.info(
+                    "serving.accepted_after_wait",
+                    &[("peer", &peer_id), ("weight", &queue_weight.to_string())],
+                );
+                if let Err(code) = serve_one_seeded(
+                    session,
+                    identity,
+                    executor,
+                    profile,
+                    &policy,
+                    &session_admission,
+                    &session_telemetry,
+                    Some(first),
+                )
+                .await
+                {
+                    session_telemetry.warn("serving.session_ended", &[("code", code.as_str())]);
+                }
+                return;
+            }
+            if let Err(code) = serve_one_seeded(
                 session,
                 identity,
                 executor,
@@ -290,6 +362,7 @@ async fn serve_inbox(
                 &policy,
                 &session_admission,
                 &session_telemetry,
+                Some(first),
             )
             .await
             {
@@ -331,6 +404,7 @@ fn wire_kind(m: &WireMessage) -> &'static str {
         WireMessage::Usage(_) => "Usage",
         WireMessage::StreamError(_) => "StreamError",
         WireMessage::ReceiptAck(_) => "ReceiptAck",
+        WireMessage::Accepted(_) => "Accepted",
         WireMessage::Cancelled(_) => "Cancelled",
         WireMessage::Completed(_) => "Completed",
         WireMessage::Cancel(_) => "Cancel",
@@ -363,6 +437,25 @@ struct AdmissionState {
     sessions: usize,
     per_peer: HashMap<String, usize>,
     seen_requests: HashMap<(String, String), Instant>,
+    /// ADR-043: WFQ service state — the per-peer virtual finish advances
+    /// by `1 / weight` per admission (so under sustained demand a
+    /// weight-4 peer is served ~4× as often), and `virtual_clock` (the
+    /// last admitted finish) levels newcomers so an idle returner never
+    /// jumps a fresh queue nor is penalized for old history.
+    virtual_finish: HashMap<String, f64>,
+    virtual_clock: f64,
+    /// ADR-043: the bounded wait queue, FIFO-ordered on arrival. WFQ
+    /// chooses WHICH waiter a freed slot goes to, not the arrival order.
+    waiters: VecDeque<Waiter>,
+}
+
+/// One session waiting for a serving slot (ADR-043). `wake` is this
+/// waiter's private notifier — the release path wakes exactly the WFQ
+/// winner, never the herd.
+struct Waiter {
+    /// WFQ virtual finish time (monotonic, per-peer advance).
+    finish: f64,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 /// RAII session slot — releasing on drop keeps the count correct on every
@@ -391,6 +484,9 @@ impl Admission {
                 sessions: 0,
                 per_peer: HashMap::new(),
                 seen_requests: HashMap::new(),
+                virtual_finish: HashMap::new(),
+                virtual_clock: 0.0,
+                waiters: VecDeque::new(),
             })),
             max_sessions,
             max_sessions_per_peer,
@@ -399,6 +495,12 @@ impl Admission {
 
     pub fn admit_session(&self, peer_id: &str) -> Result<SessionGuard, &'static str> {
         let mut state = self.inner.lock().expect("admission lock");
+        // ADR-043: a non-empty wait queue blocks side-door admission — a
+        // fresh session must take its place in line (admit_session_fair),
+        // otherwise newcomers would starve every queued waiter.
+        if !state.waiters.is_empty() {
+            return Err("session_limit");
+        }
         if state.sessions >= self.max_sessions {
             return Err("session_limit");
         }
@@ -413,14 +515,126 @@ impl Admission {
         })
     }
 
-    fn release_session(&self, peer_id: &str) {
-        let mut state = self.inner.lock().expect("admission lock");
-        state.sessions = state.sessions.saturating_sub(1);
-        if let Some(count) = state.per_peer.get_mut(peer_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.per_peer.remove(peer_id);
+    /// ADR-043 §2: admit, or wait in the bounded DRR fair queue until a
+    /// slot frees or `deadline` elapses. `weight` is the session's
+    /// hub-signed queue weight (1 / 2 / 4; the unverified token parse
+    /// defaults to base 1 — the full `LeasePolicy` check still runs after
+    /// admission, exactly as before).
+    ///
+    /// Returns the slot guard plus the position the request held when
+    /// scheduled (`Some` only when it actually waited — the caller emits
+    /// the §6.3 `accepted` frame for waited sessions only, keeping the
+    /// uncontended frame sequence unchanged).
+    pub async fn admit_session_fair(
+        &self,
+        peer_id: &str,
+        weight: u8,
+        deadline: Duration,
+    ) -> Result<(SessionGuard, Option<u32>), &'static str> {
+        let mut queued_ahead: Option<u32> = None;
+        let mut my_wake: Option<Arc<tokio::sync::Notify>> = None;
+        let deadline_at = Instant::now() + deadline;
+        loop {
+            {
+                let mut state = self.inner.lock().expect("admission lock");
+                if state.per_peer.get(peer_id).copied().unwrap_or(0) >= self.max_sessions_per_peer {
+                    return Err("per_peer_session_limit");
+                }
+                if state.sessions < self.max_sessions && state.waiters.is_empty() {
+                    // Fast path: nobody waiting, slot free.
+                    state.sessions += 1;
+                    *state.per_peer.entry(peer_id.to_string()).or_insert(0) += 1;
+                    return Ok((
+                        SessionGuard {
+                            admission: self.clone(),
+                            peer_id: peer_id.to_string(),
+                        },
+                        queued_ahead,
+                    ));
+                }
+                if state.waiters.len() >= FAIR_QUEUE_CAPACITY {
+                    return Err("session_limit");
+                }
+                match &mut my_wake {
+                    None => {
+                        // First contended pass: enqueue (WFQ-stamped).
+                        let (position, waiter) = enqueue_waiter(&mut state, peer_id, weight);
+                        queued_ahead = Some(position);
+                        my_wake = Some(Arc::clone(&waiter.wake));
+                        state.waiters.push_back(waiter);
+                    }
+                    Some(current) => {
+                        // Re-check after a wake or deadline retry: if we are
+                        // no longer queued, the release path already chose
+                        // us (it removes the winner BEFORE notifying); take
+                        // the slot it reserved.
+                        if !state.waiters.iter().any(|w| Arc::ptr_eq(&w.wake, current)) {
+                            if state.sessions < self.max_sessions {
+                                state.sessions += 1;
+                                *state.per_peer.entry(peer_id.to_string()).or_insert(0) += 1;
+                                return Ok((
+                                    SessionGuard {
+                                        admission: self.clone(),
+                                        peer_id: peer_id.to_string(),
+                                    },
+                                    queued_ahead,
+                                ));
+                            }
+                            // Slot vanished anyway (a stale wake lost the
+                            // race): re-enqueue at the back with a fresh
+                            // handle so the release path can target us.
+                            let (position, waiter) = enqueue_waiter(&mut state, peer_id, weight);
+                            queued_ahead = Some(position);
+                            my_wake = Some(Arc::clone(&waiter.wake));
+                            state.waiters.push_back(waiter);
+                        }
+                    }
+                }
             }
+            let wake = my_wake.as_ref().expect("enqueued");
+            let remaining = deadline_at.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Deadline: leave the queue honestly before refusing.
+                let mut state = self.inner.lock().expect("admission lock");
+                if let Some(idx) = state
+                    .waiters
+                    .iter()
+                    .position(|w| Arc::ptr_eq(&w.wake, wake))
+                {
+                    state.waiters.remove(idx);
+                }
+                return Err("queue_deadline");
+            }
+            let notified = wake.notified();
+            tokio::select! {
+                _ = notified => continue,
+                _ = tokio::time::sleep(remaining) => continue,
+            }
+        }
+    }
+
+    fn release_session(&self, peer_id: &str) {
+        let winner_wake = {
+            let mut state = self.inner.lock().expect("admission lock");
+            state.sessions = state.sessions.saturating_sub(1);
+            if let Some(count) = state.per_peer.get_mut(peer_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    state.per_peer.remove(peer_id);
+                }
+            }
+            // ADR-043 §2: a freed slot goes to the DRR winner, not the
+            // next arrival. The winner is REMOVED from the queue before it
+            // is notified (its post-wake recheck takes the slot); its
+            // deficit resets so a heavyweight cannot monopolize forever.
+            if state.sessions < self.max_sessions {
+                pick_fair_winner(&mut state).map(|w| w.wake)
+            } else {
+                None
+            }
+        };
+        if let Some(wake) = winner_wake {
+            wake.notify_one();
         }
     }
 
@@ -445,33 +659,61 @@ impl Admission {
     }
 }
 
-async fn serve_one(
-    session: Libp2pSession,
-    identity: std::sync::Arc<modelswarm_identity::InstallationIdentity>,
-    executor: Arc<dyn InferenceExecutor>,
-    profile_id: String,
-    lease_policy: &LeasePolicy,
-    admission: &Admission,
-    telemetry: &Telemetry,
-) -> Result<(), String> {
-    serve_one_seeded(
-        session,
-        identity,
-        executor,
-        profile_id,
-        lease_policy,
-        admission,
-        telemetry,
-        None,
-    )
-    .await
+/// ADR-043 §2 pick step (WFQ): the freed slot goes to the waiter with the
+/// SMALLEST virtual finish time (FIFO among exact ties — arrival order in
+/// the VecDeque). Finish times are stamped at enqueue (`enqueue_waiter`)
+/// and advance per-peer by `1 / weight` per admission, so a weight-4
+/// contributor beats a simultaneously-waiting weight-1 peer (0.25 steps
+/// vs 1.0), under sustained demand is served ~4× as often, and a lone
+/// lightweight is still admitted the moment it is the only waiter —
+/// contributor-priority, never starvation. Per-peer history is capped so
+/// the map cannot grow unbounded.
+fn pick_fair_winner(state: &mut AdmissionState) -> Option<Waiter> {
+    let mut best: Option<usize> = None;
+    for (idx, w) in state.waiters.iter().enumerate() {
+        let finish = best
+            .and_then(|b| state.waiters.get(b))
+            .map(|bw| bw.finish)
+            .unwrap_or(f64::INFINITY);
+        if w.finish < finish {
+            best = Some(idx);
+        }
+    }
+    let winner = best.and_then(|idx| state.waiters.remove(idx));
+    if let Some(w) = &winner {
+        state.virtual_clock = state.virtual_clock.max(w.finish);
+    }
+    if state.virtual_finish.len() > 4096 {
+        // Prototype-scale safety valve: service history is best-effort.
+        state.virtual_finish.clear();
+    }
+    winner
+}
+
+/// ADR-043 §2 stamp step: the waiter's WFQ virtual finish = max(the
+/// peer's previous finish, the virtual clock) + `1 / weight`. Weight 1
+/// advances a full step per admission; weight 4 a quarter step — exactly
+/// the 4:1 service ratio the hub-signed `queue_weight` encodes.
+fn enqueue_waiter(state: &mut AdmissionState, peer_id: &str, weight: u8) -> (u32, Waiter) {
+    let position = state.waiters.len() as u32;
+    let base = state
+        .virtual_finish
+        .get(peer_id)
+        .copied()
+        .unwrap_or(0.0)
+        .max(state.virtual_clock);
+    let finish = base + 1.0 / f64::from(weight.max(1));
+    state.virtual_finish.insert(peer_id.to_string(), finish);
+    let wake = Arc::new(tokio::sync::Notify::new());
+    (position, Waiter { finish, wake })
 }
 
 /// The msp-v1 per-session loop, optionally seeded with an already-read
 /// first frame: the composed demux (`verifydrafts::composed`) classifies a
-/// session by its FIRST frame and hands it here pre-read, so the frame is
-/// never decoded twice. `None` (the [`serve_one`] path) reads the first
-/// frame below — behavior-identical to the pre-composition loop.
+/// session by its FIRST frame and hands it here pre-read, and the
+/// ADR-043 fair-queue path pre-reads the first frame to extract the
+/// lease-carried queue weight BEFORE admission — so the frame is never
+/// decoded twice. `None` (no pre-read) reads the first frame below.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_one_seeded(
     mut session: Libp2pSession,
@@ -1410,5 +1652,135 @@ mod tests {
         assert!(adm.check_request_fresh("peer-a", "req-1"));
         assert!(!adm.check_request_fresh("peer-a", "req-1"));
         assert!(adm.check_request_fresh("peer-b", "req-1"));
+    }
+
+    /// ADR-043 §2: when a weight-4 contributor and a weight-1 peer wait
+    /// in the SAME contention episode, the contributor is admitted first
+    /// (quarter-step finish vs full-step); and a lightweight that waits
+    /// ALONE is admitted the moment a slot frees — contributor priority
+    /// without starvation.
+    #[tokio::test]
+    async fn adr043_fair_queue_prefers_the_contributor() {
+        let adm = super::Admission::new(1, 8);
+        for round in 0..10 {
+            let holder = adm.admit_session(&format!("holder-{round}")).expect("slot");
+            let light = {
+                let adm = adm.clone();
+                tokio::spawn(async move {
+                    adm.admit_session_fair("light", 1, std::time::Duration::from_secs(5))
+                        .await
+                })
+            };
+            let heavy = {
+                let adm = adm.clone();
+                tokio::spawn(async move {
+                    adm.admit_session_fair("heavy", 4, std::time::Duration::from_secs(5))
+                        .await
+                })
+            };
+            // Let both settle into the queue before freeing the slot.
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            drop(holder);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // The contributor must be the admitted one in every round.
+            assert!(
+                !light.is_finished(),
+                "round {round}: the weight-1 peer must still be waiting"
+            );
+            assert!(
+                heavy.is_finished(),
+                "round {round}: the weight-4 contributor must be admitted"
+            );
+            light.abort();
+            if let Ok(Ok((guard, _))) = heavy.await {
+                drop(guard);
+            }
+            // Let the aborted lightweight's queue entry clear (its future
+            // drops on abort; give the runtime a beat).
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Starvation guard: alone in the queue, the lightweight is
+        // admitted promptly after a release.
+        let holder = adm.admit_session("holder-final").expect("slot");
+        let light = {
+            let adm = adm.clone();
+            tokio::spawn(async move {
+                adm.admit_session_fair("light", 1, std::time::Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        drop(holder);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), light).await;
+        assert!(
+            matches!(outcome, Ok(Ok(Ok(_)))),
+            "a lone lightweight waiter is admitted after a release"
+        );
+    }
+
+    /// ADR-043 §1: a waiter past the §6.4 queue admission deadline is
+    /// refused `queue_deadline` and leaves the queue honestly.
+    #[tokio::test]
+    async fn adr043_queue_deadline_expires() {
+        let adm = super::Admission::new(1, 2);
+        let _holder = adm.admit_session("holder").expect("slot");
+        let result = adm
+            .admit_session_fair("waiter", 1, std::time::Duration::from_millis(80))
+            .await;
+        assert_eq!(result.err(), Some("queue_deadline"));
+        // Slot frees afterwards: normal admission works again (the expired
+        // waiter is not stuck in the queue).
+        drop(_holder);
+        assert!(adm.admit_session("fresh").is_ok());
+    }
+
+    /// ADR-043 §1: the wait queue is bounded — beyond 16 waiters, the
+    /// refusal is today's immediate `session_limit`.
+    #[tokio::test]
+    async fn adr043_queue_capacity_is_bounded() {
+        let adm = super::Admission::new(1, 32);
+        let _holder = adm.admit_session("holder").expect("slot");
+        let mut waiters = Vec::new();
+        for i in 0..16 {
+            let a = adm.clone();
+            waiters.push(tokio::spawn(async move {
+                a.admit_session_fair(&format!("w{i}"), 1, std::time::Duration::from_secs(5))
+                    .await
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let overflow = adm
+            .admit_session_fair("w16", 1, std::time::Duration::from_millis(50))
+            .await;
+        assert_eq!(overflow.err(), Some("session_limit"));
+        for w in waiters {
+            w.abort();
+        }
+    }
+
+    /// ADR-043 §3: the `accepted` frame's wire shape — externally tagged,
+    /// snake_case, additive variant (old peers keep parsing everything
+    /// else; golden-shape pin for the requester-side mapping).
+    #[test]
+    fn adr043_accepted_wire_shape() {
+        let frame = modelswarm_transport::message::WireMessage::Accepted(
+            modelswarm_transport::message::Accepted {
+                request_id: "r-1".into(),
+                queue_position: 0,
+                eta_ms: 0,
+            },
+        );
+        let json = serde_json::to_value(&frame).expect("serializes");
+        assert_eq!(
+            json,
+            serde_json::json!({"accepted": {
+                "request_id": "r-1",
+                "queue_position": 0,
+                "eta_ms": 0,
+            }})
+        );
+        let back: modelswarm_transport::message::WireMessage =
+            serde_json::from_value(json).expect("round-trips");
+        assert_eq!(back, frame);
     }
 }

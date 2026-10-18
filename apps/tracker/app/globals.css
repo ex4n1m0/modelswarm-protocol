@@ -36,7 +36,7 @@ a:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; borde
 .wrap { max-width: 1200px; margin: 0 auto; padding: 0 1.5rem; }
 /* Hero zone keeps the artwork's own backdrop pure under the whole image (85%) and blends into the page navy below. */
 .top { background: linear-gradient(180deg, var(--bg-hero) 0%, var(--bg-hero) 85%, var(--bg) 100%); }
-nav { display: flex; align-items: center; gap: 0.9rem; padding: 1.15rem 0 0.95rem; font-size: 0.86rem; flex-wrap: wrap; }
+nav { display: flex; align-items: center; gap: 0.9rem; padding: 0.85rem 0 0.65rem; font-size: 0.86rem; flex-wrap: wrap; }
 nav .brand { color: var(--text); font-family: var(--mono); font-weight: 700; letter-spacing: 0.08em; margin-right: 0.25rem; }
 nav .spacer { flex: 1; }
 nav .navlink { color: var(--text-2); text-decoration: none; padding: 0.45rem 0.15rem; }
@@ -58,8 +58,8 @@ nav .navlink:hover { color: var(--accent); }
 .hero-band .cta-row .btn { font-size: 0.95rem; padding: 0.65rem 1.25rem; }
 .lede { text-align: center; color: var(--text-2); padding: 1.5rem 1rem 0.2rem; font-size: 1.02rem; line-height: 1.75; max-width: 56rem; margin: 0 auto; }
 .lede b { color: var(--text); font-weight: 600; }
-section { padding: 2.4rem 0 0.2rem; scroll-margin-top: 1rem; }
-h2 { display: flex; align-items: center; gap: 1rem; font-family: var(--mono); font-size: 0.78rem; font-weight: 600; letter-spacing: 0.22em; text-transform: uppercase; color: var(--accent); margin-bottom: 1.15rem; }
+section { padding: 1.3rem 0 0.2rem; scroll-margin-top: 1rem; }
+h2 { display: flex; align-items: center; gap: 1rem; font-family: var(--mono); font-size: 0.78rem; font-weight: 600; letter-spacing: 0.22em; text-transform: uppercase; color: var(--accent); margin-bottom: 0.75rem; }
 h2::after { content: ""; flex: 1; height: 1px; background: var(--border-soft); }
 .rule { background: var(--bg); border: 1px solid var(--border); border-left: 3px solid var(--accent); padding: 1.15rem 1.3rem; border-radius: 0 12px 12px 0; color: var(--text-2); font-size: 0.95rem; }
 .rule b { color: var(--text); }
@@ -73,7 +73,7 @@ td { transition: background-color 0.12s ease; }
 td:first-child { color: var(--accent); font-family: var(--mono); font-size: 0.8rem; white-space: nowrap; }
 th { color: var(--text-3); font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; }
 .note { font-size: 0.8rem; color: var(--text-3); margin: 1rem 0 0; max-width: 46rem; line-height: 1.7; }
-footer { border-top: 1px solid var(--border-soft); margin-top: 3.2rem; padding: 2.2rem 0 2.6rem; color: var(--text-3); font-size: 0.78rem; text-align: center; line-height: 1.8; }
+footer { border-top: 1px solid var(--border-soft); margin-top: 2rem; padding: 1.5rem 0 1.9rem; color: var(--text-3); font-size: 0.78rem; text-align: center; line-height: 1.8; }
 footer a { color: var(--text-2); }
 /* How it works (2026-10-17): three plain steps. 2026-10-19: census moved
    below Desktop app, steps are the first section under the hero (owner

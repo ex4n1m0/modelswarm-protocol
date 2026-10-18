@@ -74,13 +74,6 @@ export default function Home() {
             <span id="census-body" style={{ fontSize: "0.95rem" }}>
               loading…
             </span>
-            <p className="note" style={{ marginTop: "0.5rem" }}>
-              Models other peers are hosting right now — picking one of
-              these means the swarm can cooperate from your first session.
-            </p>
-            <p className="note" id="clients-served" style={{ marginTop: "0.5rem" }}>
-              &nbsp;
-            </p>
           </div>
         </section>
 
@@ -146,6 +139,9 @@ export default function Home() {
                 <span className="fmt">AppImage · self-updating</span>
               </a>
             </div>
+            <p className="note" id="clients-served" style={{ marginTop: "0.6rem" }}>
+              &nbsp;
+            </p>
             <p className="note" style={{ marginTop: "0.6rem" }}>
               First hosting start enrolls the device (auto-approved under
               the test cap) and downloads the chosen model from its original
@@ -176,9 +172,7 @@ export default function Home() {
       badge.textContent = peersOnline + (peersOnline === 1 ? ' peer online' : ' peers online');
       const served = document.getElementById('clients-served');
       if (served && Number.isFinite(clientsServed)) {
-        served.textContent = clientsServed + (clientsServed === 1
-          ? ' client served so far (installer downloads and automatic updates, all operating systems, each count as one).'
-          : ' clients served so far (installer downloads and automatic updates, all operating systems, each count as one).');
+        served.textContent = clientsServed + (clientsServed === 1 ? ' download' : ' downloads');
       }
     } catch { badge.textContent = '— online'; }
     try {

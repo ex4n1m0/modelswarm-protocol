@@ -94,12 +94,12 @@ export default function Home() {
             </div>
             <div className="step" tabIndex={0}>
               <span className="n">STEP 2</span>
-              <h3>Join a swarm</h3>
+              <h3>Join the Swarm</h3>
               <p>
-                Pick a model for the pre selected list recommended for
-                your hardware and press Join — it downloads and hosts on
-                your machine, or serve a cloud model through your own
-                provider key. Either way your machine counts as one peer.
+                Pick from the hardware-recommended models list and press
+                Join to download and host it locally, or use your provider
+                key to serve a cloud model. Either way, your machine counts
+                as one peer.
               </p>
             </div>
             <div className="step" tabIndex={0}>

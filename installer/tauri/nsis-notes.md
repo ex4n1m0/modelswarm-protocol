@@ -93,3 +93,16 @@ Output: `target/release/bundle/nsis/ModelSwarm_<version>_x64-setup.exe`.
 Requires a code-signing certificate (OV/EV, paid, identity process) plus a
 key-management decision for updater signatures. **Recorded, not attempted.**
 No `.msi` either (deferred until asked for, ADR-008).
+
+## Update-safety hook (2026-10-19 evening incident)
+
+`installer-hooks.nsh` (wired via `bundle.windows.nsis.installerHooks` in
+`tauri.conf.json`) defines `NSIS_HOOK_PREINSTALL`: before ANY file is
+extracted, kill only `llama-server.exe` processes whose image path is under
+`$INSTDIR\engine`, then settle 500 ms. Rationale: an orphaned engine
+process (repro: benchmark harness whose cargo parent died) holds
+`engine\ggml-base.dll` open and stalls NSIS at "Error opening file for
+writing" — live during the v0.2.41 updater run on machine A. Path-scoped
+by design: never kill by image name, the owner may run an unrelated
+llama.cpp. Validation owed: a local `cargo tauri build --bundles nsis`
+must compile the hook (CI will also gate it on the next train).

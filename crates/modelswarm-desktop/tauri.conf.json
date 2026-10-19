@@ -52,6 +52,9 @@
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installerHooks": "../../installer/tauri/installer-hooks.nsh"
       }
     }
   }

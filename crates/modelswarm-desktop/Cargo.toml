@@ -32,6 +32,7 @@ tauri-shell = [
     "dep:modelswarm-telemetry",
     "dep:modelswarm-scheduler",
     "dep:modelswarm-resource",
+    "dep:modelswarm-dns",
     "dep:futures-util",
     "dep:tokio",
     "dep:reqwest",
@@ -61,8 +62,6 @@ verifydrafts-capi = ["verifydrafts", "modelswarm-node/verifydrafts-capi"]
 
 [target.'cfg(windows)'.dependencies]
 modelswarm-winjob = { path = "../modelswarm-winjob" }
-# Owner directive 2026-10-19: outbound DNS rides DoH 1.1.1.1.
-modelswarm-dns = { path = "../modelswarm-dns" }
 
 [dependencies]
 modelswarm-transport = { path = "../modelswarm-transport", features = ["libp2p-backend"] }
@@ -92,6 +91,10 @@ modelswarm-scheduler = { path = "../modelswarm-scheduler", optional = true }
 # 2026-10-12): live CPU/RAM/working-set/GPU/VRAM sampling, read-only and
 # advisory — never an enforcement mechanism (the M2 governor is separate).
 modelswarm-resource = { path = "../modelswarm-resource", optional = true }
+# Owner directive 2026-10-19: outbound DNS rides DoH 1.1.1.1 — the
+# desktop's own outbound surfaces (stats GET, artifact HEAD, hf_http,
+# both cross-check clients) resolve through it.
+modelswarm-dns = { path = "../modelswarm-dns", optional = true }
 tokio = { version = "1", optional = true, features = ["macros", "rt", "sync", "time", "net"] }
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }

@@ -62,7 +62,12 @@ function deriveProfileId(manifest) {
 
 function selfTestAgainstGoldenVectors() {
   const vectorsDir = join(repoRoot, "protocol", "vectors");
-  const files = readdirSync(vectorsDir).filter((f) => f.endsWith(".json")).sort();
+  // Manifest-shaped vectors only: the directory also carries signed-lease,
+  // receipt, relay-ticket and challenge-prompt vectors (ADR-030/038) with
+  // no `.manifest` field — the self-test derives profile ids, nothing else.
+  const files = readdirSync(vectorsDir)
+    .filter((f) => f.startsWith("manifest-") && f.endsWith(".json"))
+    .sort();
   if (files.length === 0) throw new Error("no golden vectors found — refusing to resolve");
   for (const file of files) {
     const doc = JSON.parse(readFileSync(join(vectorsDir, file), "utf8"));

@@ -38,7 +38,7 @@ pub trait AdvisoryTransport: Send + Sync + std::fmt::Debug {
 /// serves the adapter and the redirect test, so the pin cannot drift
 /// between them.
 pub fn pinned_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    modelswarm_dns::apply(reqwest::Client::builder())
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("reqwest client")

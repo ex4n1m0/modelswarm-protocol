@@ -61,7 +61,7 @@ impl ArtifactManager {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
-            http: reqwest::Client::builder()
+            http: modelswarm_dns::apply(reqwest::Client::builder())
                 .timeout(Duration::from_secs(600))
                 .build()
                 .expect("reqwest client"),

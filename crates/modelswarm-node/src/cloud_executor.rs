@@ -78,7 +78,7 @@ pub struct CloudApiExecutor {
 
 impl CloudApiExecutor {
     pub fn new(config: CloudApiConfig) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
+        let client = modelswarm_dns::apply(reqwest::Client::builder())
             .timeout(config.request_timeout)
             .build()
             .map_err(|e| format!("cloud client build failed: {e}"))?;

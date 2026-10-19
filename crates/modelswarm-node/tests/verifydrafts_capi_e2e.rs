@@ -245,6 +245,7 @@ async fn real_capi_engine_serves_verifydrafts_over_quic() {
         request_timeout: Duration::from_secs(120),
         engine: Some(identity.clone()),
         vocab: None,
+        no_prompt_cache: false,
     })
     .expect("http adapter constructs");
     let http_handle = http.load("msp1:e2e-http").await.expect("http load");

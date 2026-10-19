@@ -1,0 +1,15 @@
+[package]
+name = "modelswarm-dns"
+description = "MSP outbound DNS: DNS-over-HTTPS via 1.1.1.1 (owner directive 2026-10-19) with an honest system fallback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["net", "rt", "macros"] }
+
+[lints]
+workspace = true

@@ -213,6 +213,7 @@ fn e2e_lease_wire(key: &ed25519_dalek::SigningKey, profile: &str, peer_id: &str)
         1,
         "e2e-challenge",
         "e2e-nonce",
+        1,
         key,
     )
     .to_wire()
@@ -295,6 +296,7 @@ async fn real_capi_engine_serves_verifydrafts_through_composed_daemon() {
         request_timeout: Duration::from_secs(120),
         engine: Some(identity.clone()),
         vocab: None,
+        no_prompt_cache: false,
     })
     .expect("http adapter constructs");
     let http_handle = http.load("msp1:e2e-http").await.expect("http load");

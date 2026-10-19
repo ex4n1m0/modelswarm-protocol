@@ -1,0 +1,38 @@
+{
+  "manifest": {
+    "schema_version": 2,
+    "hf_repo": "mradermacher/Huihui-Qwen3.5-9B-abliterated-GGUF",
+    "hf_revision": "9f646d7eda193ddf2348134f3bff3d49eed7a2c6",
+    "artifact_hashes": [
+      {
+        "path": "Huihui-Qwen3.5-9B-abliterated.Q4_K_M.gguf",
+        "sha256": "ea1858ef4dc4b648b8dbb44612962a0333e945060dd0545ac0f28d7c4416e4b3"
+      }
+    ],
+    "tokenizer_hash": "5005d8d5449737c9e00ad050df24a7896da3e2ed013606a63b5df955a21babeb",
+    "chat_template_hash": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    "architecture_hash": "9b468478a2b4dcb5b39a69530954d3c24ab6ab7f81d11e39941e3a7dbce5ace2",
+    "quantization": {
+      "method": "q4_k_m",
+      "bits": 4
+    },
+    "runtime": {
+      "name": "llama.cpp",
+      "version": "b11407",
+      "build_hash": "353c4aab423bff5cb6dc0e1d32e41a447990ab3d69a411b7f58ff48187c91a03"
+    },
+    "decoding_abi_version": 1,
+    "speculative_capabilities": [
+      "proposal_tokens"
+    ]
+  },
+  "profile_id": "msp1:3dbdecb0c3a60029ca2cc798bb047004d5dfe06d79f527b1de7940882d65e2d1",
+  "display_name": "Huihui Qwen3.5 9B abliterated (Q4_K_M)",
+  "status": "candidate",
+  "provenance": {
+    "resolvedBy": "scripts/resolve-candidate.mjs (Phase H, ADR-022)",
+    "resolvedAt": "2026-10-19T06:39:03.180Z",
+    "reviewedBy": "owner",
+    "licenseEvidenceUrl": "https://huggingface.co/mradermacher/Huihui-Qwen3.5-9B-abliterated-GGUF/blob/9f646d7eda193ddf2348134f3bff3d49eed7a2c6/LICENSE"
+  }
+}

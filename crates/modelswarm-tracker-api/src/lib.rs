@@ -245,7 +245,7 @@ impl TrackerClient {
             base: base_url.into().trim_end_matches('/').to_string(),
             identity,
             session_token: tokio::sync::RwLock::new(None),
-            http: reqwest::Client::builder()
+            http: modelswarm_dns::apply(reqwest::Client::builder())
                 .timeout(Duration::from_secs(15))
                 .build()
                 .expect("reqwest client"),

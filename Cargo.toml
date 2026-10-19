@@ -13,6 +13,7 @@ members = [
     "crates/modelswarm-store",
     "crates/modelswarm-gateway",
     "crates/modelswarm-telemetry",
+    "crates/modelswarm-dns",
     "crates/modelswarm-bench",
     "crates/modelswarm-node",
     "crates/modelswarm-winjob",

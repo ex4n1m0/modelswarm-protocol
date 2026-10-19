@@ -2379,7 +2379,9 @@ async fn list_models(
     };
     let store = modelswarm_store::Store::open(inner.data_dir.join("state.sqlite")).ok();
     let manager = ArtifactManager::new(&inner.data_dir);
-    let head_client = reqwest::Client::new();
+    let head_client = modelswarm_dns::apply(reqwest::Client::builder())
+        .build()
+        .expect("outbound client builds");
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -2708,7 +2710,9 @@ async fn census(state: tauri::State<'_, DesktopState>) -> Result<serde_json::Val
     // this agent's to extend), so this is a plain reqwest GET against the
     // SAME configured tracker base URL. Short timeout: the picker never
     // waits on it — `list_models` joins whatever cache exists.
-    let http = reqwest::Client::new();
+    let http = modelswarm_dns::apply(reqwest::Client::builder())
+        .build()
+        .expect("outbound client builds");
     let fetched: Result<(u64, std::collections::BTreeMap<String, u64>), String> = async {
         let body: serde_json::Value = http
             .get(format!("{tracker_url}/api/v1/stats"))
@@ -6303,7 +6307,7 @@ async fn send_chat(
         .collect();
 
     let started = Instant::now();
-    let http = reqwest::Client::builder()
+    let http = modelswarm_dns::apply(reqwest::Client::builder())
         .timeout(Duration::from_secs(180))
         .build()
         .map_err(|e| e.to_string())?;
@@ -6998,7 +7002,7 @@ async fn try_cross_check(
                 .unwrap_or_else(|| "own hosted model".to_string()),
             Err(_) => "own hosted model".to_string(),
         };
-        let http = reqwest::Client::builder()
+        let http = modelswarm_dns::apply(reqwest::Client::builder())
             .timeout(Duration::from_secs(45))
             .build();
         let sent = match http {
@@ -7235,7 +7239,7 @@ fn valid_hf_repo(repo: &str) -> bool {
 }
 
 fn hf_http() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    modelswarm_dns::apply(reqwest::Client::builder())
         .timeout(Duration::from_secs(12))
         .build()
         .map_err(|e| e.to_string())

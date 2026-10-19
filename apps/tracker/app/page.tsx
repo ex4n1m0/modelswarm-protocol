@@ -107,21 +107,21 @@ export default function Home() {
         <section id="get" aria-labelledby="get-heading">
           <h2 id="get-heading">Desktop app</h2>
           <div className="rule">
-            <b>v0.2.39</b>
+            <b>v0.2.41</b>
             <div className="dl-grid">
-              <a className="dl" href="/api/download/ModelSwarm-Setup-0.2.39-windows-x64.exe">
+              <a className="dl" href="/api/download/ModelSwarm-Setup-0.2.41-windows-x64.exe">
                 <span className="os">Windows</span>
                 <span className="fmt">installer · .exe · x64</span>
               </a>
-              <a className="dl" href="/api/download/ModelSwarm-0.2.39-macos-arm64.dmg">
+              <a className="dl" href="/api/download/ModelSwarm-0.2.41-macos-arm64.dmg">
                 <span className="os">macOS</span>
                 <span className="fmt">Apple Silicon · .dmg</span>
               </a>
-              <a className="dl" href="/api/download/ModelSwarm-0.2.39-linux-amd64.deb">
+              <a className="dl" href="/api/download/ModelSwarm-0.2.41-linux-amd64.deb">
                 <span className="os">Linux</span>
                 <span className="fmt">.deb · amd64</span>
               </a>
-              <a className="dl" href="/api/download/ModelSwarm-0.2.39-linux-amd64.AppImage">
+              <a className="dl" href="/api/download/ModelSwarm-0.2.41-linux-amd64.AppImage">
                 <span className="os">Linux</span>
                 <span className="fmt">AppImage · self-updating</span>
               </a>

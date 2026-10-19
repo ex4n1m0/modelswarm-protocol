@@ -192,7 +192,20 @@ const vectorsChecked = selfTestAgainstGoldenVectors();
 console.error(`self-test: canonical derivation matches ${vectorsChecked} golden vectors`);
 
 // 1. Resolve the pinned revision from the HF API (never a branch name).
-const api = await fetch(`https://huggingface.co/api/models/${args.repo}`);
+// The HF endpoints reset long-lived TLS connections mid-read often enough
+// (seen live 2026-10-19, three runs in a row) that a single fetch is not
+// reliable — retry with fresh connections instead.
+let api;
+for (let attempt = 1; ; attempt++) {
+  try {
+    api = await fetch(`https://huggingface.co/api/models/${args.repo}`);
+    break;
+  } catch (err) {
+    if (attempt >= 8) throw err;
+    console.error(`HF api fetch attempt ${attempt} failed (${err.cause?.code ?? err.code ?? err.message}); retrying`);
+    await new Promise((r) => setTimeout(r, 2000 * attempt));
+  }
+}
 if (!api.ok) throw new Error(`HF api ${api.status} for ${args.repo}`);
 const model = await api.json();
 const revision = model.sha;

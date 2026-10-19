@@ -1,0 +1,38 @@
+{
+  "manifest": {
+    "schema_version": 2,
+    "hf_repo": "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive",
+    "hf_revision": "0a41c68809d375475f954be12ba7c40efa56c2a9",
+    "artifact_hashes": [
+      {
+        "path": "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf",
+        "sha256": "c0ba7beb68fd3fe47891bd549486d38dcf62d00817296ea314ad37017f5a4986"
+      }
+    ],
+    "tokenizer_hash": "03674be914c2d913d01a338baca0a59f721099beaf3e17375ee77620007e0f66",
+    "chat_template_hash": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    "architecture_hash": "9cbcb4c963567b9c3977307b297f9973c890f7d5cca72808f0640670bfaf00c2",
+    "quantization": {
+      "method": "q6_k",
+      "bits": 6
+    },
+    "runtime": {
+      "name": "llama.cpp",
+      "version": "b11407",
+      "build_hash": "353c4aab423bff5cb6dc0e1d32e41a447990ab3d69a411b7f58ff48187c91a03"
+    },
+    "decoding_abi_version": 1,
+    "speculative_capabilities": [
+      "proposal_tokens"
+    ]
+  },
+  "profile_id": "msp1:135004f13be5f9b4225e35cb0bcb8f1c78ac3d5e208ce73c2b977c803a6c1d4b",
+  "display_name": "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive (q6_k)",
+  "status": "candidate",
+  "provenance": {
+    "resolvedBy": "scripts/resolve-candidate.mjs (Phase H, ADR-022)",
+    "resolvedAt": "2026-10-19T11:04:06.856Z",
+    "reviewedBy": "owner",
+    "licenseEvidenceUrl": "https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive/blob/0a41c68809d375475f954be12ba7c40efa56c2a9/LICENSE"
+  }
+}

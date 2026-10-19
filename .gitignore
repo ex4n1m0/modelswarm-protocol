@@ -49,6 +49,8 @@ apps/tracker/public/downloads/*.AppImage
 apps/tracker/public/downloads/*.dmg
 apps/tracker/public/downloads/*.sig
 apps/tracker/public/downloads/latest.json
+# release-train local staging workdir (downloaded artifacts + sigs); never committed
+/downloads/
 
 # Staged pinned engine (installer/stage-engine-windows.mjs or CI); never committed
 crates/modelswarm-desktop/engine/

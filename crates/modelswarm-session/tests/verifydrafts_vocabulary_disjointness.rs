@@ -87,15 +87,15 @@ fn keys_of(value: &Value) -> Vec<&'_ str> {
 #[test]
 fn section6_tags_and_family_discriminant_keys_are_disjoint() {
     // The §6 tags come from the LIVE enum (not a stale copy): the frozen
-    // vocabulary is the eleven WireMessage variants (ten + receipt_ack,
-    // ADR-030 B2 — the msp-v1 §7 receipt_ack reservation implemented), and
-    // a variant added without a same-change collision test fails the
-    // disjointness comparison below whenever it collides.
+    // vocabulary is the twelve WireMessage variants (eleven + accepted,
+    // ADR-043 §3 — the msp-v1 §6.3 accepted emission un-deferred from
+    // ADR-028), and a variant added without a same-change collision test
+    // fails the disjointness comparison below whenever it collides.
     let tags = wire_message_variant_tags();
     assert_eq!(
         tags.len(),
-        11,
-        "the frozen §6 vocabulary is the eleven WireMessage variants: {tags:?}"
+        12,
+        "the frozen §6 vocabulary is the twelve WireMessage variants: {tags:?}"
     );
     for expected in [
         "handshake",
@@ -108,6 +108,7 @@ fn section6_tags_and_family_discriminant_keys_are_disjoint() {
         "completed",
         "cancel",
         "receipt_ack",
+        "accepted",
         "control",
     ] {
         assert!(

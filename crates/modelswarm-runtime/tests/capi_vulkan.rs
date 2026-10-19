@@ -202,6 +202,7 @@ async fn capi_vulkan_inprocess_exactness() {
         request_timeout: Duration::from_secs(180),
         engine: Some(identity),
         vocab: Some(vocab),
+        no_prompt_cache: false,
     })
     .expect("vulkan http adapter constructs");
 

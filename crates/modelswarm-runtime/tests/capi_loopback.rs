@@ -232,6 +232,7 @@ async fn capi_vs_http_loopback_measurements() {
         request_timeout: Duration::from_secs(120),
         engine: Some(identity),
         vocab: Some(vocab),
+        no_prompt_cache: false,
     })
     .expect("http adapter constructs");
 

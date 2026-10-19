@@ -765,8 +765,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -3433,7 +3435,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-bench"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "async-trait",
  "ed25519-dalek 2.2.0",
@@ -3462,12 +3464,13 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-desktop"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "async-trait",
  "axum",
  "futures-util",
  "hex",
+ "modelswarm-dns",
  "modelswarm-gateway",
  "modelswarm-identity",
  "modelswarm-node",
@@ -3492,8 +3495,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "modelswarm-dns"
+version = "0.2.41"
+dependencies = [
+ "reqwest 0.12.28",
+ "tokio",
+]
+
+[[package]]
 name = "modelswarm-eligibility"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3507,7 +3518,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-gateway"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "async-trait",
  "axum",
@@ -3525,7 +3536,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-identity"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -3541,7 +3552,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-node"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "async-trait",
  "axum",
@@ -3550,6 +3561,7 @@ dependencies = [
  "futures-util",
  "hex",
  "libp2p",
+ "modelswarm-dns",
  "modelswarm-eligibility",
  "modelswarm-gateway",
  "modelswarm-identity",
@@ -3577,7 +3589,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-relay"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3603,10 +3615,11 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-runtime"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "futures-util",
  "libloading",
  "modelswarm-session",
@@ -3621,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-scheduler"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "modelswarm-transport",
  "modelswarm-types",
@@ -3632,7 +3645,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-session"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3654,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-sim"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3672,11 +3685,11 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-speculation"
-version = "0.2.39"
+version = "0.2.41"
 
 [[package]]
 name = "modelswarm-store"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -3685,15 +3698,16 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-telemetry"
-version = "0.2.39"
+version = "0.2.41"
 
 [[package]]
 name = "modelswarm-tracker-api"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
  "hex",
+ "modelswarm-dns",
  "modelswarm-identity",
  "reqwest 0.12.28",
  "serde",
@@ -3704,7 +3718,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-transport"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3721,7 +3735,7 @@ dependencies = [
 
 [[package]]
 name = "modelswarm-types"
-version = "0.2.39"
+version = "0.2.41"
 dependencies = [
  "hex",
  "serde",

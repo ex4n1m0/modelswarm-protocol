@@ -41,6 +41,8 @@ libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# 9.6 pass-2 experiment artifact timestamps (tests/capi_pass2.rs).
+chrono = "0.4"
 # REAL-trait compile-proof for `capi::verify` (ADR-032 §1): the architect's
 # `BatchVerifyEngine` lives in `modelswarm-session`, which already depends
 # on THIS crate — so the impl cannot live in the lib (cyclic package

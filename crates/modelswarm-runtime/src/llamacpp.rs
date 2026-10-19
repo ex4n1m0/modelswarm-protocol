@@ -69,6 +69,16 @@ pub struct LlamaCppConfig {
     /// token-id recovery via logprob byte sequences, incl. byte-fallback
     /// tokens that detokenized text cannot represent).
     pub vocab: Option<Arc<modelswarm_types::TokenVocab>>,
+    /// Research determinism mode: when `true`, every per-token request
+    /// carries `cache_prompt: false` so the server recomputes from the
+    /// posted prefix alone — decode_step results stop depending on the
+    /// slot's KV-cache history (the 9.6 pass-2 finding: a verify pattern
+    /// that probes backward relative to the slot's furthest state makes
+    /// cached-prefix reuse perturb greedy output). DEFAULT `false` =
+    /// today's behavior (production keeps the server's prompt cache).
+    /// Costs a full re-prefill per step — the honest structural
+    /// wire-re-post cost, labeled by its users.
+    pub no_prompt_cache: bool,
 }
 
 impl LlamaCppConfig {
@@ -80,6 +90,7 @@ impl LlamaCppConfig {
             request_timeout: Duration::from_secs(60),
             engine: None,
             vocab: None,
+            no_prompt_cache: false,
         }
     }
 
@@ -879,6 +890,9 @@ impl crate::InferenceRuntime for LlamaCppAdapter {
             "max_tokens": 1,
             "stream": false,
         });
+        if self.config.no_prompt_cache {
+            body["cache_prompt"] = json!(false);
+        }
         // Exact id recovery needs the logprob byte sequence; harmless when
         // no vocab is attached (falls back to the text round-trip below).
         if self.config.vocab.is_some() {
@@ -1263,6 +1277,7 @@ mod tests {
                 bytes_to_id: map,
                 eos_id: eos,
             })),
+            no_prompt_cache: false,
         })
         .unwrap()
     }
@@ -1274,6 +1289,7 @@ mod tests {
             request_timeout: timeout,
             engine: None,
             vocab: None,
+            no_prompt_cache: false,
         })
         .unwrap()
     }

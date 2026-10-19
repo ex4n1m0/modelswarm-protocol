@@ -58,3 +58,5 @@ crates/modelswarm-desktop/engine/
 crates/modelswarm-desktop/engine-vulkan/
 
 __pycache__/
+# pass-2 harness CARGO_TARGET_DIR (crate-local; never committed)
+crates/modelswarm-runtime/target/

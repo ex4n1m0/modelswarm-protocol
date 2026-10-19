@@ -364,6 +364,7 @@ async fn capi_verify_engine_exact_through_the_session_trait() {
         request_timeout: Duration::from_secs(120),
         engine: Some(identity),
         vocab: Some(Arc::clone(&vocab)),
+        no_prompt_cache: false,
     })
     .expect("http adapter constructs");
     let http_handle = http.load("msp1:verify-http").await.expect("http load");

@@ -852,7 +852,11 @@
           const selModel = (lastModels || []).find(m => m.profile_id === s.profile_id);
           const nm = selModel ? selModel.display_name : (s.profile_id ? s.profile_id.slice(0, 14) + "…" : "");
           if (hostingOn) {
-            sl.innerHTML = '<span style="color:var(--ok)">● in the swarm</span> — serving <b>' + nm + '</b>' + (selModel && selModel.is_cloud ? ' via your cloud key' : ' on this machine') + ' · your machine counts as 1 peer and can pull from every swarm.';
+            const st = s.node.standing;
+            const standingBit = st && st.grade
+              ? ' · standing: <b>' + st.grade + '</b>' + (st.served_tokens_decayed > 0 ? ' (served ' + st.served_tokens_decayed.toLocaleString() + ' tok)' : '')
+              : '';
+            sl.innerHTML = '<span style="color:var(--ok)">● in the swarm</span> — serving <b>' + nm + '</b>' + (selModel && selModel.is_cloud ? ' via your cloud key' : ' on this machine') + ' · your machine counts as 1 peer and can pull from every swarm.' + standingBit;
           } else {
             sl.textContent = 'Not in the swarm — pick a model in the picker above, or press “Join the swarm” in Settings → Models.';
           }

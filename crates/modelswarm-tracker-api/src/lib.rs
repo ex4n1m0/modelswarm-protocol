@@ -199,6 +199,27 @@ pub struct HeartbeatResponse {
     pub suspended_until_at: Option<String>,
     #[serde(default)]
     pub notices: Vec<Notice>,
+    /// ADR-044 reputation chassis (deploy-order additive): the derived
+    /// standing { grade, served_tok_per_sec, served_tokens_decayed,
+    /// strikes } — informational display only, hub-computed from granted
+    /// accounting + the suspension row. An OLD tracker deploy (field
+    /// absent) parses as `None`.
+    #[serde(default, rename = "standing")]
+    pub standing: Option<Standing>,
+}
+
+/// ADR-044: the derived reputation standing (heartbeat-carried). The
+/// grade vocabulary is frozen by the ADR (member / contributor /
+/// cornerstone / recovering / probation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Standing {
+    pub grade: String,
+    #[serde(rename = "served_tok_per_sec")]
+    pub served_tok_per_sec: f64,
+    #[serde(rename = "served_tokens_decayed")]
+    pub served_tokens_decayed: f64,
+    #[serde(default)]
+    pub strikes: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

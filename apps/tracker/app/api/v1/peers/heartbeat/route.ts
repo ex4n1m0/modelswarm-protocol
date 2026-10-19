@@ -2,9 +2,15 @@ import { jsonOk } from "@/lib/errors";
 import { guardPeerRequest } from "@/lib/guard";
 import { leaseBindingError } from "@/lib/leases";
 import { HeartbeatSchema } from "@/lib/schemas";
-import { LEASE_TTL_MS } from "@/lib/constants";
+import {
+  DEFAULT_FAIR_WEIGHT_T2,
+  DEFAULT_FAIR_WEIGHT_T3,
+  GRANTED_HALF_LIFE_SECS,
+  LEASE_TTL_MS,
+} from "@/lib/constants";
 import { issueRelayAdmissionTicket } from "@/lib/relay-ticket";
 import { evaluateSuspension } from "@/lib/suspension";
+import { standingOf } from "@/lib/reputation";
 
 // POST /api/v1/peers/heartbeat (msp-v1 §3.3): extends the lease (row-aging
 // TTL), records an observation, and drains revocation notices (delete-on-read).
@@ -65,11 +71,34 @@ export async function POST(req: Request) {
   // configured; absent env = the feature is off — deploy-order additive,
   // the relayTicket precedent).
   const relayAddr = (process.env.MSP_RELAY_ADDR ?? "").trim();
+  // ADR-044 reputation chassis: the derived standing rides the existing
+  // per-minute surface (no extra round-trip, same signed envelope). All
+  // inputs are hub-derived — granted counters + the suspension row this
+  // heartbeat already evaluated; thresholds are the SAME env knobs fair
+  // queueing uses (MSP_FAIR_WEIGHT_T2/T3).
+  const granted = await ctx.store.grantedCounters(lease.peerId, GRANTED_HALF_LIFE_SECS);
+  const standing = standingOf(
+    granted.verifiedTokensDecayed,
+    granted.endpointSecondsDecayed,
+    suspension,
+    now,
+    fairThreshold(process.env.MSP_FAIR_WEIGHT_T2, DEFAULT_FAIR_WEIGHT_T2),
+    fairThreshold(process.env.MSP_FAIR_WEIGHT_T3, DEFAULT_FAIR_WEIGHT_T3),
+  );
   return jsonOk({
     leaseExpiresAt: new Date(expiresAt).toISOString(),
     relayTicket: relayTicket.token,
     relayAddr,
     notices,
     suspendedUntilAt: suspension ? new Date(suspension.untilAt).toISOString() : null,
+    standing,
   });
+}
+
+/// ADR-043/044 shared: env threshold parse — missing or non-positive falls
+/// back to the frozen default (never 0, which would make every valid peer
+/// a 2×-weighted contributor / instant contributor).
+function fairThreshold(raw: string | undefined, fallback: number): number {
+  const parsed = Number.parseFloat(raw ?? "");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }

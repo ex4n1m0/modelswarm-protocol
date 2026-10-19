@@ -206,6 +206,10 @@ struct Inner {
     /// while not hosting. The local `relay.addr` file still WINS over
     /// this value (the tester/operator override).
     relay_config: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    /// ADR-044 reputation chassis: the latest heartbeat-carried standing
+    /// (hub-derived; informational display only), watch-received the same
+    /// way `relay_config` is. `None` while not hosting.
+    standing: Option<tokio::sync::watch::Receiver<Option<modelswarm_tracker_api::Standing>>>,
     /// F15 shadow measurements (per-peer RTT EWMA, completion
     /// distributions): lazily opened store-backed recorder shared by the
     /// swarm executors. Shadow data only — nothing selects peers yet.
@@ -540,6 +544,7 @@ impl DesktopState {
                 swarm_executor: None,
                 relay_tickets: None,
                 relay_config: None,
+                standing: None,
                 peer_metrics: None,
                 listener_addr: None,
                 family: None,
@@ -2056,6 +2061,17 @@ async fn get_status(
                     .and_then(|rx| rx.borrow().clone())
                     .as_deref(),
             ),
+            // ADR-044 reputation chassis: the latest hub-derived standing
+            // ({grade, served_tok_per_sec, served_tokens_decayed,
+            // strikes}); null while not hosting or on an old tracker
+            // deploy. Informational display only.
+            "standing": serde_json::to_value(
+                inner
+                    .standing
+                    .as_ref()
+                    .and_then(|rx| rx.borrow().clone()),
+            )
+            .unwrap_or(serde_json::Value::Null),
             "enrollment": enrollment,
         },
         // The ADR-032 family half, exactly as the daemon decided it (on
@@ -3027,6 +3043,7 @@ async fn set_hosting_inner(
         // ticket-less instead of presenting the dead cache forever.
         inner.relay_tickets = None;
         inner.relay_config = None;
+        inner.standing = None;
         inner.swarm_executor = None;
         // 2026-10-15: hosting off = no model backing — the assistant
         // returns to the static floor with the honest label (its
@@ -3189,6 +3206,10 @@ async fn set_hosting_inner(
     // sends; the lazy supervisor and the status surface read).
     let (relay_config_tx, relay_config_rx) = tokio::sync::watch::channel::<Option<String>>(None);
     inner.relay_config = Some(relay_config_rx.clone());
+    // ADR-044: the heartbeat-carried standing channel (same pattern).
+    let (standing_tx, standing_rx) =
+        tokio::sync::watch::channel::<Option<modelswarm_tracker_api::Standing>>(None);
+    inner.standing = Some(standing_rx);
     // The pooled swarm executor (if any) predates this cache — retire it
     // so the next swarm turn rebuilds with the ticket attached (mirrored
     // by the hosting-off reset above).
@@ -3377,6 +3398,8 @@ async fn set_hosting_inner(
     // ADR-039: the heartbeat's relayAddr feeds the lazy config supervisor
     // (file-wins precedence resolves inside it) and the status surface.
     let hb_relay_config_tx = relay_config_tx;
+    // ADR-044: the heartbeat's standing feeds the status surface.
+    let hb_standing_tx = standing_tx;
     let enrollment_view = Arc::new(tokio::sync::RwLock::new(EnrollmentView {
         phase: "enrolling".into(),
         ..EnrollmentView::default()
@@ -3545,6 +3568,10 @@ async fn set_hosting_inner(
                             // counts-only event name fits, per the
                             // ticket-cache handoff).
                             let _ = hb_relay_tickets.store_heartbeat(&response);
+                            // ADR-044: replace-with-freshest standing (the
+                            // hub-derived display value; None on an old
+                            // tracker deploy keeps the previous value).
+                            hb_standing_tx.send_replace(response.standing.clone());
                             // ADR-039: forward the tracker's relay address
                             // when it changes (non-empty, multiaddr-shaped
                             // — a leading '/' with no whitespace; garbage

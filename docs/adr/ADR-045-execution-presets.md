@@ -45,7 +45,7 @@ verification baseline** (ruling 1); higher tiers add depth:
 | **Balanced** | Fast path, plus the composed in-process speculative engine when eligible (ADR-031/032 contracts, engages only when the shadow planner's live prediction says it beats the fastest single host — else silent fallback to Fast) | family verification, unchanged (speculation is lossless: `speculative_exact`, verified every round) | "Same checks as Fast; your own machine drafts ahead and verifies in one pass when that is measurably faster — otherwise it steps aside." |
 | **Deep** | Balanced, plus full verification cohort (every available same-model verifier, not the fastest one) and disagreement escalation (any verifier reject ⇒ full recompute + slow-path re-check) | family verification with all hands | "Every same-model peer verifies every reply; any disagreement forces a clean recompute." |
 | **Verified** | Deep, plus cross-model cross-check: a different-family peer on the ADR-042 serving path receives the turn's user message and draft answer (bounded) and returns a verdict (`confirmed`/`disagree`/`inconclusive`); when that peer hosts a cloud profile, the content transits the third-party provider under the HOSTING peer's key (disclosed above — this is the egress S-3 requires at the point of choice). The cross-check rides exclusively the lease-gated ADR-042 serving path; it never touches the ADR-033 advisory/assistant plane, and the requesting app opens no provider client | family + cross-model | "Everything Deep does, plus a second, different model family sanity-checks the answer; the receipt shows it." |
-| **Maximum** | Verified, plus digest re-verification of the serving artifact and a full audit record (which peer, which engine hash — `canonical_build_hash` per ADR-019 — every verify outcome; counts and hashes only, never content; token ids are content per ADR-032 §2; the audit record is local by default, anything egressing is enum/count/hex only) | family + cross-model + audit | "The whole swarm checks everything, and the receipt proves it. Slowest by design." |
+| **Maximum** | Verified, plus digest re-verification of the serving artifact and a full audit record (which peer, which engine hash — `canonical_build_hash` per ADR-019 — every verify outcome; counts and hashes only, never content; token ids are content per ADR-032 §2; the audit record is local by default, anything egressing is enum/count/hex only) | family + cross-model + audit | "The whole swarm checks everything, and the receipt records it — signed and tamper-evident. Slowest by design." |
 
 Rules pinned by this ADR:
 
@@ -144,17 +144,24 @@ Architect; S-2/S-3 the canary wording replaced with the accurate
 cross-check egress disclosure + the advisory-plane wall sentence; S-4/S-5
 receipt mechanism pinned to the existing field via SessionOffer
 negotiation, vocabulary frozen, intake validation routed to the Tracker
-Engineer; S-6 every-tier honest non-engagement labeling; S-7 the Maximum
-line's "proves" → "records" one-word correction PENDING the owner's
-re-approval — the shipped line stays the approved text until then;
-S-8..S-12 advisories tracked above).
+  Engineer; S-6 every-tier honest non-engagement labeling; S-7 the
+  Maximum-line overclaim RESOLVED by owner re-approval 2026-10-20: the
+  owner chose the strengthened accurate wording — "The whole swarm
+  checks everything, and the receipt records it — signed and
+  tamper-evident. Slowest by design." — which claims exactly the
+  provable properties (signatures + tamper-evidence) and nothing more;
+  applied across every pinned layer (ADR table, Rust enum + unit test,
+  webview, CI grep guard, sync test, rendered harness) in one commit;
+  S-8..S-12 advisories tracked above).
 
 ## Reviews
 
 - Owner: **APPROVED 2026-10-20** (tier table, disclosure lines, Fast
   default). Revision 2's Turn-path accuracy corrections (S-2/S-3) ride the
-  approved table's structure; the S-7 one-word line change is queued for
-  owner re-approval, not applied.
+  approved table's structure. The Maximum disclosure line was re-approved
+  2026-10-20 in its strengthened accurate form (S-7 resolution): "The
+  whole swarm checks everything, and the receipt records it — signed and
+  tamper-evident. Slowest by design."
 - Security: **APPROVE-WITH-CHANGES (2026-10-20)** — S-1..S-7 folded in
   revision 2; S-1's mirror edit routed to the Protocol Architect, S-5's
   intake validation routed to the Tracker Engineer.

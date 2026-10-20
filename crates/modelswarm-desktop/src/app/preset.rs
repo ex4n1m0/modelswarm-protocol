@@ -66,7 +66,7 @@ impl ExecutionPreset {
                 "Everything Deep does, plus a second, different model family sanity-checks the answer; the receipt shows it."
             }
             ExecutionPreset::Maximum => {
-                "The whole swarm checks everything, and the receipt proves it. Slowest by design."
+                "The whole swarm checks everything, and the receipt records it — signed and tamper-evident. Slowest by design."
             }
         }
     }
@@ -138,7 +138,7 @@ mod tests {
         );
         assert_eq!(
             ExecutionPreset::Maximum.disclosure(),
-            "The whole swarm checks everything, and the receipt proves it. Slowest by design."
+            "The whole swarm checks everything, and the receipt records it — signed and tamper-evident. Slowest by design."
         );
     }
 

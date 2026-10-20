@@ -28,7 +28,7 @@ const CANONICAL: &[(&str, &str)] = &[
     ),
     (
         "maximum",
-        "The whole swarm checks everything, and the receipt proves it. Slowest by design.",
+        "The whole swarm checks everything, and the receipt records it — signed and tamper-evident. Slowest by design.",
     ),
 ];
 

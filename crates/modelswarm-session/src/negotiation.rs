@@ -60,22 +60,36 @@ pub const COOPERATIVE_PROTOCOL_VERSION: &str = "msp-cooperative-v1";
 // Preset (msp-cooperative-v1 §1/§2: "SessionOffer and the preset enum")
 // ---------------------------------------------------------------------------
 
-/// The negotiated contract tier (ADR-029; msp-cooperative-v1 §2, frozen:
-/// exactly these five values). The ONLY mode-ish field on the wire;
-/// primitive-mode resolution is planner-internal (§4 of the doc).
+/// The negotiated contract tier (ADR-029 names; semantics superseded by
+/// ADR-045 — msp-cooperative-v1 §2/§6, frozen: exactly these five
+/// values). The ONLY mode-ish field on the wire; primitive-mode
+/// resolution is planner-internal (§4 of the doc). ADR-045: every tier
+/// is LOSSLESS (no tier samples differently) and the tiers form a
+/// strictly upward verification-DEPTH gradient on the always-on family
+/// baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Preset {
-    /// The msp-v1 §6 single-stream baseline; lossless; default and live.
+    /// Best single host by measured speed + family verification; lossless;
+    /// the default (ADR-045: today's behavior, relabeled honestly).
     Fast,
-    /// `single` + honesty-patched `hedged`; lossless.
+    /// Fast, plus the composed in-process speculative engine when the
+    /// live prediction says it beats the fastest single host — lossless
+    /// (`speculative_exact`, verified every round), with per-turn honest
+    /// fallback (ADR-045 P2 + its pre-registered protocol).
     Balanced,
-    /// `balanced` + best-of-n + deliberation roles; approximate — never
-    /// lossless (ADR-gated future work; not in this family).
+    /// Balanced, plus the full verification cohort (every available
+    /// same-model verifier) and disagreement escalation — LOSSLESS under
+    /// ADR-045 (the ADR-029 "approximate — never lossless" reading is
+    /// RETIRED; output-influencing additions are P3 and need their own
+    /// ADR). Fan-out lands with P2.
     Deep,
-    /// `balanced` + audited chain; detection-oriented.
+    /// Deep, plus cross-model cross-check on the lease-gated ADR-042
+    /// serving path (verdict, never rewrite; content egress disclosed at
+    /// the point of choice; never the ADR-033 advisory plane).
     Verified,
-    /// Composition of individually-gated modes only; union of labels.
+    /// Verified, plus artifact digest re-verification and the full audit
+    /// record (counts and hashes only, never content).
     Maximum,
 }
 

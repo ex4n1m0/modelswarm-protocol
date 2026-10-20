@@ -97,3 +97,43 @@ describe("intake validation (ADR-030 §3: nothing self-reported moves counters)"
     expect(perPeerShare(solo, 0)).toEqual({ endpoint_seconds: 0, verified_tokens: 0 });
   });
 });
+
+// ---- ADR-045: the presets golden vector (receipt-v2-2-presets.json) ----
+// The B2 trap's regression test: the TS side must digest the object AS
+// PARSED (zero stripping) — six DISTINCT digests prove the field cannot
+// be dropped or normalized before digesting.
+
+describe("receipt-v2-2-presets golden vector (ADR-045, digest sensitivity)", () => {
+  const P = JSON.parse(
+    readFileSync(join(vectorsDir, "receipt-v2-2-presets.json"), "utf8"),
+  ) as {
+    cases: Array<{
+      preset: string;
+      receipt: ReceiptV2;
+      phase1_canonical_json: string;
+      phase2_canonical_json: string;
+      final_canonical_json: string;
+      receipt_digest: string;
+    }>;
+  };
+
+  it("carries exactly the frozen six-value receipt-side vocabulary", () => {
+    expect(P.cases.map((c) => c.preset).sort()).toEqual(
+      ["balanced", "deep", "fast", "maximum", "unspecified", "verified"].sort(),
+    );
+  });
+
+  it("every case: preimages + digest byte-exact from the parsed object", () => {
+    for (const c of P.cases) {
+      expect(phase1Canonical(c.receipt)).toBe(c.phase1_canonical_json);
+      expect(phase2Canonical(c.receipt)).toBe(c.phase2_canonical_json);
+      expect(finalCanonical(c.receipt)).toBe(c.final_canonical_json);
+      expect(receiptDigest(c.receipt)).toBe(c.receipt_digest);
+    }
+  });
+
+  it("six DISTINCT digests — the preset field cannot be stripped or normalized pre-digest", () => {
+    const digests = new Set(P.cases.map((c) => c.receipt_digest));
+    expect(digests.size).toBe(6);
+  });
+});

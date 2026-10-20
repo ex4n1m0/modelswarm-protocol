@@ -136,3 +136,88 @@ fn grant_rules_self_work_zero_and_conservative_attribution() {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+// ---- ADR-045: the presets golden vector (receipt-v2-2-presets.json) ----
+
+fn load_presets() -> serde_json::Value {
+    let path = format!(
+        "{}/../../protocol/vectors/receipt-v2-2-presets.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn golden_receipt_v2_2_presets_vocabulary_digest_sensitive_and_signed() {
+    let v = load_presets();
+    let cases = v["cases"].as_array().expect("cases array");
+    assert_eq!(
+        cases.len(),
+        6,
+        "exactly the six-value receipt-side vocabulary"
+    );
+
+    let server_key = SigningKey::from_bytes(&unhex(v["server_signing_seed_hex"].as_str().unwrap()));
+    let requester_key =
+        SigningKey::from_bytes(&unhex(v["requester_signing_seed_hex"].as_str().unwrap()));
+
+    let vocabulary = [
+        "fast",
+        "balanced",
+        "deep",
+        "verified",
+        "maximum",
+        "unspecified",
+    ];
+    let mut seen_digests = std::collections::HashSet::new();
+    let mut first: Option<ReceiptV2> = None;
+
+    for case in cases {
+        let preset = case["preset"].as_str().unwrap();
+        assert!(vocabulary.contains(&preset), "frozen vocabulary: {preset}");
+
+        let mut receipt: ReceiptV2 = serde_json::from_value(case["receipt"].clone()).unwrap();
+        assert_eq!(receipt.preset, preset);
+
+        // Byte-pinned preimages + digest, recomputed from the parsed object.
+        assert_eq!(
+            receipt.phase1_canonical().unwrap(),
+            case["phase1_canonical_json"].as_str().unwrap()
+        );
+        assert_eq!(
+            receipt.phase2_canonical().unwrap(),
+            case["phase2_canonical_json"].as_str().unwrap()
+        );
+        assert_eq!(
+            receipt.final_canonical().unwrap(),
+            case["final_canonical_json"].as_str().unwrap()
+        );
+        assert_eq!(
+            receipt.receipt_digest().unwrap(),
+            case["receipt_digest"].as_str().unwrap()
+        );
+
+        // Both signatures verify against the fixture keys.
+        receipt
+            .verify_signatures(&server_key.verifying_key(), &requester_key.verifying_key())
+            .expect("both signatures valid");
+
+        // Digest sensitivity: six DISTINCT digests — the field cannot be
+        // dropped or normalized before digesting (the B2 trap's pin).
+        assert!(
+            seen_digests.insert(case["receipt_digest"].as_str().unwrap().to_string()),
+            "digest for preset {preset} collides with an earlier case — the vector's whole point is six distinct digests"
+        );
+
+        // Isolation: the cases differ ONLY in preset — blank it and the
+        // objects are equal (any other field drifting would silently
+        // weaken the sensitivity pin).
+        receipt.preset = String::new();
+        receipt.server_signature = String::new();
+        receipt.requester_signature = String::new();
+        match &first {
+            None => first = Some(receipt),
+            Some(baseline) => assert_eq!(&receipt, baseline, "case {preset} differs beyond preset"),
+        }
+    }
+}

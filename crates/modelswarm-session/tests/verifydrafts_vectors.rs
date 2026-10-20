@@ -48,6 +48,8 @@ const FIXTURE_MALFORMED: &str =
 const SESSION_OFFER_1: &str = include_str!("../../../protocol/vectors/session-offer-1.json");
 const SESSION_OFFER_2: &str = include_str!("../../../protocol/vectors/session-offer-2.json");
 const SESSION_OFFER_3: &str = include_str!("../../../protocol/vectors/session-offer-3.json");
+const SESSION_OFFER_4: &str =
+    include_str!("../../../protocol/vectors/session-offer-4-unknown-preset.json");
 const SESSION_ACCEPT_1: &str = include_str!("../../../protocol/vectors/session-accept-1.json");
 const SESSION_ACCEPT_2: &str = include_str!("../../../protocol/vectors/session-accept-2.json");
 const SESSION_REJECT_1: &str = include_str!("../../../protocol/vectors/session-reject-1.json");
@@ -1463,4 +1465,24 @@ fn golden_pin_carrier_2_mismatch() {
     // pure core behind the serving side's `pin_mismatch` reject.
     assert_eq!(carrier.validate(), Err(PinCarrierError::CommitmentMismatch));
     assert_eq!(f["expected_reject"].as_str().unwrap(), "pin_mismatch");
+}
+
+#[test]
+fn golden_session_offer_4_unknown_preset_fails_closed() {
+    // ADR-045 (S-1 supersession + the P2 receipt-population contract): a
+    // preset OUTSIDE the frozen five-value enum fails the offer schema —
+    // no session opens, no receipt is produced, and the value is never
+    // coerced to a nearby tier (msp-cooperative-v1 §6 compatibility).
+    let f = doc(SESSION_OFFER_4);
+    assert_eq!(
+        f["name"].as_str().unwrap(),
+        "session-offer-4-unknown-preset"
+    );
+    assert_eq!(f["fails_deserialization"], json!(true));
+    let fields = check_canonical_block(&f["block"]);
+    assert_eq!(fields["preset"], json!("turbo"));
+    assert!(
+        serde_json::from_value::<SessionOffer>(fields).is_err(),
+        "ADR-045: an unknown preset variant must fail deserialization (fail-closed)"
+    );
 }

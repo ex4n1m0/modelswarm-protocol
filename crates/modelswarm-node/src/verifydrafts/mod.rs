@@ -215,9 +215,14 @@ pub fn clamp_budget_down(offer: &SessionBudget, ceiling: &SessionBudget) -> Sess
     }
 }
 
-/// Presets this node serves for the family: everything but `deep` (Deep is
-/// the approximate tier — ADR-gated future work, never in this lossless
-/// family).
+/// Presets this node serves for the family: everything but `deep` — a
+/// CONSCIOUS post-ADR-045 decision (Integrator, 2026-10-20), not the
+/// inherited one: Deep is LOSSLESS under ADR-045 (the ADR-029
+/// "approximate tier" justification is retired), but its full-cohort
+/// fan-out + disagreement escalation are not implemented yet; serving
+/// Deep before P2's fan-out lands would label a single-verifier turn
+/// "deep" — a false disclosure. Deep joins the served set when its P2
+/// behavior + fixtures land.
 pub fn default_supported_presets() -> Vec<Preset> {
     vec![
         Preset::Fast,
@@ -421,7 +426,9 @@ mod tests {
         assert!(!d.batch_verify);
         assert_eq!(d.batch_window_max, 1);
         assert!(d.is_valid_disclosure());
-        // Deep is not in the default served presets (approximate tier).
+        // Deep is not in the default served presets (ADR-045: its
+        // full-cohort fan-out is P2 — serving it earlier would be a
+        // false disclosure, the retired "approximate tier" reason is gone).
         assert!(!default_supported_presets().contains(&Preset::Deep));
         assert!(default_supported_presets().contains(&Preset::Verified));
     }

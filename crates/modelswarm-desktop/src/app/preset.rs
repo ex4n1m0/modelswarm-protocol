@@ -33,15 +33,6 @@ pub enum ExecutionPreset {
 }
 
 impl ExecutionPreset {
-    /// All five tiers in owner-display order.
-    pub const ALL: [ExecutionPreset; 5] = [
-        ExecutionPreset::Fast,
-        ExecutionPreset::Balanced,
-        ExecutionPreset::Deep,
-        ExecutionPreset::Verified,
-        ExecutionPreset::Maximum,
-    ];
-
     /// Wire/store form (persisted key value; the receipt `preset` field
     /// reuses the same spelling when labeling becomes possible).
     pub fn as_str(self) -> &'static str {
@@ -285,7 +276,13 @@ mod spec_engage_tests {
         // P2 seam scope: until the composed execution lands, NO input can
         // produce engaged: true — this is the fixture pin for that honest
         // boundary (the R1 engaged-set discipline).
-        for preset in ExecutionPreset::ALL {
+        for preset in [
+            ExecutionPreset::Fast,
+            ExecutionPreset::Balanced,
+            ExecutionPreset::Deep,
+            ExecutionPreset::Verified,
+            ExecutionPreset::Maximum,
+        ] {
             for temp in [0.0f32, 0.5, 2.0] {
                 for seam in [true, false] {
                     if let Some(label) = spec_engage_label(preset, temp, seam) {

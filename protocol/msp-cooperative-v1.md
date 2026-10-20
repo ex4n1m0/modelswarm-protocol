@@ -89,7 +89,7 @@ traffic. Canonical JSON per msp-v1 §2.2; snake_case fields.
 |---|---|---|
 | `session_id` | string (frozen) | Correlates offer, accept, and receipt across multiplexed sessions; unique per offer; echoed by SessionAccept and carried by the ReceiptV2 |
 | `protocol_version` | string (frozen; `"msp-cooperative-v1"`) | Binds every cooperative wire message to its namespace version (state-changing messages carry their version — architecture-seat review condition, 2026-10-09) |
-| `preset` | enum (frozen; exactly the five ADR-029 values) | The negotiated contract tier. The ONLY mode-ish field on the wire. Primitive-mode resolution is planner-internal (§4) |
+| `preset` | enum (frozen; exactly the five ADR-029 values — semantics superseded by ADR-045, see §6) | The negotiated contract tier. The ONLY mode-ish field on the wire. Primitive-mode resolution is planner-internal (§4) |
 | `budget.max_endpoints` | u32 ≥ 1 | Cohort-size cap inside the preset envelope; the planner still picks the smallest useful cohort |
 | `budget.max_endpoint_seconds` | u64 ≥ 1 | Summed wall-seconds the session may spend across peers |
 | `budget.max_output_tokens` | u32 ≥ 1 | Output-token ceiling for the session |
@@ -118,6 +118,21 @@ are recorded in the **receipt** (receipts v2, ADR-030:
 Recording lives in the receipt — not on the offer/accept wire — so planner
 internals stay internal while every result stays explainable.
 
+**ADR-045 P2 receipt-population contract (SessionOffer.preset →
+ReceiptV2.preset).** The requester's execution preset reaches the serving
+peer exclusively via §2's `SessionOffer.preset` — no new field anywhere
+(ADR-045's no-new-wire-fields rule). On any session whose offer was
+accepted, the serving peer writes the negotiated value VERBATIM (the
+lowercase enum string) into the existing `ReceiptV2.preset` slot
+(ADR-030; the slot is a string — construction emits only the five enum
+labels or the literal `unspecified`). On every path where no accepted
+offer delivered a preset — including the entire msp-v1 §6 single-stream
+pull — the slot stays `unspecified` (the honest literal; never invented).
+The requester counter-signs only receipts whose `preset` equals the
+session's negotiated value, or is `unspecified` when no negotiation rode
+the session; anything else is refused (fail-closed: the receipt dies, no
+accounting moves). `SessionAccept.preset` echoes the offer unchanged (§3).
+
 ## 5. Frozen-namespace constraints (what is breaking, and forbidden)
 
 - Adding `preset`/mode fields to msp-v1's frozen `InferenceRequest` or
@@ -132,23 +147,90 @@ internals stay internal while every result stays explainable.
   pin carrier (explicitly elected, carriage-default-on; serving peers
   refuse honestly when opted out). The hub-blind rule has NO exception.
 
-## 6. Preset tier table (governed by ADR-029; mirrored for implementers)
+## 6. Preset tier table (names frozen by ADR-029; semantics superseded by ADR-045)
 
-| Preset | Primitive modes allowed | Cohort cap | Correctness label | Extra disclosure |
+> **Supersession note (Security review S-1; ADR-045, accepted and
+> owner-approved 2026-10-20, revision 2).** The five preset NAMES and the
+> §2 enum are unchanged and remain frozen, but their SEMANTICS are
+> superseded by ADR-045's accepted tier table: every tier is LOSSLESS
+> (outputs verified token-for-token; no tier samples differently — speed
+> differences come from transport/composition, never from looser
+> generation), and the tiers form a strictly upward verification-DEPTH
+> gradient on the always-on family-verification baseline (no tier removes
+> it). The ADR-029 readings mirrored here before 2026-10-20 — `deep` as
+> "approximate — never lossless" via best-of-N + deliberation roles, and
+> `verified` as an `audited` detection chain — are RETIRED.
+> Output-influencing additions (best-of-N, deliberation roles) are
+> ADR-045 P3 and require their own ADR (ruling 2). Where this mirror and
+> ADR-045 differ, ADR-045 governs. The table below is condensed for
+> implementers; ADR-045's Decision table is the verbatim authority.
+
+| Preset | Turn path | Verification | Cohort | Disclosure line (owner-approved verbatim intent) |
 |---|---|---|---|---|
-| `fast` | `single` | 1 | lossless (the baseline) | none beyond today's |
-| `balanced` | `single`, `hedged` (honesty-patched) | 3 | lossless | recipient set = raced peers |
-| `deep` | `balanced` + `best_of_n` + deliberation roles | per budget | approximate — never lossless | recipient set + roles + compute budget |
-| `verified` | `balanced` + `audited` chain | per budget | detection-oriented; carries audit proofs | auditors see canary-class tasks |
-| `maximum` | HYBRID = composition of individually-gated modes only | per budget | union of component labels | full composition + budgets |
+| `fast` (default) | best single host by measured speed (local → remote → cloud) | family verification — all same-model peers, parallel; the per-turn label shows the verifier count ("checked by 0 peers" is visible, never vacuous) | 1 | "One host answers; every same-model peer checks it. The everyday speed path." |
+| `balanced` | fast path, plus the composed in-process speculative engine when eligible (ADR-031/032 contracts; engages only when the live prediction says it beats the fastest single host — else fallback to fast, honestly labeled) | family verification, unchanged (speculation is lossless: `speculative_exact`, verified every round) | planner-smallest, inside budget | "Same checks as Fast; your own machine drafts ahead and verifies in one pass when that is measurably faster — otherwise it steps aside." |
+| `deep` | balanced, plus the full verification cohort (every available same-model verifier, not the fastest one) and disagreement escalation (any verifier reject ⇒ full recompute + slow-path re-check) | family verification with all hands | per budget | "Every same-model peer verifies every reply; any disagreement forces a clean recompute." |
+| `verified` | deep, plus cross-model cross-check: a different-family peer on the lease-gated ADR-042 serving path returns a verdict (`confirmed`/`disagree`/`inconclusive`); when that peer hosts a cloud profile, the content transits the third-party provider under the HOSTING peer's key (disclosed at the point of choice); the cross-check never touches the ADR-033 advisory/assistant plane, and the requesting app opens no provider client | family + cross-model | per budget | "Everything Deep does, plus a second, different model family sanity-checks the answer; the receipt shows it." |
+| `maximum` | verified, plus digest re-verification of the serving artifact and a full audit record (which peer, which engine hash — `canonical_build_hash` per ADR-019 — every verify outcome; counts and hashes only, never content; token ids are content per ADR-032 §2; the audit record is local by default, anything egressing is enum/count/hex only) | family + cross-model + audit | per budget | "The whole swarm checks everything, and the receipt records it — signed and tamper-evident. Slowest by design." |
 
-`fast` is default and live; other tiers light up exactly when their
-component modes pass their existing gates (M10 build order, item 11). Each
-tier's recipient-set disclosure updates `docs/privacy.md` wording when it
-lights up (ADR-029 §3).
+Notes for implementers (ADR-045 pinned rules, condensed):
+
+- Correctness label: ALL five tiers are lossless. The ADR-029 per-tier
+  correctness-label column is gone because it no longer differentiates.
+- `fast` is the default (today's behavior, relabeled honestly). ADR-045
+  P1 is label-only for every tier; tier BEHAVIORS ride P2 behind their
+  own gates (planner engage-decision, deep cohort fan-out, and the
+  `SessionOffer.preset` → `ReceiptV2.preset` population contract in §4).
+- Fallback and honest non-engagement labeling apply to EVERY tier
+  (ADR-045 S-6): any component that did not engage this turn (family
+  cohort 0, cross-check refused/undialable, speculation stepped aside) is
+  shown as not-engaged with its honest reason; a preset label never
+  claims an engagement that did not occur.
+- Each tier's recipient-set disclosure still updates `docs/privacy.md`
+  wording when the tier's behavior lights up (ADR-029 §3, unchanged).
+
+**Compatibility (ADR-029-era implementations; fail-closed, never guess).**
+An implementation written against the pre-ADR-045 semantics that
+encounters a preset value it does not understand MUST:
+
+- **Stored/local selection it cannot map:** fall back to `fast` (the
+  ADR-045 P1 gate: "unknown stored value fails closed to fast"). Never
+  put a non-enum string on the wire.
+- **`SessionOffer.preset` outside the frozen five-value enum:** the offer
+  fails schema — no session opens, no receipt is produced (the serving
+  side's schema-failure path). The value is never coerced to a nearby
+  tier and never served under an assumed meaning. A KNOWN value the peer
+  cannot honor is rejected honestly with `preset_unavailable` (§3
+  vocabulary), and the requester's fallback to the msp-v1 §6 single
+  stream is mandatory and never silent.
+- **A recorded/observed `ReceiptV2.preset` (or any preset label) outside
+  the implementation's known vocabulary:** record and display
+  `unspecified` — never guess which tier was meant and never map an
+  unknown value to `fast` on a recording surface. The receipt-side
+  vocabulary is the five enum values plus `unspecified` (the honest
+  literal for "no negotiated preset reached this object", §4).
+- **Trust/accounting surfaces** (tracker intake) additionally REJECT
+  out-of-vocabulary values rather than relabel them (ADR-045 S-5;
+  intake-side enum/length validation is routed to the Tracker Engineer
+  as a companion ADR-030/045 amendment note — never a silent change).
 
 ## 7. Vectors
 
 A cross-language golden vector for the preset enum serialization and the
 `SessionOffer` canonical form is required in `protocol/vectors/` before any
 second implementation (TS or otherwise) reads this namespace.
+
+ADR-045 P2 adds two vector files (dual-language duty per §5 hub-blindness —
+the SessionOffer vector is Rust-only because no TS parser of offers exists):
+
+- `session-offer-4-unknown-preset.json` — the offer-form-v3 canonical shape
+  with a non-enum `"preset"`; pins fail-closed offer intake (fails
+  deserialization; consumer: `modelswarm-session` vector tests).
+- `receipt-v2-2-presets.json` — six cases (`fast`/`balanced`/`deep`/
+  `verified`/`maximum`/`unspecified`), one fixed receipt per case varying
+  only `preset`; pins digest-sensitivity (six distinct digests — neither
+  language may drop or normalize the field before digesting), byte-parity
+  of both signature preimages and the final digest across Rust
+  (`modelswarm-eligibility`) and TS (`apps/tracker` receipt tests), and the
+  frozen six-value receipt vocabulary. `receipt-v2-1.json` stays
+  byte-frozen.

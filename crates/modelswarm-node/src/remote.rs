@@ -522,6 +522,12 @@ fn stream_events(
                                 &wire,
                                 &ctx.identity,
                                 &ctx.peer_id,
+                                // The remote-executor path is the plain
+                                // msp-v1 §6 pull — no SessionOffer rides
+                                // it, so no negotiated preset exists and
+                                // the receipt must honestly stay
+                                // `unspecified` (INV-4).
+                                None,
                             ) {
                                 Ok(final_wire) => {
                                     let ack = WireMessage::ReceiptAck(ReceiptAck {

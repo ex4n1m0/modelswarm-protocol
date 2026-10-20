@@ -77,6 +77,19 @@ impl std::error::Error for ReceiptError {}
 use base64::Engine as _;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+/// ADR-045 (msp-cooperative-v1 §4/§6): the frozen receipt-side preset
+/// vocabulary — the five enum values plus the honest `unspecified`
+/// literal ("no negotiated preset reached this object"). Construction
+/// emits only these; consumers refuse anything else (fail-closed, never
+/// guess). The tracker's intake zod enum mirrors this list
+/// (`apps/tracker/lib/schemas.ts`).
+pub fn is_valid_receipt_preset(value: &str) -> bool {
+    matches!(
+        value,
+        "fast" | "balanced" | "deep" | "verified" | "maximum" | "unspecified"
+    )
+}
+
 impl ReceiptV2 {
     /// `cohort_digest` (ADR-030 §1): `"sha256:" + hex(SHA-256(canonical
     /// JSON of the sorted "peer_id:role" strings))`.

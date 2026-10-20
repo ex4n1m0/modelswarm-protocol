@@ -129,13 +129,45 @@ pub fn build_server_receipt(ctx: &ReceiptContext<'_>) -> Result<JobReceipt, Stri
 /// with the local installation identity (phase 2). Cryptographic
 /// server-signature verification happens at the TRACKER's intake against
 /// enrolled keys (the trust anchor); the requester's local check is the
-/// peer binding below.
+/// peer binding below plus the ADR-045 INV-4 preset gate.
+///
+/// `negotiated_preset` is the session's negotiated tier — `Some(p)` when
+/// a SessionOffer delivered `p` on this session's path, `None` when no
+/// negotiation rode it (the msp-v1 §6 pull). INV-4: the receipt's
+/// `preset` must equal the negotiated value, or be `unspecified` when
+/// none was negotiated — a serving peer cannot monetize a tier claim
+/// this requester never negotiated.
 pub fn countersign(
     wire: &JobReceipt,
     requester_identity: &InstallationIdentity,
     remote_peer_id: &str,
+    negotiated_preset: Option<&str>,
 ) -> Result<JobReceipt, String> {
     let mut receipt = wire_to_receipt(wire)?;
+    // ADR-045 INV-4, first: the preset on the signed object must be
+    // inside the frozen vocabulary AND consistent with what rode the
+    // session — refused otherwise (the receipt dies, no accounting).
+    if !modelswarm_eligibility::receipt_v2::is_valid_receipt_preset(&receipt.preset) {
+        return Err(format!(
+            "receipt preset {:?} is outside the frozen vocabulary",
+            receipt.preset
+        ));
+    }
+    match negotiated_preset {
+        Some(p) if receipt.preset != p => {
+            return Err(format!(
+                "receipt preset {} != negotiated {p}",
+                receipt.preset
+            ));
+        }
+        None if receipt.preset != "unspecified" => {
+            return Err(format!(
+                "receipt claims preset {} but no SessionOffer rode this session",
+                receipt.preset
+            ));
+        }
+        _ => {}
+    }
     // Local honesty check: the receipt names THIS conversation's peer.
     let server = receipt
         .peers

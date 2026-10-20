@@ -221,3 +221,26 @@ fn golden_receipt_v2_2_presets_vocabulary_digest_sensitive_and_signed() {
         }
     }
 }
+
+#[test]
+fn frozen_receipt_preset_vocabulary() {
+    use modelswarm_eligibility::receipt_v2::is_valid_receipt_preset;
+    for ok in [
+        "fast",
+        "balanced",
+        "deep",
+        "verified",
+        "maximum",
+        "unspecified",
+    ] {
+        assert!(
+            is_valid_receipt_preset(ok),
+            "{ok} is in the frozen vocabulary"
+        );
+    }
+    // Case-sensitive, closed, and the legacy uppercase form is OUT
+    // (intake and countersign both refuse it — never relabel).
+    for bad in ["FAST", "turbo", "", "Verified", "fast ", "single"] {
+        assert!(!is_valid_receipt_preset(bad), "{bad:?} must be refused");
+    }
+}

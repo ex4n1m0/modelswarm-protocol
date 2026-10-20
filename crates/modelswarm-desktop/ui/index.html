@@ -1261,7 +1261,15 @@
         // selection in force when this turn started; P1 labels the
         // selection, P2 adds what the tier actually engaged).
         const presetNote = ` · preset ${currentPreset}`;
-        const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms${tempNote}${presetNote}${famNote}${ccNote}`;
+        // ADR-045 P2: the composed-path engagement label — honest on
+        // every non-fast turn (not-engaged + the first failing gate's
+        // reason, per the pre-registered protocol).
+        const specNote = r.spec_engage
+          ? (r.spec_engage.engaged
+              ? " · spec: engaged"
+              : ` · spec: not engaged (${r.spec_engage.reason || "?"})`)
+          : "";
+        const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms${tempNote}${presetNote}${specNote}${famNote}${ccNote}`;
         if (r.error) addMsg("assistant", `⚠ local engine failed (${r.error.code}) — ${r.error.message || "see Diagnostics/logs/node.jsonl"}. Restart hosting or try another model.`, meta);
         else if (r.content) addMsg("assistant", r.content, meta);
         else addMsg("assistant", "(no reply — the model ended its turn before the first token; rephrase the message and send again)", meta);

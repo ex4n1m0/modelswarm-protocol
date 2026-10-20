@@ -2170,6 +2170,22 @@ async fn set_tracker(state: tauri::State<'_, DesktopState>, url: String) -> Resu
     persist_config(&inner)
 }
 
+/// ADR-045 gate 4: is the in-process engine seam live for THIS turn?
+/// True only when the running node holds the production capi family
+/// engine source (the hash-verified bundle venue) — the scripted Shared
+/// venue and non-verifydrafts builds must never claim the seam.
+fn family_engine_live(inner: &Inner) -> bool {
+    #[cfg(feature = "verifydrafts-capi")]
+    {
+        inner.family_engine.is_some()
+    }
+    #[cfg(not(feature = "verifydrafts-capi"))]
+    {
+        let _ = inner;
+        false
+    }
+}
+
 /// The "allow swarm pairing" settings toggle (owner directive 2026-10-13):
 /// persisted key, default on. The toggle gates the serving listener + the
 /// family verify engine at HOSTING START — changing it while hosting would
@@ -6187,6 +6203,20 @@ async fn send_chat(
     temperature: Option<f64>,
 ) -> Result<serde_json::Value, String> {
     let temperature = temperature.unwrap_or(0.0).clamp(0.0, 2.0) as f32;
+    // ADR-045 P2 seam: the composed-path engagement label, captured at
+    // SEND time with the preset in force for this turn (the
+    // pre-registered protocol's gate discipline — every non-fast turn's
+    // reply carries the FIRST failing gate's honest reason; the composed
+    // execution itself rides the next chunk, so gate 5 refuses
+    // conservatively until measurements exist).
+    let (spec_engage_local, spec_engage_remote) = {
+        let inner = state.inner.lock().await;
+        let preset_now = inner.execution_preset;
+        (
+            preset::spec_engage_label(preset_now, temperature, family_engine_live(&inner)),
+            preset::spec_engage_label_remote(preset_now),
+        )
+    };
     // Per-delta surface (P1): every path that produces tokens (remote swarm
     // peer, local fallback, local gateway SSE) calls this so the UI renders
     // text as it arrives. Content only — the final turn (mode label, error
@@ -6312,6 +6342,12 @@ async fn send_chat(
                     });
                 }
                 reply["served_by"] = serde_json::json!("swarm");
+                // ADR-045 P2: a remote-served turn can never engage the
+                // in-process composed path — the honest label rides the
+                // reply (gate 3, turn_not_local).
+                if let Some(label) = &spec_engage_remote {
+                    reply["spec_engage"] = label.clone();
+                }
                 // The chat_log guard MUST drop here: the cross-check below
                 // takes the same mutex (v0.2.38 deadlocked exactly here —
                 // the streamed reply rendered, then the turn hung and the
@@ -6457,6 +6493,11 @@ async fn send_chat(
             stream_error,
         )
         .await?;
+        // ADR-045 P2: the local turn's engagement label (the
+        // pre-registered gate cascade; Fast carries none at all).
+        if let Some(label) = &spec_engage_local {
+            local_reply["spec_engage"] = label.clone();
+        }
         // ADR-042 §5: the local path (own engine or own cloud key) gets
         // the same cross-check — a different swarm model verifies the
         // reply when one is reachable; the OWN hosted model verifies

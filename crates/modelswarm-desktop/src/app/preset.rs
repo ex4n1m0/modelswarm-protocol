@@ -33,6 +33,15 @@ pub enum ExecutionPreset {
 }
 
 impl ExecutionPreset {
+    /// All five tiers in owner-display order.
+    pub const ALL: [ExecutionPreset; 5] = [
+        ExecutionPreset::Fast,
+        ExecutionPreset::Balanced,
+        ExecutionPreset::Deep,
+        ExecutionPreset::Verified,
+        ExecutionPreset::Maximum,
+    ];
+
     /// Wire/store form (persisted key value; the receipt `preset` field
     /// reuses the same spelling when labeling becomes possible).
     pub fn as_str(self) -> &'static str {
@@ -178,5 +187,116 @@ mod tests {
                 .preset,
             ExecutionPreset::Verified
         );
+    }
+}
+
+/// ADR-045 P2 (the pre-registered protocol,
+/// `experiments/reports/P2-BALANCED-FALLBACK-PROTOCOL.md`, gates 1–5):
+/// the honest engagement label for a turn that will execute LOCALLY.
+/// `None` = the turn is not engage-eligible — the Fast baseline never
+/// claims engagement, so its replies carry no `spec_engage` at all.
+///
+/// P2 SEAM SCOPE: the composed engine is not wired to turns yet, so the
+/// cascade can only label `engaged: false` with the FIRST failing gate's
+/// honest reason — gate 5 refuses conservatively
+/// (`prediction_insufficient_evidence`) until in-situ measurements
+/// validate the cost model. The composed execution (the next chunk)
+/// replaces that refusal with a real prediction + execution, and gate
+/// 6's per-turn failure label `composed_failed_before_first_token`
+/// lands with it.
+pub fn spec_engage_label(
+    preset: ExecutionPreset,
+    temperature: f32,
+    capi_seam_live: bool,
+) -> Option<serde_json::Value> {
+    if preset == ExecutionPreset::Fast {
+        return None;
+    }
+    let reason = if temperature != 0.0 {
+        // Gate 2: speculative_exact is greedy-only — a sampled turn
+        // cannot be bit-verified, so it must never engage.
+        "temperature_not_greedy"
+    } else if !capi_seam_live {
+        // Gate 4: no hash-verified in-process engine seam this turn.
+        "capi_seam_unavailable"
+    } else {
+        // Gate 5: conservative refusal until measured acceptance exists.
+        "prediction_insufficient_evidence"
+    };
+    Some(serde_json::json!({ "engaged": false, "reason": reason }))
+}
+
+/// The same label for a turn that was served by a REMOTE peer: the
+/// composed path is in-process by construction, so a remote-served turn
+/// can never engage (gate 3, `turn_not_local`) — the label still rides
+/// the reply so a Balanced turn is honest on every path.
+pub fn spec_engage_label_remote(preset: ExecutionPreset) -> Option<serde_json::Value> {
+    if preset == ExecutionPreset::Fast {
+        return None;
+    }
+    Some(serde_json::json!({ "engaged": false, "reason": "turn_not_local" }))
+}
+
+#[cfg(test)]
+mod spec_engage_tests {
+    use super::*;
+
+    fn reason(label: &serde_json::Value) -> &str {
+        label["reason"].as_str().unwrap()
+    }
+
+    #[test]
+    fn fast_never_carries_a_label() {
+        // The baseline tier claims nothing — no spec_engage at all.
+        assert!(spec_engage_label(ExecutionPreset::Fast, 0.0, true).is_none());
+        assert!(spec_engage_label_remote(ExecutionPreset::Fast).is_none());
+    }
+
+    #[test]
+    fn gate_cascade_labels_the_first_failing_gate() {
+        // Gate 2: a sampled turn can never be bit-verified.
+        let sampled = spec_engage_label(ExecutionPreset::Balanced, 0.7, true).unwrap();
+        assert_eq!(sampled["engaged"], false);
+        assert_eq!(reason(&sampled), "temperature_not_greedy");
+        // Gate 4: no in-process engine seam this turn.
+        let no_seam = spec_engage_label(ExecutionPreset::Balanced, 0.0, false).unwrap();
+        assert_eq!(reason(&no_seam), "capi_seam_unavailable");
+        // Gate 5: the conservative pre-measurement refusal — the seam
+        // exists but no in-situ measurement has validated the cost model
+        // yet, so engagement refuses rather than guess.
+        let refusing = spec_engage_label(ExecutionPreset::Balanced, 0.0, true).unwrap();
+        assert_eq!(reason(&refusing), "prediction_insufficient_evidence");
+        // The cascade covers every engage-eligible tier (Deep+ inherit
+        // Balanced's composed machinery per the ADR-045 table).
+        for preset in [
+            ExecutionPreset::Deep,
+            ExecutionPreset::Verified,
+            ExecutionPreset::Maximum,
+        ] {
+            assert_eq!(
+                reason(&spec_engage_label(preset, 0.0, true).unwrap()),
+                "prediction_insufficient_evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn the_seam_never_claims_engagement_yet() {
+        // P2 seam scope: until the composed execution lands, NO input can
+        // produce engaged: true — this is the fixture pin for that honest
+        // boundary (the R1 engaged-set discipline).
+        for preset in ExecutionPreset::ALL {
+            for temp in [0.0f32, 0.5, 2.0] {
+                for seam in [true, false] {
+                    if let Some(label) = spec_engage_label(preset, temp, seam) {
+                        assert_eq!(label["engaged"], false);
+                    }
+                }
+            }
+            if let Some(label) = spec_engage_label_remote(preset) {
+                assert_eq!(label["engaged"], false);
+                assert_eq!(reason(&label), "turn_not_local");
+            }
+        }
     }
 }

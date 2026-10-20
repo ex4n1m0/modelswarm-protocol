@@ -31,7 +31,7 @@ async function buildReceipt(
   const receipt: ReceiptV2 = {
     request_id: `req-${Math.random().toString(36).slice(2, 10)}`,
     profile_id: profileId,
-    preset: "FAST",
+    preset: "fast",
     mode_id: "single",
     cohort_digest: cohortDigestOf(peers),
     peers,
@@ -127,6 +127,28 @@ describe("job-result intake with ReceiptV2 (ADR-030 §3)", () => {
     const counters = await rig.store.grantedCounters(server.peerId, GRANTED_HALF_LIFE_SECS);
     expect(counters.rows).toBe(0);
   });
+
+  // ADR-045 S-5 (rev 2, 2026-10-20): intake rejects out-of-vocabulary
+  // preset values at the schema layer — the honest invalid_body failure,
+  // never a relabel and never a silent strip. "FAST" is the pre-freeze
+  // legacy literal this fixture itself used to carry.
+  it.each(["turbo", "FAST"])(
+    "out-of-vocabulary preset %j is rejected with invalid_body — no relabel, no rows",
+    async (bad) => {
+      const requester = await enroll(rig);
+      const server = await enroll(rig);
+      const { receipt, digest } = await buildReceipt(requester, server, { preset: bad });
+
+      const res = await post(requester, { receiptDigest: digest, outcome: "stop", receipt });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("invalid_body");
+
+      // Schema rejection happens before any storage: no digest row, no grants.
+      expect(await rig.store.getReceipt(digest)).toBeNull();
+      const counters = await rig.store.grantedCounters(server.peerId, GRANTED_HALF_LIFE_SECS);
+      expect(counters.rows).toBe(0);
+    },
+  );
 
   it("signatures must verify against ENROLLED keys — a third party's key grants nothing", async () => {
     const requester = await enroll(rig);

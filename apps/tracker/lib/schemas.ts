@@ -127,14 +127,28 @@ export const JobResultSchema = z
       .object({
         request_id: z.string(),
         profile_id: z.string(),
-        preset: z.string(),
+        // ADR-045 S-5 (rev 2, 2026-10-20): intake-side frozen-vocabulary
+        // validation — exactly the five preset enum values plus the honest
+        // `unspecified` literal carried on unnegotiated paths
+        // (msp-cooperative-v1 §4/§6). Trust/accounting intake REJECTS
+        // out-of-vocabulary values (fail-closed, never relabeled); the
+        // digest mirror in lib/receipt-v2.ts deliberately keeps
+        // `preset: string` — the enum belongs to intake only.
+        preset: z.enum(["fast", "balanced", "deep", "verified", "maximum", "unspecified"]),
         mode_id: z.string(),
         cohort_digest: z.string(),
-        peers: z.array(z.object({
-          peer_id: z.string(),
-          installation_id: z.string(),
-          role: z.string(),
-        })),
+        // Peer entries strict too: they sit inside the digest preimage, so
+        // an unknown key here must fail schema rather than be stripped
+        // before the digest check (same ADR-045 T/R B2 trap, nested level).
+        peers: z.array(
+          z
+            .object({
+              peer_id: z.string(),
+              installation_id: z.string(),
+              role: z.string(),
+            })
+            .strict(),
+        ),
         started_at: z.string(),
         ended_at: z.string(),
         outcome: z.string(),
@@ -146,6 +160,14 @@ export const JobResultSchema = z
         server_signature: z.string(),
         requester_signature: z.string(),
       })
+      // ADR-045 T/R B2 (zod-strip digest trap): the inner receipt object is
+      // strict so unknown keys are rejected at the schema layer with
+      // invalid_body instead of being silently stripped before the digest
+      // check. Verified against the full Rust ReceiptV2 wire struct
+      // (modelswarm-eligibility receipt_v2.rs): 16 fields, exact match, no
+      // conditional serialization — legitimate traffic carries no key this
+      // schema would reject.
+      .strict()
       .optional(),
   })
   .strict();

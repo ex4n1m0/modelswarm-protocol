@@ -256,6 +256,10 @@ struct Inner {
     /// cross-check run unchanged for every tier); P2 maps tiers to
     /// engaged behaviors.
     execution_preset: ExecutionPreset,
+    /// ADR-045 P2 gate 5: the composed-path measurement unlock snapshot
+    /// (config.json `composed_unlock`, DEFAULT FALSE — startup-config
+    /// snapshot; the flip rides the registered A/B verdict + restart).
+    composed_unlock: bool,
     /// The cohort size of the most recent ELECTED family-verified turn
     /// (the §3.1 disclosure's N — the ACTUAL count for that turn, bounded
     /// by the preset cohort cap and the budget's `max_endpoints`; 1 in
@@ -548,6 +552,7 @@ impl DesktopState {
                 allow_content_carriage: config.allow_content_carriage,
                 allow_cross_check: config.allow_cross_check,
                 execution_preset: config.execution_preset,
+                composed_unlock: config.composed_unlock,
                 #[cfg(feature = "verifydrafts")]
                 last_family_cohort: None,
                 #[cfg(feature = "verifydrafts")]
@@ -650,6 +655,15 @@ struct PersistedConfig {
         deserialize_with = "preset::deserialize_fallback_fast"
     )]
     execution_preset: ExecutionPreset,
+    /// ADR-045 P2 gate 5: the composed-path measurement unlock (DEFAULT
+    /// FALSE). Flips to true ONLY by the registered A/B protocol's
+    /// passing verdict (`experiments/reports/P2-BALANCED-FALLBACK-PROTOCOL.md`)
+    /// — an owner-local harness writes it into config.json and the change
+    /// applies at the NEXT app start (no live toggle: the unlock is a
+    /// measured verdict, never a guess). Until then every eligible turn
+    /// refuses engagement with `prediction_insufficient_evidence`.
+    #[serde(default)]
+    composed_unlock: bool,
     /// ADR-036 §3.1/§3.3: the REQUESTER-side election for
     /// family-verified chat — DEFAULT OFF. Election is the USER's choice
     /// (only the serving side is default-on): while elected, chat turns
@@ -707,6 +721,7 @@ impl Default for PersistedConfig {
             allow_content_carriage: default_allow_content_carriage(),
             allow_cross_check: default_allow_cross_check(),
             execution_preset: default_execution_preset(),
+            composed_unlock: false,
             assistant_acknowledged: false,
             assistant_enabled: default_assistant_enabled(),
         }
@@ -1743,9 +1758,9 @@ async fn resolve_profile(
 
 fn persist_config(inner: &Inner) -> Result<(), String> {
     // TR-RC-8 (ADR-033 §9.2 review): READ-MODIFY-WRITE the FULL JSON
-    // object. The daemon owns exactly seven keys (`tracker`, `profile_id`,
+    // object. The daemon owns exactly eight keys (`tracker`, `profile_id`,
     // `allow_swarm_pairing`, `allow_content_carriage`,
-    // `execution_preset`, `assistant_acknowledged`,
+    // `execution_preset`, `composed_unlock`, `assistant_acknowledged`,
     // `assistant_enabled`); every other key in
     // config.json — another subsystem's config surface that later moves
     // in here, including the RETIRED `family_verified_chat` election key
@@ -1770,6 +1785,10 @@ fn persist_config(inner: &Inner) -> Result<(), String> {
     root.insert(
         "execution_preset".into(),
         serde_json::json!(inner.execution_preset),
+    );
+    root.insert(
+        "composed_unlock".into(),
+        serde_json::json!(inner.composed_unlock),
     );
     root.insert(
         "assistant_acknowledged".into(),
@@ -5063,8 +5082,217 @@ async fn family_engage_checkpoint(
 /// explicitly accepted the measured cost the gate exists to protect them
 /// from). Renders the conversation under the profile's pinned chat
 /// template + tokenizer (the ADR-025 application point — the same
-/// `render_chatml` the serving executor applies, so the carrier root is
-/// the same tokenization the single-serving path would send), opens ONE
+/// ADR-045 P2 chunk 2b — the composed in-process execution for the LOCAL
+/// chat leg (the Balanced tier's engine, inherited by Deep+): this
+/// machine's runtime drafts greedy windows, the conversation-rooted capi
+/// engine verifies each window in ONE batched pass, and the VERIFIED
+/// stream commits locally — the pass-2 "A arm" shape in the product,
+/// behind the pre-registered protocol's gates (1–4 checked by the
+/// caller's pre-check; gate 5 = the measurement unlock; this function is
+/// reached only when all five passed).
+///
+/// GATE 6 (per-turn fallback): ANY failure before the first committed
+/// token returns `None` — the caller runs the plain local path with the
+/// honest `composed_failed_before_first_token` label, never a broken
+/// turn. After the first committed token the turn completes composed (an
+/// early divergence or EOS ends it honestly, the family-loop
+/// discipline). Every committed token except a trailing correction is
+/// the verify engine's own greedy continuation under the pinned params —
+/// the `speculative_exact` lossless contract.
+#[cfg(feature = "verifydrafts")]
+async fn try_composed_chat(
+    inner: &tokio::sync::Mutex<Inner>,
+    telemetry: &std::sync::Arc<Telemetry>,
+    profile: &str,
+    log: &[ChatTurn],
+    max_tokens: Option<u32>,
+    on_delta: &(dyn Fn(&str) + Send + Sync),
+) -> Option<serde_json::Value> {
+    let engage_label = |engaged: bool, reason: &str, detail: Option<&str>| {
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("engaged", if engaged { "true" } else { "false" }),
+            ("reason", reason),
+        ];
+        if let Some(detail) = detail {
+            fields.push(("detail", detail));
+        }
+        telemetry.info("spec.engage", &fields);
+    };
+    // The same machinery the family loop proved (ADR-036): this
+    // machine's runtime (drafts) + the conversation-rooted capi engine
+    // (one batched verify per window, cache-cold at open).
+    let (runtime, family_engine) = {
+        let guard = inner.lock().await;
+        let node = guard.node.as_ref();
+        (
+            node.and_then(|r| r.handle.runtime.clone()),
+            guard.family_engine.clone(),
+        )
+    };
+    let (Some(runtime), Some(family_engine)) = (runtime, family_engine) else {
+        engage_label(
+            false,
+            "composed_failed_before_first_token",
+            Some("no_local_engine"),
+        );
+        return None;
+    };
+    let turns: Vec<modelswarm_gateway::NormalizedMessage> = log
+        .iter()
+        .map(|t| modelswarm_gateway::NormalizedMessage {
+            role: t.role.clone(),
+            content: t.content.clone(),
+        })
+        .collect();
+    let rendered = modelswarm_node::render_chatml(&turns);
+    let root = match modelswarm_node::runtime_tokenize(Some(&runtime), &rendered).await {
+        Ok(ids) if !ids.is_empty() => ids,
+        Ok(_) => {
+            engage_label(
+                false,
+                "composed_failed_before_first_token",
+                Some("unrenderable_conversation"),
+            );
+            return None;
+        }
+        Err(e) => {
+            engage_label(
+                false,
+                "composed_failed_before_first_token",
+                Some(&format!("tokenize: {e}")),
+            );
+            return None;
+        }
+    };
+    let selfcheck = match family_engine.engine_for_root(Some(&root)).await {
+        Ok(engine) => engine,
+        Err(e) => {
+            engage_label(
+                false,
+                "composed_failed_before_first_token",
+                Some(&format!("engine load: {e}")),
+            );
+            return None;
+        }
+    };
+    // The composed loop: propose w → ONE batched verify → commit the
+    // accepted prefix + the correction/bonus token. A rejection does NOT
+    // end the turn — the replacement token re-anchors the next draft
+    // (the lossless contract); only EOS (no correction) or the draft
+    // ending does.
+    let started = Instant::now();
+    let mut committed: Vec<u32> = Vec::new();
+    let max_out = max_tokens.unwrap_or(256) as usize;
+    let w_cap = 8u32.min(selfcheck.capabilities().batch_window_max).max(1);
+    let params = modelswarm_node::verifydrafts::SamplingParams::default();
+    let mut rounds = 0u32;
+    while committed.len() < max_out {
+        let remaining = max_out - committed.len();
+        let want = w_cap.min(remaining as u32) as usize;
+        let mut prefix = root.clone();
+        prefix.extend_from_slice(&committed);
+        let window = match modelswarm_node::runtime_propose_window(
+            Some(&runtime),
+            profile,
+            &prefix,
+            want as u32,
+        )
+        .await
+        {
+            Ok(window) => window,
+            Err(e) => {
+                telemetry.warn(
+                    "chat.composed.draft_failed",
+                    &[("phase", "draft"), ("error", &e)],
+                );
+                break;
+            }
+        };
+        let window: Vec<u32> = window.into_iter().take(remaining).collect();
+        if window.is_empty() {
+            break; // the engine ended its turn (EOS): an honest short reply
+        }
+        match selfcheck.verify_window(&window, &params).await {
+            Ok((accepted, correction)) => {
+                let accepted = (accepted as usize).min(window.len());
+                committed.extend_from_slice(&window[..accepted]);
+                match correction {
+                    Some(token) => committed.push(token),
+                    None => {
+                        rounds += 1;
+                        break; // EOS exactly at the acceptance boundary
+                    }
+                }
+                rounds += 1;
+            }
+            Err(e) => {
+                telemetry.warn(
+                    "chat.composed.verify_failed",
+                    &[("phase", "verify"), ("error", &e.to_string())],
+                );
+                break;
+            }
+        }
+    }
+    drop(selfcheck); // teardown-bounded: the conversation-rooted engine dies here
+    committed.truncate(max_out);
+    if committed.is_empty() {
+        // Gate 6: nothing verified before the first token — the honest
+        // fallback to the plain path (labeled, never silent).
+        engage_label(false, "composed_failed_before_first_token", None);
+        return None;
+    }
+    let content = match modelswarm_node::runtime_detokenize(Some(&runtime), &committed).await {
+        Ok(text) => text,
+        Err(e) => {
+            engage_label(
+                false,
+                "composed_failed_before_first_token",
+                Some(&format!("detokenize: {e}")),
+            );
+            return None;
+        }
+    };
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        engage_label(
+            false,
+            "composed_failed_before_first_token",
+            Some("empty_reply"),
+        );
+        return None;
+    }
+    on_delta(&content);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let completion_tokens = committed.len() as u64;
+    let tok_s = if elapsed_ms > 0 {
+        (completion_tokens as f64) * 1000.0 / elapsed_ms as f64
+    } else {
+        0.0
+    };
+    telemetry.info(
+        "spec.engage",
+        &[
+            ("engaged", "true"),
+            ("reason", "measurement_unlocked"),
+            ("rounds", &rounds.to_string()),
+            ("tokens", &completion_tokens.to_string()),
+            ("elapsed_ms", &elapsed_ms.to_string()),
+        ],
+    );
+    Some(serde_json::json!({
+        "content": content,
+        "completion_tokens": completion_tokens,
+        "elapsed_ms": elapsed_ms,
+        "tokens_per_second": tok_s,
+        "mode": "composed in-process — drafted ahead + verified in one pass (greedy)",
+        "spec_engage": { "engaged": true, "reason": "measurement_unlocked", "rounds": rounds },
+    }))
+}
+
+/// The requester-side family-verified chat loop: renders the SAME
+/// ChatML the serving executor applies (so the carrier root is the same
+/// tokenization the single-serving path would send), opens ONE
 /// carrier session to the verifying peer (lease → signed pin carrier →
 /// offer), then drives the lossless `speculative_exact` loop: THIS
 /// machine's own engine drafts every window (greedy, pinned params), the
@@ -6209,14 +6437,26 @@ async fn send_chat(
     // reply carries the FIRST failing gate's honest reason; the composed
     // execution itself rides the next chunk, so gate 5 refuses
     // conservatively until measurements exist).
-    let (spec_engage_local, spec_engage_remote) = {
+    let (preset_now, seam_live, unlocked) = {
         let inner = state.inner.lock().await;
-        let preset_now = inner.execution_preset;
         (
-            preset::spec_engage_label(preset_now, temperature, family_engine_live(&inner)),
-            preset::spec_engage_label_remote(preset_now),
+            inner.execution_preset,
+            family_engine_live(&inner),
+            inner.composed_unlock,
         )
     };
+    // cfg twins: the mut + attempt bindings exist only where the composed
+    // block (below) can consume them — non-verifydrafts builds can never
+    // attempt (family_engine_live is structurally false there).
+    #[cfg(feature = "verifydrafts")]
+    let mut spec_engage_local =
+        preset::spec_engage_label(preset_now, temperature, seam_live, unlocked);
+    #[cfg(not(feature = "verifydrafts"))]
+    let spec_engage_local = preset::spec_engage_label(preset_now, temperature, seam_live, unlocked);
+    let spec_engage_remote = preset::spec_engage_label_remote(preset_now);
+    #[cfg(feature = "verifydrafts")]
+    let attempt_composed =
+        preset_now != ExecutionPreset::Fast && temperature == 0.0 && seam_live && unlocked;
     // Per-delta surface (P1): every path that produces tokens (remote swarm
     // peer, local fallback, local gateway SSE) calls this so the UI renders
     // text as it arrives. Content only — the final turn (mode label, error
@@ -6394,6 +6634,63 @@ async fn send_chat(
                 return Ok(reply);
             }
         }
+    }
+
+    // ADR-045 P2 chunk 2b: the composed attempt on the LOCAL leg —
+    // reached only when every pre-gate passed AND the measurement unlock
+    // allows it. Gate 6: ANY failure before the first committed token
+    // returns None; the plain path below runs instead with the honest
+    // label, never a broken turn.
+    #[cfg(feature = "verifydrafts")]
+    if attempt_composed {
+        if let Some(mut reply) = try_composed_chat(
+            &state.inner,
+            &state.telemetry,
+            &profile,
+            &request_log,
+            max_tokens,
+            &on_delta,
+        )
+        .await
+        {
+            // ADR-042 §5: composed replies get the same cross-check as
+            // the plain local path (a different swarm model verifies the
+            // reply when one is reachable; never rewrites).
+            let (allow_cross, cross_tracker_url, cross_data_dir, hosted_for_check) = {
+                let inner_g = state.inner.lock().await;
+                (
+                    inner_g.allow_cross_check,
+                    inner_g.tracker_url.clone(),
+                    inner_g.data_dir.clone(),
+                    inner_g
+                        .node
+                        .as_ref()
+                        .and_then(|r| r.handle.profile_id.clone()),
+                )
+            };
+            if allow_cross {
+                try_cross_check(
+                    &state.inner,
+                    &cross_tracker_url,
+                    &cross_data_dir,
+                    &state.telemetry,
+                    &mut reply,
+                    &profile,
+                    hosted_for_check.as_deref(),
+                    &gateway,
+                    &request_log,
+                )
+                .await;
+            }
+            return Ok(reply);
+        }
+        // Gate 6 fell back: the pre-check stepped aside (None) but the
+        // attempt failed before the first token — the honest label
+        // replaces the step-aside silence for this reply.
+        spec_engage_local = Some(serde_json::json!({
+            "engaged": false,
+            "reason": "composed_failed_before_first_token",
+        }));
     }
 
     // Plain {role, content} turns — the serving executor applies ChatML
@@ -8614,6 +8911,7 @@ mod tests {
             allow_content_carriage: true,
             allow_cross_check: true,
             execution_preset: ExecutionPreset::Fast,
+            composed_unlock: false,
             standing: None,
             #[cfg(feature = "verifydrafts")]
             last_family_cohort: None,
@@ -8694,7 +8992,7 @@ mod tests {
         assert_eq!(saved["profile_id"], serde_json::Value::Null);
         assert_eq!(
             saved.as_object().unwrap().len(),
-            7,
+            8,
             "a fresh file carries exactly the daemon's keys"
         );
         assert_eq!(saved["allow_swarm_pairing"], true, "default-on posture");
@@ -9018,8 +9316,8 @@ mod tests {
         assert_eq!(saved["advisory"]["caps"], 3, "unknown keys survive");
         assert_eq!(
             saved.as_object().unwrap().len(),
-            8,
-            "seven daemon keys + the one unknown key"
+            9,
+            "eight daemon keys + the one unknown key"
         );
     }
 

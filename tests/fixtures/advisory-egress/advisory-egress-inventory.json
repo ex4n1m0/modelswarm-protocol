@@ -124,7 +124,7 @@
       "event": "catalog.error",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:2421"
+        "crates/modelswarm-desktop/src/app.rs:2458"
       ],
       "fields": []
     },
@@ -132,7 +132,7 @@
       "event": "census.error",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:2802"
+        "crates/modelswarm-desktop/src/app.rs:2839"
       ],
       "fields": []
     },
@@ -140,23 +140,71 @@
       "event": "chat.cleared",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:2265"
+        "crates/modelswarm-desktop/src/app.rs:2302"
       ],
       "fields": []
+    },
+    {
+      "event": "chat.composed.draft_failed",
+      "classification": "excluded",
+      "sources": [
+        "crates/modelswarm-desktop/src/app.rs:5185"
+      ],
+      "fields": [
+        {
+          "field": "draft",
+          "type": "string_expr",
+          "adversarial_value": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        },
+        {
+          "field": "error",
+          "type": "string_expr",
+          "adversarial_value": "823.7"
+        },
+        {
+          "field": "phase",
+          "type": "string_expr",
+          "adversarial_value": "line1\nline2\tCR\rEND"
+        }
+      ]
+    },
+    {
+      "event": "chat.composed.verify_failed",
+      "classification": "excluded",
+      "sources": [
+        "crates/modelswarm-desktop/src/app.rs:5210"
+      ],
+      "fields": [
+        {
+          "field": "error",
+          "type": "string_expr",
+          "adversarial_value": "sk-zz0000000000000000000000000000000"
+        },
+        {
+          "field": "phase",
+          "type": "string_expr",
+          "adversarial_value": "sk-zz0000000000000000000000000000000"
+        },
+        {
+          "field": "verify",
+          "type": "string_expr",
+          "adversarial_value": "AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA (overlong)"
+        }
+      ]
     },
     {
       "event": "chat.crosscheck",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:6898",
-        "crates/modelswarm-desktop/src/app.rs:6976",
-        "crates/modelswarm-desktop/src/app.rs:7001",
-        "crates/modelswarm-desktop/src/app.rs:7014",
-        "crates/modelswarm-desktop/src/app.rs:7027",
-        "crates/modelswarm-desktop/src/app.rs:7102",
-        "crates/modelswarm-desktop/src/app.rs:7113",
-        "crates/modelswarm-desktop/src/app.rs:7121",
-        "crates/modelswarm-desktop/src/app.rs:7130"
+        "crates/modelswarm-desktop/src/app.rs:7206",
+        "crates/modelswarm-desktop/src/app.rs:7284",
+        "crates/modelswarm-desktop/src/app.rs:7309",
+        "crates/modelswarm-desktop/src/app.rs:7322",
+        "crates/modelswarm-desktop/src/app.rs:7335",
+        "crates/modelswarm-desktop/src/app.rs:7410",
+        "crates/modelswarm-desktop/src/app.rs:7421",
+        "crates/modelswarm-desktop/src/app.rs:7429",
+        "crates/modelswarm-desktop/src/app.rs:7438"
       ],
       "fields": [
         {
@@ -250,7 +298,7 @@
       "event": "chat.family_verified.completed",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:5372"
+        "crates/modelswarm-desktop/src/app.rs:5591"
       ],
       "fields": [
         {
@@ -279,7 +327,7 @@
       "event": "chat.family_verified.draft_failed",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:5264"
+        "crates/modelswarm-desktop/src/app.rs:5483"
       ],
       "fields": [
         {
@@ -303,7 +351,7 @@
       "event": "chat.family_verified.selfcheck_failed",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:5297"
+        "crates/modelswarm-desktop/src/app.rs:5516"
       ],
       "fields": [
         {
@@ -327,8 +375,8 @@
       "event": "chat.local.error",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:6497",
-        "crates/modelswarm-desktop/src/app.rs:7161"
+        "crates/modelswarm-desktop/src/app.rs:6805",
+        "crates/modelswarm-desktop/src/app.rs:7469"
       ],
       "fields": []
     },
@@ -336,11 +384,11 @@
       "event": "chat.receipt",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:5470",
-        "crates/modelswarm-desktop/src/app.rs:5490",
-        "crates/modelswarm-desktop/src/app.rs:5517",
-        "crates/modelswarm-desktop/src/app.rs:5527",
-        "crates/modelswarm-desktop/src/app.rs:5550"
+        "crates/modelswarm-desktop/src/app.rs:5689",
+        "crates/modelswarm-desktop/src/app.rs:5709",
+        "crates/modelswarm-desktop/src/app.rs:5736",
+        "crates/modelswarm-desktop/src/app.rs:5746",
+        "crates/modelswarm-desktop/src/app.rs:5769"
       ],
       "fields": [
         {
@@ -394,7 +442,7 @@
       "event": "chat.swarm",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:5694"
+        "crates/modelswarm-desktop/src/app.rs:5913"
       ],
       "fields": [
         {
@@ -413,7 +461,7 @@
       "event": "chat.swarm.completed",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:6045"
+        "crates/modelswarm-desktop/src/app.rs:6264"
       ],
       "fields": [
         {
@@ -447,11 +495,11 @@
       "event": "chat.swarm.cross",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:6564",
-        "crates/modelswarm-desktop/src/app.rs:6584",
-        "crates/modelswarm-desktop/src/app.rs:6596",
-        "crates/modelswarm-desktop/src/app.rs:6658",
-        "crates/modelswarm-desktop/src/app.rs:6687"
+        "crates/modelswarm-desktop/src/app.rs:6872",
+        "crates/modelswarm-desktop/src/app.rs:6892",
+        "crates/modelswarm-desktop/src/app.rs:6904",
+        "crates/modelswarm-desktop/src/app.rs:6966",
+        "crates/modelswarm-desktop/src/app.rs:6995"
       ],
       "fields": [
         {
@@ -515,7 +563,7 @@
       "event": "chat.swarm.empty",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:6026"
+        "crates/modelswarm-desktop/src/app.rs:6245"
       ],
       "fields": []
     },
@@ -523,13 +571,13 @@
       "event": "chat.swarm.error",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:4747",
-        "crates/modelswarm-desktop/src/app.rs:5585",
-        "crates/modelswarm-desktop/src/app.rs:5593",
-        "crates/modelswarm-desktop/src/app.rs:5929",
-        "crates/modelswarm-desktop/src/app.rs:5946",
-        "crates/modelswarm-desktop/src/app.rs:5990",
-        "crates/modelswarm-desktop/src/app.rs:6007"
+        "crates/modelswarm-desktop/src/app.rs:4784",
+        "crates/modelswarm-desktop/src/app.rs:5804",
+        "crates/modelswarm-desktop/src/app.rs:5812",
+        "crates/modelswarm-desktop/src/app.rs:6148",
+        "crates/modelswarm-desktop/src/app.rs:6165",
+        "crates/modelswarm-desktop/src/app.rs:6209",
+        "crates/modelswarm-desktop/src/app.rs:6226"
       ],
       "fields": [
         {
@@ -568,8 +616,8 @@
       "event": "chat.swarm.fallback",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:5906",
-        "crates/modelswarm-desktop/src/app.rs:5977"
+        "crates/modelswarm-desktop/src/app.rs:6125",
+        "crates/modelswarm-desktop/src/app.rs:6196"
       ],
       "fields": [
         {
@@ -732,7 +780,7 @@
       "event": "enroll.approved",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:3508"
+        "crates/modelswarm-desktop/src/app.rs:3545"
       ],
       "fields": []
     },
@@ -740,8 +788,8 @@
       "event": "enroll.error",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:3529",
-        "crates/modelswarm-desktop/src/app.rs:3583"
+        "crates/modelswarm-desktop/src/app.rs:3566",
+        "crates/modelswarm-desktop/src/app.rs:3620"
       ],
       "fields": []
     },
@@ -749,7 +797,7 @@
       "event": "enroll.pending",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:3567"
+        "crates/modelswarm-desktop/src/app.rs:3604"
       ],
       "fields": []
     },
@@ -781,7 +829,7 @@
       "event": "family.enabled",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:1626"
+        "crates/modelswarm-desktop/src/app.rs:1641"
       ],
       "fields": []
     },
@@ -789,22 +837,22 @@
       "event": "family.engage",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:5038",
-        "crates/modelswarm-desktop/src/app.rs:5088",
-        "crates/modelswarm-desktop/src/app.rs:5282",
-        "crates/modelswarm-desktop/src/app.rs:5359"
+        "crates/modelswarm-desktop/src/app.rs:5075",
+        "crates/modelswarm-desktop/src/app.rs:5307",
+        "crates/modelswarm-desktop/src/app.rs:5501",
+        "crates/modelswarm-desktop/src/app.rs:5578"
       ],
       "fields": "dynamic",
       "dynamic_sites": [
-        "crates/modelswarm-desktop/src/app.rs:5038 (dynamic field array)",
-        "crates/modelswarm-desktop/src/app.rs:5088 (dynamic field array)"
+        "crates/modelswarm-desktop/src/app.rs:5075 (dynamic field array)",
+        "crates/modelswarm-desktop/src/app.rs:5307 (dynamic field array)"
       ]
     },
     {
       "event": "family.engine_ready",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:1554"
+        "crates/modelswarm-desktop/src/app.rs:1569"
       ],
       "fields": []
     },
@@ -812,12 +860,12 @@
       "event": "family.fallback",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:1413",
-        "crates/modelswarm-desktop/src/app.rs:1464",
-        "crates/modelswarm-desktop/src/app.rs:1485",
-        "crates/modelswarm-desktop/src/app.rs:1515",
-        "crates/modelswarm-desktop/src/app.rs:1570",
-        "crates/modelswarm-desktop/src/app.rs:1597"
+        "crates/modelswarm-desktop/src/app.rs:1428",
+        "crates/modelswarm-desktop/src/app.rs:1479",
+        "crates/modelswarm-desktop/src/app.rs:1500",
+        "crates/modelswarm-desktop/src/app.rs:1530",
+        "crates/modelswarm-desktop/src/app.rs:1585",
+        "crates/modelswarm-desktop/src/app.rs:1612"
       ],
       "fields": []
     },
@@ -825,9 +873,9 @@
       "event": "family.pin",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:1278",
-        "crates/modelswarm-desktop/src/app.rs:1300",
-        "crates/modelswarm-desktop/src/app.rs:1318"
+        "crates/modelswarm-desktop/src/app.rs:1293",
+        "crates/modelswarm-desktop/src/app.rs:1315",
+        "crates/modelswarm-desktop/src/app.rs:1333"
       ],
       "fields": []
     },
@@ -835,14 +883,14 @@
       "event": "family.probe",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:3993",
-        "crates/modelswarm-desktop/src/app.rs:4045",
-        "crates/modelswarm-desktop/src/app.rs:4059",
-        "crates/modelswarm-desktop/src/app.rs:4071",
-        "crates/modelswarm-desktop/src/app.rs:4095",
-        "crates/modelswarm-desktop/src/app.rs:4141",
-        "crates/modelswarm-desktop/src/app.rs:4241",
-        "crates/modelswarm-desktop/src/app.rs:4275"
+        "crates/modelswarm-desktop/src/app.rs:4030",
+        "crates/modelswarm-desktop/src/app.rs:4082",
+        "crates/modelswarm-desktop/src/app.rs:4096",
+        "crates/modelswarm-desktop/src/app.rs:4108",
+        "crates/modelswarm-desktop/src/app.rs:4132",
+        "crates/modelswarm-desktop/src/app.rs:4178",
+        "crates/modelswarm-desktop/src/app.rs:4278",
+        "crates/modelswarm-desktop/src/app.rs:4312"
       ],
       "fields": []
     },
@@ -850,7 +898,7 @@
       "event": "family.probe.pairing",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:4373"
+        "crates/modelswarm-desktop/src/app.rs:4410"
       ],
       "fields": [
         {
@@ -908,10 +956,10 @@
       "event": "host.autostart",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:3748",
-        "crates/modelswarm-desktop/src/app.rs:3835",
-        "crates/modelswarm-desktop/src/app.rs:3843",
-        "crates/modelswarm-desktop/src/app.rs:3845"
+        "crates/modelswarm-desktop/src/app.rs:3785",
+        "crates/modelswarm-desktop/src/app.rs:3872",
+        "crates/modelswarm-desktop/src/app.rs:3880",
+        "crates/modelswarm-desktop/src/app.rs:3882"
       ],
       "fields": [
         {
@@ -960,8 +1008,8 @@
       "event": "host.mixed",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:3767",
-        "crates/modelswarm-desktop/src/app.rs:3776"
+        "crates/modelswarm-desktop/src/app.rs:3804",
+        "crates/modelswarm-desktop/src/app.rs:3813"
       ],
       "fields": [
         {
@@ -1047,7 +1095,7 @@
       "event": "lease.earn",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:4594"
+        "crates/modelswarm-desktop/src/app.rs:4631"
       ],
       "fields": [
         {
@@ -1066,7 +1114,7 @@
       "event": "lease.earned",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:4685"
+        "crates/modelswarm-desktop/src/app.rs:4722"
       ],
       "fields": [
         {
@@ -1085,8 +1133,8 @@
       "event": "listener.bound",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:896",
-        "crates/modelswarm-desktop/src/app.rs:1012"
+        "crates/modelswarm-desktop/src/app.rs:911",
+        "crates/modelswarm-desktop/src/app.rs:1027"
       ],
       "fields": []
     },
@@ -1094,10 +1142,10 @@
       "event": "listener.error",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:843",
-        "crates/modelswarm-desktop/src/app.rs:856",
-        "crates/modelswarm-desktop/src/app.rs:875",
-        "crates/modelswarm-desktop/src/app.rs:1019"
+        "crates/modelswarm-desktop/src/app.rs:858",
+        "crates/modelswarm-desktop/src/app.rs:871",
+        "crates/modelswarm-desktop/src/app.rs:890",
+        "crates/modelswarm-desktop/src/app.rs:1034"
       ],
       "fields": []
     },
@@ -1105,7 +1153,7 @@
       "event": "model.request",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:7482"
+        "crates/modelswarm-desktop/src/app.rs:7790"
       ],
       "fields": []
     },
@@ -1346,7 +1394,7 @@
       "event": "roster.error",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:3692"
+        "crates/modelswarm-desktop/src/app.rs:3729"
       ],
       "fields": []
     },
@@ -1426,7 +1474,7 @@
       "event": "sched.shadow.decision",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:4834"
+        "crates/modelswarm-desktop/src/app.rs:4871"
       ],
       "fields": [
         {
@@ -1490,7 +1538,7 @@
       "event": "sched.shadow.policy",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:4789"
+        "crates/modelswarm-desktop/src/app.rs:4826"
       ],
       "fields": [
         {
@@ -1504,8 +1552,8 @@
       "event": "sched.shadow.realized",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:4881",
-        "crates/modelswarm-desktop/src/app.rs:6076"
+        "crates/modelswarm-desktop/src/app.rs:4918",
+        "crates/modelswarm-desktop/src/app.rs:6295"
       ],
       "fields": [
         {
@@ -1755,7 +1803,7 @@
       "event": "settings.content_carriage",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:2238"
+        "crates/modelswarm-desktop/src/app.rs:2275"
       ],
       "fields": []
     },
@@ -1763,7 +1811,7 @@
       "event": "settings.pairing",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:2187"
+        "crates/modelswarm-desktop/src/app.rs:2224"
       ],
       "fields": []
     },
@@ -1771,9 +1819,21 @@
       "event": "settings.preset",
       "classification": "excluded",
       "sources": [
-        "crates/modelswarm-desktop/src/app.rs:2209"
+        "crates/modelswarm-desktop/src/app.rs:2246"
       ],
       "fields": []
+    },
+    {
+      "event": "spec.engage",
+      "classification": "excluded",
+      "sources": [
+        "crates/modelswarm-desktop/src/app.rs:5116",
+        "crates/modelswarm-desktop/src/app.rs:5246"
+      ],
+      "fields": "dynamic",
+      "dynamic_sites": [
+        "crates/modelswarm-desktop/src/app.rs:5116 (dynamic field array)"
+      ]
     },
     {
       "event": "store.opened",

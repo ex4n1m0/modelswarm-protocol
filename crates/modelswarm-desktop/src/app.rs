@@ -62,6 +62,13 @@ mod updater;
 /// transcript (the chat wall, W1/W4).
 mod assistant;
 
+/// ADR-045 execution presets: the five-tier owner vocabulary
+/// (Fast/Balanced/Deep/Verified/Maximum) — P1 is the vocabulary + picker +
+/// verbatim disclosures; behavior mapping rides P2 with per-turn fallback.
+mod preset;
+
+use preset::ExecutionPreset;
+
 /// The registered no-listener-yet multiaddr: present in the roster, fails
 /// direct-connect honestly for every remote peer (beta boundary).
 const ADDR_NO_LISTENER: &str = "/ip4/0.0.0.0/tcp/0";
@@ -243,6 +250,12 @@ struct Inner {
     /// `allow_cross_check`, DEFAULT ON). Startup-config snapshot — the
     /// opt-out is a config flip + restart, never a hosting restart.
     allow_cross_check: bool,
+    /// ADR-045: the selected execution preset (config.json
+    /// `execution_preset`, DEFAULT "fast"). P1: selection + disclosure
+    /// only — no behavior is wired to it yet (family verification and the
+    /// cross-check run unchanged for every tier); P2 maps tiers to
+    /// engaged behaviors.
+    execution_preset: ExecutionPreset,
     /// The cohort size of the most recent ELECTED family-verified turn
     /// (the §3.1 disclosure's N — the ACTUAL count for that turn, bounded
     /// by the preset cohort cap and the budget's `max_endpoints`; 1 in
@@ -534,6 +547,7 @@ impl DesktopState {
                 allow_swarm_pairing: config.allow_swarm_pairing,
                 allow_content_carriage: config.allow_content_carriage,
                 allow_cross_check: config.allow_cross_check,
+                execution_preset: config.execution_preset,
                 #[cfg(feature = "verifydrafts")]
                 last_family_cohort: None,
                 #[cfg(feature = "verifydrafts")]
@@ -627,6 +641,15 @@ struct PersistedConfig {
     /// engages honestly (reason surfaced, the chat never errors).
     #[serde(default = "default_allow_cross_check")]
     allow_cross_check: bool,
+    /// ADR-045: the selected execution preset (store form: "fast" |
+    /// "balanced" | "deep" | "verified" | "maximum"; DEFAULT "fast" — the
+    /// owner-approved default, today's behavior relabeled honestly). An
+    /// unknown value fails closed to "fast" at load.
+    #[serde(
+        default = "default_execution_preset",
+        deserialize_with = "preset::deserialize_fallback_fast"
+    )]
+    execution_preset: ExecutionPreset,
     /// ADR-036 §3.1/§3.3: the REQUESTER-side election for
     /// family-verified chat — DEFAULT OFF. Election is the USER's choice
     /// (only the serving side is default-on): while elected, chat turns
@@ -666,6 +689,10 @@ fn default_allow_content_carriage() -> bool {
     true
 }
 
+fn default_execution_preset() -> ExecutionPreset {
+    ExecutionPreset::Fast
+}
+
 impl Default for PersistedConfig {
     fn default() -> Self {
         // Mirrors the serde field defaults exactly: a missing file/keys
@@ -679,6 +706,7 @@ impl Default for PersistedConfig {
             allow_swarm_pairing: default_allow_swarm_pairing(),
             allow_content_carriage: default_allow_content_carriage(),
             allow_cross_check: default_allow_cross_check(),
+            execution_preset: default_execution_preset(),
             assistant_acknowledged: false,
             assistant_enabled: default_assistant_enabled(),
         }
@@ -1715,9 +1743,10 @@ async fn resolve_profile(
 
 fn persist_config(inner: &Inner) -> Result<(), String> {
     // TR-RC-8 (ADR-033 §9.2 review): READ-MODIFY-WRITE the FULL JSON
-    // object. The daemon owns exactly six keys (`tracker`, `profile_id`,
+    // object. The daemon owns exactly seven keys (`tracker`, `profile_id`,
     // `allow_swarm_pairing`, `allow_content_carriage`,
-    // `assistant_acknowledged`, `assistant_enabled`); every other key in
+    // `execution_preset`, `assistant_acknowledged`,
+    // `assistant_enabled`); every other key in
     // config.json — another subsystem's config surface that later moves
     // in here, including the RETIRED `family_verified_chat` election key
     // (owner directive 2026-10-15: always on, no toggle) — is preserved
@@ -1737,6 +1766,10 @@ fn persist_config(inner: &Inner) -> Result<(), String> {
     root.insert(
         "allow_content_carriage".into(),
         serde_json::json!(inner.allow_content_carriage),
+    );
+    root.insert(
+        "execution_preset".into(),
+        serde_json::json!(inner.execution_preset),
     );
     root.insert(
         "assistant_acknowledged".into(),
@@ -2021,6 +2054,12 @@ async fn get_status(
         // 2026-10-13): the UI renders the posture from THIS field, never
         // a guessed default.
         "pairing_allowed": inner.allow_swarm_pairing,
+        // ADR-045: the selected execution preset + the current tier's
+        // owner-approved disclosure verbatim (P1: selection + disclosure
+        // only — the UI's honest source for the picker and the chat meta
+        // line).
+        "execution_preset": inner.execution_preset.as_str(),
+        "execution_preset_disclosure": inner.execution_preset.disclosure(),
         // ADR-036 §3.1: the serving-side carriage posture (default on)
         // and the requester-side election (default off) — the UI's honest
         // posture sources for both disclosures.
@@ -2152,6 +2191,28 @@ async fn set_pairing_allowed(
         "info",
         "settings.pairing",
         &[("allowed", &allowed.to_string())],
+    );
+    persist_config(&inner)
+}
+
+/// ADR-045: the execution-preset picker (persisted key, DEFAULT "fast").
+/// P1: selection + disclosure only — no serving path reads it yet, so the
+/// switch is allowed while hosting (it cannot make the live listener
+/// contradict anything; P2 adds the engage gates when behavior lands).
+#[tauri::command]
+async fn set_execution_preset(
+    state: tauri::State<'_, DesktopState>,
+    preset: String,
+) -> Result<(), String> {
+    let parsed = ExecutionPreset::from_str(&preset)
+        .ok_or_else(|| format!("unknown execution preset {preset:?}"))?;
+    let mut inner = state.inner.lock().await;
+    inner.execution_preset = parsed;
+    log_event(
+        &state.telemetry,
+        "info",
+        "settings.preset",
+        &[("preset", parsed.as_str())],
     );
     persist_config(&inner)
 }
@@ -7492,6 +7553,7 @@ pub fn run() {
             get_status,
             set_tracker,
             set_pairing_allowed,
+            set_execution_preset,
             set_content_carriage,
             accept_privacy,
             list_models,
@@ -8510,6 +8572,8 @@ mod tests {
             allow_swarm_pairing: true,
             allow_content_carriage: true,
             allow_cross_check: true,
+            execution_preset: ExecutionPreset::Fast,
+            standing: None,
             #[cfg(feature = "verifydrafts")]
             last_family_cohort: None,
             #[cfg(feature = "verifydrafts")]
@@ -8589,7 +8653,7 @@ mod tests {
         assert_eq!(saved["profile_id"], serde_json::Value::Null);
         assert_eq!(
             saved.as_object().unwrap().len(),
-            6,
+            7,
             "a fresh file carries exactly the daemon's keys"
         );
         assert_eq!(saved["allow_swarm_pairing"], true, "default-on posture");
@@ -8913,8 +8977,8 @@ mod tests {
         assert_eq!(saved["advisory"]["caps"], 3, "unknown keys survive");
         assert_eq!(
             saved.as_object().unwrap().len(),
-            7,
-            "six daemon keys + the one unknown key"
+            8,
+            "seven daemon keys + the one unknown key"
         );
     }
 

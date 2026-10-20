@@ -270,3 +270,29 @@ jobs:
               exit 1
             fi
           done
+      # ADR-045 (added at the T/R review 2026-10-20, same drift class as
+      # the steps above but STRONGER for the preset tier: the five
+      # disclosure lines are OWNER-APPROVED verbatim texts, so this step
+      # greps them FIXED-STRING byte-exact (grep -Fc, exactly once) —
+      # em-dashes and all. The compiled layer is crates/modelswarm-desktop/
+      # tests/preset_disclosure_sync.rs; this step exists so a UI-only
+      # edit cannot dodge the desktop test step.
+      - name: ADR-045 preset picker + verbatim disclosures exist in the webview
+        run: |
+          for id in panel-preset preset-list; do
+            if ! grep -q "\"$id\"" crates/modelswarm-desktop/ui/index.html; then
+              echo "::error::ADR-045 UI surface '$id' missing from crates/modelswarm-desktop/ui/index.html (the preset picker contract)"
+              exit 1
+            fi
+          done
+          for ipc in set_execution_preset; do
+            if ! grep -q "$ipc" crates/modelswarm-desktop/ui/index.html; then
+              echo "::error::ADR-045 IPC '$ipc' no longer referenced by the webview (the picker must write through)"
+              exit 1
+            fi
+          done
+          grep -Fc 'One host answers; every same-model peer checks it. The everyday speed path.' crates/modelswarm-desktop/ui/index.html | grep -q '^1$' || { echo "::error::ADR-045 Fast disclosure line drifted (owner-approved verbatim)"; exit 1; }
+          grep -Fc 'Same checks as Fast; your own machine drafts ahead and verifies in one pass when that is measurably faster — otherwise it steps aside.' crates/modelswarm-desktop/ui/index.html | grep -q '^1$' || { echo "::error::ADR-045 Balanced disclosure line drifted (owner-approved verbatim)"; exit 1; }
+          grep -Fc 'Every same-model peer verifies every reply; any disagreement forces a clean recompute.' crates/modelswarm-desktop/ui/index.html | grep -q '^1$' || { echo "::error::ADR-045 Deep disclosure line drifted (owner-approved verbatim)"; exit 1; }
+          grep -Fc 'Everything Deep does, plus a second, different model family sanity-checks the answer; the receipt shows it.' crates/modelswarm-desktop/ui/index.html | grep -q '^1$' || { echo "::error::ADR-045 Verified disclosure line drifted (owner-approved verbatim)"; exit 1; }
+          grep -Fc 'The whole swarm checks everything, and the receipt proves it. Slowest by design.' crates/modelswarm-desktop/ui/index.html | grep -q '^1$' || { echo "::error::ADR-045 Maximum disclosure line drifted (owner-approved verbatim)"; exit 1; }

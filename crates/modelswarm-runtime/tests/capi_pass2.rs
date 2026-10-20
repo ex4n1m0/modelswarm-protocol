@@ -210,8 +210,7 @@ struct RunRecord {
 /// skipped and their timings re-seeded into the cell aggregates (the final
 /// table then covers both sessions, environment-labeled in the report).
 fn load_resume(path: &Path) -> std::collections::HashMap<u32, Vec<RunRecord>> {
-    let mut map: std::collections::HashMap<u32, Vec<RunRecord>> =
-        std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<u32, Vec<RunRecord>> = std::collections::HashMap::new();
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read resume file {}: {e}", path.display()));
     for line in text.lines() {
@@ -303,8 +302,9 @@ async fn pass2_loopback_repeat_p50() {
         let metadata = modelswarm_types::read_metadata(&model).expect("gguf metadata");
         std::sync::Arc::new(modelswarm_types::token_vocab(&metadata).expect("gguf tokenizer vocab"))
     };
-    let capi = LlamaCppCapi::new(CapiConfig::new(&engine_dir, &model).with_engine(identity.clone()))
-        .expect("capi adapter constructs");
+    let capi =
+        LlamaCppCapi::new(CapiConfig::new(&engine_dir, &model).with_engine(identity.clone()))
+            .expect("capi adapter constructs");
     let sampling = SamplingParams::default(); // greedy on both adapters
 
     let mut all_cells: Vec<CellRecord> = Vec::new();
@@ -427,7 +427,10 @@ async fn pass2_loopback_repeat_p50() {
             }
             let b1_ms = ms(b1_started.elapsed());
             let want = truth.len();
-            assert!(want > 0, "run {run_idx}: greedy truth is empty (immediate eos)");
+            assert!(
+                want > 0,
+                "run {run_idx}: greedy truth is empty (immediate eos)"
+            );
 
             // ---- B2: wire-spec-http (pass-1 protocol over HTTP) --------
             let b2_started = Instant::now();
@@ -475,10 +478,7 @@ async fn pass2_loopback_repeat_p50() {
                 }
             }
             let b2_ms = ms(b2_started.elapsed());
-            let mismatch = committed
-                .iter()
-                .zip(truth.iter())
-                .position(|(a, b)| a != b);
+            let mismatch = committed.iter().zip(truth.iter()).position(|(a, b)| a != b);
             assert!(
                 mismatch.is_none(),
                 "B2 wire-spec mismatch at {mismatch:?} (run {run_idx}, window {window}):\n\

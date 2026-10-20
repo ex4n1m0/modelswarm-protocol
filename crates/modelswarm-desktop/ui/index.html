@@ -31,6 +31,11 @@
     .menu-panel { position: absolute; top: calc(100% + 4px); left: 0; z-index: 60; min-width: 300px; max-width: min(420px, 92vw); background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 6px; box-shadow: 0 10px 28px rgba(0,0,0,.5); }
     .menu-panel .menu-note { display: block; padding: 6px 10px 8px; color: var(--muted); font-size: 11px; font-family: var(--mono); border-bottom: 1px solid var(--border); margin-bottom: 4px; overflow-wrap: anywhere; }
     button.menu-item { display: block; width: 100%; text-align: left; background: transparent; color: var(--ink); border: 0; border-radius: 6px; padding: 7px 10px; font-weight: 400; font-size: 13px; }
+    /* ADR-045 preset picker rows: block buttons in the panel (not the
+       dropdown menu); the active tier carries the ok-color border. */
+    button.preset-row { display: block; width: 100%; text-align: left; background: transparent; color: var(--ink); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin: 4px 0; font-size: 13px; }
+    button.preset-row.current { border-color: var(--ok); }
+    button.preset-row .chip { margin-left: 6px; }
     button.menu-item:hover, button.menu-item:focus-visible { background: var(--accent); color: #0b1220; }
 
     /* ---- Main page: the operating surface only. Single column, chat
@@ -150,6 +155,7 @@
           <button type="button" class="menu-item" data-panel="panel-setup" role="menuitem">Cloud API key, tracker &amp; engine…</button>
           <button type="button" class="menu-item" data-panel="panel-serving" role="menuitem">Swarm pairing &amp; conversation carriage…</button>
           <button type="button" class="menu-item" data-panel="panel-temp" role="menuitem">Chat temperature…</button>
+          <button type="button" class="menu-item" data-panel="panel-preset" role="menuitem">Execution preset…</button>
           <button type="button" class="menu-item" data-panel="panel-assistant-settings" role="menuitem">Assistant…</button>
         </div>
       </div>
@@ -317,6 +323,19 @@
           <input type="range" id="chat-temp" min="0" max="1" step="0.05" value="0" style="flex:1;min-width:80px" aria-label="Chat temperature">
         </div>
         <p class="note" style="margin:6px 0 0">temperature applies to chat replies only — pairing/verification stays greedy (its determinism contract).</p>
+      </section>
+
+      <!-- ADR-045 (2026-10-20): the five execution presets. P1 = selection
+           + owner-approved verbatim disclosures; NO behavior is wired to
+           the choice yet (family verification and the ADR-042 cross-check
+           run unchanged for every tier) — the deeper tiers light up as
+           their machinery lands, and each turn's meta shows what actually
+           ran. The disclosure lines are pinned byte-exact by
+           tests/preset_disclosure_sync.rs — edit them only via the ADR. -->
+      <section id="panel-preset" data-title="Execution preset" hidden>
+        <h2>Execution preset</h2>
+        <div id="preset-list" role="radiogroup" aria-label="Execution preset"></div>
+        <p class="note" style="margin:8px 0 0">the choice is saved for every chat; family verification stays on in all five tiers (the swarm's baseline, by design). What actually ran shows on every reply.</p>
       </section>
 
       <section id="panel-assistant-settings" data-title="Assistant (Settings)" hidden>
@@ -844,6 +863,10 @@
       verifiedLine.hidden = false;
       verifiedLine.textContent = verified.disclosure
         || ("Family verification ON: your conversation — in a form the receiving computers can read — goes to every verification peer this turn (" + (verified.cohort ?? 1) + "). It is slower than single-peer chat, not faster. The hub (modelswarm.deepflux.space) never sees any of it.");
+      // ADR-045: the selected preset rides the chat disclosure (selection
+      // only in P1 — behavior mapping lands with P2; the line never claims
+      // more than the selection).
+      renderPresets(s.execution_preset || "fast");
       hostingOn = s.node.hosting;
       // Swarm HUD: am I in, and as what? (cloud vs local honestly labeled)
       {
@@ -1039,6 +1062,40 @@
       const t = parseFloat($("chat-temp").value);
       $("chat-temp-val").textContent = t === 0 ? "0 (greedy)" : t.toFixed(2);
     };
+    // ADR-045 execution presets (Settings → Execution preset): the five
+    // owner-approved tiers with their verbatim disclosure lines. The
+    // daemon owns the current selection (get_status.execution_preset);
+    // the strings below are pinned byte-exact by
+    // tests/preset_disclosure_sync.rs.
+    const PRESETS = [
+      ["fast", "Fast", "One host answers; every same-model peer checks it. The everyday speed path."],
+      ["balanced", "Balanced", "Same checks as Fast; your own machine drafts ahead and verifies in one pass when that is measurably faster — otherwise it steps aside."],
+      ["deep", "Deep", "Every same-model peer verifies every reply; any disagreement forces a clean recompute."],
+      ["verified", "Verified", "Everything Deep does, plus a second, different model family sanity-checks the answer; the receipt shows it."],
+      ["maximum", "Maximum", "The whole swarm checks everything, and the receipt proves it. Slowest by design."]
+    ];
+    let currentPreset = "fast";
+    function renderPresets(current) {
+      currentPreset = current || "fast";
+      const host = $("preset-list");
+      if (!host) return;
+      host.replaceChildren(...PRESETS.map(([id, name, line]) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "menu-item preset-row" + (id === current ? " current" : "");
+        btn.dataset.preset = id;
+        btn.setAttribute("role", "radio");
+        btn.setAttribute("aria-checked", id === current ? "true" : "false");
+        btn.innerHTML = "<b>" + name + "</b>" + (id === current ? ' <span class="chip">active</span>' : "") +
+          '<span class="note" style="display:block;margin:3px 0 0">' + line + "</span>";
+        btn.onclick = async () => {
+          try { await invoke("set_execution_preset", { preset: id }); error(""); }
+          catch (e) { error(String(e)); }
+          refresh();
+        };
+        return btn;
+      }));
+    }
     // The two-desktop pairing diagnostic (ADR-032 §2; Help → Diagnostics):
     // opens one real family session presenting this machine's earned
     // lease. The outcome is the daemon's own truth — opened (peer, real
@@ -1200,7 +1257,11 @@
             : ` · cross-check: not engaged (${r.cross_check.reason || "unavailable"})`
           : "";
         const tempNote = temperature > 0 ? ` · temp ${temperature.toFixed(2)}` : "";
-        const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms${tempNote}${famNote}${ccNote}`;
+        // ADR-045: the turn's preset — captured at SEND time (the
+        // selection in force when this turn started; P1 labels the
+        // selection, P2 adds what the tier actually engaged).
+        const presetNote = ` · preset ${currentPreset}`;
+        const meta = `${r.mode} · ${r.completion_tokens} tok · ${(r.tokens_per_second).toFixed(1)} tok/s (measured) · ${r.elapsed_ms} ms${tempNote}${presetNote}${famNote}${ccNote}`;
         if (r.error) addMsg("assistant", `⚠ local engine failed (${r.error.code}) — ${r.error.message || "see Diagnostics/logs/node.jsonl"}. Restart hosting or try another model.`, meta);
         else if (r.content) addMsg("assistant", r.content, meta);
         else addMsg("assistant", "(no reply — the model ended its turn before the first token; rephrase the message and send again)", meta);

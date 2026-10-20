@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MSP ADR-045 UI harness — execution preset picker</title>
+  <style>
+    body { font: 13px/1.5 system-ui, sans-serif; color: #e8edf7; background: #10141c; margin: 1.5rem; }
+    h1 { font-size: 16px; } h2 { font-size: 13px; color: #9aa7bf; text-transform: uppercase; }
+    .pass { color: #43c78f; } .fail { color: #e06565; }
+    td, th { text-align: left; padding: 3px 10px 3px 0; border-bottom: 1px solid #2c3850; }
+    code { color: #a855f7; }
+  </style>
+</head>
+<body>
+  <h1>ADR-045 harness — the execution preset picker</h1>
+  <p>Loads the REAL <code>../ui/index.html</code> into a same-origin 1152×648 iframe with a stubbed
+  <code>window.__TAURI__</code> bridge, then asserts the P1 contract: the Settings → Execution
+  preset panel opens behaviorally and renders ALL FIVE tiers with the OWNER-APPROVED verbatim
+  disclosure lines; the daemon's current selection is marked active; clicking a tier writes through
+  <code>set_execution_preset</code>; the default (no preset in status) fails closed to Fast.
+  Rendered geometry is measured at the app's default window size.</p>
+  <p><strong>Run:</strong> serve the crate root over http — e.g.
+  <code>python -m http.server 4817</code> from <code>crates/modelswarm-desktop</code> — then open
+  <code>http://127.0.0.1:4817/ui-harness/adr045-preset.html</code>.</p>
+  <h2>Results</h2>
+  <div id="results">running…</div>
+  <script>
+    // ADR-045 §Decision, owner-approved 2026-10-20 — verbatim.
+    const LINES = {
+      fast: "One host answers; every same-model peer checks it. The everyday speed path.",
+      balanced: "Same checks as Fast; your own machine drafts ahead and verifies in one pass when that is measurably faster — otherwise it steps aside.",
+      deep: "Every same-model peer verifies every reply; any disagreement forces a clean recompute.",
+      verified: "Everything Deep does, plus a second, different model family sanity-checks the answer; the receipt shows it.",
+      maximum: "The whole swarm checks everything, and the receipt proves it. Slowest by design."
+    };
+    const ORDER = ["fast", "balanced", "deep", "verified", "maximum"];
+
+    const calls = { set_execution_preset: null };
+    let currentStub = "fast";
+    const BASE = {
+      version: "0.0.0-harness", tracker: "https://stub.local", data_dir: "C:/stub",
+      engine_available: true, engine_path: "C:/stub/engine/llama-server.exe",
+      gpu_engine_available: false, license_accepted: true, profile_id: null, artifact: null,
+      pairing_allowed: true, content_carriage_allowed: true,
+      execution_preset: currentStub,
+      family_verified_chat: { elected: true, cohort: 1, disclosure: null },
+      node: { running: false, hosting: false, gateway_addr: null, installation_id: null,
+              engine_port: null, engine_backend: null, listener_addr: null, enrollment: null },
+      family: null, chat_turns: 0,
+    };
+    window.__stubInvoke = async (cmd, args) => {
+      switch (cmd) {
+        case "get_status": return { ...BASE, execution_preset: currentStub };
+        case "analyze_hardware": return { ram_mb: 32000, cpu_cores: 12, gpu: null };
+        case "list_models": return [];
+        case "census": return { peers_online: 0, counts: {} };
+        case "set_execution_preset":
+          calls.set_execution_preset = args;
+          currentStub = args && args.preset in LINES ? args.preset : "fast";
+          return {};
+        default: return {};
+      }
+    };
+    const STUB = '<scr' + 'ipt>window.__TAURI__ = { core: { invoke: (cmd, args) => parent.__stubInvoke(cmd, args) }, event: { listen: async () => {} } };</scr' + 'ipt>';
+
+    async function runScenario(ui) {
+      const frame = document.createElement("iframe");
+      frame.setAttribute("aria-hidden", "true");
+      frame.style.cssText = "width:1152px;height:648px;border:0;position:absolute;left:-12000px;top:0;";
+      document.body.appendChild(frame);
+      frame.srcdoc = ui.replace("<head>", "<head>" + STUB);
+      let doc = null;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        await new Promise((r) => setTimeout(r, 100));
+        doc = frame.contentDocument;
+        if (doc && doc.getElementById("preset-list")) break;
+      }
+      return { doc, frame };
+    }
+
+    function openPanel(doc, id) {
+      const item = doc.querySelector(`.menu-item[data-panel="${id}"]`);
+      if (!item) return false;
+      item.closest(".menu").querySelector(".menu-btn").click();
+      item.click();
+      const panel = doc.getElementById(id);
+      return !doc.getElementById("sheet").hidden && panel && !panel.hidden;
+    }
+
+    function render(rows) {
+      const table = document.createElement("table");
+      for (const { label, pass, detail } of rows) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td class="${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</td><td>${label}</td><td><code>${detail ?? ""}</code></td>`;
+        table.appendChild(tr);
+      }
+      const all = rows.every((r) => r.pass);
+      const summary = document.createElement("p");
+      summary.innerHTML = `<strong class="${all ? "pass" : "fail"}">${rows.filter((r) => r.pass).length}/${rows.length} checks pass</strong>`;
+      document.getElementById("results").replaceChildren(summary, table);
+      document.title = all ? "ALL PASS" : "FAILURES";
+    }
+
+    (async () => {
+      const ui = await (await fetch("../ui/index.html")).text();
+      const rows = [];
+
+      // ---- Scenario A: default fast, panel opens, five tiers verbatim ----
+      currentStub = "fast";
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        rows.push({ label: "menu: Settings → Execution preset panel opens behaviorally (menu button + item clicks)",
+          pass: openPanel(doc, "panel-preset"), detail: "sheet visible" });
+        const list = doc.getElementById("preset-list");
+        const buttons = list ? [...list.querySelectorAll("button.preset-row")] : [];
+        rows.push({ label: "picker: all FIVE tiers render in the owner's order (fast→maximum)",
+          pass: buttons.length === 5 && ORDER.every((id, i) => buttons[i].dataset.preset === id),
+          detail: buttons.map((b) => b.dataset.preset).join(",") });
+        rows.push({ label: "picker: every disclosure line is the owner-approved VERBATIM text",
+          pass: buttons.length === 5 && ORDER.every((id) => buttons.find((b) => b.dataset.preset === id).textContent.includes(LINES[id])),
+          detail: "byte-exact via textContent" });
+        const active = buttons.filter((b) => b.classList.contains("current"));
+        rows.push({ label: "picker: exactly one tier is marked active (the daemon's selection: fast)",
+          pass: active.length === 1 && active[0].dataset.preset === "fast" && active[0].getAttribute("aria-checked") === "true",
+          detail: active.map((b) => b.dataset.preset).join(",") });
+        // Geometry at the app default size: rows occupy real space, no clip.
+        const panelBox = doc.getElementById("panel-preset").getBoundingClientRect();
+        rows.push({ label: "geometry: the picker renders with real height at 1152×648 (no clip)",
+          pass: panelBox.height > 80, detail: panelBox.height.toFixed(0) + "px" });
+        // Write-through: click Verified, expect the IPC + the active flip.
+        buttons.find((b) => b.dataset.preset === "verified").click();
+        await new Promise((r) => setTimeout(r, 400));
+        rows.push({ label: "write-through: clicking Verified calls set_execution_preset({preset:\"verified\"})",
+          pass: !!calls.set_execution_preset && calls.set_execution_preset.preset === "verified",
+          detail: JSON.stringify(calls.set_execution_preset) });
+        const activeAfter = [...doc.querySelectorAll("button.preset-row.current")];
+        rows.push({ label: "write-through: the daemon's echoed selection flips the active mark to verified",
+          pass: activeAfter.length === 1 && activeAfter[0].dataset.preset === "verified",
+          detail: activeAfter.map((b) => b.dataset.preset).join(",") });
+        frame.remove();
+      }
+
+      // ---- Scenario B: a hostile/garbage status value fails closed ------
+      currentStub = "bogus";
+      {
+        const { doc, frame } = await runScenario(ui);
+        await new Promise((r) => setTimeout(r, 300));
+        openPanel(doc, "panel-preset");
+        const active = [...doc.querySelectorAll("button.preset-row.current")];
+        rows.push({ label: "fail-closed: an unknown daemon value renders NO tier active (never a silent wrong claim)",
+          pass: active.length === 0, detail: active.map((b) => b.dataset.preset).join(",") });
+        frame.remove();
+      }
+
+      render(rows);
+    })().catch((e) => render([{ label: "harness error", pass: false, detail: String(e) }]));
+  </script>
+</body>
+</html>

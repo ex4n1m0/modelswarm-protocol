@@ -117,6 +117,10 @@ tempfile = "3"
 # loopback mock tracker for try_swarm_chat's no-eligible-peer failure
 # path. Test-only.
 axum = "0.8"
+# ADR-045 P2: the turn-fixture + disclosure-sync tests build the reply
+# JSON fragments in EVERY feature combo (serde_json is an optional
+# runtime dep under tauri-shell).
+serde_json = "1"
 
 [lints]
 workspace = true

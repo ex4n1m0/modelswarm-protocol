@@ -5286,8 +5286,80 @@ async fn try_composed_chat(
         "elapsed_ms": elapsed_ms,
         "tokens_per_second": tok_s,
         "mode": "composed in-process — drafted ahead + verified in one pass (greedy)",
-        "spec_engage": { "engaged": true, "reason": "measurement_unlocked", "rounds": rounds },
+        "spec_engage": preset::spec_engage_engaged_label(rounds),
     }))
+}
+
+/// Opens ONE family verification session (dial + negotiate) — the shared
+/// open path for the primary verifier and Deep's extra verifiers. The
+/// error pair is (engage-reason, detail) for the caller's honest label.
+#[cfg(feature = "verifydrafts")]
+async fn open_family_session(
+    profile: &str,
+    addr: &str,
+    remote_peer_id: &str,
+    identity: &modelswarm_identity::InstallationIdentity,
+    lease: Option<&str>,
+    root: &[u32],
+    engine_backend: Option<&str>,
+) -> Result<
+    modelswarm_node::verifydrafts::VerifyDraftsClient<
+        modelswarm_node::verifydrafts::wire::QuicVerifyWire,
+    >,
+    (String, String),
+> {
+    // The verifier key is PINNED from the roster peer id (the probe's
+    // discipline — never a payload claim).
+    let verifier_key = modelswarm_node::verifydrafts::verifying_key_from_peer_id(remote_peer_id)
+        .map_err(|_| {
+            (
+                "peer_id_not_ed25519".to_string(),
+                remote_peer_id.to_string(),
+            )
+        })?;
+    let mut config = modelswarm_node::verifydrafts::VerifyDraftsClientConfig::new(
+        profile.to_string(),
+        verifier_key,
+    );
+    // E0 pairing: the offer carries THIS machine's real engine backend.
+    config.verifier_backend = match engine_backend {
+        Some("vulkan") => modelswarm_node::verifydrafts::Backend::Vulkan,
+        _ => modelswarm_node::verifydrafts::Backend::Cpu,
+    };
+    config.lease = lease.map(str::to_string);
+    config.carrier_prompt_tokens = Some(root.to_vec());
+    // The open-phase deadline: the serving side prefills the WHOLE
+    // conversation at engine construction before the accept (the Capi
+    // seam), so the carrier's deadline must bound that work honestly —
+    // the 2.5 s round default would refuse real conversations as
+    // `deadline_exceeded`. 20 s sits inside the 30 s per-frame I/O
+    // deadline with margin; the serving side clamps [1000, 120000].
+    config.round_deadline_ms = 20_000;
+    let wire = modelswarm_node::verifydrafts::dial_quic(
+        addr,
+        identity,
+        &verifier_key,
+        Duration::from_secs(10),
+    )
+    .await
+    .map_err(|e| ("dial_failed".to_string(), e.to_string()))?;
+    let tel = Telemetry::memory().0;
+    modelswarm_node::verifydrafts::VerifyDraftsClient::negotiate(
+        wire,
+        identity.clone(),
+        config,
+        &tel,
+    )
+    .await
+    .map_err(|error| {
+        let label = match &error {
+            modelswarm_node::verifydrafts::ClientOpenError::Rejected(reason) => {
+                (*reason).to_string()
+            }
+            other => family_open_error_reason(other).to_string(),
+        };
+        (label, error.to_string())
+    })
 }
 
 /// The requester-side family-verified chat loop: renders the SAME
@@ -5319,6 +5391,9 @@ async fn try_family_verified_chat(
     remote_peer_id: &str,
     identity: &modelswarm_identity::InstallationIdentity,
     lease: Option<&str>,
+    // ADR-045 Deep: the additional same-model verifiers (dialable addr,
+    // peer id) beyond the primary — empty for Fast/Balanced (cohort 1).
+    extra_verifiers: &[(String, String)],
     on_delta: &(dyn Fn(&str) + Send + Sync),
 ) -> Option<serde_json::Value> {
     let engage_label = |reason: &str, detail: Option<&str>| {
@@ -5407,70 +5482,62 @@ async fn try_family_verified_chat(
         );
         return None;
     }
-    // The verifier key is PINNED from the roster peer id (the probe's
-    // discipline — never a payload claim).
-    let Ok(verifier_key) =
-        modelswarm_node::verifydrafts::verifying_key_from_peer_id(remote_peer_id)
-    else {
-        engage_label("peer_id_not_ed25519", None);
-        return None;
-    };
-    let mut config = modelswarm_node::verifydrafts::VerifyDraftsClientConfig::new(
-        profile.to_string(),
-        verifier_key,
-    );
-    // E0 pairing: the offer carries THIS machine's real engine backend.
-    config.verifier_backend = match engine_backend.as_deref() {
-        Some("vulkan") => modelswarm_node::verifydrafts::Backend::Vulkan,
-        _ => modelswarm_node::verifydrafts::Backend::Cpu,
-    };
-    config.lease = lease.map(str::to_string);
-    config.carrier_prompt_tokens = Some(root.clone());
-    // The open-phase deadline: the serving side prefills the WHOLE
-    // conversation at engine construction before the accept (the Capi
-    // seam), so the carrier's deadline must bound that work honestly —
-    // the 2.5 s round default would refuse real conversations as
-    // `deadline_exceeded`. 20 s sits inside the 30 s per-frame I/O
-    // deadline with margin; the serving side clamps [1000, 120000].
-    config.round_deadline_ms = 20_000;
-    let wire = match modelswarm_node::verifydrafts::dial_quic(
+    // The primary session via the shared open path.
+    let mut client = match open_family_session(
+        profile,
         addr,
+        remote_peer_id,
         identity,
-        &verifier_key,
-        Duration::from_secs(10),
-    )
-    .await
-    {
-        Ok(wire) => wire,
-        Err(e) => {
-            engage_label("dial_failed", Some(&e.to_string()));
-            return None;
-        }
-    };
-    let tel = Telemetry::memory().0;
-    let mut client = match modelswarm_node::verifydrafts::VerifyDraftsClient::negotiate(
-        wire,
-        identity.clone(),
-        config,
-        &tel,
+        lease,
+        &root,
+        engine_backend.as_deref(),
     )
     .await
     {
         Ok(client) => client,
-        Err(error) => {
-            // The honest refusal classification: the peer's reject reason
-            // (pin_mismatch / content_carriage_refused / profile_mismatch
-            // / params_mismatch / budget_infeasible — "conversation does
-            // not fit this peer") rides the label; the caller falls back
-            // to the plain path, never silently.
-            let label = match &error {
-                modelswarm_node::verifydrafts::ClientOpenError::Rejected(reason) => *reason,
-                other => family_open_error_reason(other),
-            };
-            engage_label(label, Some(&error.to_string()));
+        Err((label, detail)) => {
+            engage_label(&label, Some(&detail));
             return None;
         }
     };
+    // ADR-045 Deep (inherited by Verified/Maximum): the full verification
+    // cohort — a session to EVERY extra same-model verifier, all must
+    // agree per round. A secondary that cannot open degrades the COHORT,
+    // never the turn (S-6: the cohort label reports what actually
+    // engaged); a secondary that later diverges escalates the turn.
+    let mut secondaries: Vec<(
+        String,
+        modelswarm_node::verifydrafts::VerifyDraftsClient<
+            modelswarm_node::verifydrafts::wire::QuicVerifyWire,
+        >,
+    )> = Vec::with_capacity(extra_verifiers.len());
+    for (vaddr, vpeer) in extra_verifiers {
+        match open_family_session(
+            profile,
+            vaddr,
+            vpeer,
+            identity,
+            lease,
+            &root,
+            engine_backend.as_deref(),
+        )
+        .await
+        {
+            Ok(extra_client) => secondaries.push((vpeer.clone(), extra_client)),
+            Err((reason, detail)) => {
+                telemetry.info(
+                    "family.engage",
+                    &[
+                        ("phase", "chat"),
+                        ("peer", vpeer.as_str()),
+                        ("engaged", "false"),
+                        ("reason", &reason),
+                        ("detail", &detail),
+                    ],
+                );
+            }
+        }
+    }
     // The self-check engine for THIS conversation (prefilled with the
     // carrier root; KV advances round by round exactly as the serving
     // engine's does — cache-cold by construction at open).
@@ -5485,6 +5552,7 @@ async fn try_family_verified_chat(
     // under the pinned params) → local self-check → wire → commit. The
     // COMMITTED stream is the verifying peer's engine's own continuation
     // (ADR-036 §3.2 — lossless-verification sessions only).
+    let tel = Telemetry::memory().0;
     let started = Instant::now();
     let mut committed: Vec<u32> = Vec::new();
     let max_out = max_tokens.unwrap_or(256) as usize;
@@ -5549,6 +5617,51 @@ async fn try_family_verified_chat(
         }
         match client.round(&window, &tel).await {
             Ok(outcome) => {
+                // ADR-045 Deep: EVERY secondary verifier must agree with
+                // the primary's committed outcome — any divergence or
+                // failure escalates (the caller's plain path IS the full
+                // recompute, labeled honestly — "any verifier reject ⇒
+                // full recompute").
+                let mut deep_agreed = true;
+                for (vpeer, secondary) in secondaries.iter_mut() {
+                    match secondary.round(&window, &tel).await {
+                        Ok(outcome2)
+                            if outcome2.committed == outcome.committed
+                                && outcome2.divergence_point == outcome.divergence_point => {}
+                        Ok(_) => {
+                            deep_agreed = false;
+                            divergence_label = Some("deep_disagreement_recompute");
+                            telemetry.info(
+                                "family.engage",
+                                &[
+                                    ("phase", "chat"),
+                                    ("peer", vpeer.as_str()),
+                                    ("engaged", "false"),
+                                    ("reason", "deep_disagreement_recompute"),
+                                ],
+                            );
+                            break;
+                        }
+                        Err(failure) => {
+                            deep_agreed = false;
+                            divergence_label = Some("deep_verifier_unavailable");
+                            telemetry.info(
+                                "family.engage",
+                                &[
+                                    ("phase", "chat"),
+                                    ("peer", vpeer.as_str()),
+                                    ("engaged", "false"),
+                                    ("reason", "deep_verifier_unavailable"),
+                                    ("detail", pairing_round_failure_label(&failure)),
+                                ],
+                            );
+                            break;
+                        }
+                    }
+                }
+                if !deep_agreed {
+                    break;
+                }
                 let eos_now =
                     outcome.divergence_point.is_none() && (window.len() as u32) < want as u32;
                 for token in &outcome.committed {
@@ -5595,9 +5708,9 @@ async fn try_family_verified_chat(
     } else {
         0.0
     };
-    // The cohort: ONE verifying peer in the shipped configuration
-    // (bounded by the preset cohort cap and the budget's max_endpoints).
-    let cohort: u32 = 1;
+    // The cohort: the primary verifier + every Deep secondary that
+    // actually opened (the honest engaged count — S-6).
+    let cohort: u32 = 1 + secondaries.len() as u32;
     {
         let mut guard = inner.lock().await;
         guard.last_family_cohort = Some(cohort);
@@ -5823,6 +5936,9 @@ async fn try_swarm_chat(
     // greedy-pinned and the family session pins its own defaults).
     temperature: f32,
     lease: Option<String>,
+    // ADR-045: the turn's execution preset — gates Deep's full-cohort
+    // fan-out (Deep + its inheritors Verified/Maximum).
+    preset: ExecutionPreset,
     on_delta: &(dyn Fn(&str) + Send + Sync),
 ) -> Option<serde_json::Value> {
     let tracker = match tracker_client(tracker_url, data_dir, telemetry).await {
@@ -5865,11 +5981,15 @@ async fn try_swarm_chat(
     // First peer with a DIALABLE advertised address (F2B: a direct QUIC
     // multiaddr OR a circuit address — a relayed peer is reachable, not
     // skipped) that is not us.
-    let candidate = match peers.into_iter().find(|p| {
+    // The eligible roster (dialable, non-self, free slots) — kept as a
+    // list so ADR-045 Deep can fan out to the full cohort beyond the
+    // fastest pick.
+    let mut eligible = peers.into_iter().filter(|p| {
         p.peer_id != own_peer_id
             && p.free_slots > 0
             && p.addresses.iter().any(|a| peer_addr_dialable(a))
-    }) {
+    });
+    let candidate = match eligible.next() {
         Some(c) => c,
         None => {
             // Log the shadow decision anyway (production pick: none) and
@@ -5887,6 +6007,29 @@ async fn try_swarm_chat(
             );
             return None;
         }
+    };
+    // ADR-045 Deep: the full verification cohort beyond the fastest pick
+    // (Deep + its inheritors Verified/Maximum). Bounded at 3 extra
+    // verifiers — beyond that the tracker lookup's own cap dominates and
+    // every-opened count is reported honestly in the cohort label.
+    let deep_fanout = matches!(
+        preset,
+        ExecutionPreset::Deep | ExecutionPreset::Verified | ExecutionPreset::Maximum
+    );
+    let extra_verifiers: Vec<(String, String)> = if deep_fanout {
+        eligible
+            .take(3)
+            .filter_map(|p| {
+                let a = p
+                    .addresses
+                    .iter()
+                    .find(|a| peer_addr_direct(a))
+                    .or_else(|| p.addresses.iter().find(|a| peer_addr_dialable(a)));
+                a.cloned().map(|a| (a, p.peer_id.clone()))
+            })
+            .collect()
+    } else {
+        Vec::new()
     };
     let addr = match candidate.addresses.iter().find(|a| peer_addr_dialable(a)) {
         Some(a) => a.clone(),
@@ -5980,6 +6123,7 @@ async fn try_swarm_chat(
             &remote_peer_id,
             &identity,
             lease.as_deref(),
+            &extra_verifiers,
             on_delta,
         )
         .await
@@ -6548,6 +6692,7 @@ async fn send_chat(
                 max_tokens,
                 temperature,
                 lease,
+                preset_now,
                 &on_delta,
             )
             .await
@@ -6687,10 +6832,7 @@ async fn send_chat(
         // Gate 6 fell back: the pre-check stepped aside (None) but the
         // attempt failed before the first token — the honest label
         // replaces the step-aside silence for this reply.
-        spec_engage_local = Some(serde_json::json!({
-            "engaged": false,
-            "reason": "composed_failed_before_first_token",
-        }));
+        spec_engage_local = Some(preset::spec_engage_fallback_label());
     }
 
     // Plain {role, content} turns — the serving executor applies ChatML
@@ -9713,6 +9855,7 @@ mod tests {
                 Some(8),
                 0.0,
                 None,
+                ExecutionPreset::Fast,
                 &noop,
             )
             .await;
@@ -9746,6 +9889,7 @@ mod tests {
                 Some(8),
                 0.0,
                 None,
+                ExecutionPreset::Fast,
                 &noop,
             )
             .await;
@@ -9841,6 +9985,7 @@ mod tests {
                 Some(8),
                 0.0,
                 None,
+                ExecutionPreset::Fast,
                 &noop,
             )
             .await;

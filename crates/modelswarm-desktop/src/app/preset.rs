@@ -145,6 +145,27 @@ pub fn spec_engage_label_remote(preset: ExecutionPreset) -> Option<serde_json::V
     Some(serde_json::json!({ "engaged": false, "reason": "turn_not_local" }))
 }
 
+/// The EXECUTED composed turn's success label — the ONLY producer of
+/// `engaged: true` (the pre-check can never emit it; the R1 engaged-set
+/// discipline). Single-sourced so the turn fixtures pin this exact shape.
+pub fn spec_engage_engaged_label(rounds: u32) -> serde_json::Value {
+    serde_json::json!({
+        "engaged": true,
+        "reason": "measurement_unlocked",
+        "rounds": rounds,
+    })
+}
+
+/// The EXECUTED composed turn's gate-6 failure label (the honest fallback
+/// that replaces the pre-check's step-aside when the attempt failed
+/// before the first committed token).
+pub fn spec_engage_fallback_label() -> serde_json::Value {
+    serde_json::json!({
+        "engaged": false,
+        "reason": "composed_failed_before_first_token",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

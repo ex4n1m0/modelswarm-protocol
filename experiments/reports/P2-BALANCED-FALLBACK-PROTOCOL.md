@@ -79,3 +79,29 @@ No output-changing modes (P3 needs its own ADR); no wire changes
 (`SessionOffer.preset` negotiation is the Protocol Architect's separate
 contract work — deploy-ordered before any preset-carrying cooperative
 session); no relaxation of the family-verification baseline.
+
+## Verdict (2026-10-21, the registered campaign)
+
+The protocol ran verbatim (`crates/modelswarm-runtime/tests/composed_ab.rs`):
+60 interleaved pairs, 3 regimes, per-pair token-for-token exactness.
+**VERDICT: PASS.**
+
+| pooled | B (plain) | A (composed) | A/B |
+|---|---|---|---|
+| P50 | 16917 ms | **1364 ms** | **0.081** (≤ 1.05) |
+| P95 | 25085 ms | **1501 ms** | **0.060** (≤ 1.15) |
+
+Coverage 91.7% (55/60 exact; the 5 excluded pairs are ALL in regime 2, the
+prose-definition class — the F3 near-tie argmax territory, excluded per
+the protocol's exactness gate and recorded in the JSONL). Environment:
+single machine, loopback, SmolLM2-135M, dev-session load — NOT LAN, NOT a
+product claim. The B arm pays the full per-step re-prefill (the
+`no_prompt_cache` determinism requirement — the WORST case for the plain
+path, biasing the test against the composed arm).
+
+The composed path is not merely within the registered 5%/15% bounds — it
+is ~12× FASTER in this regime, the pass-2 result reproduced under the
+pre-registered discipline. **A PASS authorizes the `composed_unlock`
+flip (config.json + app restart); the harness itself never flips it, and
+the flip is the owner's call.** Raw artifacts:
+`experiments/raw/AB-REGISTERED-2026-10-21/`.

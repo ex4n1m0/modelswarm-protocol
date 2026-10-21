@@ -1,0 +1,21 @@
+{
+  "coverage": 0.9166666666666666,
+  "engine_tag": "unknown",
+  "environment": "single-machine loopback, Windows x64, dev-session load — NOT LAN, NOT a product claim",
+  "experiment": "adr-045-p2-balanced-ab",
+  "pairs_exact": 55,
+  "pairs_total": 60,
+  "pooled": {
+    "a_over_b_p50": 0.08060117515184163,
+    "a_over_b_p95": 0.059828117210200316,
+    "a_p50_ms": 1363.5408,
+    "a_p95_ms": 1500.7695999999999,
+    "b_p50_ms": 16917.132999999998,
+    "b_p95_ms": 25084.6871
+  },
+  "registered_bounds": {
+    "p50": 1.05,
+    "p95": 1.15
+  },
+  "verdict": "PASS"
+}

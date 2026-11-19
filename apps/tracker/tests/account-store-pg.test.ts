@@ -198,9 +198,13 @@ describe.skipIf(!dbUrl)("Pg account store", () => {
     // Deny path on a fresh code clears the claim without approving.
     const deviceCode2 = `dc2-${uid()}`;
     const userCode2 = `UD${uid().slice(0, 6).toUpperCase()}`;
+    // device_codes.installation_id is a real FK on Pg — the installations
+    // parent must exist (MemoryStore can't catch this; CI Postgres did).
+    const installation2 = uid();
+    await store.upsertInstallation({ installationId: installation2, pubKeyB58: `pk${uid()}`.slice(0, 64), createdAt: nowMs });
     await store.createDeviceAuth({
       deviceCode: deviceCode2,
-      installationId: uid(),
+      installationId: installation2,
       userCode: userCode2,
       verifyUrl: "https://example.com/verify",
       expiresAt: nowMs + 15 * 60 * 1000,

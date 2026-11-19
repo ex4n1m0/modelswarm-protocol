@@ -26,6 +26,8 @@ export interface RateLimits {
   enrollPerIp: number;
   /** per IP on /health + /catalog */
   publicPerIp: number;
+  /** per IP on website-account endpoints (signup/login/approve) */
+  accountPerIp: number;
 }
 
 export const DEFAULT_RATE_LIMITS: RateLimits = {
@@ -33,6 +35,7 @@ export const DEFAULT_RATE_LIMITS: RateLimits = {
   unsignedPerIp: 60,
   enrollPerIp: 10,
   publicPerIp: 120,
+  accountPerIp: 20,
 };
 
 const WINDOW_MS = 60_000;
@@ -93,4 +96,4 @@ export function clientIpOf(req: Request): string {
   return req.headers.get("x-real-ip") ?? "unknown";
 }
 
-export type LimiterClass = "peer" | "unsigned" | "enroll" | "public";
+export type LimiterClass = "peer" | "unsigned" | "enroll" | "public" | "account";

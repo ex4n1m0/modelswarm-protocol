@@ -97,6 +97,15 @@ a.dl:hover { border-color: var(--accent); }
 a.dl .os { font-weight: 650; color: var(--text); font-size: 0.95rem; }
 a.dl .fmt { color: var(--text-3); font-family: var(--mono); font-size: 0.72rem; }
 @media (hover: hover) { tbody tr:hover td { background: var(--surface-2); } }
+/* Account pages (/account, /account/login — added with the 0008 account
+   layer). Shell + card + form controls match the /verify page's inline-style
+   look, hoisted as small classes so both routes share them. */
+.acct-shell { background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: flex-start; justify-content: center; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+.acct-card { border: 1px solid var(--border); background: var(--surface); border-radius: 14px; padding: 1.6rem; }
+.acct-title { font-size: 1.05rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); font-family: var(--mono); }
+.acct-label { display: block; font-size: 0.72rem; letter-spacing: 0.1em; color: var(--text-3); margin-bottom: 14px; }
+.acct-input { width: 100%; margin-top: 4px; background: var(--bg); color: var(--text); border: 1px solid #31435F; border-radius: 8px; padding: 0.6rem 0.7rem; font-size: 0.95rem; font-family: inherit; }
+.acct-input:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 1px; }
 @media (max-width: 900px) {
   .steps { grid-template-columns: 1fr; }
 }

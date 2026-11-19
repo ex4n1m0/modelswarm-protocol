@@ -27,6 +27,10 @@ export interface TrackerContext {
   /** Max distinct enrolled installations under auto-approval (env
    *  DEVICE_APPROVAL_CAP, default 250). */
   deviceApprovalCap: number;
+  /** Website-account signup open (env ACCOUNT_SIGNUP_OPEN=1; default
+   *  closed). The owner flips it at deploy — /account/signup returns 403
+   *  signup_closed while closed. */
+  accountSignupOpen: boolean;
   /** Pinned greedy-canary possession digests per profile (env
    *  MSP_CANARY_PINS, JSON profileId -> "sha256:<64 hex>"; D16 / ADR-028
    *  §7). Null = unset (v0 legacy mode: nonce-bound prompt, no digest).
@@ -82,11 +86,13 @@ function buildDefaultContext(): TrackerContext {
       unsignedPerIp: envInt("MSP_RATE_UNSIGNED", DEFAULT_RATE_LIMITS.unsignedPerIp),
       enrollPerIp: envInt("MSP_RATE_ENROLL", DEFAULT_RATE_LIMITS.enrollPerIp),
       publicPerIp: envInt("MSP_RATE_PUBLIC", DEFAULT_RATE_LIMITS.publicPerIp),
+      accountPerIp: envInt("MSP_RATE_ACCOUNT", DEFAULT_RATE_LIMITS.accountPerIp),
     },
     adminToken: process.env.ADMIN_TOKEN ?? null,
     verifyUrl: process.env.DEVICE_VERIFY_URL ?? "https://modelswarm.deepflux.space/verify",
     autoApproveDevices: process.env.DEVICE_AUTO_APPROVE === "1",
     deviceApprovalCap: envInt("DEVICE_APPROVAL_CAP", 250),
+    accountSignupOpen: process.env.ACCOUNT_SIGNUP_OPEN === "1",
     // Malformed pins fail closed at context build (see parseCanaryPins).
     canaryPins: parseCanaryPins(process.env.MSP_CANARY_PINS),
   };

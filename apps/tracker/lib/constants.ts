@@ -20,6 +20,10 @@ export const CHALLENGE_TTL_MS = 120_000;
 /** X-MSP-Session lifetime (msp-v1 §2.3). */
 export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
+/** Website-account session lifetime (msw_session cookie + user_sessions
+ *  row-aging expiry; migration 0008). */
+export const USER_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
 /** Device enrollment code lifetime. */
 export const DEVICE_CODE_TTL_MS = 15 * 60 * 1000;
 

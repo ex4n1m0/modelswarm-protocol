@@ -14,7 +14,10 @@ import { z } from "zod";
 
 const Hex32 = z.string().regex(/^[0-9a-f]{64}$/, "64 lowercase hex chars");
 const ProfileId = z.string().regex(/^msp1:[0-9a-f]{64}$/, "msp1:<64 hex>");
-const Base58Id = z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{8,64}$/, "base58 id");
+/** Base58 id shape (msp-v1 §2.1) — exported so dynamic-segment routes can
+ *  validate path params against the SAME pattern without a body schema. */
+export const BASE58_ID_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{8,64}$/;
+const Base58Id = z.string().regex(BASE58_ID_PATTERN, "base58 id");
 const Multiaddr = z
   .string()
   .min(1)
@@ -294,5 +297,56 @@ export const ModelRequestResolveSchema = z
   .object({
     id: z.number().int().min(1),
     resolution: z.enum(["promoted", "rejected"]),
+  })
+  .strict();
+
+// -- website accounts (migration 0008; account layer over device enrollment)
+
+/** Normalized email: trimmed + lowercased before validation, stored that way
+ *  so uniqueness is case-insensitive by construction. */
+const AccountEmail = z.string().trim().max(254).toLowerCase().email();
+
+export const AccountSignupSchema = z
+  .object({
+    email: AccountEmail,
+    password: z.string().min(10).max(128),
+    displayName: z.string().trim().min(1).max(64),
+  })
+  .strict();
+
+export const AccountLoginSchema = z
+  .object({
+    email: AccountEmail,
+    // Login bounds are looser than signup: any candidate password is run
+    // through verification so the failure is 401 invalid_credentials, not a
+    // 400 that would reveal which side was wrong.
+    password: z.string().min(1).max(128),
+  })
+  .strict();
+
+/** POST /account/devices/approve — same pairing-code alphabet as the admin
+ *  DeviceApproveSchema above, plus an optional machine label. */
+export const AccountDeviceApproveSchema = z
+  .object({
+    userCode: z.string().regex(
+      /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$/,
+      "user pairing code (8 characters, e.g. AB2CDEFG)",
+    ),
+    label: z.string().trim().min(1).max(64).optional(),
+  })
+  .strict();
+
+export const AccountMachineLabelSchema = z
+  .object({
+    label: z.string().trim().min(1).max(64),
+  })
+  .strict();
+
+/** POST /admin/account/reset-password — ops password recovery until email
+ *  infra exists; sets a new hash for a known email. */
+export const AdminAccountResetSchema = z
+  .object({
+    email: AccountEmail,
+    newPassword: z.string().min(10).max(128),
   })
   .strict();

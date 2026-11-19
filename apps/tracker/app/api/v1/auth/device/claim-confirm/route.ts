@@ -52,19 +52,25 @@ export async function POST(req: Request) {
     return jsonErrorFor("unknown_request", "no pending claim for this device");
   }
 
-  const resolved = await ctx.store.resolveDeviceClaim(parsed.value.deviceCode, true, ctx.now());
-  if (!resolved) {
-    return jsonError(401, "unauthorized", "unknown device code for this installation");
-  }
+  // Bind BEFORE flipping the code approved (security review finding 5): a
+  // lost exclusivity race must not leave an approved+confirmed code whose
+  // session then lands under a different account than the one this
+  // device's user just allowed.
   const bound = await ctx.store.bindMachineToAccount({
-    userId: resolved.claimedByUserId as string,
-    installationId: resolved.installationId,
-    label: resolved.claimedLabel,
+    userId: device.claimedByUserId,
+    installationId: device.installationId,
+    label: device.claimedLabel,
     now: ctx.now(),
   });
   if (bound === "already_bound") {
-    // Lost the exclusivity race (another account bound it meanwhile).
+    // Lost the race to another account — clear the dangling claim so the
+    // code cannot be confirmed into a binding it does not have.
+    await ctx.store.resolveDeviceClaim(parsed.value.deviceCode, false, ctx.now());
     return jsonErrorFor("already_bound", "device is already bound to another account");
+  }
+  const resolved = await ctx.store.resolveDeviceClaim(parsed.value.deviceCode, true, ctx.now());
+  if (!resolved) {
+    return jsonError(401, "unauthorized", "unknown device code for this installation");
   }
   logEvent("info", {
     event: "device_claim_confirmed",

@@ -15,6 +15,9 @@
 -- handshake so the confirm-time bind uses what the approver typed. All
 -- columns nullable; a row with claimed_by_user set and claim_confirmed_at
 -- NULL is a pending claim, and code expiry (15 min) retires it with the row.
+-- (FK note: no ON DELETE action — device_codes rows are short-lived (15 min)
+-- and pruned at write time, and account_users rows are never deleted today;
+-- if user deletion ever lands, prune expired codes first or the FK blocks.)
 ALTER TABLE device_codes
   ADD COLUMN claimed_by_user   varchar(64) REFERENCES account_users (user_id),
   ADD COLUMN claimed_label     varchar(64),

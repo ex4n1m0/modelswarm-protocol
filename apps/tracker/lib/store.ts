@@ -254,7 +254,10 @@ export interface UserSessionRecord {
 export type AccountMachineStatus = "active" | "revoked";
 
 /** One account↔installation binding row; approvedAt is null only for rows
- *  written by hand (dashboard approval always sets it). */
+ *  written by hand (dashboard approval always sets it). lastSeenAt is the
+ *  signed machine heartbeat's touch (migration 0009) — null while the
+ *  binding has never been seen (fresh binds reset it; row-aging display
+ *  only, no timers). */
 export interface AccountMachineRecord {
   userId: string;
   installationId: string;
@@ -262,6 +265,7 @@ export interface AccountMachineRecord {
   status: AccountMachineStatus;
   addedAt: number;
   approvedAt: number | null;
+  lastSeenAt: number | null;
 }
 
 export interface TrackerStore {
@@ -501,6 +505,11 @@ export interface TrackerStore {
    *  status='active' path here. False when unknown or not owned. */
   revokeAccountMachine(userId: string, installationId: string): Promise<boolean>;
   setAccountMachineLabel(userId: string, installationId: string, label: string): Promise<boolean>;
+  /** Machine-seen touch (migration 0009): stamp lastSeenAt on the
+   *  installation's ACTIVE account_machines row. True iff an active row was
+   *  touched — no active binding (never bound, or revoked) is false, which
+   *  the heartbeat route maps to 404 unknown_machine. */
+  touchAccountMachineSeen(installationId: string, now: number): Promise<boolean>;
   /** Device pairing-code lookup for the dashboard approve flow (newest
    *  matching row, mirroring approveDeviceByUserCode's update set). */
   getDeviceAuthByUserCode(userCode: string): Promise<DeviceAuthRecord | null>;
@@ -1352,6 +1361,9 @@ export class MemoryStore implements TrackerStore {
       existing.label = rec.label;
       existing.status = "active";
       existing.approvedAt = rec.now;
+      // Liveness is per-binding: a re-activated row has not been seen under
+      // it (mirrors the Pg upsert's last_seen_at = NULL).
+      existing.lastSeenAt = null;
     } else {
       this.accountMachines.set(`${rec.userId}:${rec.installationId}`, {
         userId: rec.userId,
@@ -1360,6 +1372,7 @@ export class MemoryStore implements TrackerStore {
         status: "active",
         addedAt: rec.now,
         approvedAt: rec.now,
+        lastSeenAt: null,
       });
     }
     return "created";
@@ -1377,6 +1390,19 @@ export class MemoryStore implements TrackerStore {
     if (!rec) return false;
     rec.label = label;
     return true;
+  }
+
+  async touchAccountMachineSeen(installationId: string, now: number): Promise<boolean> {
+    // At most one ACTIVE row per installation (the partial unique index's
+    // rule, enforced in code on this side) — touch it and report existence.
+    let touched = false;
+    for (const rec of this.accountMachines.values()) {
+      if (rec.installationId === installationId && rec.status === "active") {
+        rec.lastSeenAt = now;
+        touched = true;
+      }
+    }
+    return touched;
   }
 }
 
@@ -2646,7 +2672,7 @@ export class PgStore implements TrackerStore {
 
   async listAccountMachines(userId: string): Promise<AccountMachineRecord[]> {
     const rows = await this.query(
-      `SELECT user_id, installation_id, label, status, added_at, approved_at
+      `SELECT user_id, installation_id, label, status, added_at, approved_at, last_seen_at
        FROM account_machines WHERE user_id = $1
        ORDER BY added_at DESC, installation_id ASC`,
       [userId],
@@ -2658,6 +2684,7 @@ export class PgStore implements TrackerStore {
       status: row.status as AccountMachineStatus,
       addedAt: (row.added_at as Date).getTime(),
       approvedAt: row.approved_at === null ? null : (row.approved_at as Date).getTime(),
+      lastSeenAt: row.last_seen_at === null ? null : (row.last_seen_at as Date).getTime(),
     }));
   }
 
@@ -2686,7 +2713,8 @@ export class PgStore implements TrackerStore {
         `INSERT INTO account_machines (user_id, installation_id, label, status, added_at, approved_at)
          VALUES ($1, $2, $3, 'active', $4, $4)
          ON CONFLICT (user_id, installation_id) DO UPDATE
-           SET label = EXCLUDED.label, status = 'active', approved_at = EXCLUDED.approved_at`,
+           SET label = EXCLUDED.label, status = 'active', approved_at = EXCLUDED.approved_at,
+               last_seen_at = NULL`,
         [rec.userId, rec.installationId, rec.label, at],
       );
       return "created";
@@ -2714,6 +2742,18 @@ export class PgStore implements TrackerStore {
         WHERE user_id = $1 AND installation_id = $2
         RETURNING installation_id`,
       [userId, installationId, label],
+    );
+    return rows.length > 0;
+  }
+
+  async touchAccountMachineSeen(installationId: string, now: number): Promise<boolean> {
+    // The partial unique index guarantees at most one ACTIVE row per
+    // installation — the heartbeat's last-seen touch targets exactly it.
+    const rows = await this.query(
+      `UPDATE account_machines SET last_seen_at = $2
+        WHERE installation_id = $1 AND status = 'active'
+        RETURNING installation_id`,
+      [installationId, PgStore.iso(now)],
     );
     return rows.length > 0;
   }

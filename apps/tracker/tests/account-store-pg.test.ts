@@ -118,6 +118,14 @@ describe.skipIf(!dbUrl)("Pg account store", () => {
     expect((await store.listAccountMachines(u2.userId))[0]?.label).toBe("Renamed");
     expect(await store.setAccountMachineLabel(uid(), installationId, "X")).toBe(false);
 
+    // Machine-seen touch (migration 0009): only the ACTIVE row updates, the
+    // same installation's revoked row keeps null, and unknown ids touch
+    // nothing (the heartbeat route maps false to 404 unknown_machine).
+    expect(await store.touchAccountMachineSeen(installationId, nowMs + 5_000)).toBe(true);
+    expect((await store.listAccountMachines(u2.userId))[0]).toMatchObject({ lastSeenAt: nowMs + 5_000 });
+    expect((await store.listAccountMachines(u1.userId))[0]).toMatchObject({ status: "revoked", lastSeenAt: null });
+    expect(await store.touchAccountMachineSeen(uid(), nowMs)).toBe(false);
+
     // deleteUserSession removes the row.
     const token = `pg-del-${uid()}`;
     await store.createUserSession({ userId: u2.userId, createdAt: nowMs, expiresAt: nowMs + 60_000, token });

@@ -342,6 +342,13 @@ export const AccountMachineLabelSchema = z
   })
   .strict();
 
+/** POST /account/machines/{installationId}/heartbeat — the machine liveness
+ *  touch. The body is exactly {} (nothing to say: identity is the signed
+ *  envelope + session; the timestamp is server-side). Named
+ *  MachineHeartbeatSchema because HeartbeatSchema above is the frozen peer
+ *  lease heartbeat (/peers/heartbeat). */
+export const MachineHeartbeatSchema = z.object({}).strict();
+
 /** POST /admin/account/reset-password — ops password recovery until email
  *  infra exists; sets a new hash for a known email. */
 export const AdminAccountResetSchema = z

@@ -19,6 +19,24 @@ interface Machine {
   status: "active" | "revoked";
   addedAt: string;
   approvedAt: string | null;
+  lastSeenAt: string | null;
+}
+
+/** Online window for the machine heartbeat's last-seen touch (0009). */
+const ONLINE_WINDOW_MS = 120_000;
+
+/** Liveness label, computed at render/refresh only — no timers. Online iff
+ *  the machine heartbeated inside the window; otherwise minute-level
+ *  relative "Seen …"; null = never heartbeated under this binding. */
+function seenStatus(lastSeenAt: string | null, now: number): { text: string; online: boolean } {
+  if (lastSeenAt === null) return { text: "Never", online: false };
+  const ageMs = now - Date.parse(lastSeenAt);
+  if (ageMs < ONLINE_WINDOW_MS) return { text: "Online", online: true };
+  const mins = Math.max(1, Math.floor(ageMs / 60_000));
+  if (mins < 60) return { text: `Seen ${mins}m ago`, online: false };
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return { text: `Seen ${hours}h ago`, online: false };
+  return { text: `Seen ${Math.floor(hours / 24)}d ago`, online: false };
 }
 
 function shortId(id: string): string {
@@ -197,6 +215,7 @@ export default function AccountDashboardPage() {
                 <th>Label</th>
                 <th>Installation</th>
                 <th>Status</th>
+                <th>Seen</th>
                 <th>Added</th>
                 <th />
               </tr>
@@ -204,12 +223,14 @@ export default function AccountDashboardPage() {
             <tbody>
               {machines.length === 0 && (
                 <tr>
-                  <td colSpan={5} style={{ color: "var(--text-3)" }}>
+                  <td colSpan={6} style={{ color: "var(--text-3)" }}>
                     No machines yet — add one with its pairing code above.
                   </td>
                 </tr>
               )}
-              {machines.map((m) => (
+              {machines.map((m) => {
+                const seen = seenStatus(m.lastSeenAt, Date.now());
+                return (
                 <tr key={m.installationId}>
                   <td>
                     {renaming?.installationId === m.installationId ? (
@@ -245,6 +266,20 @@ export default function AccountDashboardPage() {
                       {m.status}
                     </span>
                   </td>
+                  <td style={{ whiteSpace: "nowrap", color: seen.online ? "var(--text)" : "var(--text-3)" }}>
+                    <span
+                      aria-hidden
+                      style={{
+                        display: "inline-block",
+                        width: 8,
+                        height: 8,
+                        borderRadius: "999px",
+                        marginRight: "0.45rem",
+                        background: seen.online ? "var(--ok)" : "var(--text-3)",
+                      }}
+                    />
+                    {seen.text}
+                  </td>
                   <td>{new Date(m.addedAt).toLocaleDateString()}</td>
                   <td style={{ whiteSpace: "nowrap" }}>
                     {renaming?.installationId === m.installationId ? null : (
@@ -271,7 +306,8 @@ export default function AccountDashboardPage() {
                     )}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

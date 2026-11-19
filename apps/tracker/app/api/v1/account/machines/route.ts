@@ -22,6 +22,7 @@ export async function GET(req: Request): Promise<Response> {
       status: m.status,
       addedAt: new Date(m.addedAt).toISOString(),
       approvedAt: m.approvedAt === null ? null : new Date(m.approvedAt).toISOString(),
+      lastSeenAt: m.lastSeenAt === null ? null : new Date(m.lastSeenAt).toISOString(),
     })),
   });
 }

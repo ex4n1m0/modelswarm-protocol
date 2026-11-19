@@ -118,18 +118,121 @@ describe.skipIf(!dbUrl)("Pg account store", () => {
     expect((await store.listAccountMachines(u2.userId))[0]?.label).toBe("Renamed");
     expect(await store.setAccountMachineLabel(uid(), installationId, "X")).toBe(false);
 
-    // Machine-seen touch (migration 0009): only the ACTIVE row updates, the
-    // same installation's revoked row keeps null, and unknown ids touch
-    // nothing (the heartbeat route maps false to 404 unknown_machine).
-    expect(await store.touchAccountMachineSeen(installationId, nowMs + 5_000)).toBe(true);
+    // Machine contact (migrations 0009 + 0011): only the ACTIVE row updates,
+    // the same installation's revoked row keeps null, and unknown ids touch
+    // nothing (the heartbeat route maps false to 404 unknown_machine). The
+    // signaling mapping is present-means-set (null clears), and a NULL label
+    // auto-fills from displayName while a named one never does.
+    expect(await store.updateMachineContact(installationId, {}, nowMs + 5_000)).toBe(true);
     expect((await store.listAccountMachines(u2.userId))[0]).toMatchObject({ lastSeenAt: nowMs + 5_000 });
     expect((await store.listAccountMachines(u1.userId))[0]).toMatchObject({ status: "revoked", lastSeenAt: null });
-    expect(await store.touchAccountMachineSeen(uid(), nowMs)).toBe(false);
+    expect(await store.updateMachineContact(uid(), {}, nowMs)).toBe(false);
+
+    // Bind with a null label (claim-handshake binds), then auto-populate.
+    const installationB = uid();
+    await store.upsertInstallation({ installationId: installationB, pubKeyB58: `pk${uid()}`.slice(0, 64), createdAt: nowMs });
+    await store.bindMachineToAccount({ userId: u2.userId, installationId: installationB, label: null, now: nowMs });
+    expect((await store.listAccountMachines(u2.userId)).find((m) => m.installationId === installationB)).toMatchObject({
+      label: null,
+      signalingDeviceId: null,
+    });
+    await store.updateMachineContact(installationB, { signalingDeviceId: "0123456789abcdef", displayName: "Studio PC" }, nowMs);
+    expect((await store.listAccountMachines(u2.userId)).find((m) => m.installationId === installationB)).toMatchObject({
+      label: "Studio PC",
+      signalingDeviceId: "0123456789abcdef",
+    });
+    // A named label never gets overwritten by a later displayName.
+    await store.updateMachineContact(installationB, { displayName: "Ignore Me" }, nowMs);
+    expect((await store.listAccountMachines(u2.userId)).find((m) => m.installationId === installationB)?.label).toBe("Studio PC");
+    // Present null clears the signaling mapping (sharing off); absent keeps it.
+    await store.updateMachineContact(installationB, { signalingDeviceId: null }, nowMs);
+    expect((await store.listAccountMachines(u2.userId)).find((m) => m.installationId === installationB)?.signalingDeviceId).toBeNull();
+    await store.updateMachineContact(installationB, { signalingDeviceId: "0123456789abcdef" }, nowMs);
+    await store.updateMachineContact(installationB, {}, nowMs);
+    expect((await store.listAccountMachines(u2.userId)).find((m) => m.installationId === installationB)?.signalingDeviceId).toBe("0123456789abcdef");
 
     // deleteUserSession removes the row.
     const token = `pg-del-${uid()}`;
     await store.createUserSession({ userId: u2.userId, createdAt: nowMs, expiresAt: nowMs + 60_000, token });
     await store.deleteUserSession(token);
     expect(await store.getUserSession(token)).toBeNull();
+  });
+
+  it("claim handshake: claim, conflict, confirm-and-bind, deny (migration 0010 SQL)", async () => {
+    const owner = accountUser();
+    const rival = accountUser();
+    await store.createAccountUser(owner);
+    await store.createAccountUser(rival);
+    const installationId = uid();
+    await store.upsertInstallation({ installationId, pubKeyB58: `pk${uid()}`.slice(0, 64), createdAt: nowMs });
+
+    const deviceCode = `dc-${uid()}`;
+    await store.createDeviceAuth({
+      deviceCode,
+      installationId,
+      userCode: `UC${uid().slice(0, 6).toUpperCase()}`,
+      verifyUrl: "https://example.com/verify",
+      expiresAt: nowMs + 15 * 60 * 1000,
+      approved: false,
+      claimedByUserId: null,
+      claimedLabel: null,
+      claimedAt: null,
+      claimConfirmedAt: null,
+    });
+
+    // Claim by the owner; a rival's claim on the pending code conflicts;
+    // the owner's own re-claim refreshes idempotently.
+    expect(await store.claimDeviceByUserCode((await store.getDeviceAuth(deviceCode))!.userCode, owner.userId, "Laptop", nowMs)).toBe("claimed");
+    expect(await store.claimDeviceByUserCode((await store.getDeviceAuth(deviceCode))!.userCode, rival.userId, null, nowMs)).toBe("already_claimed");
+    expect(await store.claimDeviceByUserCode((await store.getDeviceAuth(deviceCode))!.userCode, owner.userId, "Laptop 2", nowMs)).toBe("claimed");
+
+    // Reads carry the claim; complete's gate is claimed-set + unconfirmed.
+    const pending = await store.getDeviceAuth(deviceCode);
+    expect(pending).toMatchObject({ claimedByUserId: owner.userId, claimedLabel: "Laptop 2", claimConfirmedAt: null, approved: false });
+
+    // Confirm flips approved AND claim_confirmed_at; the caller binds.
+    const confirmed = await store.resolveDeviceClaim(deviceCode, true, nowMs + 1_000);
+    expect(confirmed).toMatchObject({ approved: true, claimConfirmedAt: nowMs + 1_000, claimedByUserId: owner.userId });
+    expect(await store.bindMachineToAccount({ userId: owner.userId, installationId, label: confirmed!.claimedLabel, now: nowMs })).toBe("created");
+
+    // Deny path on a fresh code clears the claim without approving.
+    const deviceCode2 = `dc2-${uid()}`;
+    const userCode2 = `UD${uid().slice(0, 6).toUpperCase()}`;
+    await store.createDeviceAuth({
+      deviceCode: deviceCode2,
+      installationId: uid(),
+      userCode: userCode2,
+      verifyUrl: "https://example.com/verify",
+      expiresAt: nowMs + 15 * 60 * 1000,
+      approved: false,
+      claimedByUserId: null,
+      claimedLabel: null,
+      claimedAt: null,
+      claimConfirmedAt: null,
+    });
+    await store.claimDeviceByUserCode(userCode2, rival.userId, null, nowMs);
+    const denied = await store.resolveDeviceClaim(deviceCode2, false, nowMs);
+    expect(denied).toMatchObject({ approved: false, claimedByUserId: null, claimedLabel: null, claimConfirmedAt: null });
+    // Unknown codes resolve to null; unknown userCodes claim to "unknown".
+    expect(await store.resolveDeviceClaim(`missing-${uid()}`, true, nowMs)).toBeNull();
+    expect(await store.claimDeviceByUserCode(`XX${uid().slice(0, 6).toUpperCase()}`, owner.userId, null, nowMs)).toBe("unknown");
+  });
+
+  it("deleteAllUserSessions removes every row of the user only", async () => {
+    const user = accountUser();
+    const other = accountUser();
+    await store.createAccountUser(user);
+    await store.createAccountUser(other);
+    const mine = [`a-${uid()}`, `b-${uid()}`];
+    const theirs = `c-${uid()}`;
+    for (const token of mine) {
+      await store.createUserSession({ userId: user.userId, createdAt: nowMs, expiresAt: nowMs + 60_000, token });
+    }
+    await store.createUserSession({ userId: other.userId, createdAt: nowMs, expiresAt: nowMs + 60_000, token: theirs });
+
+    await store.deleteAllUserSessions(user.userId);
+    expect(await store.getUserSession(mine[0]!)).toBeNull();
+    expect(await store.getUserSession(mine[1]!)).toBeNull();
+    expect(await store.getUserSession(theirs)).not.toBeNull();
   });
 });

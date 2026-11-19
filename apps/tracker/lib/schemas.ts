@@ -37,6 +37,16 @@ export const DeviceCompleteSchema = z
   })
   .strict();
 
+/** POST /auth/device/claim-confirm — the device-side answer to a pending
+ *  account claim (ADR-013 P2 gate (a)). Same deviceCode channel as
+ *  complete; accept=false denies the claiming account and frees the code. */
+export const DeviceClaimConfirmSchema = z
+  .object({
+    deviceCode: z.string().min(16).max(128),
+    accept: z.boolean(),
+  })
+  .strict();
+
 export const DeviceApproveSchema = z
   .object({
     // Format of randomUserCode(): 8 chars, no separators, ambiguous glyphs removed.
@@ -343,11 +353,24 @@ export const AccountMachineLabelSchema = z
   .strict();
 
 /** POST /account/machines/{installationId}/heartbeat — the machine liveness
- *  touch. The body is exactly {} (nothing to say: identity is the signed
- *  envelope + session; the timestamp is server-side). Named
+ *  touch plus optional contact info (migration 0011). Identity is still the
+ *  signed envelope + session; the timestamp is server-side. signalingDeviceId
+ *  is the rd15 mailbox id (16 lowercase hex): PRESENT means set (null clears
+ *  it — sharing off; the string maps the machine for in-app connect),
+ *  ABSENT keeps the stored one (bare liveness payloads, old clients).
+ *  displayName auto-fills the machine's label while unnamed. Named
  *  MachineHeartbeatSchema because HeartbeatSchema above is the frozen peer
  *  lease heartbeat (/peers/heartbeat). */
-export const MachineHeartbeatSchema = z.object({}).strict();
+export const MachineHeartbeatSchema = z
+  .object({
+    signalingDeviceId: z
+      .string()
+      .regex(/^[0-9a-f]{16}$/, "16 lowercase hex signaling device id")
+      .nullable()
+      .optional(),
+    displayName: z.string().trim().min(1).max(64).optional(),
+  })
+  .strict();
 
 /** POST /admin/account/reset-password — ops password recovery until email
  *  infra exists; sets a new hash for a known email. */

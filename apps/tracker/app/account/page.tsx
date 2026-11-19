@@ -15,7 +15,7 @@ interface Me {
 
 interface Machine {
   installationId: string;
-  label: string;
+  label: string | null;
   status: "active" | "revoked";
   addedAt: string;
   approvedAt: string | null;
@@ -53,6 +53,8 @@ export default function AccountDashboardPage() {
   const [addError, setAddError] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<{ installationId: string; value: string } | null>(null);
   const [rowBusy, setRowBusy] = useState(false);
+  const [addInfo, setAddInfo] = useState<string | null>(null);
+  const [signOutBusy, setSignOutBusy] = useState(false);
 
   async function load(): Promise<boolean> {
     const meRes = await fetch("/api/v1/account/me", { credentials: "same-origin" });
@@ -82,6 +84,7 @@ export default function AccountDashboardPage() {
     e.preventDefault();
     setAddBusy(true);
     setAddError(null);
+    setAddInfo(null);
     try {
       const res = await fetch("/api/v1/account/devices/approve", {
         method: "POST",
@@ -92,7 +95,12 @@ export default function AccountDashboardPage() {
           ...(label.trim() ? { label: label.trim() } : {}),
         }),
       });
-      if (res.ok) {
+      if (res.status === 202) {
+        // Claim accepted — the binding waits for the device-side confirm.
+        setCode("");
+        setLabel("");
+        setAddInfo("Claim sent — check the machine's screen and confirm there to finish adding it.");
+      } else if (res.ok) {
         setCode("");
         setLabel("");
         await load();
@@ -104,6 +112,19 @@ export default function AccountDashboardPage() {
       setAddError("network error — try again");
     }
     setAddBusy(false);
+  }
+
+  async function signOutEverywhere() {
+    setSignOutBusy(true);
+    try {
+      await fetch("/api/v1/account/sessions/revoke-all", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+      }).catch(() => null);
+    } finally {
+      window.location.assign("/account/login");
+    }
   }
 
   async function revoke(installationId: string) {
@@ -164,6 +185,16 @@ export default function AccountDashboardPage() {
         <div style={{ display: "flex", alignItems: "baseline", gap: "0.8rem", flexWrap: "wrap" }}>
           <a href="/" style={{ color: "var(--accent)", fontSize: "0.8rem", textDecoration: "none" }}>← modelswarm.deepflux.space</a>
           <span style={{ flex: 1 }} />
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={signOutBusy}
+            onClick={() => void signOutEverywhere()}
+            style={{ fontSize: "0.78rem" }}
+            title="Sign out of every browser and device session, including this one"
+          >
+            {signOutBusy ? "signing out…" : "Sign out everywhere"}
+          </button>
           <button type="button" className="btn ghost" onClick={logout} style={{ fontSize: "0.78rem" }}>
             Log out
           </button>
@@ -180,7 +211,7 @@ export default function AccountDashboardPage() {
         <form onSubmit={addMachine} className="acct-card" style={{ background: "var(--bg)", marginBottom: "1.2rem", padding: "1rem 1.1rem" }}>
           <h2 style={{ margin: "0 0 0.5rem" }}>Add a machine</h2>
           <p style={{ color: "var(--text-2)", fontSize: "0.8rem", margin: "0 0 0.8rem", lineHeight: 1.6 }}>
-            Start hosting in the desktop app, then type the 8-character pairing code it shows here — the machine joins this account.
+            Start hosting in the desktop app, then type the 8-character pairing code it shows here — the machine asks you to confirm the claim on its screen, and joins this account once you accept there.
           </p>
           <div style={{ display: "flex", gap: "0.6rem", flexWrap: "wrap" }}>
             <input
@@ -206,6 +237,7 @@ export default function AccountDashboardPage() {
             </button>
           </div>
           {addError && <p role="alert" style={{ margin: "0.7rem 0 0", fontSize: "0.82rem", color: "#E07A7A" }}>{addError}</p>}
+          {addInfo && <p role="status" style={{ margin: "0.7rem 0 0", fontSize: "0.82rem", color: "var(--ok, #7AC97A)" }}>{addInfo}</p>}
         </form>
 
         <div className="tblcard">
@@ -257,7 +289,7 @@ export default function AccountDashboardPage() {
                         </button>
                       </span>
                     ) : (
-                      m.label
+                      m.label ?? <span style={{ color: "var(--text-3)" }}>Unnamed machine</span>
                     )}
                   </td>
                   <td title={m.installationId}>{shortId(m.installationId)}</td>
@@ -288,7 +320,7 @@ export default function AccountDashboardPage() {
                           type="button"
                           className="btn ghost"
                           disabled={rowBusy}
-                          onClick={() => setRenaming({ installationId: m.installationId, value: m.label })}
+                          onClick={() => setRenaming({ installationId: m.installationId, value: m.label ?? "" })}
                           style={{ padding: "0.3rem 0.7rem", fontSize: "0.75rem" }}
                         >
                           Rename

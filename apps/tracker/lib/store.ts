@@ -94,6 +94,15 @@ export interface DeviceAuthRecord {
   verifyUrl: string;
   expiresAt: number;
   approved: boolean;
+  /** Claim handshake (migration 0010, ADR-013 P2 gate (a)): the account
+   *  user who typed the userCode, the label they chose, and whether the
+   *  DEVICE has confirmed. claimedByUserId set + claimConfirmedAt null =
+   *  pending claim — binding happens only at confirm. All null on rows the
+   *  admin/auto-approve paths approved without a claim. */
+  claimedByUserId: string | null;
+  claimedLabel: string | null;
+  claimedAt: number | null;
+  claimConfirmedAt: number | null;
 }
 
 export interface SessionRecord {
@@ -243,7 +252,8 @@ export interface AccountUserRecord {
   createdAt: number;
 }
 
-/** Server session behind the msw_session cookie (30-day TTL, row-aging). */
+/** Server session behind the msw_session cookie (14-day TTL since P2 gate
+ *  (b); row-aging). */
 export interface UserSessionRecord {
   token: string;
   userId: string;
@@ -257,15 +267,20 @@ export type AccountMachineStatus = "active" | "revoked";
  *  written by hand (dashboard approval always sets it). lastSeenAt is the
  *  signed machine heartbeat's touch (migration 0009) — null while the
  *  binding has never been seen (fresh binds reset it; row-aging display
- *  only, no timers). */
+ *  only, no timers). signalingDeviceId (migration 0011) maps the machine to
+ *  its rd15 signaling mailbox for in-app connect — null while sharing is
+ *  off or no heartbeat carried a mapping. label is null until the owner
+ *  names the machine or a heartbeat auto-populates it from the display
+ *  name (only while NULL — renames win). */
 export interface AccountMachineRecord {
   userId: string;
   installationId: string;
-  label: string;
+  label: string | null;
   status: AccountMachineStatus;
   addedAt: number;
   approvedAt: number | null;
   lastSeenAt: number | null;
+  signalingDeviceId: string | null;
 }
 
 export interface TrackerStore {
@@ -487,16 +502,20 @@ export interface TrackerStore {
    *  (mirroring getSession usage). */
   getUserSession(token: string): Promise<UserSessionRecord | null>;
   deleteUserSession(token: string): Promise<void>;
+  /** Gate (b) affordance: delete EVERY session row of the user ("sign out
+   *  everywhere"). Also the shared core of setAccountUserPassword's kill. */
+  deleteAllUserSessions(userId: string): Promise<void>;
   listAccountMachines(userId: string): Promise<AccountMachineRecord[]>;
   /** The single active owner of an installation, if any. */
   getActiveAccountForInstallation(installationId: string): Promise<{ userId: string } | null>;
   /** Create/refresh the binding as 'active' (flips the user's own revoked
    *  row back). "already_bound" when the installation is active under a
-   *  DIFFERENT account — the caller maps that to 409 already_bound. */
+   *  DIFFERENT account — the caller maps that to 409 already_bound. label
+   *  may be null (claim-handshake binds; heartbeat auto-populates later). */
   bindMachineToAccount(rec: {
     userId: string;
     installationId: string;
-    label: string;
+    label: string | null;
     now: number;
   }): Promise<"created" | "already_bound">;
   /** Revoke one of the user's machines (frees the installation for another
@@ -505,14 +524,37 @@ export interface TrackerStore {
    *  status='active' path here. False when unknown or not owned. */
   revokeAccountMachine(userId: string, installationId: string): Promise<boolean>;
   setAccountMachineLabel(userId: string, installationId: string, label: string): Promise<boolean>;
-  /** Machine-seen touch (migration 0009): stamp lastSeenAt on the
-   *  installation's ACTIVE account_machines row. True iff an active row was
-   *  touched — no active binding (never bound, or revoked) is false, which
-   *  the heartbeat route maps to 404 unknown_machine. */
-  touchAccountMachineSeen(installationId: string, now: number): Promise<boolean>;
+  /** Machine heartbeat contact (migrations 0009 + 0011): stamp lastSeenAt,
+   *  set-or-clear signalingDeviceId (present means set — null clears, so a
+   *  sharing-off machine drops out of the controllable directory; absent
+   *  keeps the stored mapping for bare liveness payloads), and
+   *  auto-populate a NULL label from the display name (renames win). True
+   *  iff an active row was touched — no active binding (never bound, or
+   *  revoked) is false, which the heartbeat route maps to 404
+   *  unknown_machine. */
+  updateMachineContact(
+    installationId: string,
+    contact: { signalingDeviceId?: string | null; displayName?: string },
+    now: number,
+  ): Promise<boolean>;
   /** Device pairing-code lookup for the dashboard approve flow (newest
    *  matching row, mirroring approveDeviceByUserCode's update set). */
   getDeviceAuthByUserCode(userCode: string): Promise<DeviceAuthRecord | null>;
+  /** Claim handshake (gate (a)): the dashboard approve writes a PENDING
+   *  claim — no bind. "already_claimed" when a DIFFERENT user's claim is
+   *  pending (same user re-approving refreshes idempotently); "unknown"
+   *  when no live code matches (caller keeps the no-liveness-oracle 404). */
+  claimDeviceByUserCode(
+    userCode: string,
+    userId: string,
+    label: string | null,
+    now: number,
+  ): Promise<"claimed" | "already_claimed" | "unknown">;
+  /** Device-side confirm (accept=true: stamp claim_confirmed_at AND flip
+   *  approved — the caller then binds via bindMachineToAccount) or deny
+   *  (accept=false: clear the claim so the owner can re-approve). Returns
+   *  the updated record, or null when the deviceCode is unknown. */
+  resolveDeviceClaim(deviceCode: string, accept: boolean, now: number): Promise<DeviceAuthRecord | null>;
 }
 
 // ===========================================================================
@@ -613,6 +655,43 @@ export class MemoryStore implements TrackerStore {
       if (rec.userCode === userCode && (!best || rec.expiresAt > best.expiresAt)) best = rec;
     }
     return best ? { ...best } : null;
+  }
+
+  async claimDeviceByUserCode(
+    userCode: string,
+    userId: string,
+    label: string | null,
+    now: number,
+  ): Promise<"claimed" | "already_claimed" | "unknown"> {
+    let best: DeviceAuthRecord | null = null;
+    for (const rec of this.deviceAuths.values()) {
+      if (rec.userCode === userCode && (!best || rec.expiresAt > best.expiresAt)) best = rec;
+    }
+    if (!best || best.expiresAt <= this.clock()) return "unknown";
+    if (best.claimedByUserId !== null && best.claimedByUserId !== userId) return "already_claimed";
+    best.claimedByUserId = userId;
+    best.claimedLabel = label;
+    best.claimedAt = now;
+    best.claimConfirmedAt = null; // same-user re-claim: back to pending
+    return "claimed";
+  }
+
+  async resolveDeviceClaim(deviceCode: string, accept: boolean, now: number): Promise<DeviceAuthRecord | null> {
+    const rec = this.deviceAuths.get(deviceCode);
+    if (!rec) return null;
+    if (accept) {
+      // Confirm: the claim becomes binding-approved. The CALLER performs the
+      // account_machines bind (needs the claiming user + label).
+      rec.claimConfirmedAt = now;
+      rec.approved = true;
+    } else {
+      // Deny: clear the claim; the code stays usable for a fresh approval.
+      rec.claimedByUserId = null;
+      rec.claimedLabel = null;
+      rec.claimedAt = null;
+      rec.claimConfirmedAt = null;
+    }
+    return { ...rec };
   }
 
   async createSession(rec: SessionRecord): Promise<void> {
@@ -1288,9 +1367,7 @@ export class MemoryStore implements TrackerStore {
     if (!rec) return false;
     rec.passwordHash = passwordHash;
     // Kill every live session: a reset must invalidate stolen cookies too.
-    for (const [token, session] of this.userSessions) {
-      if (session.userId === userId) this.userSessions.delete(token);
-    }
+    await this.deleteAllUserSessions(userId);
     return true;
   }
 
@@ -1327,6 +1404,12 @@ export class MemoryStore implements TrackerStore {
     this.userSessions.delete(token);
   }
 
+  async deleteAllUserSessions(userId: string): Promise<void> {
+    for (const [token, session] of this.userSessions) {
+      if (session.userId === userId) this.userSessions.delete(token);
+    }
+  }
+
   async listAccountMachines(userId: string): Promise<AccountMachineRecord[]> {
     return [...this.accountMachines.values()]
       .filter((m) => m.userId === userId)
@@ -1346,7 +1429,7 @@ export class MemoryStore implements TrackerStore {
   async bindMachineToAccount(rec: {
     userId: string;
     installationId: string;
-    label: string;
+    label: string | null;
     now: number;
   }): Promise<"created" | "already_bound"> {
     // The partial unique index's rule, in code: one ACTIVE owner per
@@ -1361,9 +1444,11 @@ export class MemoryStore implements TrackerStore {
       existing.label = rec.label;
       existing.status = "active";
       existing.approvedAt = rec.now;
-      // Liveness is per-binding: a re-activated row has not been seen under
-      // it (mirrors the Pg upsert's last_seen_at = NULL).
+      // Liveness and the signaling mapping are per-binding: a re-activated
+      // row has not been seen under it and carries no connect mapping until
+      // the machine heartbeats one (mirrors the Pg upsert's NULL resets).
       existing.lastSeenAt = null;
+      existing.signalingDeviceId = null;
     } else {
       this.accountMachines.set(`${rec.userId}:${rec.installationId}`, {
         userId: rec.userId,
@@ -1373,6 +1458,7 @@ export class MemoryStore implements TrackerStore {
         addedAt: rec.now,
         approvedAt: rec.now,
         lastSeenAt: null,
+        signalingDeviceId: null,
       });
     }
     return "created";
@@ -1392,13 +1478,21 @@ export class MemoryStore implements TrackerStore {
     return true;
   }
 
-  async touchAccountMachineSeen(installationId: string, now: number): Promise<boolean> {
+  async updateMachineContact(
+    installationId: string,
+    contact: { signalingDeviceId?: string | null; displayName?: string },
+    now: number,
+  ): Promise<boolean> {
     // At most one ACTIVE row per installation (the partial unique index's
     // rule, enforced in code on this side) — touch it and report existence.
     let touched = false;
     for (const rec of this.accountMachines.values()) {
       if (rec.installationId === installationId && rec.status === "active") {
         rec.lastSeenAt = now;
+        if (contact.signalingDeviceId !== undefined) rec.signalingDeviceId = contact.signalingDeviceId;
+        // Auto-populate only while unnamed: an owner rename (or an earlier
+        // displayName) always wins over the machine's self-report.
+        if (rec.label === null && contact.displayName !== undefined) rec.label = contact.displayName;
         touched = true;
       }
     }
@@ -1509,29 +1603,13 @@ export class PgStore implements TrackerStore {
 
   async getDeviceAuth(deviceCode: string): Promise<DeviceAuthRecord | null> {
     const rows = await this.query(
-      `SELECT device_code, installation_id, user_code, verify_url, approved, expires_at
+      `SELECT device_code, installation_id, user_code, verify_url, approved, expires_at,
+              claimed_by_user, claimed_label, claimed_at, claim_confirmed_at
        FROM device_codes WHERE device_code = $1`,
       [deviceCode],
     );
-    const row = rows[0] as
-      | {
-          device_code: string;
-          installation_id: string;
-          user_code: string;
-          verify_url: string;
-          approved: boolean;
-          expires_at: Date;
-        }
-      | undefined;
-    if (!row) return null;
-    return {
-      deviceCode: row.device_code,
-      installationId: row.installation_id,
-      userCode: row.user_code,
-      verifyUrl: row.verify_url,
-      approved: row.approved,
-      expiresAt: row.expires_at.getTime(),
-    };
+    const row = rows[0];
+    return row ? PgStore.rowToDeviceAuth(row as Record<string, unknown>) : null;
   }
 
   async approveDevice(deviceCode: string): Promise<boolean> {
@@ -1554,30 +1632,63 @@ export class PgStore implements TrackerStore {
     // Newest matching row — the same population approveDeviceByUserCode
     // updates (it flips every matching row; binding needs the one newest).
     const rows = await this.query(
-      `SELECT device_code, installation_id, user_code, verify_url, approved, expires_at
+      `SELECT device_code, installation_id, user_code, verify_url, approved, expires_at,
+              claimed_by_user, claimed_label, claimed_at, claim_confirmed_at
        FROM device_codes WHERE user_code = $1
        ORDER BY created_at DESC LIMIT 1`,
       [userCode],
     );
-    const row = rows[0] as
-      | {
-          device_code: string;
-          installation_id: string;
-          user_code: string;
-          verify_url: string;
-          approved: boolean;
-          expires_at: Date;
-        }
-      | undefined;
-    if (!row) return null;
-    return {
-      deviceCode: row.device_code,
-      installationId: row.installation_id,
-      userCode: row.user_code,
-      verifyUrl: row.verify_url,
-      approved: row.approved,
-      expiresAt: row.expires_at.getTime(),
-    };
+    const row = rows[0];
+    return row ? PgStore.rowToDeviceAuth(row as Record<string, unknown>) : null;
+  }
+
+  async claimDeviceByUserCode(
+    userCode: string,
+    userId: string,
+    label: string | null,
+    now: number,
+  ): Promise<"claimed" | "already_claimed" | "unknown"> {
+    // Targets exactly the newest live code with that userCode — the same row
+    // getDeviceAuthByUserCode reads. Same-user re-claims refresh (back to
+    // pending); a different user's pending claim blocks (already_claimed).
+    const rows = await this.query(
+      `UPDATE device_codes d SET
+         claimed_by_user = $2, claimed_label = $3, claimed_at = $4, claim_confirmed_at = NULL
+       WHERE d.user_code = $1
+         AND d.expires_at > $4::timestamptz
+         AND (d.claimed_by_user IS NULL OR d.claimed_by_user = $2)
+         AND d.created_at = (SELECT MAX(created_at) FROM device_codes WHERE user_code = $1)
+       RETURNING device_code`,
+      [userCode, userId, label, PgStore.iso(now)],
+    );
+    if (rows.length > 0) return "claimed";
+    // Conflict classification for the caller's 404-vs-409: an expired or
+    // missing code is "unknown" (no liveness oracle), someone else's pending
+    // claim on a live code is "already_claimed".
+    const current = await this.getDeviceAuthByUserCode(userCode);
+    if (current && current.expiresAt > now && current.claimedByUserId !== null && current.claimedByUserId !== userId) {
+      return "already_claimed";
+    }
+    return "unknown";
+  }
+
+  async resolveDeviceClaim(deviceCode: string, accept: boolean, now: number): Promise<DeviceAuthRecord | null> {
+    // Confirm: stamp claim_confirmed_at AND flip approved — the caller then
+    // binds via bindMachineToAccount. Deny: clear the claim entirely so the
+    // owner can re-approve with the same still-live code.
+    const sql = accept
+      ? `UPDATE device_codes SET claim_confirmed_at = $2, approved = true
+         WHERE device_code = $1
+         RETURNING device_code, installation_id, user_code, verify_url, approved, expires_at,
+                   claimed_by_user, claimed_label, claimed_at, claim_confirmed_at`
+      : `UPDATE device_codes SET claimed_by_user = NULL, claimed_label = NULL,
+                                 claimed_at = NULL, claim_confirmed_at = NULL
+         WHERE device_code = $1
+         RETURNING device_code, installation_id, user_code, verify_url, approved, expires_at,
+                   claimed_by_user, claimed_label, claimed_at, claim_confirmed_at`;
+    const rows = await this.query(sql, accept ? [deviceCode, PgStore.iso(now)] : [deviceCode]);
+    const row = rows[0];
+    return row ? PgStore.rowToDeviceAuth(row as Record<string, unknown>) : null;
   }
 
   async createSession(rec: SessionRecord): Promise<void> {
@@ -2591,6 +2702,24 @@ export class PgStore implements TrackerStore {
     };
   }
 
+  private static rowToDeviceAuth(row: Record<string, unknown>): DeviceAuthRecord {
+    return {
+      deviceCode: row.device_code as string,
+      installationId: row.installation_id as string,
+      userCode: row.user_code as string,
+      verifyUrl: row.verify_url as string,
+      approved: row.approved as boolean,
+      expiresAt: (row.expires_at as Date).getTime(),
+      claimedByUserId: (row.claimed_by_user as string | null) ?? null,
+      claimedLabel: (row.claimed_label as string | null) ?? null,
+      claimedAt: row.claimed_at === null || row.claimed_at === undefined ? null : (row.claimed_at as Date).getTime(),
+      claimConfirmedAt:
+        row.claim_confirmed_at === null || row.claim_confirmed_at === undefined
+          ? null
+          : (row.claim_confirmed_at as Date).getTime(),
+    };
+  }
+
   async createAccountUser(rec: AccountUserRecord): Promise<void> {
     // A duplicate email raises Pg 23505 here — the route checked first and
     // maps this throw to 409 email_taken.
@@ -2628,7 +2757,7 @@ export class PgStore implements TrackerStore {
     );
     if (rows.length === 0) return false;
     // Kill every live session: a reset must invalidate stolen cookies too.
-    await this.query(`DELETE FROM user_sessions WHERE user_id = $1`, [userId]);
+    await this.deleteAllUserSessions(userId);
     return true;
   }
 
@@ -2670,9 +2799,13 @@ export class PgStore implements TrackerStore {
     await this.query(`DELETE FROM user_sessions WHERE token = $1`, [token]);
   }
 
+  async deleteAllUserSessions(userId: string): Promise<void> {
+    await this.query(`DELETE FROM user_sessions WHERE user_id = $1`, [userId]);
+  }
+
   async listAccountMachines(userId: string): Promise<AccountMachineRecord[]> {
     const rows = await this.query(
-      `SELECT user_id, installation_id, label, status, added_at, approved_at, last_seen_at
+      `SELECT user_id, installation_id, label, status, added_at, approved_at, last_seen_at, signaling_device_id
        FROM account_machines WHERE user_id = $1
        ORDER BY added_at DESC, installation_id ASC`,
       [userId],
@@ -2680,11 +2813,12 @@ export class PgStore implements TrackerStore {
     return (rows as Record<string, unknown>[]).map((row) => ({
       userId: row.user_id as string,
       installationId: row.installation_id as string,
-      label: row.label as string,
+      label: (row.label as string | null) ?? null,
       status: row.status as AccountMachineStatus,
       addedAt: (row.added_at as Date).getTime(),
       approvedAt: row.approved_at === null ? null : (row.approved_at as Date).getTime(),
       lastSeenAt: row.last_seen_at === null ? null : (row.last_seen_at as Date).getTime(),
+      signalingDeviceId: (row.signaling_device_id as string | null) ?? null,
     }));
   }
 
@@ -2700,7 +2834,7 @@ export class PgStore implements TrackerStore {
   async bindMachineToAccount(rec: {
     userId: string;
     installationId: string;
-    label: string;
+    label: string | null;
     now: number;
   }): Promise<"created" | "already_bound"> {
     // Pre-check mirrors the partial unique index's rule; the index itself is
@@ -2714,7 +2848,7 @@ export class PgStore implements TrackerStore {
          VALUES ($1, $2, $3, 'active', $4, $4)
          ON CONFLICT (user_id, installation_id) DO UPDATE
            SET label = EXCLUDED.label, status = 'active', approved_at = EXCLUDED.approved_at,
-               last_seen_at = NULL`,
+               last_seen_at = NULL, signaling_device_id = NULL`,
         [rec.userId, rec.installationId, rec.label, at],
       );
       return "created";
@@ -2746,14 +2880,31 @@ export class PgStore implements TrackerStore {
     return rows.length > 0;
   }
 
-  async touchAccountMachineSeen(installationId: string, now: number): Promise<boolean> {
+  async updateMachineContact(
+    installationId: string,
+    contact: { signalingDeviceId?: string | null; displayName?: string },
+    now: number,
+  ): Promise<boolean> {
     // The partial unique index guarantees at most one ACTIVE row per
-    // installation — the heartbeat's last-seen touch targets exactly it.
+    // installation — the heartbeat's touch targets exactly it. The signaling
+    // mapping is PRESENT-means-set (a present NULL clears it: a sharing-off
+    // machine reports null so the directory stops listing it as
+    // controllable); ABSENT keeps the stored one (bare liveness payloads).
+    // Label auto-populates only while NULL — owner renames always win.
     const rows = await this.query(
-      `UPDATE account_machines SET last_seen_at = $2
+      `UPDATE account_machines SET
+         last_seen_at = $2,
+         signaling_device_id = CASE WHEN $5 THEN $3 ELSE signaling_device_id END,
+         label = COALESCE(label, $4)
         WHERE installation_id = $1 AND status = 'active'
         RETURNING installation_id`,
-      [installationId, PgStore.iso(now)],
+      [
+        installationId,
+        PgStore.iso(now),
+        contact.signalingDeviceId ?? null,
+        contact.displayName ?? null,
+        contact.signalingDeviceId !== undefined,
+      ],
     );
     return rows.length > 0;
   }

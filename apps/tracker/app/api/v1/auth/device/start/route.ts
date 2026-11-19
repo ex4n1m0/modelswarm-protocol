@@ -51,6 +51,12 @@ export async function POST(req: Request) {
     verifyUrl: ctx.verifyUrl,
     expiresAt: now + DEVICE_CODE_TTL_MS,
     approved: autoApprove,
+    // No claim yet — the account-side approve handshake (migration 0010)
+    // fills these in.
+    claimedByUserId: null,
+    claimedLabel: null,
+    claimedAt: null,
+    claimConfirmedAt: null,
   });
 
   return jsonOk({

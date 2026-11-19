@@ -23,6 +23,7 @@ export type ErrorCode =
   | "invalid_credentials"
   | "signup_closed"
   | "already_bound"
+  | "already_claimed"
   | "unknown_machine";
 
 /** Frozen mapping (msp-v1 §3.4). unknown_profile is 404 on public catalog
@@ -49,6 +50,7 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   invalid_credentials: 401,
   signup_closed: 403,
   already_bound: 409,
+  already_claimed: 409,
   unknown_machine: 404,
 };
 

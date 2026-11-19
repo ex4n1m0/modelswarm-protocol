@@ -1,9 +1,11 @@
-// POST /api/v1/account/devices/approve — the signed-in website user approves
-// a device enrollment by its 8-char pairing code AND binds that installation
-// to their account (the account-layer twin of /admin/devices/approve: the
-// pending phase still lives in device_codes; approval here also creates the
-// account_machines row directly as 'active'). Requires a live msw_session.
-// Rate class "account" applies BEFORE any parse or store write.
+// POST /api/v1/account/devices/approve — the signed-in website user claims
+// a device enrollment by its 8-char pairing code (gate (a), migration 0010).
+// This no longer binds: the claim is PENDING until the DEVICE confirms it
+// (its next /auth/device/complete poll reports the claim; the device answers
+// via /auth/device/claim-confirm, and the bind happens there). A leaked
+// userCode can then at worst dangle a pending claim the device declines.
+// Requires a live msw_session. Rate class "account" applies BEFORE any
+// parse or store write.
 
 import { jsonErrorFor, jsonOk, logEvent } from "@/lib/errors";
 import { guardPublicBody, requireJsonContentType } from "@/lib/guard";
@@ -35,21 +37,29 @@ export async function POST(req: Request): Promise<Response> {
     return jsonErrorFor("already_bound", "device is already bound to another account");
   }
 
-  // Same update the admin route performs, then the binding.
-  if (!(await ctx.store.approveDeviceByUserCode(body.userCode))) {
+  const claimed = await ctx.store.claimDeviceByUserCode(
+    body.userCode,
+    auth.userId,
+    body.label?.trim() || null,
+    ctx.now(),
+  );
+  if (claimed === "unknown") {
+    // Lost a race with code expiry between the read and the write.
     return jsonErrorFor("unknown_request", "no pending device with that code");
   }
-  const label = body.label ?? "Machine";
-  const bound = await ctx.store.bindMachineToAccount({
-    userId: auth.userId,
-    installationId: device.installationId,
-    label,
-    now: ctx.now(),
-  });
-  if (bound === "already_bound") {
-    // Lost the exclusivity race between the check and the write.
-    return jsonErrorFor("already_bound", "device is already bound to another account");
+  if (claimed === "already_claimed") {
+    return jsonErrorFor("already_claimed", "another account has a pending claim on this code");
   }
-  logEvent("info", { event: "account_device_approve", userId: auth.userId, installationId: device.installationId });
-  return jsonOk({ installationId: device.installationId, label, status: "active" }, 201);
+  logEvent("info", { event: "account_device_claim", userId: auth.userId, installationId: device.installationId });
+  // 202: the claim is accepted but the binding awaits the device-side
+  // confirmation. The dashboard tells the user to look at the machine.
+  return jsonOk(
+    {
+      status: "claim_pending",
+      installationId: device.installationId,
+      label: body.label?.trim() || null,
+      confirmBy: new Date(device.expiresAt).toISOString(),
+    },
+    202,
+  );
 }

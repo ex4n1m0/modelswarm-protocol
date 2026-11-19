@@ -134,6 +134,10 @@ describe("device_codes: expired-beyond-grace rows are swept at write time", () =
       verifyUrl: "https://x/verify",
       approved: false,
       expiresAt: t - EXPIRED_ROW_GRACE_MS - 1,
+      claimedByUserId: null,
+      claimedLabel: null,
+      claimedAt: null,
+      claimConfirmedAt: null,
     });
     await store.createDeviceAuth({
       deviceCode: "fresh",
@@ -142,6 +146,10 @@ describe("device_codes: expired-beyond-grace rows are swept at write time", () =
       verifyUrl: "https://x/verify",
       approved: false,
       expiresAt: t + 60_000,
+      claimedByUserId: null,
+      claimedLabel: null,
+      claimedAt: null,
+      claimConfirmedAt: null,
     });
     expect(await store.getDeviceAuth("fresh")).not.toBeNull();
     expect(await store.getDeviceAuth("dead")).toBeNull();

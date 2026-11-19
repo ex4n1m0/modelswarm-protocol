@@ -14,9 +14,13 @@ import * as revokeRoute from "@/app/api/v1/account/machines/[installationId]/rev
 import * as labelRoute from "@/app/api/v1/account/machines/[installationId]/label/route";
 import * as resetRoute from "@/app/api/v1/admin/account/reset-password/route";
 import * as deviceStart from "@/app/api/v1/auth/device/start/route";
+import * as deviceComplete from "@/app/api/v1/auth/device/complete/route";
+import * as claimConfirmRoute from "@/app/api/v1/auth/device/claim-confirm/route";
+import * as revokeAllRoute from "@/app/api/v1/account/sessions/revoke-all/route";
+import * as directoryRoute from "@/app/api/v1/account/directory/route";
 import { hashPassword, verifyPassword } from "@/lib/passwords";
 import { USER_SESSION_TTL_MS } from "@/lib/constants";
-import { keyPairIds, makeKeypair, makeRig } from "./helpers";
+import { keyPairIds, makeKeypair, makeRig, signedRequest } from "./helpers";
 import { DEVICE_CODE_TTL_MS } from "@/lib/constants";
 
 let rig: ReturnType<typeof makeRig>;
@@ -68,7 +72,7 @@ async function createAccount(email: string, password = "correct-horse-battery", 
  *  pairing code). Pass `keys` to re-enroll the SAME installation. */
 async function startDeviceEnrollment(
   keys = makeKeypair(),
-): Promise<{ installationId: string; userCode: string; keys: ReturnType<typeof makeKeypair> }> {
+): Promise<{ installationId: string; userCode: string; deviceCode: string; keys: ReturnType<typeof makeKeypair> }> {
   const { installationId, pubKeyB58 } = keyPairIds(keys);
   const res = await deviceStart.POST(
     new Request("http://tracker.local/api/v1/auth/device/start", {
@@ -78,8 +82,38 @@ async function startDeviceEnrollment(
     }),
   );
   expect(res.status).toBe(200);
-  const body = (await res.json()) as { userCode: string };
-  return { installationId, userCode: body.userCode, keys };
+  const body = (await res.json()) as { userCode: string; deviceCode: string };
+  return { installationId, userCode: body.userCode, deviceCode: body.deviceCode, keys };
+}
+
+/** The full claim handshake as the real parties run it: the account user
+ *  claims the userCode at the dashboard (202, no bind yet), and the DEVICE
+ *  confirms with its key (the only step that can complete the binding). */
+async function claimAndConfirm(
+  acctToken: string,
+  enrollment: { installationId: string; userCode: string; deviceCode: string; keys: ReturnType<typeof makeKeypair> },
+  label?: string,
+): Promise<void> {
+  const claimRes = await approveRoute.POST(
+    jsonPost(
+      "/api/v1/account/devices/approve",
+      { userCode: enrollment.userCode, ...(label !== undefined ? { label } : {}) },
+      { ...withCookie(acctToken), "x-forwarded-for": nextIp() },
+    ),
+  );
+  expect(claimRes.status).toBe(202);
+  const confirmRes = await claimConfirmRoute.POST(
+    signedRequest(
+      enrollment.keys,
+      enrollment.installationId,
+      "",
+      "/api/v1/auth/device/claim-confirm",
+      JSON.stringify({ deviceCode: enrollment.deviceCode, accept: true }),
+      rig.ctx.now,
+      { ip: nextIp() },
+    ),
+  );
+  expect(confirmRes.status).toBe(200);
 }
 
 // ---------------------------------------------------------------------------
@@ -275,27 +309,37 @@ describe("login + logout + expiry", () => {
 // device approve + machine binding
 
 describe("account devices/approve + machines", () => {
-  it("end-to-end: approve binds the installation; re-approve from another account -> 409; revoke frees it", async () => {
+  it("end-to-end: claim + device confirm binds the installation; re-claim from another account -> 409; revoke frees it", async () => {
     const owner = await createAccount("owner@example.com");
     const rival = await createAccount("rival@example.com");
     const first = await startDeviceEnrollment();
-    const { installationId, userCode, keys } = first;
+    const { installationId, keys } = first;
 
-    const approveRes = await approveRoute.POST(
-      jsonPost("/api/v1/account/devices/approve", { userCode }, { ...withCookie(owner.token), "x-forwarded-for": nextIp() }),
+    // The dashboard claim alone does NOT bind — 202, pending device confirm.
+    const claimRes = await approveRoute.POST(
+      jsonPost("/api/v1/account/devices/approve", { userCode: first.userCode, label: "Machine" }, { ...withCookie(owner.token), "x-forwarded-for": nextIp() }),
     );
-    expect(approveRes.status).toBe(201);
-    expect(await approveRes.json()).toEqual({ installationId, label: "Machine", status: "active" });
+    expect(claimRes.status).toBe(202);
+    const claimBody = (await claimRes.json()) as { status: string; installationId: string; label: string | null; confirmBy: string };
+    expect(claimBody).toMatchObject({ status: "claim_pending", installationId, label: "Machine" });
+    expect(Date.parse(claimBody.confirmBy)).toBeGreaterThan(rig.nowMs);
+    expect((await rig.store.listAccountMachines(owner.userId))).toHaveLength(0);
+
+    // The device confirms — only this step creates the binding.
+    const confirmRes = await claimConfirmRoute.POST(
+      signedRequest(keys, installationId, "", "/api/v1/auth/device/claim-confirm", JSON.stringify({ deviceCode: first.deviceCode, accept: true }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(confirmRes.status).toBe(200);
 
     const listRes = await machinesRoute.GET(new Request("http://tracker.local/api/v1/account/machines", { headers: withCookie(owner.token) }));
     expect(listRes.status).toBe(200);
-    const list = (await listRes.json()) as { machines: Array<{ installationId: string; label: string; status: string; addedAt: string; approvedAt: string | null }> };
+    const list = (await listRes.json()) as { machines: Array<{ installationId: string; label: string | null; status: string; addedAt: string; approvedAt: string | null }> };
     expect(list.machines).toHaveLength(1);
     expect(list.machines[0]).toMatchObject({ installationId, label: "Machine", status: "active" });
     expect(Date.parse(list.machines[0]!.addedAt)).toBe(rig.nowMs);
     expect(list.machines[0]!.approvedAt).not.toBeNull();
 
-    // A second enrollment of the SAME installation, approved by the rival:
+    // A second enrollment of the SAME installation, claimed by the rival:
     // the installation is active under the owner -> already_bound.
     const second = await startDeviceEnrollment(keys);
     expect(second.installationId).toBe(installationId);
@@ -320,11 +364,8 @@ describe("account devices/approve + machines", () => {
     expect(ownerList[0]!.status).toBe("revoked");
 
     const third = await startDeviceEnrollment(keys);
-    const rebindRes = await approveRoute.POST(
-      jsonPost("/api/v1/account/devices/approve", { userCode: third.userCode, label: "Rival Machine" }, { ...withCookie(rival.token), "x-forwarded-for": nextIp() }),
-    );
-    expect(rebindRes.status).toBe(201);
-    const rivalList = ((await (await machinesRoute.GET(new Request("http://tracker.local/api/v1/account/machines", { headers: withCookie(rival.token) }))).json()) as { machines: Array<{ installationId: string; status: string; label: string }> }).machines;
+    await claimAndConfirm(rival.token, third, "Rival Machine");
+    const rivalList = ((await (await machinesRoute.GET(new Request("http://tracker.local/api/v1/account/machines", { headers: withCookie(rival.token) }))).json()) as { machines: Array<{ installationId: string; status: string; label: string | null }> }).machines;
     expect(rivalList).toHaveLength(1);
     expect(rivalList[0]).toMatchObject({ installationId, status: "active", label: "Rival Machine" });
   });
@@ -359,10 +400,9 @@ describe("account devices/approve + machines", () => {
   it("label rename works and 404s for machines you do not own", async () => {
     const acct = await createAccount("rename@example.com");
     const other = await createAccount("other@example.com");
-    const { installationId, userCode } = await startDeviceEnrollment();
-    await approveRoute.POST(
-      jsonPost("/api/v1/account/devices/approve", { userCode, label: "Workstation" }, { ...withCookie(acct.token), "x-forwarded-for": nextIp() }),
-    );
+    const enrollment = await startDeviceEnrollment();
+    const { installationId } = enrollment;
+    await claimAndConfirm(acct.token, enrollment, "Workstation");
 
     const labelRes = await labelRoute.POST(
       new Request(`http://tracker.local/api/v1/account/machines/${installationId}/label`, {
@@ -410,6 +450,227 @@ describe("account devices/approve + machines", () => {
     );
     expect(garbageRes.status).toBe(404);
     expect(((await garbageRes.json()) as { error: { code: string } }).error.code).toBe("unknown_machine");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the claim handshake (gate (a), migration 0010)
+
+describe("claim handshake", () => {
+  /** Full enrollment WITH an MSP session (admin-approve hook like the
+   *  heartbeat suite), so the claim tests can drive complete + directory. */
+  async function enrollWithSession(keys = makeKeypair()): Promise<{
+    installationId: string;
+    userCode: string;
+    deviceCode: string;
+    keys: ReturnType<typeof makeKeypair>;
+    session: string;
+  }> {
+    const e = await startDeviceEnrollment(keys);
+    await rig.store.approveDevice(e.deviceCode);
+    const res = await deviceComplete.POST(
+      signedRequest(keys, e.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: e.deviceCode }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(res.status).toBe(200);
+    return { ...e, session: ((await res.json()) as { token: string }).token };
+  }
+
+  it("an unconfirmed claim gates complete: claim_pending with the masked claimer; confirm releases the session", async () => {
+    const owner = await createAccount("claimer@example.com");
+    const machine = await startDeviceEnrollment();
+
+    const claimRes = await approveRoute.POST(
+      jsonPost("/api/v1/account/devices/approve", { userCode: machine.userCode }, { ...withCookie(owner.token), "x-forwarded-for": nextIp() }),
+    );
+    expect(claimRes.status).toBe(202);
+
+    // complete now reports the pending claim instead of minting a session.
+    const pendingRes = await deviceComplete.POST(
+      signedRequest(machine.keys, machine.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: machine.deviceCode }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(pendingRes.status).toBe(200);
+    expect(await pendingRes.json()).toEqual({ status: "claim_pending", claimedBy: "c***@example.com" });
+
+    // Confirm; the next complete mints the session normally.
+    const confirmRes = await claimConfirmRoute.POST(
+      signedRequest(machine.keys, machine.installationId, "", "/api/v1/auth/device/claim-confirm", JSON.stringify({ deviceCode: machine.deviceCode, accept: true }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(confirmRes.status).toBe(200);
+    const doneRes = await deviceComplete.POST(
+      signedRequest(machine.keys, machine.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: machine.deviceCode }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(doneRes.status).toBe(200);
+    expect(((await doneRes.json()) as { token: string }).token).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("a rival's pending claim blocks the owner's claim -> 409 already_claimed", async () => {
+    const owner = await createAccount("real-owner@example.com");
+    const rival = await createAccount("code-thief@example.com");
+    const machine = await startDeviceEnrollment();
+
+    // The leaked userCode lets the rival CLAIM — but only pending.
+    const rivalRes = await approveRoute.POST(
+      jsonPost("/api/v1/account/devices/approve", { userCode: machine.userCode }, { ...withCookie(rival.token), "x-forwarded-for": nextIp() }),
+    );
+    expect(rivalRes.status).toBe(202);
+    expect((await rig.store.listAccountMachines(rival.userId))).toHaveLength(0);
+
+    const ownerRes = await approveRoute.POST(
+      jsonPost("/api/v1/account/devices/approve", { userCode: machine.userCode }, { ...withCookie(owner.token), "x-forwarded-for": nextIp() }),
+    );
+    expect(ownerRes.status).toBe(409);
+    expect(((await ownerRes.json()) as { error: { code: string } }).error.code).toBe("already_claimed");
+  });
+
+  it("device denies the claim -> cleared, nothing bound, the right owner can re-claim the same code", async () => {
+    const owner = await createAccount("denied-owner@example.com");
+    const rival = await createAccount("denied-rival@example.com");
+    const machine = await startDeviceEnrollment();
+
+    await approveRoute.POST(
+      jsonPost("/api/v1/account/devices/approve", { userCode: machine.userCode }, { ...withCookie(rival.token), "x-forwarded-for": nextIp() }),
+    );
+    const denyRes = await claimConfirmRoute.POST(
+      signedRequest(machine.keys, machine.installationId, "", "/api/v1/auth/device/claim-confirm", JSON.stringify({ deviceCode: machine.deviceCode, accept: false }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(denyRes.status).toBe(200);
+    expect((await rig.store.listAccountMachines(rival.userId))).toHaveLength(0);
+
+    const reClaim = await approveRoute.POST(
+      jsonPost("/api/v1/account/devices/approve", { userCode: machine.userCode }, { ...withCookie(owner.token), "x-forwarded-for": nextIp() }),
+    );
+    expect(reClaim.status).toBe(202);
+    const confirmRes = await claimConfirmRoute.POST(
+      signedRequest(machine.keys, machine.installationId, "", "/api/v1/auth/device/claim-confirm", JSON.stringify({ deviceCode: machine.deviceCode, accept: true }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(confirmRes.status).toBe(200);
+    expect((await rig.store.listAccountMachines(owner.userId)).find((m) => m.installationId === machine.installationId)?.status).toBe("active");
+  });
+
+  it("claim-confirm signed by a DIFFERENT installation's key -> 401; confirm with no pending claim -> 404", async () => {
+    const owner = await createAccount("cc-edges@example.com");
+    const machine = await startDeviceEnrollment();
+    const stranger = await startDeviceEnrollment();
+
+    await approveRoute.POST(
+      jsonPost("/api/v1/account/devices/approve", { userCode: machine.userCode }, { ...withCookie(owner.token), "x-forwarded-for": nextIp() }),
+    );
+    // Stranger signs over the machine's deviceCode — the envelope's
+    // installation is the stranger's, so the code lookup 401s.
+    const forged = await claimConfirmRoute.POST(
+      signedRequest(stranger.keys, stranger.installationId, "", "/api/v1/auth/device/claim-confirm", JSON.stringify({ deviceCode: machine.deviceCode, accept: true }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(forged.status).toBe(401);
+
+    // A fresh code with no claim: accepting has nothing to confirm.
+    const noClaim = await claimConfirmRoute.POST(
+      signedRequest(stranger.keys, stranger.installationId, "", "/api/v1/auth/device/claim-confirm", JSON.stringify({ deviceCode: stranger.deviceCode, accept: true }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(noClaim.status).toBe(404);
+    expect(((await noClaim.json()) as { error: { code: string } }).error.code).toBe("unknown_request");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sessions revoke-all (gate (b)) + the machine directory (P2)
+
+describe("sessions revoke-all + account directory", () => {
+  it("revoke-all deletes every session of the user (this browser included) and only theirs", async () => {
+    const acct = await createAccount("everywhere@example.com");
+    const other = await createAccount("other-device@example.com");
+    // A second session for the same user (another browser): login again.
+    const secondLogin = await loginRoute.POST(
+      jsonPost("/api/v1/account/login", { email: "everywhere@example.com", password: "correct-horse-battery" }, { "x-forwarded-for": nextIp() }),
+    );
+    expect(secondLogin.status).toBe(200);
+    const secondToken = sessionTokenOf(secondLogin);
+
+    const res = await revokeAllRoute.POST(
+      jsonPost("/api/v1/account/sessions/revoke-all", {}, { ...withCookie(acct.token), "x-forwarded-for": nextIp() }),
+    );
+    expect(res.status).toBe(200);
+    expect(await rig.store.getUserSession(acct.token)).toBeNull();
+    expect(await rig.store.getUserSession(secondToken)).toBeNull();
+    expect(await rig.store.getUserSession(other.token)).not.toBeNull();
+    // The cookie is cleared too.
+    expect(res.headers.get("set-cookie")).toMatch(/msw_session=;.*Max-Age=0/);
+  });
+
+  it("directory: a bound machine sees its account's ACTIVE machines with signaling ids; unbound -> the same 404", async () => {
+    const owner = await createAccount("dir-owner@example.com");
+    const outsider = await createAccount("dir-outsider@example.com");
+
+    // Machine A: enrolled + bound (label from the claim).
+    const keysA = makeKeypair();
+    const a = await startDeviceEnrollment(keysA);
+    await rig.store.approveDevice(a.deviceCode);
+    const completeA = await deviceComplete.POST(
+      signedRequest(keysA, a.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: a.deviceCode }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(completeA.status).toBe(200);
+    const sessionA = ((await completeA.json()) as { token: string }).token;
+    await approveRoute.POST(
+      jsonPost("/api/v1/account/devices/approve", { userCode: a.userCode, label: "Alpha" }, { ...withCookie(owner.token), "x-forwarded-for": nextIp() }),
+    );
+    const confirmA = await claimConfirmRoute.POST(
+      signedRequest(keysA, a.installationId, "", "/api/v1/auth/device/claim-confirm", JSON.stringify({ deviceCode: a.deviceCode, accept: true }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(confirmA.status).toBe(200);
+
+    // Machine B: bound too, and it shared a signaling id via its heartbeat.
+    const keysB = makeKeypair();
+    const b = await startDeviceEnrollment(keysB);
+    await rig.store.approveDevice(b.deviceCode);
+    const completeB = await deviceComplete.POST(
+      signedRequest(keysB, b.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: b.deviceCode }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(completeB.status).toBe(200);
+    await approveRoute.POST(
+      jsonPost("/api/v1/account/devices/approve", { userCode: b.userCode, label: "Beta" }, { ...withCookie(owner.token), "x-forwarded-for": nextIp() }),
+    );
+    await claimConfirmRoute.POST(
+      signedRequest(keysB, b.installationId, "", "/api/v1/auth/device/claim-confirm", JSON.stringify({ deviceCode: b.deviceCode, accept: true }), rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(await rig.store.updateMachineContact(b.installationId, { signalingDeviceId: "fedcba9876543210" }, rig.nowMs)).toBe(true);
+
+    // A asks for the directory: both machines, Beta controllable, Alpha not.
+    const dirRes = await directoryRoute.GET(
+      signedRequest(keysA, a.installationId, sessionA, "/api/v1/account/directory", undefined, rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(dirRes.status).toBe(200);
+    const dir = (await dirRes.json()) as { machines: Array<{ installationId: string; label: string | null; signalingDeviceId: string | null }> };
+    expect(dir.machines).toHaveLength(2);
+    const beta = dir.machines.find((m) => m.installationId === b.installationId);
+    const alpha = dir.machines.find((m) => m.installationId === a.installationId);
+    expect(beta).toMatchObject({ label: "Beta", signalingDeviceId: "fedcba9876543210" });
+    expect(alpha).toMatchObject({ label: "Alpha", signalingDeviceId: null });
+
+    // Revoked machines drop out of the directory.
+    await revokeRoute.POST(
+      new Request(`http://tracker.local/api/v1/account/machines/${b.installationId}/revoke`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...withCookie(owner.token) },
+      }),
+      { params: Promise.resolve({ installationId: b.installationId }) },
+    );
+    const afterRevoke = await directoryRoute.GET(
+      signedRequest(keysA, a.installationId, sessionA, "/api/v1/account/directory", undefined, rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(((await afterRevoke.json()) as { machines: string[] }).machines).toHaveLength(1);
+
+    // An enrolled-but-unbound machine gets the same 404 as a total stranger.
+    const unbound = await startDeviceEnrollment();
+    await rig.store.approveDevice(unbound.deviceCode);
+    const unboundComplete = await deviceComplete.POST(
+      signedRequest(unbound.keys, unbound.installationId, "", "/api/v1/auth/device/complete", JSON.stringify({ deviceCode: unbound.deviceCode }), rig.ctx.now, { ip: nextIp() }),
+    );
+    const unboundSession = ((await unboundComplete.json()) as { token: string }).token;
+    const unboundDir = await directoryRoute.GET(
+      signedRequest(unbound.keys, unbound.installationId, unboundSession, "/api/v1/account/directory", undefined, rig.ctx.now, { ip: nextIp() }),
+    );
+    expect(unboundDir.status).toBe(404);
+    expect(((await unboundDir.json()) as { error: { code: string } }).error.code).toBe("unknown_machine");
+    void outsider;
   });
 });
 

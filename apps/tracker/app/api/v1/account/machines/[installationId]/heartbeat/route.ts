@@ -1,11 +1,13 @@
 // POST /api/v1/account/machines/[installationId]/heartbeat — signed machine
-// liveness for the account dashboard: touches last_seen_at (migration 0009)
-// on the installation's ACTIVE account_machines row. Auth is exactly the
+// liveness + contact info for the account layer: touches last_seen_at
+// (migration 0009), sets or clears the signaling mailbox mapping and
+// auto-fills an unnamed label from the display name (migration 0011) on the
+// installation's ACTIVE account_machines row. Auth is exactly the
 // peer-route stack (MSP1 envelope + the 24h x-msp-session from
 // auth/device/complete, guardPeerRequest); rate limiting is the house
-// per-installation peer bucket — nothing new. The body is exactly {}.
-// Mismatched path id, no active binding, and revoked machines all answer
-// the same 404 unknown_machine (no existence oracle).
+// per-installation peer bucket — nothing new. The body is {} or the optional
+// contact fields. Mismatched path id, no active binding, and revoked
+// machines all answer the same 404 unknown_machine (no existence oracle).
 
 import { jsonErrorFor, jsonOk } from "@/lib/errors";
 import { guardPeerRequest } from "@/lib/guard";
@@ -29,7 +31,7 @@ export async function POST(
     return jsonErrorFor("unknown_machine", "no active machine with that id");
   }
   const now = guarded.ctx.now();
-  const touched = await guarded.ctx.store.touchAccountMachineSeen(installationId, now);
+  const touched = await guarded.ctx.store.updateMachineContact(installationId, guarded.body, now);
   if (!touched) {
     return jsonErrorFor("unknown_machine", "no active machine with that id");
   }

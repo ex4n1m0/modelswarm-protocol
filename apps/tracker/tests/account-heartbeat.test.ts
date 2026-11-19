@@ -13,6 +13,7 @@ import * as revokeRoute from "@/app/api/v1/account/machines/[installationId]/rev
 import * as machineHeartbeatRoute from "@/app/api/v1/account/machines/[installationId]/heartbeat/route";
 import * as deviceStart from "@/app/api/v1/auth/device/start/route";
 import * as deviceComplete from "@/app/api/v1/auth/device/complete/route";
+import * as claimConfirmRoute from "@/app/api/v1/auth/device/claim-confirm/route";
 import { SESSION_TTL_MS } from "@/lib/constants";
 import type { KeyPair } from "@/lib/crypto";
 import { keyPairIds, makeKeypair, makeRig, signedRequest } from "./helpers";
@@ -56,8 +57,9 @@ async function createAccount(email: string): Promise<{ userId: string; token: st
 }
 
 /** Full device enrollment (start -> approve via store hook -> complete) that
- *  KEEPS the pairing userCode, so the account approve route can bind it. */
-async function enrollMachine(): Promise<{ keys: KeyPair; installationId: string; userCode: string; session: string }> {
+ *  KEEPS the pairing userCode + deviceCode, so the account claim handshake
+ *  can bind it. */
+async function enrollMachine(): Promise<{ keys: KeyPair; installationId: string; userCode: string; deviceCode: string; session: string }> {
   const keys = makeKeypair();
   const { installationId, pubKeyB58 } = keyPairIds(keys);
   const startRes = await deviceStart.POST(
@@ -71,13 +73,14 @@ async function enrollMachine(): Promise<{ keys: KeyPair; installationId: string;
   );
   if (completeRes.status !== 200) throw new Error(`device/complete failed: ${completeRes.status} ${await completeRes.text()}`);
   const session = (await completeRes.json()) as { token: string };
-  return { keys, installationId, userCode: start.userCode, session: session.token };
+  return { keys, installationId, userCode: start.userCode, deviceCode: start.deviceCode, session: session.token };
 }
 
 interface Enrolled {
   keys: KeyPair;
   installationId: string;
   userCode: string;
+  deviceCode: string;
   session: string;
 }
 
@@ -95,10 +98,14 @@ async function beat(m: Enrolled, pathId = m.installationId, body = "{}"): Promis
 }
 
 async function bind(acctToken: string, m: Enrolled): Promise<void> {
-  const res = await approveRoute.POST(
+  const claim = await approveRoute.POST(
     jsonPost("/api/v1/account/devices/approve", { userCode: m.userCode }, { ...withCookie(acctToken), "x-forwarded-for": nextIp() }),
   );
-  if (res.status !== 201) throw new Error(`approve failed: ${res.status} ${await res.text()}`);
+  if (claim.status !== 202) throw new Error(`claim failed: ${claim.status} ${await claim.text()}`);
+  const confirm = await claimConfirmRoute.POST(
+    signedRequest(m.keys, m.installationId, "", "/api/v1/auth/device/claim-confirm", JSON.stringify({ deviceCode: m.deviceCode, accept: true }), rig.ctx.now, { ip: nextIp() }),
+  );
+  if (confirm.status !== 200) throw new Error(`claim-confirm failed: ${confirm.status} ${await confirm.text()}`);
 }
 
 interface ListedMachine {
@@ -195,7 +202,7 @@ describe("machine heartbeat", () => {
     expect((await rig.store.listAccountMachines(acct.userId))[0]!.lastSeenAt).toBeNull();
   });
 
-  it("the frozen body is exactly {} — anything else is 400 invalid_body", async () => {
+  it("the body is {} or the contact fields — unknown keys are 400 invalid_body", async () => {
     const acct = await createAccount("hb-body@example.com");
     const machine = await enrollMachine();
     await bind(acct.token, machine);
@@ -203,5 +210,34 @@ describe("machine heartbeat", () => {
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe("invalid_body");
     expect((await rig.store.listAccountMachines(acct.userId))[0]!.lastSeenAt).toBeNull();
+  });
+
+  it("contact fields: signaling id maps the machine, null clears it, displayName fills a NULL label once", async () => {
+    const acct = await createAccount("hb-contact@example.com");
+    const machine = await enrollMachine();
+    await bind(acct.token, machine);
+    const row = () => (async () => (await rig.store.listAccountMachines(acct.userId))[0])();
+
+    // Claim-handshake bind carries no label; the heartbeat names it.
+    expect((await row()).label).toBeNull();
+    const nameIt = await beat(machine, machine.installationId, JSON.stringify({ displayName: "Den PC" }));
+    expect(nameIt.status).toBe(200);
+    expect((await row())).toMatchObject({ label: "Den PC", signalingDeviceId: null });
+
+    // Share the signaling id; then clear it (sharing off).
+    const share = await beat(machine, machine.installationId, JSON.stringify({ signalingDeviceId: "0123456789abcdef" }));
+    expect(share.status).toBe(200);
+    expect((await row()).signalingDeviceId).toBe("0123456789abcdef");
+    const unshare = await beat(machine, machine.installationId, JSON.stringify({ signalingDeviceId: null }));
+    expect(unshare.status).toBe(200);
+    expect((await row()).signalingDeviceId).toBeNull();
+
+    // A later displayName never renames a named machine; a malformed id is
+    // rejected with nothing written.
+    await beat(machine, machine.installationId, JSON.stringify({ displayName: "Ignore" }));
+    expect((await row()).label).toBe("Den PC");
+    const bad = await beat(machine, machine.installationId, JSON.stringify({ signalingDeviceId: "not-hex!" }));
+    expect(bad.status).toBe(400);
+    expect((await row()).lastSeenAt).toBe(rig.nowMs); // untouched by the 400
   });
 });

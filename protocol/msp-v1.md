@@ -89,8 +89,24 @@ routes).
 | Endpoint | Body | Result |
 |---|---|---|
 | `POST /auth/device/start` | `{installationId, pubKey}` | `{deviceCode, userCode, verifyUrl, expiresAt}`; `pubKey` is base58; 10 req/min per IP |
-| `POST /auth/device/complete` | signed envelope `{deviceCode}` | `{session}` or `403 pending` |
+| `POST /auth/device/complete` | signed envelope `{deviceCode}` | `{session}`, `403 pending`, or `{status:"claim_pending", claimedBy}` while an account claim awaits the device's answer |
+| `POST /auth/device/claim-confirm` | signed envelope `{deviceCode, accept}` | `{status:"claim_confirmed"\|"claim_denied"}`; the device-side answer to a pending account claim — accept binds the installation to the claiming account's machines, deny clears the claim and frees the code (2026-11-19) |
 | `POST /admin/devices/approve` | admin token (`X-MSP-Admin`) `{userCode}` | `{approved:true}` or `404`; the `verifyUrl` approval page — knowing the user code alone is never enough |
+
+**Account claim handshake (2026-11-19, migrations 0010/0011).** The website
+account flow (`POST /account/devices/approve`, cookie session) writes a
+PENDING claim by `userCode` — it no longer binds directly. The device's
+`/complete` poll reports the claim (`claimedBy` = masked claimer email), and
+the binding happens only if the device answers `/auth/device/claim-confirm`
+with `accept: true` before the code expires (15 min). A leaked 8-char
+userCode can then at most dangle a pending claim the device declines. The
+admin-token approve keeps its direct semantics (trusted out-of-band
+channel). Also in this layer: the account machine heartbeat
+(`POST /account/machines/{id}/heartbeat`) accepts optional contact fields —
+`signalingDeviceId` (16 hex; present means set, `null` clears, absent keeps)
+and `displayName` (fills an unnamed machine's label once) — and
+`GET /account/directory` (machine-signed) returns the signing installation's
+account's ACTIVE machines with their signaling ids for in-app connect.
 
 **Automatic approval (deployment option, 2026-10-06).** A tracker MAY
 auto-approve device codes at `/auth/device/start` (`DEVICE_AUTO_APPROVE=1`):
@@ -419,6 +435,7 @@ undocumented amendments.
 | 2026-10-09 | ADR-029 (execution presets) | Creates `protocol/msp-cooperative-v1.md` (SessionOffer/preset namespace); this document stays byte-identical to its pre-ADR-029 frozen text |
 | 2026-10-09 | ADR-030 (receipts v2) | §7 additive successor: ReceiptV2 is a new signed object (v1 §7 shape unchanged in place); `/events/job-result` `receiptDigest` preimage defined as SHA-256 over the canonical counter-signed ReceiptV2 |
 | 2026-10-09 | Post-gate R0.5 code batch (owner gate D7/D16; ADR-028 §7) | §3.3 `challenge/start` row: `challengePrompt` is nonce-bound (`"ModelSwarm readiness challenge <challengeId>"` + optional `"; greedy-canary sha256:<64hex>"` pinned possession digest, hash-only) — value-level change riding the existing field, NO schema edit, golden vector `protocol/vectors/challenge-prompt-1.json`; §5 honest-label note: `verified_capacity`/`capacityClass` are self-reported labels, not hub-verified measurements |
+| 2026-11-19 | DeepMulti merge P2 gates (Remote-repo ADR-013 (a)/(b); migrations 0010/0011) | §3.2 account claim handshake note + `POST /auth/device/claim-confirm` row; `/complete` gains the `claim_pending` answer; account machine heartbeat contact fields (`signalingDeviceId`, `displayName`) + `GET /account/directory` (machine-signed, website-account scoped — non-protocol website surface like the §3 appendix) |
 
 ### §3 appendix — non-protocol website surface
 

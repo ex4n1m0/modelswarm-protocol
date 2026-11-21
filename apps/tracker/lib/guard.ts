@@ -6,6 +6,7 @@ import { getTrackerContext, type TrackerContext } from "@/lib/context";
 import { parseJsonBody, readBody, verifySignedRequest } from "@/lib/envelope";
 import { jsonError, jsonErrorFor } from "@/lib/errors";
 import { safeEqual } from "@/lib/crypto";
+import { getHubStore, HubNotConfiguredError, type HubStore } from "@/lib/hub-store";
 import { clientIpOf } from "@/lib/ratelimit";
 import type { SignedEnvelope } from "@/lib/envelope";
 
@@ -72,6 +73,29 @@ export async function guardPublicBody<S extends z.ZodTypeAny>(
   const parsed = parseJsonBody(body.text, schema, new URL(req.url).pathname);
   if (!parsed.ok) return { ok: false, response: parsed.response };
   return { ok: true, ctx, body: parsed.value };
+}
+
+/** Hub storage precondition (D4): fail closed with 503 when unconfigured,
+ *  mirroring the reference. An explicitly injected store (tests via
+ *  setHubStore) is returned unchanged. The 503 body uses the reference's plain
+ *  {error} shape — a hub-universe config condition outside the frozen msp-v1
+ *  error taxonomy (no ErrorCode maps to 503). */
+export function guardHubStore(): { ok: true; store: HubStore } | { ok: false; response: Response } {
+  const ctx = getTrackerContext();
+  try {
+    return { ok: true, store: getHubStore(ctx.now) };
+  } catch (err) {
+    if (err instanceof HubNotConfiguredError) {
+      return {
+        ok: false,
+        response: new Response(JSON.stringify({ error: "hub storage not configured" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        }),
+      };
+    }
+    throw err;
+  }
 }
 
 /** Session-authed account routes (me/machines/logout/revoke/label): size

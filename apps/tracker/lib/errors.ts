@@ -91,6 +91,13 @@ export function jsonOk(body: unknown, status = 200): Response {
   });
 }
 
+/** Attach Cache-Control: no-store (hub lookup/drain responses carry per-peer
+ *  opaque records and must never be held by shared caches; mirrors reference). */
+export function noStore(res: Response): Response {
+  res.headers.set("cache-control", "no-store");
+  return res;
+}
+
 // Structured logging that can never carry request bodies (F3 / ADR-001).
 type LogFields = Record<string, string | number | boolean | null | undefined>;
 export function logEvent(level: "info" | "warn" | "error", fields: LogFields): void {

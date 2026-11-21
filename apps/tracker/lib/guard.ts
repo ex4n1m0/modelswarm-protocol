@@ -4,7 +4,7 @@
 import type { z } from "zod";
 import { getTrackerContext, type TrackerContext } from "@/lib/context";
 import { parseJsonBody, readBody, verifySignedRequest } from "@/lib/envelope";
-import { jsonError } from "@/lib/errors";
+import { jsonError, jsonErrorFor } from "@/lib/errors";
 import { safeEqual } from "@/lib/crypto";
 import { clientIpOf } from "@/lib/ratelimit";
 import type { SignedEnvelope } from "@/lib/envelope";
@@ -54,19 +54,55 @@ export async function guardPeerGet(
 export async function guardPublicBody<S extends z.ZodTypeAny>(
   req: Request,
   schema: S,
-  rateClass: "public" | "enroll",
+  rateClass: "public" | "enroll" | "account",
 ): Promise<{ ok: true; ctx: TrackerContext; body: z.infer<S> } | { ok: false; response: Response }> {
   const ctx = getTrackerContext();
   const ip = clientIpOf(req);
   const body = await readBody(req);
   if (!body.ok) return { ok: false, response: body.response };
-  const limit = rateClass === "public" ? ctx.limits.publicPerIp : ctx.limits.enrollPerIp;
+  const limit =
+    rateClass === "public"
+      ? ctx.limits.publicPerIp
+      : rateClass === "enroll"
+        ? ctx.limits.enrollPerIp
+        : ctx.limits.accountPerIp;
   if (!ctx.limiter.hit(`${rateClass}:${ip}`, limit)) {
     return { ok: false, response: jsonError(429, "rate_limited", "rate limit exceeded", true) };
   }
   const parsed = parseJsonBody(body.text, schema, new URL(req.url).pathname);
   if (!parsed.ok) return { ok: false, response: parsed.response };
   return { ok: true, ctx, body: parsed.value };
+}
+
+/** Session-authed account routes (me/machines/logout/revoke/label): size
+ *  cap + the per-IP "account" rate class, BEFORE any session store read —
+ *  the session-authed twin of guardPublicBody (no public schema here;
+ *  bodies, when a route has one, are parsed by the caller from `text`).
+ *  devices/approve is NOT on this helper: it takes a public body and stays
+ *  on guardPublicBody(..., "account"), which buckets it the same way. */
+export async function guardAccountRequest(
+  req: Request,
+): Promise<{ ok: true; ctx: TrackerContext; text: string } | { ok: false; response: Response }> {
+  const ctx = getTrackerContext();
+  const body = await readBody(req);
+  if (!body.ok) return { ok: false, response: body.response };
+  const ip = clientIpOf(req);
+  if (!ctx.limiter.hit(`account:${ip}`, ctx.limits.accountPerIp)) {
+    return { ok: false, response: jsonError(429, "rate_limited", "rate limit exceeded", true) };
+  }
+  return { ok: true, ctx, text: body.text };
+}
+
+/** Content-Type gate for the NEW account POST routes only: a cross-site
+ *  form can POST text/plain bodies, and a JSON parse of those must not be
+ *  reachable. Opt-in per call site — every pre-existing route keeps its
+ *  frozen behavior (content-type was never enforced there). Null = ok. */
+export function requireJsonContentType(req: Request): Response | null {
+  const mime = (req.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+  if (mime !== "application/json") {
+    return jsonErrorFor("invalid_body", "content-type must be application/json");
+  }
+  return null;
 }
 
 /** X-MSP-Admin check (ops runbook token from ADMIN_TOKEN). Null response = ok. */

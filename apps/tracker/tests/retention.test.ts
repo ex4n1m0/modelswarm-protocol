@@ -91,6 +91,39 @@ describe("sessions: census-safe pruning", () => {
   });
 });
 
+describe("user_sessions: census-safe pruning (website accounts, migration 0008)", () => {
+  const userSession = (userId: string, token: string, expiresAt: number) => ({
+    token,
+    userId,
+    createdAt: 0,
+    expiresAt,
+  });
+
+  it("deletes expired-beyond-grace sessions but keeps one tombstone per user (the newest expired row)", async () => {
+    const t = rig.nowMs;
+    const ancient = t - EXPIRED_ROW_GRACE_MS - 10_000;
+    await store.createUserSession(userSession("user-old", "ut1", ancient));
+    await store.createUserSession(userSession("user-old", "ut2", ancient + 1));
+    await store.createUserSession(userSession("user-old", "ut3", ancient + 2));
+    await store.createUserSession(userSession("user-old", "ut-live", t + 60_000));
+    // Each creating write prunes; user-old keeps exactly its newest expired
+    // row plus the live one.
+    const internals = store as unknown as { userSessions: Map<string, { userId: string }> };
+    expect([...internals.userSessions.keys()].sort()).toEqual(["ut-live", "ut3"]);
+    expect(await store.getUserSession("ut3")).not.toBeNull();
+    expect(await store.getUserSession("ut-live")).not.toBeNull();
+    expect(await store.getUserSession("ut1")).toBeNull();
+    expect(await store.getUserSession("ut2")).toBeNull();
+  });
+
+  it("never removes the only row of a user", async () => {
+    const t = rig.nowMs;
+    await store.createUserSession(userSession("solo-user", "ut-only", t - EXPIRED_ROW_GRACE_MS - 60_000));
+    await store.createUserSession(userSession("other-user", "ut-live", t + 60_000));
+    expect(await store.getUserSession("ut-only")).not.toBeNull();
+  });
+});
+
 describe("device_codes: expired-beyond-grace rows are swept at write time", () => {
   it("keeps fresh and pending codes, drops long-expired ones", async () => {
     const t = rig.nowMs;
@@ -101,6 +134,10 @@ describe("device_codes: expired-beyond-grace rows are swept at write time", () =
       verifyUrl: "https://x/verify",
       approved: false,
       expiresAt: t - EXPIRED_ROW_GRACE_MS - 1,
+      claimedByUserId: null,
+      claimedLabel: null,
+      claimedAt: null,
+      claimConfirmedAt: null,
     });
     await store.createDeviceAuth({
       deviceCode: "fresh",
@@ -109,6 +146,10 @@ describe("device_codes: expired-beyond-grace rows are swept at write time", () =
       verifyUrl: "https://x/verify",
       approved: false,
       expiresAt: t + 60_000,
+      claimedByUserId: null,
+      claimedLabel: null,
+      claimedAt: null,
+      claimConfirmedAt: null,
     });
     expect(await store.getDeviceAuth("fresh")).not.toBeNull();
     expect(await store.getDeviceAuth("dead")).toBeNull();

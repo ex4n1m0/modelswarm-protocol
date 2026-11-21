@@ -8,8 +8,22 @@ import { SESSION_TTL_MS } from "@/lib/constants";
 
 // POST /api/v1/auth/device/complete (msp-v1 §3.2): signed envelope over
 // {deviceCode} (no session yet). Approved -> {token, expiresAt} (24 h);
-// not approved -> 403 pending. Approval itself is the ops-runbook stand-in
-// store.approveDevice() (documented in DESIGN/handoff; test hook).
+// not approved -> 403 pending. Since the claim handshake (gate (a),
+// migration 0010) a PENDING account claim gates the session too: the
+// device must first see who claimed it and answer at
+// /auth/device/claim-confirm — 200 {status:"claim_pending", claimedBy}
+// (masked email) instead of a token. The admin /verify approve and the
+// auto-approve path (no claim rows touched) still complete directly.
+
+/** Masked claimer identity for the device-side confirm prompt: the local
+ *  part keeps its first character only. The email (not the display name —
+ *  which is choosable and confusable) is what lets the person at the
+ *  machine spot a wrong-account claim. */
+function maskEmail(email: string): string {
+  const at = email.indexOf("@");
+  if (at <= 0) return "…";
+  return `${email.slice(0, 1)}***${email.slice(at)}`;
+}
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,6 +50,14 @@ export async function POST(req: Request) {
   }
   if (device.expiresAt <= ctx.now()) {
     return jsonError(401, "unauthorized", "device code expired; restart enrollment");
+  }
+  // An unconfirmed claim gates the session even when approved is already
+  // true (admin/auto-approve): the device-side confirm is the anti-hijack
+  // step, so it takes precedence over every approval path.
+  if (device.claimedByUserId !== null && device.claimConfirmedAt === null) {
+    const claimer = await ctx.store.getAccountUserById(device.claimedByUserId);
+    const claimedBy = claimer ? maskEmail(claimer.email) : "unknown account";
+    return jsonOk({ status: "claim_pending", claimedBy });
   }
   if (!device.approved) {
     return jsonError(403, "pending", "device enrollment awaiting user approval");

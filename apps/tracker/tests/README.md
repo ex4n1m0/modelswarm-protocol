@@ -21,6 +21,8 @@ against MemoryStore, plus the Phase B endpoints (DESIGN.md):
 - `meta.test.ts` — H2 (no runtime/model references), no background timers,
   protocol-version parity, frozen-constant bands.
 
-The Postgres suite (PgStore against disposable Postgres via DATABASE_URL) is
-the Phase-B integration follow-up; `npm run db:migrate` applies
-`migrations/0001_init.sql` when DATABASE_URL is set and no-ops otherwise.
+The Postgres suites (`pg-enrollment.test.ts`, `account-store-pg.test.ts`) run
+PgStore against real Postgres via DATABASE_URL — `describe.skipIf` locally,
+and in full inside CI's `integration-postgres` job (which migrates first).
+`npm run db:migrate` applies `migrations/*.sql` in order when DATABASE_URL is
+set and no-ops otherwise.

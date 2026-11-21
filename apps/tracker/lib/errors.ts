@@ -18,7 +18,13 @@ export type ErrorCode =
   | "lease_expired"
   | "no_capability"
   | "ineligible"
-  | "balance_exceeded";
+  | "balance_exceeded"
+  | "email_taken"
+  | "invalid_credentials"
+  | "signup_closed"
+  | "already_bound"
+  | "already_claimed"
+  | "unknown_machine";
 
 /** Frozen mapping (msp-v1 §3.4). unknown_profile is 404 on public catalog
  * reads and 400 on request-body validation; call sites pick explicitly. */
@@ -40,6 +46,12 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   lease_expired: 410,
   no_capability: 403,
   ineligible: 403,
+  email_taken: 409,
+  invalid_credentials: 401,
+  signup_closed: 403,
+  already_bound: 409,
+  already_claimed: 409,
+  unknown_machine: 404,
 };
 
 export interface JsonErrorBody {

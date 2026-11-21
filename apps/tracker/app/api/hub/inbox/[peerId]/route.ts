@@ -9,11 +9,12 @@
 // (the peer:<id> reg record). A stranger who knows a peerId — even with a valid
 // signature from a DIFFERENT key — cannot read or delete its box (403). No reg
 // record -> 403. The hub holds no private keys and never plaintexts env_json.
+// Cache-Control: no-store on every response (reference drain sets no-store).
 
 import { getTrackerContext } from "@/lib/context";
-import { jsonError, jsonErrorFor, jsonOk } from "@/lib/errors";
+import { jsonError, jsonErrorFor, jsonOk, noStore } from "@/lib/errors";
+import { guardHubStore } from "@/lib/guard";
 import { drainAuthorized } from "@/lib/hub-crypto";
-import { getHubStore } from "@/lib/hub-store";
 import { HUB_DRAIN_FRESHNESS_MS } from "@/lib/hub-schemas";
 import { clientIpOf } from "@/lib/ratelimit";
 
@@ -24,10 +25,12 @@ export async function GET(
   req: Request,
   { params }: { params: Promise<{ peerId: string }> },
 ): Promise<Response> {
+  const hub = guardHubStore();
+  if (!hub.ok) return noStore(hub.response);
   const ctx = getTrackerContext();
   const ip = clientIpOf(req);
   if (!ctx.limiter.hit(`public:${ip}`, ctx.limits.publicPerIp)) {
-    return jsonError(429, "rate_limited", "rate limit exceeded", true);
+    return noStore(jsonError(429, "rate_limited", "rate limit exceeded", true));
   }
   const { peerId } = await params;
   const url = new URL(req.url);
@@ -35,18 +38,18 @@ export async function GET(
   const ts = Number(url.searchParams.get("ts_ms") ?? NaN);
   const sigB64 = url.searchParams.get("sig_b64");
   if (peerId.length < 8 || peerId.length > 128 || !Number.isFinite(ts) || !sigB64) {
-    return jsonErrorFor("invalid_body", "bad drain request");
+    return noStore(jsonErrorFor("invalid_body", "bad drain request"));
   }
   if (Math.abs(ctx.now() - ts) > HUB_DRAIN_FRESHNESS_MS) {
-    return jsonErrorFor("stale_timestamp", "drain ts outside the ±60 s window");
+    return noStore(jsonErrorFor("stale_timestamp", "drain ts outside the ±60 s window"));
   }
 
   // Ownership proof against the registered key (reference inbox/[peerId].ts).
-  const store = getHubStore(ctx.now);
+  const store = hub.store;
   const reg = await store.getPeer(peerId);
   if (!drainAuthorized(peerId, ts, sigB64, reg?.public_key_b64)) {
-    return jsonError(403, "forbidden", "drain not authorized");
+    return noStore(jsonError(403, "forbidden", "drain not authorized"));
   }
   const items = await store.drainInbox(peerId);
-  return jsonOk({ items });
+  return noStore(jsonOk({ items }));
 }

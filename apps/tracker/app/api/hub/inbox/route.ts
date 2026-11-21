@@ -10,15 +10,18 @@
 //
 // Batch cap 1..16 (the client asserts ≤16). Per box: TTL 86400 s, keep the last
 // 32 items. The body cap is the hub inbox's own (2 MiB), NOT the tracker's
-// 64 KiB peer cap — a 16-item batch of 64 KiB envelopes exceeds 64 KiB, and the
-// reference rides Vercel's ~4.5 MB limit. Rate class "public" per IP, plus a
+// 64 KiB peer cap — a 16-item batch of 64 KiB envelopes exceeds 64 KiB. The
+// staging tracker is SELF-HOSTED (next start, no Vercel body limit), so the cap
+// is enforced by an INCREMENTAL stream read that aborts the moment accumulated
+// bytes exceed 2 MiB — never buffering beyond the cap, even for chunked
+// transfers without Content-Length. Rate class "public" per IP, plus a
 // per-sender throttle mirroring the reference's `rl:mail:<from>` 1-per-4s NX.
 
 import { getTrackerContext } from "@/lib/context";
 import { jsonError, jsonErrorFor, jsonOk } from "@/lib/errors";
 import { parseJsonBody } from "@/lib/envelope";
+import { guardHubStore } from "@/lib/guard";
 import { mailItemVerified } from "@/lib/hub-crypto";
-import { getHubStore } from "@/lib/hub-store";
 import { HubInboxBatchSchema, HUB_INBOX_FRESHNESS_MS, HUB_INBOX_MAX_BODY_BYTES } from "@/lib/hub-schemas";
 import { clientIpOf } from "@/lib/ratelimit";
 
@@ -29,13 +32,15 @@ export const dynamic = "force-dynamic";
 const MAIL_PER_MIN = 15;
 
 export async function POST(req: Request): Promise<Response> {
+  const hub = guardHubStore();
+  if (!hub.ok) return hub.response;
   const ctx = getTrackerContext();
   const ip = clientIpOf(req);
   if (!ctx.limiter.hit(`public:${ip}`, ctx.limits.publicPerIp)) {
     return jsonError(429, "rate_limited", "rate limit exceeded", true);
   }
 
-  // Size cap first (hub inbox cap; see header). Mirrors envelope.readBody.
+  // Declared Content-Length: reject oversized up front (cheap early out).
   const declared = req.headers.get("content-length");
   if (declared !== null) {
     const value = Number.parseInt(declared, 10);
@@ -43,12 +48,12 @@ export async function POST(req: Request): Promise<Response> {
       return jsonError(413, "payload_too_large", "inbox batch exceeds the 2 MiB cap");
     }
   }
-  const text = await req.text();
-  if (Buffer.byteLength(text, "utf8") > HUB_INBOX_MAX_BODY_BYTES) {
-    return jsonError(413, "payload_too_large", "inbox batch exceeds the 2 MiB cap");
-  }
+  // Incremental read: abort the moment accumulated bytes exceed the cap, so a
+  // chunked body without Content-Length can never OOM the self-hosted process.
+  const body = await readCapped(req, HUB_INBOX_MAX_BODY_BYTES);
+  if (!body.ok) return body.response;
 
-  const parsed = parseJsonBody(text, HubInboxBatchSchema, new URL(req.url).pathname);
+  const parsed = parseJsonBody(body.text, HubInboxBatchSchema, new URL(req.url).pathname);
   if (!parsed.ok) return parsed.response;
   const items = parsed.value.items;
 
@@ -67,6 +72,34 @@ export async function POST(req: Request): Promise<Response> {
     return jsonError(429, "rate_limited", "rate limit exceeded", true);
   }
 
-  await getHubStore(ctx.now).appendInbox(items);
+  await hub.store.appendInbox(items);
   return jsonOk({ ok: true, stored: items.length });
+}
+
+/** Incrementally read req.body under `cap`, aborting (413) the instant the
+ *  accumulated byte count exceeds it — the crossing chunk is counted but never
+ *  appended, so buffered bytes never exceed the cap. Concatenating the raw
+ *  chunks before UTF-8 decode yields the same text req.text() would produce
+ *  (multi-byte sequences split across chunks decode correctly). */
+async function readCapped(
+  req: Request,
+  cap: number,
+): Promise<{ ok: true; text: string } | { ok: false; response: Response }> {
+  const reader = req.body?.getReader();
+  if (!reader) return { ok: true, text: "" };
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > cap) {
+      // Stop upstream; the request is already refused, so a cancel error is moot.
+      await reader.cancel().catch(() => {});
+      return { ok: false, response: jsonError(413, "payload_too_large", "inbox batch exceeds the 2 MiB cap") };
+    }
+    chunks.push(value);
+  }
+  return { ok: true, text: Buffer.concat(chunks).toString("utf8") };
 }

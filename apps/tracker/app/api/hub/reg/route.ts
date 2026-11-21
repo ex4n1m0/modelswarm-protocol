@@ -10,11 +10,9 @@
 // accepted record is stored VERBATIM. TTL 300 s. Mini-STUN: echo the observed
 // public IP (advisory response data, never stored) as the reference does.
 
-import { getTrackerContext } from "@/lib/context";
 import { jsonError, jsonErrorFor, jsonOk } from "@/lib/errors";
-import { guardPublicBody } from "@/lib/guard";
+import { guardHubStore, guardPublicBody } from "@/lib/guard";
 import { registrationVerified } from "@/lib/hub-crypto";
-import { getHubStore } from "@/lib/hub-store";
 import { HubRegistrationSchema, HUB_REG_FRESHNESS_MS } from "@/lib/hub-schemas";
 
 export const runtime = "nodejs";
@@ -25,6 +23,8 @@ export const dynamic = "force-dynamic";
 const REG_PER_MIN = 2;
 
 export async function PUT(req: Request): Promise<Response> {
+  const hub = guardHubStore();
+  if (!hub.ok) return hub.response;
   const guarded = await guardPublicBody(req, HubRegistrationSchema, "public");
   if (!guarded.ok) return guarded.response;
   const { ctx, body } = guarded;
@@ -41,7 +41,7 @@ export async function PUT(req: Request): Promise<Response> {
     return jsonError(429, "rate_limited", "rate limit exceeded", true);
   }
 
-  await getHubStore(ctx.now).setPeer(body.peer_id, body);
+  await hub.store.setPeer(body.peer_id, body);
   return jsonOk({ ok: true, observedIp: observedIp(req) });
 }
 

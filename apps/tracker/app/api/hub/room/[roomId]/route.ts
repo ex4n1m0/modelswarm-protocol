@@ -5,7 +5,7 @@
 
 import { getTrackerContext } from "@/lib/context";
 import { jsonError, jsonErrorFor, jsonOk } from "@/lib/errors";
-import { getHubStore } from "@/lib/hub-store";
+import { guardHubStore } from "@/lib/guard";
 import { ROOM_ID_PATTERN } from "@/lib/hub-schemas";
 import { clientIpOf } from "@/lib/ratelimit";
 
@@ -16,6 +16,8 @@ export async function GET(
   req: Request,
   { params }: { params: Promise<{ roomId: string }> },
 ): Promise<Response> {
+  const hub = guardHubStore();
+  if (!hub.ok) return hub.response;
   const ctx = getTrackerContext();
   const ip = clientIpOf(req);
   if (!ctx.limiter.hit(`public:${ip}`, ctx.limits.publicPerIp)) {
@@ -25,7 +27,7 @@ export async function GET(
   if (!ROOM_ID_PATTERN.test(roomId)) {
     return jsonErrorFor("invalid_body", "bad room id");
   }
-  const record = await getHubStore(ctx.now).getRoom(roomId);
+  const record = await hub.store.getRoom(roomId);
   if (!record) {
     return jsonError(404, "unknown_request", "no host record");
   }

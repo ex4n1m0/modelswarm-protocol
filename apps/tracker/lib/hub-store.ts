@@ -4,9 +4,9 @@
 // implementations, mirroring lib/store.ts's MemoryStore/PgStore split:
 //   - UpstashHubStore: plain fetch to Upstash REST (no SDK), constructed only
 //     when DM1_UPSTASH_REDIS_REST_URL + DM1_UPSTASH_REDIS_REST_TOKEN are set.
-//   - MemoryHubStore:  Maps + injectable clock, used in tests and when the
-//     env vars are absent (the same fail-soft fallback store.ts uses for
-//     DATABASE_URL — unlike the reference, which 503s when unconfigured).
+//   - MemoryHubStore:  Maps + injectable clock, used ONLY via explicit test
+//     injection (setHubStore). Production FAILS CLOSED with 503 when the env
+//     vars are absent (matching the reference) — never a silent memory serve.
 //
 // UNIVERSE ISOLATION (D4): this hub is a SEPARATE universe from
 // onlyhumans.deepflux.space. Two independent layers keep them apart:
@@ -260,16 +260,31 @@ export class MemoryHubStore implements HubStore {
 // ---------------------------------------------------------------------------
 // Factory + test injection point (mirrors store.ts getStore / context init).
 
+/** No injected store and DM1_UPSTASH_* absent. Routes map this to 503 (fail
+ *  closed) so production never silently serves from memory; the reference 503s
+ *  the same way. Tests inject MemoryHubStore explicitly via setHubStore. */
+export class HubNotConfiguredError extends Error {
+  constructor() {
+    super("hub storage not configured");
+    this.name = "HubNotConfiguredError";
+  }
+}
+
 let singleton: HubStore | null = null;
 
 /** Env-driven hub store. The injectable clock keeps TTL row-aging coherent
- *  with the route context clock (never Date.now() directly in routes). */
+ *  with the route context clock (never Date.now() directly in routes). An
+ *  explicitly injected store (tests) wins; otherwise Upstash when configured;
+ *  otherwise throws HubNotConfiguredError (NOT a memory fallback). */
 export function getHubStore(clock: () => number = Date.now): HubStore {
   if (singleton) return singleton;
   const url = process.env.DM1_UPSTASH_REDIS_REST_URL;
   const token = process.env.DM1_UPSTASH_REDIS_REST_TOKEN;
-  singleton = url && token ? new UpstashHubStore(url, token, clock) : new MemoryHubStore(clock);
-  return singleton;
+  if (url && token) {
+    singleton = new UpstashHubStore(url, token, clock);
+    return singleton;
+  }
+  throw new HubNotConfiguredError();
 }
 
 /** Replace the hub store — the test injection point (null resets to lazy). */

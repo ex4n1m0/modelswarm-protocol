@@ -16,15 +16,16 @@
 // hosts retry every ~120 s while records live 300 s).
 
 import { jsonError, jsonErrorFor, jsonOk } from "@/lib/errors";
-import { guardPublicBody } from "@/lib/guard";
+import { guardHubStore, guardPublicBody } from "@/lib/guard";
 import { roomHostVerified } from "@/lib/hub-crypto";
-import { getHubStore } from "@/lib/hub-store";
 import { HubRoomHostSchema, HUB_ROOM_FRESHNESS_MS } from "@/lib/hub-schemas";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function PUT(req: Request): Promise<Response> {
+  const hub = guardHubStore();
+  if (!hub.ok) return hub.response;
   const guarded = await guardPublicBody(req, HubRoomHostSchema, "public");
   if (!guarded.ok) return guarded.response;
   const { ctx, body } = guarded;
@@ -36,7 +37,7 @@ export async function PUT(req: Request): Promise<Response> {
     return jsonError(403, "forbidden", "signature verification failed (key does not derive host peer id)");
   }
 
-  const store = getHubStore(ctx.now);
+  const store = hub.store;
   const existing = await store.getRoom(body.room_id);
   const mine =
     existing !== null &&

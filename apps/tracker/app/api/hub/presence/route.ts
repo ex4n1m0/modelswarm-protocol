@@ -8,8 +8,7 @@
 // 900 s. hub.rs maps a 429 to Ok(0) ("a beat landed <30 s ago; still counted").
 
 import { jsonError, jsonOk } from "@/lib/errors";
-import { guardPublicBody } from "@/lib/guard";
-import { getHubStore } from "@/lib/hub-store";
+import { guardHubStore, guardPublicBody } from "@/lib/guard";
 import { HubPresenceSchema } from "@/lib/hub-schemas";
 
 export const runtime = "nodejs";
@@ -19,10 +18,12 @@ export const dynamic = "force-dynamic";
 const PRESENCE_PER_MIN = 2;
 
 export async function POST(req: Request): Promise<Response> {
+  const hub = guardHubStore();
+  if (!hub.ok) return hub.response;
   const guarded = await guardPublicBody(req, HubPresenceSchema, "public");
   if (!guarded.ok) return guarded.response;
   const { ctx, body } = guarded;
-  const store = getHubStore(ctx.now);
+  const store = hub.store;
 
   if (body.leave === true) {
     await store.presenceLeave(body.token);

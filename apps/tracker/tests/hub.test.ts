@@ -23,7 +23,7 @@ import * as inboxDrainRoute from "@/app/api/hub/inbox/[peerId]/route";
 import * as presenceRoute from "@/app/api/hub/presence/route";
 import { base64UrlEncode, derivePeerId, publicKeyOf } from "@/lib/crypto";
 import { MemoryHubStore, UpstashHubStore, setHubStore } from "@/lib/hub-store";
-import { HUB_INBOX_BATCH_MAX } from "@/lib/hub-schemas";
+import { HUB_INBOX_BATCH_MAX, HUB_INBOX_MAX_BODY_BYTES } from "@/lib/hub-schemas";
 import type { HubMailItem, HubRegistration, HubRoomHost } from "@/lib/hub-schemas";
 import { makeRig } from "./helpers";
 
@@ -364,6 +364,96 @@ describe("hub presence", () => {
     const res = await presenceRoute.POST(req("POST", "/api/hub/presence", { token: "not-a-hex-token!", leave: false }));
     expect(res.status).toBe(400);
     expect(await errCode(res)).toBe("invalid_body");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Self-hosted hardening (staging = next start on a VM, no Vercel body limit).
+describe("hub self-hosted hardening", () => {
+  // undici requires duplex:"half" for a ReadableStream body; the DOM RequestInit
+  // type lacks the field, hence the single localized cast.
+  const streamPost = (stream: ReadableStream<Uint8Array>) =>
+    new Request("http://tracker.local/api/hub/inbox", {
+      method: "POST",
+      headers: { "x-forwarded-for": nextIp() },
+      body: stream,
+      duplex: "half",
+    } as RequestInit);
+
+  it("aborts a chunked oversized body at the cap WITHOUT full buffering -> 413", async () => {
+    const chunkSize = HUB_INBOX_MAX_BODY_BYTES / 4; // 4 chunks fill the cap; the 5th crosses it
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls > 40) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(new Uint8Array(chunkSize));
+      },
+    });
+    const res = await inboxRoute.POST(streamPost(stream)); // no Content-Length (chunked)
+    expect(res.status).toBe(413);
+    expect(await errCode(res)).toBe("payload_too_large");
+    expect(pulls).toBeGreaterThanOrEqual(5); // read enough to cross the cap
+    expect(pulls).toBeLessThan(40); // aborted early — never drained/buffered the whole stream
+  });
+
+  it("accepts a valid batch sent as a chunked stream (no Content-Length) -> 200", async () => {
+    const payload = Buffer.from(JSON.stringify({ items: [mailRecord(ID_A, ID_B.peerId)] }), "utf8");
+    const mid = Math.floor(payload.length / 2);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(payload.subarray(0, mid)));
+        controller.enqueue(new Uint8Array(payload.subarray(mid)));
+        controller.close();
+      },
+    });
+    const res = await inboxRoute.POST(streamPost(stream));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, stored: 1 });
+  });
+
+  it("sets Cache-Control: no-store on lookup responses (success and 404)", async () => {
+    await regRoute.PUT(req("PUT", "/api/hub/reg", regRecord(ID_A)));
+    const ok = await lookupReq(ID_A.peerId);
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("cache-control")).toBe("no-store");
+    const missing = await lookupReq(ID_B.peerId);
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("sets Cache-Control: no-store on drain responses (success and 403)", async () => {
+    await register(ID_B);
+    await inboxRoute.POST(req("POST", "/api/hub/inbox", { items: [mailRecord(ID_A, ID_B.peerId)] }));
+    const ts = rig.ctx.now();
+    const owner = await drainReq(ID_B.peerId, ts, drainSig(ID_B.peerId, ts, ID_B));
+    expect(owner.status).toBe(200);
+    expect(owner.headers.get("cache-control")).toBe("no-store");
+    const stranger = await drainReq(ID_B.peerId, ts, drainSig(ID_B.peerId, ts, ID_C));
+    expect(stranger.status).toBe(403);
+    expect(stranger.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("fails closed with 503 when hub storage is unconfigured (no silent memory serve)", async () => {
+    const prevUrl = process.env.DM1_UPSTASH_REDIS_REST_URL;
+    const prevTok = process.env.DM1_UPSTASH_REDIS_REST_TOKEN;
+    delete process.env.DM1_UPSTASH_REDIS_REST_URL;
+    delete process.env.DM1_UPSTASH_REDIS_REST_TOKEN;
+    setHubStore(null); // remove the injected test store -> production path
+    try {
+      const reg = await regRoute.PUT(req("PUT", "/api/hub/reg", regRecord(ID_A)));
+      expect(reg.status).toBe(503);
+      expect(await reg.json()).toEqual({ error: "hub storage not configured" });
+      const lookup = await lookupReq(ID_A.peerId);
+      expect(lookup.status).toBe(503);
+      expect(lookup.headers.get("cache-control")).toBe("no-store");
+    } finally {
+      if (prevUrl !== undefined) process.env.DM1_UPSTASH_REDIS_REST_URL = prevUrl;
+      if (prevTok !== undefined) process.env.DM1_UPSTASH_REDIS_REST_TOKEN = prevTok;
+    }
   });
 });
 
